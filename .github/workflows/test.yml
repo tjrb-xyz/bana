@@ -20,7 +20,7 @@ jobs:
       - name: tests (macOS's /bin/bash 3.2 and awk)
         if: runner.os == 'macOS'
         run: BASH_UNDER_TEST=/bin/bash tests/run.sh
-      - name: tests (as root: a Proxmox container's path too)
+      - name: "tests (as root, so a Proxmox container's path too)"
         if: runner.os == 'Linux'
         run: sudo -E env PATH="$PATH" tests/run.sh
   manager:
