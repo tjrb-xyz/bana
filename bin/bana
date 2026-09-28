@@ -707,7 +707,9 @@ manager() {
     say "Building the manager (the first time takes a minute)"
     cargo build -q --release --locked --manifest-path "$bana_root/manager/Cargo.toml"
   fi
-  export BANA_CONFIG=$conf_file # its tasks run bana with this project's settings
+  # Its tasks run bana with this project's settings.
+  export BANA_REPO=$repo BANA_PREFIX=$prefix
+  [[ -z $conf_file ]] || export BANA_CONFIG=$conf_file
   exec "$bin" --script "$self" --repo "$repo" --workflow "$(conf workflow ci.yml)" \
     --tiers "$(words "$(conf tiers "quick nightly release")" | tr -s ' ' ',')" \
     --tier-input "$(conf tier_input tier)" "$@"

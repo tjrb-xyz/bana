@@ -170,7 +170,8 @@ Otherwise pass `--token`: *Settings → Actions → Runners → New self-hosted 
 - **runs**: the latest ten, each job with the runner it landed on; *Start a run* and *Cancel*;
 - **tasks**: what the page started, with its output.
 
-It serves loopback only, behind a token kept in `~/.bana/manager-token`, and runs only `bana` and `gh`, with
+*Join the pool* runs `bana up` without a terminal, so a hook that asks for a password (dsper's driver install)
+has to run once from a terminal first. It serves loopback only, behind a token kept in `~/.bana/manager-token`, and runs only `bana` and `gh`, with
 arguments it checks, one runner change at a time. To see another machine's page:
 `ssh -L 8471:127.0.0.1:8470 mac-mini.local`, then open `http://127.0.0.1:8471/#token=…` with that machine's token.
 
