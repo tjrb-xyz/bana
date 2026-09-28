@@ -1,0 +1,33 @@
+name: bana plan
+description: Which jobs a run needs, from its tier and the files changed since the previous push (bana.conf's plan.* keys).
+inputs:
+  tier:
+    description: The run's tier (one of bana.conf's tiers).
+    required: true
+  before:
+    description: The push's previous head; else the files since where HEAD left `branch`.
+    default: ${{ github.event.before }}
+  branch:
+    description: The branch to compare with when `before` is unknown.
+    default: ${{ github.event.repository.default_branch }}
+outputs:
+  json:
+    description: 'The plan as JSON: {"tier":"quick","rust":true,...}; read one key with fromJSON(steps.<id>.outputs.json).rust.'
+    value: ${{ steps.plan.outputs.json }}
+  tier:
+    description: The tier.
+    value: ${{ inputs.tier }}
+runs:
+  using: composite
+  steps:
+    - id: plan
+      shell: bash
+      env:
+        TIER: ${{ inputs.tier }}
+        BEFORE: ${{ inputs.before }}
+        BRANCH: ${{ inputs.branch }}
+      run: |
+        bana=$GITHUB_ACTION_PATH/../../bin/bana
+        json=$("$bana" changed "$BEFORE" "$BRANCH" | "$bana" plan "$TIER" --json)
+        echo "$json"
+        echo "json=$json" >> "$GITHUB_OUTPUT"

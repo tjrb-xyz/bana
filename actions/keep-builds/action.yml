@@ -1,0 +1,20 @@
+name: bana keep-builds
+description: On a self-hosted runner, a clean checkout that keeps the build caches bana.conf names (keep, keep_max_gb). Run it right after actions/checkout with `clean` off on self-hosted runners.
+inputs:
+  keep:
+    description: git clean -e patterns to keep, e.g. "/target/ node_modules/" (default bana.conf's keep).
+    default: ''
+  max-gb:
+    description: A kept top-level directory past this many GiB starts over (default bana.conf's keep_max_gb; 0 never).
+    default: ''
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        KEEP: ${{ inputs.keep }}
+        MAX_GB: ${{ inputs.max-gb }}
+      run: |
+        [[ -z $KEEP ]] || export BANA_KEEP=$KEEP
+        [[ -z $MAX_GB ]] || export BANA_KEEP_MAX_GB=$MAX_GB
+        "$GITHUB_ACTION_PATH/../../bin/bana" keep-builds

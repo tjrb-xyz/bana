@@ -1,0 +1,35 @@
+name: test
+# bana's own tests, on GitHub's runners (bana should not need itself to be
+# tested). macOS: its stock bash 3.2 and BSD tools, where bana has to work.
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  scripts:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        if: runner.os == 'Linux'
+        run: shellcheck -x bin/bana lib/*.sh install.sh tests/run.sh tests/stand-ins/* tests/fixtures/runner/*.sh examples/dsper/*.sh
+      - name: tests (macOS's /bin/bash 3.2 and awk)
+        if: runner.os == 'macOS'
+        run: BASH_UNDER_TEST=/bin/bash tests/run.sh
+      - name: tests (as root: a Proxmox container's path too)
+        if: runner.os == 'Linux'
+        run: sudo -E env PATH="$PATH" tests/run.sh
+  manager:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: manager
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
