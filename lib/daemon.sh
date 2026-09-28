@@ -383,13 +383,27 @@ d_wait_build() { # PORT
   done
 }
 
+# Stops the LaunchAgent, and waits until launchd has let go of it: bootout may return
+# while the daemon still stops a build (up to ExitTimeOut). A bootstrap before then
+# fails, or starts a daemon that finds the old one on its port and leaves for good.
+d_bootout() {
+  local k uid
+  uid=$(id -u)
+  launchctl bootout "gui/$uid/$d_label" 2>/dev/null || true
+  for ((k = 0; k < 70; k++)); do
+    launchctl print "gui/$uid/$d_label" >/dev/null 2>&1 || return 0
+    sleep "$d_step"
+  done
+  warn "launchd still has $d_label after 70 s"
+}
+
 # Starts the service, or starts it again with the new snapshot and settings.
 d_service() { # PATH TRAY
   local uid was=''
   uid=$(id -u)
   if [[ $os == Darwin ]]; then
     d_write_plist "$1" "$2"
-    launchctl bootout "gui/$uid/$d_label" 2>/dev/null || true
+    d_bootout
     launchctl bootstrap "gui/$uid" "$d_plist" || die "launchctl could not start $d_plist"
   else
     command -v systemctl >/dev/null || die "The daemon runs as a systemd user service, and there is no systemctl here"
@@ -464,7 +478,7 @@ daemon_uninstall() {
   case ${1:-} in '') ;; --purge) purge=1 ;; *) daemon_usage ;; esac
   if [[ $os == Darwin ]]; then
     # launchd stops it (SIGTERM): a running build stops, and is not run again.
-    launchctl bootout "gui/$(id -u)/$d_label" 2>/dev/null || true
+    d_bootout
     rm -f "$d_plist"
   elif [[ -f $d_unit_file ]]; then
     systemctl --user disable --now "$d_unit" 2>/dev/null || true

@@ -1,8 +1,20 @@
 #!/bin/sh
-# Stand-in launchd: remembers what was bootstrapped.
+# Stand-in launchd: remembers what was bootstrapped. FAKE_BOOTOUT_SLOW=N: a service booted
+# out stays loaded for N more prints (the daemon still stops).
 echo "launchctl $*" >>"$FAKE_LOG"
 case $1 in
 bootstrap) touch "$FAKE_STATE/launchd-$(basename "$3" .plist)" ;;
-bootout) rm -f "$FAKE_STATE/launchd-${2##*/}" ;;
-print) [ -e "$FAKE_STATE/launchd-${2##*/}" ] ;;
+bootout)
+  if [ -n "${FAKE_BOOTOUT_SLOW:-}" ] && [ -e "$FAKE_STATE/launchd-${2##*/}" ]; then
+    echo "$FAKE_BOOTOUT_SLOW" >"$FAKE_STATE/stopping-${2##*/}"
+  else
+    rm -f "$FAKE_STATE/launchd-${2##*/}"
+  fi ;;
+print)
+  s=$FAKE_STATE/stopping-${2##*/}
+  if [ -e "$s" ]; then
+    n=$(cat "$s")
+    if [ "$n" -gt 0 ]; then echo $((n - 1)) >"$s"; else rm -f "$s" "$FAKE_STATE/launchd-${2##*/}"; fi
+  fi
+  [ -e "$FAKE_STATE/launchd-${2##*/}" ] ;;
 esac

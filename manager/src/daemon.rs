@@ -554,7 +554,7 @@ impl Daemon {
             std::fs::create_dir_all(dir.join(d)).map_err(|e| format!("{}: {e}", dir.display()))?;
         }
         let claimed = claim(&dir).await?;
-        let state: State = match std::fs::read(dir.join("state.json")) {
+        let mut state: State = match std::fs::read(dir.join("state.json")) {
             Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("state.json: {e}"))?,
             Err(_) => State::default(),
         };
@@ -577,6 +577,10 @@ impl Daemon {
                 Ok(_) => eprintln!("bana daemon: builds/{id}/build.json: another id"),
                 Err(e) => eprintln!("bana daemon: builds/{id}/build.json: {e}"),
             }
+        }
+        // A build is saved before state.json counts it (a crash between the two).
+        if let Some(last) = records.keys().next_back() {
+            state.next_id = state.next_id.max(last + 1);
         }
         let seq = records
             .values()
@@ -1090,9 +1094,17 @@ impl Shared {
         let retry = (rec.request.trigger == Trigger::Retry).then(|| rec.request.clone());
         inner.records.remove(&id);
         let _ = std::fs::remove_dir_all(self.build_dir(id));
-        let Some(req) = retry else { return };
+        if let Some(req) = retry {
+            self.settle_interrupted(inner, &req);
+        }
+    }
+
+    /// A retry (`req`) is over: the build it ran again says how it ended, for
+    /// each of its statuses the retry did not take over (a job the retry never
+    /// reached), or that job's pending would stay on GitHub.
+    fn settle_interrupted(&self, inner: &mut Inner, req: &Request) {
         let Inner { records, seq, .. } = inner;
-        let first = records.range_mut(..id).rev().map(|(_, r)| r).find(|r| {
+        let first = records.range_mut(..req.id).rev().map(|(_, r)| r).find(|r| {
             (&r.request.git_ref, &r.request.sha, &r.request.tier)
                 == (&req.git_ref, &req.sha, &req.tier)
                 && r.build.reason.as_deref() == Some(INTERRUPTED)
@@ -1179,6 +1191,9 @@ impl Shared {
                 want_now(r, &report, &mut inner.seq);
             }
             self.save(r);
+            if !retry && rec.request.trigger == Trigger::Retry {
+                self.settle_interrupted(inner, &rec.request);
+            }
             if retry {
                 let req = Request {
                     trigger: Trigger::Retry,
@@ -1532,6 +1547,14 @@ impl Shared {
         self.release_lock(&[std::process::id(), pid.unwrap_or(0)]);
         let mut inner = self.lock();
         inner.running = None;
+        let retried = inner
+            .records
+            .get(&id)
+            .filter(|r| r.request.trigger == Trigger::Retry && r.build.state.finished())
+            .map(|r| r.request.clone());
+        if let Some(req) = retried {
+            self.settle_interrupted(&mut inner, &req);
+        }
         self.prune(&mut inner);
         self.save_state(&inner.state);
         self.publish(&inner);
@@ -1887,7 +1910,15 @@ impl Shared {
             want(rec, updates, &mut inner.seq);
             self.save(rec);
             let (git_ref, sha) = (rec.request.git_ref.clone(), rec.request.sha.clone());
-            (state == BuildState::Success).then(|| {
+            // Green says the ref's pushes passed up to here: only a build at the
+            // tier its pushes run says so (a nightly may run other jobs).
+            let rules = &self.settings.rules;
+            let push_tier = if watch::is_tag(&git_ref) {
+                &rules.tag_tier
+            } else {
+                &rules.tier
+            };
+            (state == BuildState::Success && rec.request.tier == *push_tier).then(|| {
                 inner.state.green.insert(git_ref.clone(), sha.clone());
                 self.save_state(&inner.state);
                 (git_ref, sha)
@@ -2605,7 +2636,8 @@ pub(crate) mod tests {
     /// `fixture` file) with small delays. SIGINT ends it, unless the `mode`
     /// file says `stubborn` (the first SIGINT is ignored) or `deaf` (all are).
     /// With `orphans`, it first leaves two sleeps that are not its children
-    /// (setsid, nohup), carrying the marker, and records their pids.
+    /// (setsid, nohup), carrying the marker, and records their pids. While
+    /// `stall` exists, it stops after a job's first line.
     const BANA: &str = r#"ctl='CTL'; fx='FX'
 [[ $1 == ci ]] || exit 2
 shift
@@ -2638,6 +2670,7 @@ while [[ -e $ctl/hold ]]; do sleep 0.05; done
 sleep 0.2
 while IFS= read -r line; do
   case $line in '{'*) printf '%s\n' "$line" ;; *) printf '%s\n' "$line" >&2 ;; esac
+  case $line in *'"jobID"'*) while [[ -e $ctl/stall ]]; do sleep 0.05; done ;; esac
   sleep 0.01
 done <"$fx/$f.jsonl"
 case $f in fail | syntax) exit 1 ;; esac
@@ -3837,6 +3870,103 @@ exec git \"$@\"
                 "error".into(),
                 "cancelled from the page".into()
             )
+        );
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_a_build_at_the_push_tier_moves_green() {
+        let p = Project::new("green-tier");
+        let d = start(&p, "").await;
+        let a = p.commit("pass", "a");
+        p.push("main");
+        poll(&d).await;
+        assert_eq!(finished(&d, 1).await.build.state, BuildState::Success);
+        assert_eq!(d.0.lock().state.green.get("refs/heads/main"), Some(&a));
+        // b's push build waits; a nightly of b, asked for by hand, passes.
+        d.set_paused(true);
+        p.commit("pass", "b");
+        p.push("main");
+        poll(&d).await;
+        assert_eq!(d.clear_queue(), 1);
+        let id = d.run_now("main", "nightly").unwrap();
+        d.set_paused(false);
+        assert_eq!(finished(&d, id).await.build.state, BuildState::Success);
+        // It says nothing of b's quick jobs: the next push still diffs from a.
+        assert_eq!(d.0.lock().state.green.get("refs/heads/main"), Some(&a));
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ids_are_never_given_twice_after_a_crash() {
+        let p = Project::new("ids");
+        let s = p.settings("");
+        let d = start_with(s.clone()).await;
+        d.set_paused(true);
+        p.commit("pass", "a");
+        p.push("main");
+        poll(&d).await;
+        assert_eq!(d.summary().queue.len(), 1);
+        d.crash();
+        // As if it died between build 1's build.json and state.json.
+        let file = p.dir.join("state.json");
+        let mut state: State = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        (state.queue, state.next_id) = (vec![], 1);
+        write_json(&file, &state).unwrap();
+        let d = start_with(s).await;
+        assert_eq!(d.summary().queue.len(), 1, "build 1 is queued again");
+        let b = p.commit("pass", "b");
+        p.push("other");
+        poll(&d).await;
+        let queue: Vec<u64> = d.summary().queue.iter().map(|q| q.id).collect();
+        assert_eq!(queue, [1, 2]);
+        assert_eq!(d.0.lock().records[&2].request.sha, b);
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retry_that_never_reaches_a_job_ends_that_jobs_pending() {
+        let p = Project::new("retry-pending");
+        let s = p.settings("");
+        let d = start_with(s.clone()).await;
+        // Build 1's first job starts (its pending is posted), then the daemon stops.
+        p.set("stall", true);
+        let a = p.commit("pass", "a");
+        p.push("main");
+        poll(&d).await;
+        until("plan's pending", || {
+            d.0.lock()
+                .records
+                .get(&1)
+                .is_some_and(|r| r.statuses.contains_key("bana/plan"))
+        })
+        .await;
+        posted(&d).await;
+        d.shutdown().await;
+        p.set("stall", false);
+        // Its retry cannot start: plan never runs in it.
+        p.set("git-log-fails", true);
+        let d = start_with(s).await;
+        let two = finished(&d, 2).await;
+        assert_eq!(
+            (two.request.trigger, two.build.state),
+            (Trigger::Retry, BuildState::Error)
+        );
+        posted(&d).await;
+        let last = |context: &str| {
+            p.posts()
+                .into_iter()
+                .rfind(|x| x.sha == a && x.context == context)
+        };
+        assert_eq!(last("bana").map(|x| x.state), Some("error".into()));
+        let plan = last("bana/plan").unwrap();
+        assert_eq!(
+            (plan.state.as_str(), plan.description.as_str()),
+            ("error", INTERRUPTED),
+            "no pending is left"
         );
         d.shutdown().await;
         p.remove();

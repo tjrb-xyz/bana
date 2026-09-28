@@ -30,6 +30,9 @@ fresh() {
   export HOME=$T/w/home FAKE_STATE=$T/w/state FAKE_LOG=$T/w/log
   unset FAKE_OS FAKE_ARCH FAKE_UID FAKE_IOREG BANA_SYS_ROOT BANA_TOKEN FAKE_GH FAKE_POOL FAKE_SVC_FAIL GITHUB_TOKEN \
     FAKE_HEALTH FAKE_LINGER FAKE_GH_SCOPES BANA_DAEMON_BIN BANA_DAEMON_STEP CARGO_TARGET_DIR
+  # What the host (GitHub's runners, act, a daemon's build) may have set, which bana reads.
+  unset XDG_CONFIG_HOME BANA_HOME BANA_CONFIG BANA_PROJECT_ROOT BANA_ACT_LOCKED BANA_DAEMON ACT \
+    RUNNER_ENVIRONMENT GITHUB_WORKSPACE DOCKER_HOST DISPLAY WAYLAND_DISPLAY
   : >"$FAKE_LOG"
   cd "$T/w/project"
   git init -q . && git remote add origin git@github.com:acme/widget.git
@@ -495,6 +498,11 @@ echo '{"now":100,"watcher":{},"running":{"id":8,"ref":"main"},"queue":[],"last":
 bash "$bana" daemon install --now --no-open >"$T/out" 2>&1 || { cat "$T/out"; false; }
 check "daemon --now: restarts without waiting" lacks "$FAKE_LOG" "ci/v1/local"
 check "daemon --now: restarted" has "$FAKE_LOG" "launchctl bootstrap gui/1000 $p"
+: >"$FAKE_LOG"
+FAKE_BOOTOUT_SLOW=3 bash "$bana" daemon install --now --no-open >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "daemon: bootstrap waits until launchd has let the old one go" \
+  same "$(grep -o '^launchctl [a-z]*' "$FAKE_LOG" | tr '\n' ' ')" \
+  "launchctl bootout launchctl print launchctl print launchctl print launchctl print launchctl bootstrap "
 
 cat >"$FAKE_STATE/local.json" <<'JSON'
 {"repo":"acme/widget","prefix":"wid","machine":"mbp","now":1000,
