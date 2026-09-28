@@ -53,17 +53,74 @@ pre { margin: 6px 0 0; max-height: 220px; overflow: auto; background: var(--bg);
 .error { color: var(--bad); }
 details summary { cursor: pointer; }
 a { color: var(--accent); }
+h3 { font-size: 13px; margin: 14px 0 6px; color: var(--muted); }
+.dot.running, .dot.waiting, .dot.queued { background: var(--warn); }
+.dot.error { background: var(--bad); }
+.chip.running, .chip.waiting { border-color: var(--warn); }
+.chip.error, .chip.cancelled { border-color: var(--bad); }
+.chip.skipped, .chip.unsupported { color: var(--muted); }
+a.chip { color: var(--ink); text-decoration: none; }
+a.chip.sel { background: var(--accent); border-color: var(--accent); color: #fff; }
+#log { position: relative; max-height: 480px; min-height: 60px; }
+#log .step { color: var(--accent); }
+#log .success { color: var(--ok); } #log .failure, #log .cancelled { color: var(--bad); }
+#log .skipped { color: var(--muted); }
+tr.sel td { background: var(--bg); }
+#pool-box > summary { list-style: none; } #pool-box > summary h2 { display: inline; }
+#pool-box > summary::before { content: "▸ "; color: var(--muted); } #pool-box[open] > summary::before { content: "▾ "; }
+.stack { display: grid; gap: 16px; margin-top: 12px; }
 </style>
 </head>
 <body>
 <main>
   <header>
-    <h1>bana</h1>
+    <h1><span aria-hidden="true">🧱</span> bana</h1>
     <span class="muted" id="where"></span>
     <span class="muted" id="updated"></span>
   </header>
   <p class="error" id="fatal" hidden></p>
 
+  <section id="ci" hidden>
+    <h2>Local CI</h2>
+    <p id="watcher" class="muted"></p>
+    <div class="row">
+      <button id="pause" type="button">Pause new builds</button>
+      <button id="poll" type="button">Check now</button>
+      <button id="clear" class="danger" type="button">Clear queue</button>
+    </div>
+    <form id="run-now">
+      <label>Run <select id="run-ref"></select></label>
+      <label id="run-tier-label">at <select id="run-tier"></select></label>
+      <button class="primary" type="submit">Run now</button>
+    </form>
+
+    <h3>Queue</h3>
+    <p class="muted" id="queue-empty">Nothing waiting.</p>
+    <div class="wrap"><table id="queue"></table></div>
+
+    <h3 id="build-heading">Build</h3>
+    <p class="muted" id="build-empty">No build yet. Push to a branch the daemon watches, or use Run now.</p>
+    <div id="build" hidden>
+      <p id="build-title"></p>
+      <p class="muted" id="build-meta"></p>
+      <div class="row">
+        <button id="build-cancel" class="danger" type="button">Cancel</button>
+        <button id="build-rerun" type="button">Re-run</button>
+        <a id="build-current" href="#">Show the current build</a>
+      </div>
+      <div class="chips" id="jobs" style="margin-top:10px"></div>
+      <pre class="mono" id="log"></pre>
+    </div>
+
+    <h3>History</h3>
+    <p class="muted" id="history-empty">No builds yet.</p>
+    <div class="wrap"><table id="history"></table></div>
+    <details id="skipped-box" hidden><summary class="muted">Pushes not built</summary><ul class="plain" id="skipped"></ul></details>
+  </section>
+
+  <details id="pool-box" open>
+  <summary><h2>Runner pool (optional)</h2> <span class="muted">self-hosted runners GitHub sends jobs to</span></summary>
+  <div class="stack">
   <div class="cols">
     <section>
       <h2>This machine's runners</h2>
@@ -111,14 +168,29 @@ a { color: var(--accent); }
     <p class="muted" id="tasks-empty">Nothing started from here yet.</p>
     <div id="tasks"></div>
   </section>
+  </div>
+  </details>
 </main>
 <script>
 "use strict";
+// The token comes once in the address (#token=…), is kept in localStorage (so a
+// GitHub Details link opened later works too) and taken out of the address.
 const token = (() => {
-  const m = /token=([A-Za-z0-9_-]{16,})/.exec(location.hash);
-  if (m) { try { sessionStorage.setItem("bana", m[1]); } catch (e) {} history.replaceState(null, "", location.pathname); return m[1]; }
-  try { return sessionStorage.getItem("bana"); } catch (e) { return null; }
+  const h = new URLSearchParams(location.hash.slice(1));
+  const t = h.get("token");
+  if (t && /^[A-Za-z0-9_-]{16,}$/.test(t)) {
+    try { localStorage.setItem("bana-token", t); } catch (e) {}
+    h.delete("token");
+    const rest = h.toString();
+    history.replaceState(null, "", location.pathname + (rest ? "#" + rest : ""));
+    return t;
+  }
+  try { return localStorage.getItem("bana-token") || sessionStorage.getItem("bana"); } catch (e) { return null; }
 })();
+let daemon = false;
+const noToken = () => daemon
+  ? "Click the bana icon in the menu bar once (or run `bana daemon open`): that gives this browser the page's token."
+  : "Open the link bana-manager printed (it carries the token).";
 const $ = (id) => document.getElementById(id);
 const chip = (l) => `<span class="chip${/^usb-/.test(l) ? " hw" : ""}">${esc(l)}</span>`;
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -208,13 +280,13 @@ async function refresh() {
     show("runs-error", s.runs_error);
     $("tier-label").hidden = !s.tiers.length;
     if (!$("tier").options.length) $("tier").innerHTML = s.tiers.map((t, i) => `<option ${i === Math.min(1, s.tiers.length - 1) ? "selected" : ""}>${esc(t)}</option>`).join("");
-    document.title = `bana · ${s.repo}`;
+    if (!daemon) document.title = `bana · ${s.repo}`;
     const open = new Set([...document.querySelectorAll("#tasks details")].map((d, i) => d.open ? i : -1));
     $("tasks").innerHTML = taskBlocks(s);
     $("tasks-empty").hidden = s.tasks.length > 0;
-    if (!token) show("fatal", "Open the link bana-manager printed (it carries the token).");
+    if (!token) show("fatal", noToken());
   } catch (e) {
-    show("fatal", e.message === "missing or wrong token" ? "Open the link bana-manager printed (it carries the token)." : "Cannot reach bana-manager: " + e.message);
+    show("fatal", e.message === "missing or wrong token" ? noToken() : "Cannot reach bana-manager: " + e.message);
   } finally { busy = false; }
 }
 
@@ -237,8 +309,282 @@ $("run").addEventListener("submit", (e) => {
   if (!$("tier-label").hidden) body.tier = $("tier").value;
   act("POST", "/runs", body);
 });
-refresh();
-setInterval(refresh, 3000);
+// Local CI (the daemon): its summary every 2 s while it builds (10 s
+// otherwise), the history when that changes, one build and its log.
+// Branch names, commit messages and log lines go in as text only.
+const text = (tag, t, cls) => { const e = document.createElement(tag); e.textContent = t; if (cls) e.className = cls; return e; };
+const shortSha = (s) => String(s || "").slice(0, 7);
+const shortRef = (r) => String(r).replace(/^refs\/(heads|tags)\//, "");
+function dur(sec) {
+  sec = Math.max(0, Math.round(sec || 0));
+  if (sec < 60) return sec + " s";
+  const m = Math.floor(sec / 60);
+  if (m < 60) return m + " min" + (sec % 60 ? " " + (sec % 60) + " s" : "");
+  return Math.floor(m / 60) + " h " + (m % 60) + " min";
+}
+const ago = (now, t) => t == null ? "" : dur(now - t) + " ago";
+const githubUrl = (u) => typeof u === "string" && /^https:\/\/github\.com\//.test(u) ? u : null;
+function route() {
+  const h = new URLSearchParams(location.hash.slice(1));
+  const b = Number(h.get("build"));
+  return { build: Number.isInteger(b) && b > 0 ? b : null, job: h.get("job") || null };
+}
+
+let local = null, builds = [], shown = null, logState = null;
+let localBusy = false, timer = null, lastSig = "", buildsAt = 0;
+const currentId = () => local && (local.running ? local.running.id : local.last ? local.last.id : null);
+const selectedId = () => route().build || currentId();
+
+function watcherLine(l) {
+  const w = l.watcher, parts = [`${l.prefix} · ${l.repo} on ${l.machine}`];
+  parts.push(w.fetch_error ? "fetch failed: " + w.fetch_error : w.fetched_at ? "checked " + ago(l.now, w.fetched_at) : "not checked yet");
+  if (w.paused) parts.push("new builds paused");
+  parts.push(w.docker ? "Docker up" : "Docker down");
+  if (w.lock_holder) parts.push("act is busy here: " + w.lock_holder);
+  parts.push(w.unposted
+    ? `${w.unposted} status${w.unposted === 1 ? "" : "es"} waiting` + (w.post_error ? ` (${w.post_error})` : "")
+    : "GitHub: up to date");
+  return parts.join(" · ");
+}
+
+function queueRows(l) {
+  if (!l.queue.length) return "";
+  return "<tr><th>Ref</th><th>Commit</th><th>Tier</th><th>Why</th><th>Queued</th><th>Waiting for</th><th></th></tr>" + l.queue.map((q) => {
+    const id = Number(q.id);
+    return `<tr><td><a href="#build=${id}">${esc(q.ref)}</a></td><td class="mono">${esc(shortSha(q.sha))}</td><td>${esc(q.tier)}</td>
+      <td>${esc(q.trigger)}</td><td>${esc(ago(l.now, q.queued_at))}</td><td>${esc(q.waiting || (l.running ? "the build before it" : ""))}</td>
+      <td><button data-remove="${id}">Remove</button></td></tr>`;
+  }).join("");
+}
+
+function historyRows(l) {
+  if (!builds.length) return "";
+  const sel = shown && shown.id;
+  return "<tr><th>Build</th><th>Ref</th><th>Commit</th><th>Tier</th><th>Why</th><th>Took</th><th>Statuses</th><th>Result</th></tr>" + builds.map((b) => {
+    const id = Number(b.id);
+    const st = b.unposted ? `${Number(b.posted)} posted, ${Number(b.unposted)} waiting` : b.posted ? `${Number(b.posted)} posted` : "";
+    const when = b.ended_at ? ago(l.now, b.ended_at) : b.state;
+    const why = b.trigger + (b.attempt > 1 ? ` (attempt ${Number(b.attempt)})` : "");
+    return `<tr class="${id === sel ? "sel" : ""}"><td><span class="dot ${esc(b.state)}"></span><a href="#build=${id}">#${id}</a> <span class="muted">${esc(when)}</span></td>
+      <td>${esc(b.ref)}</td><td class="mono">${esc(shortSha(b.sha))}</td><td>${esc(b.tier)}</td><td>${esc(why)}</td>
+      <td>${b.started_at ? esc(dur(b.elapsed)) : ""}</td><td>${esc(st)}</td>
+      <td title="${esc(b.description)}">${esc(b.state)}${b.reason ? ": " + esc(b.reason) : ""}</td></tr>`;
+  }).join("");
+}
+
+function fillSelect(sel, values, label) {
+  const want = values.join("\n");
+  if (sel.dataset.values === want) return;
+  const keep = sel.value;
+  sel.replaceChildren(...values.map((v) => { const o = text("option", label(v)); o.value = v; return o; }));
+  if (values.includes(keep)) sel.value = keep;
+  sel.dataset.values = want;
+}
+
+// The build a view (running, queued or in the history) shows.
+function findView(id) {
+  if (!local) return null;
+  if (local.running && local.running.id === id) return local.running;
+  const b = builds.find((b) => b.id === id);
+  if (b) return b;
+  const q = local.queue.find((q) => q.id === id);
+  if (q) return { ...q, state: "queued", jobs: [], elapsed: 0, attempt: 1 };
+  return shown && shown.id === id ? shown.view : null;
+}
+
+async function renderBuild() {
+  const id = selectedId(), r = route();
+  $("build").hidden = !id;
+  $("build-empty").hidden = !!id;
+  if (!id) return;
+  let v = findView(id);
+  if (!v) {
+    try { v = (await api("GET", `/builds?before=${id + 1}&limit=1`)).builds.find((b) => b.id === id) || null; } catch (e) {}
+  }
+  if (!shown || shown.id !== id || (v && shown.state !== v.state)) {
+    let detail;
+    try { detail = await api("GET", `/builds/${id}`); } catch (e) { detail = { error: e.message }; }
+    shown = { id, detail, state: v && v.state };
+  }
+  shown.view = v;
+  const d = shown.detail;
+  $("build-heading").textContent = r.build ? "Build" : local && local.running ? "Building now" : "Last build";
+  $("build-current").hidden = !(r.build && currentId() && r.build !== currentId());
+  if (!v) {
+    $("build-title").textContent = `#${id}: ` + (d.error || "not found");
+    $("build-meta").replaceChildren();
+    $("jobs").replaceChildren();
+    $("log").replaceChildren();
+    $("build-cancel").hidden = $("build-rerun").hidden = true;
+    logState = null;
+    return;
+  }
+  const running = v.state === "running";
+  $("build-title").textContent = `#${id} ${v.ref} · ${v.state}` + (v.reason ? ": " + v.reason : "") + (v.description ? " — " + v.description : "");
+  const meta = $("build-meta"), repo = local ? local.repo.split("/").map(encodeURIComponent).join("/") : "";
+  meta.replaceChildren();
+  const add = (n) => { if (meta.childNodes.length) meta.append(" · "); meta.append(n); };
+  const link = (href, label) => { const a = text("a", label, "mono"); a.href = href; a.target = "_blank"; a.rel = "noopener"; return a; };
+  if (repo && /^[0-9a-f]{7,64}$/.test(v.sha)) add(link(`https://github.com/${repo}/commit/${v.sha}`, shortSha(v.sha)));
+  if (githubUrl(d.compare)) add(link(d.compare, "compare"));
+  add(`tier ${v.tier || "none"}`);
+  add(v.trigger + (v.attempt > 1 ? `, attempt ${v.attempt}` : ""));
+  if (v.started_at) add((running ? "running for " : "took ") + dur(v.elapsed));
+  $("build-cancel").hidden = !(running || v.state === "queued");
+  $("build-rerun").hidden = !["success", "failure", "error"].includes(v.state);
+
+  // The job asked for; else a finished build's failed job opens.
+  const failed = !running && (v.jobs || []).find((j) => j.state === "failure");
+  const job = r.job || (r.build || !running ? failed && failed.key : null) || null;
+  const chips = [["", "All jobs", "", null]].concat((v.jobs || []).map((j) => [j.key, j.key, j.state, j.step]));
+  $("jobs").replaceChildren(...chips.map(([key, label, state, step]) => {
+    const a = text("a", label + (step ? " · " + step : ""), "chip " + state + ((key || null) === job ? " sel" : ""));
+    a.title = state || "every job's lines";
+    a.href = "#build=" + id + (key ? "&job=" + encodeURIComponent(key) : "");
+    return a;
+  }));
+  startLog(id, job, running || v.state === "queued");
+}
+
+function startLog(id, job, live) {
+  const key = id + "|" + (job || "");
+  const s = logState;
+  if (s && s.key === key) {
+    if (s.live && !live) s.done = false; // one more read after the end
+    s.live = live;
+    return;
+  }
+  logState = { key, id, job, next: 0, live, done: false, busy: false, jumped: false };
+  $("log").replaceChildren();
+  pumpLog();
+}
+
+async function pumpLog() {
+  const s = logState;
+  if (!s || s.busy || document.hidden || (s.done && !s.live)) return;
+  s.busy = true;
+  try {
+    for (let i = 0; i < 20; i++) {
+      const q = `?from=${s.next}` + (s.job ? "&job=" + encodeURIComponent(s.job) : "");
+      const p = await api("GET", `/builds/${s.id}/log${q}`);
+      if (logState !== s) return;
+      appendLog(s, p.lines);
+      const moved = p.next !== s.next;
+      s.next = p.next;
+      if (!moved) { s.done = true; break; }
+    }
+  } catch (e) {
+    if (logState === s) appendLog(s, [{ msg: "(the log: " + e.message + ")" }]);
+    s.done = true;
+  } finally { s.busy = false; }
+}
+
+function appendLog(s, lines) {
+  const pre = $("log");
+  const atEnd = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+  const frag = document.createDocumentFragment();
+  let failure = null;
+  for (const l of lines) {
+    const who = !s.job && l.job ? `[${l.job}] ` : "";
+    const cls = l.result ? l.result : /⭐ Run /.test(l.msg) ? "step" : "";
+    const msg = l.msg || (l.result ? `${l.step || l.job || ""}: ${l.result}` : "");
+    const span = text("span", who + msg + "\n", cls);
+    if (l.result === "failure" && !failure) failure = span;
+    frag.append(span);
+  }
+  pre.append(frag);
+  while (pre.childNodes.length > 5000) pre.firstChild.remove();
+  if (failure && !s.jumped) { s.jumped = true; pre.scrollTop = Math.max(0, failure.offsetTop - 40); }
+  else if (atEnd) pre.scrollTop = pre.scrollHeight;
+}
+
+function schedule(ms) { clearTimeout(timer); timer = setTimeout(refreshLocal, ms); }
+
+async function refreshLocal() {
+  if (localBusy) return;
+  localBusy = true;
+  try {
+    const l = await api("GET", "/local");
+    local = l;
+    const sig = JSON.stringify([l.running && [l.running.id, l.running.state], l.last && l.last.id, l.queue.map((q) => q.id), l.watcher.unposted]);
+    if (sig !== lastSig || Date.now() - buildsAt > 30000) {
+      builds = (await api("GET", "/builds?limit=100")).builds;
+      lastSig = sig;
+      buildsAt = Date.now();
+    }
+    $("where").textContent = `${l.machine} · ${l.repo}`;
+    $("updated").textContent = "updated " + new Date().toLocaleTimeString();
+    $("watcher").textContent = watcherLine(l);
+    $("pause").textContent = l.watcher.paused ? "Resume builds" : "Pause new builds";
+    fillSelect($("run-ref"), l.refs, shortRef);
+    fillSelect($("run-tier"), l.tiers, (t) => t);
+    $("run-tier-label").hidden = !l.tiers.length;
+    $("queue").innerHTML = queueRows(l);
+    $("queue-empty").hidden = l.queue.length > 0;
+    await renderBuild();
+    $("history").innerHTML = historyRows(l);
+    $("history-empty").hidden = builds.length > 0;
+    const sk = l.skipped || [];
+    $("skipped-box").hidden = !sk.length;
+    $("skipped").replaceChildren(...sk.map((x) => text("li", `${shortRef(x.ref)} ${shortSha(x.sha)}: ${x.why} (${ago(l.now, x.at)})`)));
+    show("fatal", "");
+  } catch (e) {
+    show("fatal", e.message === "missing or wrong token" ? noToken() : "Cannot reach bana: " + e.message);
+  } finally {
+    localBusy = false;
+    schedule(document.hidden ? 30000 : local && (local.running || local.queue.length) ? 2000 : 10000);
+  }
+}
+
+async function actLocal(method, path, body) {
+  let r = null;
+  try { r = await api(method, path, body); show("fatal", ""); } catch (e) { show("fatal", e.message); }
+  lastSig = "";
+  refreshLocal();
+  return r;
+}
+
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-remove]");
+  if (b) actLocal("POST", `/builds/${Number(b.dataset.remove)}/cancel`);
+});
+$("build-cancel").addEventListener("click", () => { if (shown) actLocal("POST", `/builds/${shown.id}/cancel`); });
+$("build-rerun").addEventListener("click", async () => {
+  if (!shown) return;
+  const r = await actLocal("POST", `/builds/${shown.id}/rerun`);
+  if (r && r.build) location.hash = "build=" + Number(r.build);
+});
+$("pause").addEventListener("click", () => { if (local) actLocal("POST", "/daemon", { paused: !local.watcher.paused }); });
+$("poll").addEventListener("click", () => actLocal("POST", "/daemon/poll"));
+$("clear").addEventListener("click", () => {
+  if (local && local.queue.length && confirm(`Drop the ${local.queue.length} queued build(s)?`)) actLocal("POST", "/queue/clear");
+});
+$("run-now").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const body = { ref: $("run-ref").value };
+  if (!$("run-tier-label").hidden) body.tier = $("run-tier").value;
+  const r = await actLocal("POST", "/builds", body);
+  if (r && r.build) location.hash = "build=" + Number(r.build);
+});
+window.addEventListener("hashchange", () => { if (daemon) { renderBuild(); if (local) $("history").innerHTML = historyRows(local); } });
+document.addEventListener("visibilitychange", () => { if (!document.hidden && daemon) { refreshLocal(); pumpLog(); } });
+
+// The pool's sections refresh while open; a daemon's page starts them closed.
+(async () => {
+  let h = {};
+  try { h = await (await fetch("/ci/v1/health")).json(); } catch (e) {}
+  daemon = h.daemon === true;
+  if (daemon) {
+    $("ci").hidden = false;
+    $("pool-box").open = false;
+    document.title = `bana · ${h.prefix}`;
+    if (token) { refreshLocal(); setInterval(pumpLog, 2000); }
+  }
+  if (!token) show("fatal", noToken());
+  else if ($("pool-box").open) refresh();
+  setInterval(() => { if ($("pool-box").open && token) refresh(); }, 3000);
+  $("pool-box").addEventListener("toggle", () => { if ($("pool-box").open && token) refresh(); });
+})();
 </script>
 </body>
 </html>

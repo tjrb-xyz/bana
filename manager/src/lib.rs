@@ -16,6 +16,8 @@ pub mod daemon;
 pub mod guard;
 pub mod server;
 pub mod sweep;
+#[cfg(target_os = "macos")]
+pub mod tray;
 pub mod watch;
 
 use serde::Serialize;

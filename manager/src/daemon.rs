@@ -874,6 +874,24 @@ impl Daemon {
         ids.len()
     }
 
+    /// Each build's statuses: how many were posted, and how many wait to be
+    /// (not those a newer build of the commit took over). For the history.
+    pub fn statuses(&self) -> BTreeMap<u64, (usize, usize)> {
+        let inner = self.0.lock();
+        let waiting = to_post(&inner);
+        inner
+            .records
+            .iter()
+            .map(|(id, r)| {
+                let posted = r.statuses.values().filter(|p| p.posted).count();
+                (
+                    *id,
+                    (posted, waiting.iter().filter(|(w, _)| w == id).count()),
+                )
+            })
+            .collect()
+    }
+
     /// Stops fetching and starting builds, stops the running build (the short
     /// ladder, then the sweeps) and waits for the tasks. The build is left
     /// unfinished, with nothing more to post: the next start decides.
@@ -2541,8 +2559,9 @@ fn write_secret(path: &Path, text: &str) -> std::io::Result<()> {
     f.write_all(text.as_bytes())
 }
 
+/// server.rs's tests use its project and stand-ins too.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::process::Command as Std;
 
@@ -2634,7 +2653,7 @@ exec git \"$@\"
 
     /// A project on a local origin, a clone of it where the daemon keeps
     /// one (`<dir>/src`), and the stand-ins.
-    struct Project {
+    pub(crate) struct Project {
         /// Its own, so one test's sweep never meets another's builds.
         prefix: String,
         root: PathBuf,
@@ -2664,7 +2683,7 @@ exec git \"$@\"
     }
 
     impl Project {
-        fn new(name: &str) -> Self {
+        pub(crate) fn new(name: &str) -> Self {
             let root =
                 std::env::temp_dir().join(format!("bana-daemon-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
@@ -2730,7 +2749,7 @@ exec git \"$@\"
         }
 
         /// A commit whose `bana ci` replays `fixture`.
-        fn commit(&self, fixture: &str, message: &str) -> String {
+        pub(crate) fn commit(&self, fixture: &str, message: &str) -> String {
             let wf = self.work.join(".github/workflows");
             std::fs::create_dir_all(&wf).unwrap();
             std::fs::write(wf.join("ci.yml"), "on: workflow_dispatch\n").unwrap();
@@ -2741,7 +2760,7 @@ exec git \"$@\"
             git(&self.work, &["rev-parse", "HEAD"])
         }
 
-        fn push(&self, branch: &str) {
+        pub(crate) fn push(&self, branch: &str) {
             let to = format!("HEAD:refs/heads/{branch}");
             git(&self.work, &["push", "-q", "--force", "origin", &to]);
         }
@@ -2763,7 +2782,7 @@ exec git \"$@\"
         }
 
         /// A test that passed leaves nothing behind; one that failed keeps its files.
-        fn remove(self) {
+        pub(crate) fn remove(self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
 
@@ -2794,7 +2813,7 @@ exec git \"$@\"
         url: Option<String>,
     }
 
-    async fn until(what: &str, mut ok: impl FnMut() -> bool) {
+    pub(crate) async fn until(what: &str, mut ok: impl FnMut() -> bool) {
         for _ in 0..1500 {
             if ok() {
                 return;
@@ -2810,7 +2829,7 @@ exec git \"$@\"
         until("a poll", || d.0.lock().polls > n).await;
     }
 
-    async fn finished(d: &Daemon, id: u64) -> Record {
+    pub(crate) async fn finished(d: &Daemon, id: u64) -> Record {
         until(&format!("build {id} to finish"), || {
             let inner = d.0.lock();
             inner
@@ -2827,7 +2846,7 @@ exec git \"$@\"
         until("statuses posted", || d.summary().watcher.unposted == 0).await;
     }
 
-    async fn start(p: &Project, extra: &str) -> Daemon {
+    pub(crate) async fn start(p: &Project, extra: &str) -> Daemon {
         start_with(p.settings(extra)).await
     }
 

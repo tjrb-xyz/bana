@@ -1,14 +1,20 @@
 //! The manager's HTTP side: `GET /` (the page) and the `/ci/v1` API behind
 //! the token guard. Everything it runs goes through [`Tools`]: `bana` and the
 //! GitHub CLI, with arguments checked here first.
+//!
+//! In daemon mode ([`daemon_router`]) the same page and pool routes, plus the
+//! daemon's: its summary, the builds and their logs, and what the page's
+//! buttons do. Those call [`Daemon`]'s methods, with numeric ids, refs among
+//! the heads fetched and tiers from the settings.
 
+use crate::daemon::Daemon;
 use crate::guard::{err, guarded, health, Access};
 use crate::{
     attach_jobs, parse_local, parse_pool, parse_runs, runs_to_detail, valid_ref, valid_runner,
-    Local, PoolRunner, RunView,
+    valid_tier, Local, PoolRunner, RunView,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -48,6 +54,18 @@ pub struct Tools {
 }
 
 impl Tools {
+    /// The daemon's: its project, and the programs its settings name.
+    pub fn from_settings(s: &crate::daemon::Settings) -> Self {
+        Self {
+            script: s.script.clone(),
+            gh: s.gh.clone(),
+            repo: s.repo.clone(),
+            workflow: s.workflow.clone(),
+            tiers: s.tiers.clone(),
+            tier_input: s.tier_input.clone(),
+        }
+    }
+
     async fn output(&self, program: &str, args: &[&str], secs: u64) -> Result<String, String> {
         let run = Command::new(program)
             .args(args)
@@ -465,6 +483,16 @@ async fn page() -> Response {
 
 /// The page at `/`, the API at `/ci/v1`, behind the guard.
 pub fn router(m: Arc<Manager>, access: Arc<Access>) -> Router {
+    app(m, None, access)
+}
+
+/// The daemon's: the manager's routes, the daemon's, and a health that says
+/// which project's daemon answers.
+pub fn daemon_router(m: Arc<Manager>, d: Daemon, access: Arc<Access>) -> Router {
+    app(m, Some(d), access)
+}
+
+fn app(m: Arc<Manager>, d: Option<Daemon>, access: Arc<Access>) -> Router {
     let api = Router::new()
         .route("/state", get(state))
         .route("/pool/join", post(join))
@@ -473,12 +501,189 @@ pub fn router(m: Arc<Manager>, access: Arc<Access>) -> Router {
         .route("/runs", post(start_run))
         .route("/runs/{id}/cancel", post(cancel_run))
         .route("/tasks/{id}", get(task))
-        .with_state(m)
-        .merge(health("ci", 1));
+        .with_state(m);
+    let api = match d {
+        None => api.merge(health("ci", 1)),
+        Some(d) => api.merge(local_routes(d)),
+    };
     guarded(
         Router::new().route("/", get(page)).nest("/ci/v1", api),
         access,
     )
+}
+
+type D = State<Daemon>;
+
+fn local_routes(d: Daemon) -> Router {
+    Router::new()
+        .route("/health", get(daemon_health))
+        .route("/local", get(local))
+        .route("/builds", get(builds).post(run_now))
+        .route("/builds/{id}", get(build))
+        .route("/builds/{id}/log", get(build_log))
+        .route("/builds/{id}/cancel", post(cancel_build))
+        .route("/builds/{id}/rerun", post(rerun))
+        .route("/daemon", post(set_daemon))
+        .route("/daemon/poll", post(poll))
+        .route("/queue/clear", post(clear_queue))
+        .with_state(d)
+}
+
+/// Open, like the manager's: `bana manager` and `bana daemon` look for it.
+async fn daemon_health(State(d): D) -> Json<Value> {
+    let s = d.settings();
+    Json(
+        json!({"ok": true, "service": "ci", "api": 1, "daemon": true, "repo": s.repo, "prefix": s.prefix}),
+    )
+}
+
+/// The summary, and what Run now may offer: the refs fetched and the tiers.
+async fn local(State(d): D) -> Json<Value> {
+    let mut v = json!(d.summary());
+    v["refs"] = json!(d.heads().keys().collect::<Vec<_>>());
+    v["tiers"] = json!(d.settings().tiers);
+    v["skipped"] = json!(d.skipped().iter().rev().take(20).collect::<Vec<_>>());
+    v["port"] = json!(d.settings().port);
+    Json(v)
+}
+
+#[derive(Deserialize)]
+struct Page {
+    before: Option<u64>,
+    limit: Option<usize>,
+}
+
+/// The history, each build with its statuses posted and waiting.
+async fn builds(State(d): D, Query(q): Query<Page>) -> Json<Value> {
+    let statuses = d.statuses();
+    let builds: Vec<Value> = d
+        .builds(q.before, q.limit.unwrap_or(100).min(100))
+        .into_iter()
+        .map(|b| {
+            let (posted, unposted) = statuses.get(&b.id).copied().unwrap_or_default();
+            let mut v = json!(b);
+            v["posted"] = json!(posted);
+            v["unposted"] = json!(unposted);
+            v
+        })
+        .collect();
+    Json(json!({ "builds": builds }))
+}
+
+async fn build(State(d): D, Path(id): Path<u64>) -> Response {
+    match d.build(id) {
+        Some(b) => Json(b).into_response(),
+        None => err(StatusCode::NOT_FOUND, format!("no build {id}")),
+    }
+}
+
+#[derive(Deserialize)]
+struct LogQuery {
+    job: Option<String>,
+    #[serde(default)]
+    from: u64,
+}
+
+async fn build_log(State(d): D, Path(id): Path<u64>, Query(q): Query<LogQuery>) -> Response {
+    let job = q.job.filter(|j| !j.is_empty());
+    if job.as_ref().is_some_and(|j| j.len() > 200) {
+        return err(StatusCode::BAD_REQUEST, "job: a job's key");
+    }
+    if d.build(id).is_none() {
+        return err(StatusCode::NOT_FOUND, format!("no build {id}"));
+    }
+    match d.log(id, job.as_deref(), q.from) {
+        Ok(page) => Json(page).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunNow {
+    #[serde(rename = "ref")]
+    git_ref: String,
+    #[serde(default)]
+    tier: String,
+}
+
+async fn run_now(State(d): D, Json(b): Json<RunNow>) -> Response {
+    if !valid_ref(&b.git_ref) {
+        return err(StatusCode::BAD_REQUEST, "ref: a branch or tag name");
+    }
+    if !b.tier.is_empty() && !valid_tier(&b.tier) {
+        return err(StatusCode::BAD_REQUEST, "tier: a word from the settings");
+    }
+    // Refused unless the ref is a head fetched and the tier a settings' tier.
+    match d.run_now(&b.git_ref, &b.tier) {
+        Ok(id) => Json(json!({ "build": id })).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn cancel_build(State(d): D, Path(id): Path<u64>) -> Response {
+    match d.cancel(id, "cancelled from the page") {
+        Ok(()) => Json(json!({ "build": id })).into_response(),
+        Err(e) => err(StatusCode::CONFLICT, e),
+    }
+}
+
+async fn rerun(State(d): D, Path(id): Path<u64>) -> Response {
+    if d.build(id).is_none() {
+        return err(StatusCode::NOT_FOUND, format!("no build {id}"));
+    }
+    match d.rerun(id) {
+        Ok(new) => Json(json!({ "build": new })).into_response(),
+        Err(e) => err(StatusCode::CONFLICT, e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DaemonChange {
+    paused: bool,
+}
+
+async fn set_daemon(State(d): D, Json(b): Json<DaemonChange>) -> Json<Value> {
+    d.set_paused(b.paused);
+    Json(json!({ "paused": b.paused }))
+}
+
+async fn poll(State(d): D) -> Json<Value> {
+    d.poll_now();
+    Json(json!({ "ok": true }))
+}
+
+async fn clear_queue(State(d): D) -> Json<Value> {
+    Json(json!({ "cleared": d.clear_queue() }))
+}
+
+/// What answers `GET /ci/v1/health` on this machine's `port`, if anything
+/// does: before the daemon takes its port, it looks whether bana has it.
+pub async fn health_at(port: u16) -> Option<Value> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let ask = async {
+        let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .ok()?;
+        let req = format!(
+            "GET /ci/v1/health HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        );
+        c.write_all(req.as_bytes()).await.ok()?;
+        let mut buf = Vec::new();
+        c.take(64 * 1024).read_to_end(&mut buf).await.ok()?;
+        let text = String::from_utf8_lossy(&buf);
+        let (head, body) = text.split_once("\r\n\r\n")?;
+        if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
+            return None;
+        }
+        serde_json::from_str::<Value>(body).ok()
+    };
+    tokio::time::timeout(Duration::from_secs(3), ask)
+        .await
+        .ok()
+        .flatten()
+        .filter(|v| v["ok"] == true && v["service"] == "ci")
 }
 
 #[cfg(test)]
@@ -760,5 +965,288 @@ esac"#,
         let (code, v) = call(&app, "POST", "/ci/v1/runners/a/start", None, true).await;
         assert_eq!(code, 409, "{v}");
         assert!(v["error"].as_str().unwrap().contains("leave the pool"));
+    }
+
+    use crate::daemon::tests::{finished as built, start as start_daemon, until, Project};
+
+    /// A daemon over the stand-ins of daemon.rs's tests, and its router.
+    async fn daemon_app(name: &str) -> (Project, Daemon, Router) {
+        let p = Project::new(name);
+        let d = start_daemon(&p, "").await;
+        let m = Manager::new(Tools::from_settings(d.settings()), "t".into());
+        let access = Arc::new(Access::loopback(TOKEN, 8470, &["/ci/v1/"]));
+        let app = daemon_router(m, d.clone(), access);
+        (p, d, app)
+    }
+
+    async fn status_from(
+        app: &Router,
+        method: &str,
+        path: &str,
+        host: &str,
+        origin: Option<&str>,
+    ) -> u16 {
+        let mut b = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::HOST, host)
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"));
+        if let Some(o) = origin {
+            b = b.header(header::ORIGIN, o);
+        }
+        let r = app.clone().oneshot(b.body(Body::empty()).unwrap()).await;
+        r.unwrap().status().as_u16()
+    }
+
+    /// A job key in a query string.
+    fn escape(s: &str) -> String {
+        s.bytes()
+            .map(|c| match c {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => {
+                    (c as char).to_string()
+                }
+                _ => format!("%{c:02X}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn daemon_routes_need_the_token_a_known_host_and_no_foreign_origin() {
+        let (p, d, app) = daemon_app("srv-guard").await;
+        let (code, h) = call(&app, "GET", "/ci/v1/health", None, false).await;
+        assert_eq!(code, 200, "{h}");
+        assert_eq!(
+            (&h["daemon"], &h["repo"], &h["prefix"]),
+            (&json!(true), &json!("o/r"), &json!(d.settings().prefix))
+        );
+        for (method, path) in [
+            ("GET", "/ci/v1/local"),
+            ("GET", "/ci/v1/builds"),
+            ("GET", "/ci/v1/builds/1"),
+            ("GET", "/ci/v1/builds/1/log?from=0"),
+            ("POST", "/ci/v1/builds"),
+            ("POST", "/ci/v1/builds/1/cancel"),
+            ("POST", "/ci/v1/builds/1/rerun"),
+            ("POST", "/ci/v1/daemon"),
+            ("POST", "/ci/v1/daemon/poll"),
+            ("POST", "/ci/v1/queue/clear"),
+            ("GET", "/ci/v1/state"),
+        ] {
+            let what = format!("{method} {path}");
+            assert_eq!(call(&app, method, path, None, false).await.0, 401, "{what}");
+            let evil = Some("https://evil.example");
+            let from = |host, origin| status_from(&app, method, path, host, origin);
+            assert_eq!(from("127.0.0.1:8470", evil).await, 403, "{what}");
+            assert_eq!(from("evil.example:8470", None).await, 421, "{what}");
+        }
+        let (code, v) = call(&app, "GET", "/ci/v1/local", None, true).await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(v["repo"], "o/r");
+        assert_eq!(v["tiers"], json!(["quick", "nightly"]));
+        assert!(
+            v["refs"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("refs/heads/main")),
+            "{v}"
+        );
+
+        // Over a real socket, as a second daemon asks before it takes the port.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let m = Manager::new(Tools::from_settings(d.settings()), "t".into());
+        let access = Arc::new(Access::loopback(TOKEN, port, &["/ci/v1/"]));
+        let served = daemon_router(m, d.clone(), access);
+        let server = tokio::spawn(async move { axum::serve(listener, served).await });
+        let h = health_at(port).await.expect("health");
+        assert_eq!((&h["daemon"], &h["repo"]), (&json!(true), &json!("o/r")));
+        server.abort();
+        let _ = server.await;
+        assert_eq!(health_at(port).await, None, "nobody answers");
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test]
+    async fn the_page_runs_cancels_and_reruns_builds_and_tails_their_logs() {
+        let (p, d, app) = daemon_app("srv-builds").await;
+        let post = |path: &'static str, body: Option<Value>| {
+            let app = app.clone();
+            async move { call(&app, "POST", path, body, true).await }
+        };
+        let (code, v) = post("/ci/v1/daemon", Some(json!({"paused": true}))).await;
+        assert_eq!((code, &v["paused"]), (200, &json!(true)), "{v}");
+
+        // Run now takes a head fetched and a tier from the settings, nothing else.
+        for (body, why) in [
+            (json!({"ref": "nope", "tier": "quick"}), "no branch or tag"),
+            (json!({"ref": "main", "tier": "weekly"}), "tier"),
+            (json!({"ref": "main"}), "tier"),
+            (json!({"ref": "--help", "tier": "quick"}), "ref"),
+            (json!({"ref": "main", "tier": "a b"}), "tier"),
+        ] {
+            let (code, v) = post("/ci/v1/builds", Some(body.clone())).await;
+            assert_eq!(code, 400, "{body}: {v}");
+            assert!(v["error"].as_str().unwrap().contains(why), "{body}: {v}");
+        }
+        let (code, v) = post(
+            "/ci/v1/builds",
+            Some(json!({"ref": "main", "tier": "quick"})),
+        )
+        .await;
+        assert_eq!(code, 200, "{v}");
+        let queued = v["build"].as_u64().unwrap();
+        let (_, l) = call(&app, "GET", "/ci/v1/local", None, true).await;
+        assert_eq!(l["watcher"]["paused"], true);
+        assert_eq!(l["queue"][0]["id"], queued, "{l}");
+        assert_eq!(l["queue"][0]["trigger"], "manual");
+        until("the queue to wait for the pause", || {
+            d.summary().queue.first().and_then(|q| q.waiting.clone()) == Some("paused".into())
+        })
+        .await;
+        let cancel = format!("/ci/v1/builds/{queued}/cancel");
+        assert_eq!(call(&app, "POST", &cancel, None, true).await.0, 200);
+        let (_, l) = call(&app, "GET", "/ci/v1/local", None, true).await;
+        assert_eq!(l["queue"], json!([]), "removed");
+        assert_eq!(call(&app, "POST", &cancel, None, true).await.0, 409);
+        assert_eq!(
+            call(&app, "POST", "/ci/v1/builds/x/cancel", None, true)
+                .await
+                .0,
+            400
+        );
+
+        for _ in 0..2 {
+            post(
+                "/ci/v1/builds",
+                Some(json!({"ref": "refs/heads/main", "tier": "nightly"})),
+            )
+            .await;
+        }
+        let (code, v) = post("/ci/v1/queue/clear", None).await;
+        assert_eq!((code, &v["cleared"]), (200, &json!(2)), "{v}");
+
+        // A push of a two-entry matrix, built once resumed.
+        p.commit("matrix", "two entries");
+        p.push("main");
+        assert_eq!(post("/ci/v1/daemon/poll", None).await.0, 200);
+        until("the push to be queued", || d.summary().queue.len() == 1).await;
+        let id = d.summary().queue[0].id;
+        post("/ci/v1/daemon", Some(json!({"paused": false}))).await;
+        built(&d, id).await;
+
+        until("statuses posted", || d.summary().watcher.unposted == 0).await;
+        let (_, v) = call(&app, "GET", "/ci/v1/builds", None, true).await;
+        assert_eq!(v["builds"][0]["id"], id, "newest first: {v}");
+        assert!(v["builds"][0]["posted"].as_u64() > Some(0), "{v}");
+        assert_eq!(v["builds"][0]["unposted"], 0);
+        assert_eq!(v["builds"][0]["trigger"], "push");
+        let (_, v) = call(&app, "GET", "/ci/v1/builds?limit=1", None, true).await;
+        assert_eq!(v["builds"].as_array().unwrap().len(), 1);
+        let (_, v) = call(
+            &app,
+            "GET",
+            &format!("/ci/v1/builds?before={id}"),
+            None,
+            true,
+        )
+        .await;
+        assert!(v["builds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b["id"].as_u64() < Some(id)));
+        let (code, b) = call(&app, "GET", &format!("/ci/v1/builds/{id}"), None, true).await;
+        assert_eq!(code, 200, "{b}");
+        assert!(!b["listed"].as_array().unwrap().is_empty(), "{b}");
+        assert_eq!(
+            call(&app, "GET", "/ci/v1/builds/999", None, true).await.0,
+            404
+        );
+        assert_eq!(
+            call(&app, "GET", "/ci/v1/builds/999/log", None, true)
+                .await
+                .0,
+            404
+        );
+
+        // The log from the start, from the middle, and from its end.
+        let log = |q: String| {
+            let app = app.clone();
+            async move {
+                let (code, v) = call(
+                    &app,
+                    "GET",
+                    &format!("/ci/v1/builds/{id}/log{q}"),
+                    None,
+                    true,
+                )
+                .await;
+                assert_eq!(code, 200, "{q}: {v}");
+                (
+                    v["next"].as_u64().unwrap(),
+                    v["lines"].as_array().unwrap().clone(),
+                )
+            }
+        };
+        let file = d.settings().dir.join(format!("builds/{id}/act.jsonl"));
+        let bytes = std::fs::read(&file).unwrap();
+        let (next, all) = log(String::new()).await;
+        assert_eq!(next, bytes.len() as u64);
+        assert!(all.len() > 4, "{all:?}");
+        let mid = bytes.len() / 2;
+        let mid = mid + bytes[mid..].iter().position(|&c| c == b'\n').unwrap() + 1;
+        let (next2, rest) = log(format!("?from={mid}")).await;
+        assert_eq!(next2, next);
+        assert!(!rest.is_empty() && rest.len() < all.len());
+        assert_eq!(
+            rest[..],
+            all[all.len() - rest.len()..],
+            "it resumes where it left off"
+        );
+        let (next3, none) = log(format!("?from={next}")).await;
+        assert_eq!((next3, none.len()), (next, 0));
+
+        // One job's lines only.
+        let mut keys: Vec<String> = all
+            .iter()
+            .filter_map(|l| l["job"].as_str().map(String::from))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        assert!(keys.len() >= 2, "{keys:?}");
+        let (_, one) = log(format!("?job={}&from=0", escape(&keys[1]))).await;
+        assert!(!one.is_empty() && one.len() < all.len());
+        assert!(one.iter().all(|l| l["job"] == json!(keys[1])), "{one:?}");
+
+        // Re-run: a finished build only.
+        let (code, v) = call(
+            &app,
+            "POST",
+            &format!("/ci/v1/builds/{id}/rerun"),
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(code, 200, "{v}");
+        let again = v["build"].as_u64().unwrap();
+        assert!(again > id);
+        assert_eq!(
+            call(&app, "POST", "/ci/v1/builds/999/rerun", None, true)
+                .await
+                .0,
+            404
+        );
+        d.shutdown().await;
+        let (code, v) = call(
+            &app,
+            "POST",
+            &format!("/ci/v1/builds/{again}/rerun"),
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(code, 409, "not finished: {v}");
+        p.remove();
     }
 }
