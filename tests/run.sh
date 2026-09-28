@@ -71,7 +71,7 @@ json_lines() { python3 -c 'import json,sys; [json.loads(l) for l in sys.stdin if
 fresh
 bash "$bana" settings >"$T/out"
 check "settings come from .github/bana.conf" has "$T/out" "repo = acme/widget"
-check "hooks are relative to bana.conf" has "$T/out" "hook.mac = $T/w/project/.github/mac-hook.sh"
+check "hooks are relative to bana.conf" has "$T/out" "hook.mac = $(pwd -P)/.github/mac-hook.sh"
 BANA_REPO=o/other bash "$bana" settings >"$T/out"
 check "BANA_* overrides bana.conf" has "$T/out" "repo = o/other"
 rm .github/bana.conf
