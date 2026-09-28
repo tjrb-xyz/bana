@@ -4,5 +4,6 @@ case ${1:-} in
 -s) echo "${FAKE_OS:-Linux}" ;;
 -m) echo "${FAKE_ARCH:-x86_64}" ;;
 -n) echo "${FAKE_HOST:-box}" ;;
+-r) echo "${FAKE_KERNEL:-6.12.48-amd64}" ;;
 *) echo "${FAKE_OS:-Linux}" ;;
 esac

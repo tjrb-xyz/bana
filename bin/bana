@@ -156,6 +156,10 @@ settings() {
     case $k in
     repo) v=$repo ;; prefix) v=$prefix ;; vm) v=$vm ;; vm_x64) v=$vm_x64 ;; linux_user) v=$linux_user ;;
     hook.*) v=$(conf_path "$k") ;;
+    workflow) v=$(conf workflow ci.yml) ;;
+    tiers) v=$(conf tiers "quick nightly release") ;;
+    tier_input) v=$(conf tier_input tier) ;;
+    keep_max_gb) v=$(conf keep_max_gb 0) ;;
     *) v=$(conf "$k") ;;
     esac
     printf '%s = %s\n' "$k" "$v"
@@ -381,6 +385,7 @@ linux_prepare() {
   [[ -d ${BANA_SYS_ROOT:-}/run/systemd/system ]] || die "runners run as systemd services, and systemd is not running here (a Proxmox container: Options → Features → nesting)"
   read -r -a extra <<<"$(words "$(conf packages.linux)")" || true
   apt_missing "${need[@]}" ${extra[@]+"${extra[@]}"}
+  [[ -n $no_usb ]] || sound_kernel
   run_hook linux
   add_paths
 }
@@ -393,6 +398,35 @@ add_paths() {
     PATH=$d:$PATH
   done
   export PATH
+}
+
+# USB audio needs the kernel's snd-usb-audio. Debian's cloud kernels and Ubuntu's
+# virtual ones leave it out: this installs what brings it. A container uses its
+# host's kernel (Proxmox's has it), so there is nothing to do there.
+sound_kernel() {
+  local r=${BANA_SYS_ROOT:-} release pkg
+  release=$(uname -r)
+  if [[ -e $r/run/systemd/container ]] || { [[ -z $r ]] && systemd-detect-virt -cq 2>/dev/null; }; then
+    return 0
+  fi
+  grep -qs 'snd-usb-audio\.ko' "$r/lib/modules/$release/modules.dep" "$r/lib/modules/$release/modules.builtin" && return 0
+  case $release in
+  *-cloud-amd64 | *-cloud-arm64)
+    pkg=linux-image-${release##*-cloud-}
+    say "This kernel ($release) has no sound drivers: installing $pkg, the standard one"
+    apt_missing "$pkg"
+    warn "Reboot into the new kernel for USB audio (then 'bana relabel'); the runners work meanwhile."
+    ;;
+  *)
+    pkg=linux-modules-extra-$release
+    say "This kernel ($release) has no USB audio driver: installing $pkg"
+    if apt_missing "$pkg"; then
+      sudo modprobe snd-usb-audio || true
+    else
+      warn "Could not install $pkg: USB audio devices need a kernel with snd-usb-audio"
+    fi
+    ;;
+  esac
 }
 
 # The settings, as BANA_* for bana in another machine or as another user.

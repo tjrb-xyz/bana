@@ -198,6 +198,26 @@ check "linux: the first runner holds the USB device" has "$FAKE_LOG" \
   "--name wid-pve-ci-linux-x64-1 --labels wid-linux,linux-x64,pve-ci,big-disk,usb-audio,usb-1c75-af70 --work"
 check "linux: the second does not (two jobs never share a device)" has "$FAKE_LOG" \
   "--name wid-pve-ci-linux-x64-2 --labels wid-linux,linux-x64,pve-ci,big-disk --work"
+check "linux: its kernel has snd-usb-audio, so no kernel packages" lacks "$FAKE_LOG" "linux-image"
+
+# A Debian cloud kernel (no sound drivers), and Ubuntu's virtual one.
+cp -R "$here/fixtures/linux-sys" "$T/w/sys" && rm -rf "$T/w/sys/lib"
+: >"$FAKE_LOG"
+BANA_SYS_ROOT=$T/w/sys FAKE_KERNEL=6.12.48-cloud-amd64 FAKE_MISSING=linux-image-amd64 bash "$bana" up --linux 1 >"$T/out" 2>&1
+check "linux: a cloud kernel gets the standard one" has "$FAKE_LOG" "apt-get install -y -q linux-image-amd64"
+check "linux: and says to reboot" has "$T/out" "Reboot into the new kernel"
+: >"$FAKE_LOG"
+BANA_SYS_ROOT=$T/w/sys FAKE_KERNEL=6.8.0-1015-kvm FAKE_MISSING=linux-modules-extra-6.8.0-1015-kvm bash "$bana" up --linux 1 >"$T/out" 2>&1
+check "linux: Ubuntu's virtual kernel gets its extra modules" has "$FAKE_LOG" "apt-get install -y -q linux-modules-extra-6.8.0-1015-kvm"
+check "linux: and loads the driver" has "$FAKE_LOG" "sudo modprobe snd-usb-audio"
+: >"$FAKE_LOG"
+touch "$T/w/sys/run/systemd/container"
+BANA_SYS_ROOT=$T/w/sys FAKE_KERNEL=6.12.48-cloud-amd64 bash "$bana" up --linux 1 >/dev/null 2>&1
+check "linux: a container uses its host's kernel" lacks "$FAKE_LOG" "linux-image"
+: >"$FAKE_LOG"
+rm "$T/w/sys/run/systemd/container"
+BANA_SYS_ROOT=$T/w/sys FAKE_KERNEL=6.12.48-cloud-amd64 bash "$bana" up --linux 1 --no-usb >/dev/null 2>&1
+check "linux: --no-usb leaves the kernel alone" lacks "$FAKE_LOG" "linux-image"
 unset BANA_SYS_ROOT
 bash -c "BANA_SYS_ROOT=/nonexistent bash '$bana' up" >"$T/out" 2>&1 || true
 check "linux: without systemd, says what to do" has "$T/out" "nesting"
