@@ -225,12 +225,14 @@ d_clone() { # ROOT GH
   if ! {
     git clone -q --no-checkout "$1" "$tmp" &&
       git -C "$tmp" remote set-url origin "https://github.com/$repo.git" &&
-      d_git "$2" -C "$tmp" fetch -q --prune origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' &&
-      d_git "$2" -C "$tmp" remote set-head origin --auto >/dev/null
+      d_git "$2" -C "$tmp" fetch -q --prune origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*'
   }; then
     rm -rf "$tmp"
     die "Could not clone $repo into $src"
   fi
+  # The default branch, for a push's event; an origin whose HEAD names no branch has none.
+  d_git "$2" -C "$tmp" remote set-head origin --auto >/dev/null 2>&1 ||
+    warn "$repo's default branch is unknown (its HEAD names no branch): push events carry none, and bana changed compares with main"
   mv "$tmp" "$src"
 }
 

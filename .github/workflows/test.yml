@@ -86,7 +86,7 @@ jobs:
           # where bana's home is); GitHub is a local bare repository.
           export HOME=$T/home BANA_HOME=$T/home/.bana FAKE_LOG=$T/log FAKE_STATE=$T/state
           mkdir -p "$HOME" "$FAKE_STATE" "$T/bin"
-          git init -q --bare "$T/origin.git"
+          git init -q --bare -b main "$T/origin.git"
           printf '[user]\n  name = ci\n  email = ci@example.com\n[url "file://%s"]\n  insteadOf = https://github.com/acme/wid.git\n' "$T/origin.git" >"$HOME/.gitconfig"
           ln -s "$PWD/tests/stand-ins/gh" "$T/bin/gh"
           ln -s "$PWD/tests/stand-ins/act" "$T/bin/act"
