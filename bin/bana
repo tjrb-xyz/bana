@@ -5,6 +5,9 @@
 #
 # On this machine, when you want it (act, in OrbStack's Docker; nothing stays running):
 #   bana ci [TIER] [-j JOB] [--x64] [--list] [--event FILE]   the workflow's jobs here (bana ci --help)
+# CI on push, on this machine (a daemon runs each push through act and posts commit statuses):
+#   bana daemon install [--port N] [--no-tray] [--no-open] [--now]   start it (bana daemon help)
+#   bana daemon uninstall [--purge] | run [--build] | status | log | open | poke
 # A runner pool, if you want GitHub to run the jobs on your machines (they must stay awake):
 #   bana up [options]        join the pool
 #       on a Mac:   a macOS runner (in your login session: real CoreAudio, real USB
@@ -25,6 +28,7 @@
 #   bana usb                 the USB audio devices here, and the labels they give
 #   bana relabel             update this machine's runner labels (after plugging a device in)
 #   bana manager [--port N]  the dev manager: a page that shows and drives all this
+#                            (the daemon's page instead, when this project's daemon runs)
 #   bana tart up|status|log|shell|down   a Linux VM in Tart on a Mac (bana tart help)
 # In workflows (and by hand):
 #   bana changed BEFORE [BRANCH]   files changed since BEFORE, else since BRANCH ('*': unknown)
@@ -156,12 +160,30 @@ need_repo() {
   [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "repo: owner/name, not '$repo'"
 }
 
+# A daemon.* setting, with its default (`bana daemon install` writes them for the daemon).
+daemon_conf() { # KEY
+  local t=()
+  read -r -a t <<<"$(words "$(conf tiers "quick nightly release")")" || true
+  case $1 in
+  daemon.branches) conf "$1" '* !dependabot/* !renovate/*' ;;
+  daemon.tier) conf "$1" "${t[0]:-}" ;;
+  daemon.tag_tier) if ((${#t[@]})); then conf "$1" "${t[${#t[@]} - 1]}"; else conf "$1"; fi ;;
+  daemon.poll) conf "$1" 30 ;;
+  daemon.timeout) conf "$1" 120 ;;
+  daemon.supersede) conf "$1" queued ;;
+  daemon.token) conf "$1" gh ;;
+  *) conf "$1" ;;
+  esac
+}
+
 settings() {
   local k v
   echo "# bana $BANA_VERSION at $bana_root"
   echo "# bana.conf: ${conf_file:-none}"
   for k in repo prefix labels vm vm_x64 linux_user packages.linux path hook.mac hook.linux \
-    runner_version workflow tiers tier_input act.image act.args keep keep_max_gb; do
+    runner_version workflow tiers tier_input act.image act.args keep keep_max_gb \
+    daemon.branches daemon.tags daemon.tier daemon.tag_tier daemon.poll daemon.timeout \
+    daemon.supersede daemon.token; do
     case $k in
     repo) v=$repo ;; prefix) v=$prefix ;; vm) v=$vm ;; vm_x64) v=$vm_x64 ;; linux_user) v=$linux_user ;;
     hook.*) v=$(conf_path "$k") ;;
@@ -170,6 +192,7 @@ settings() {
     tier_input) v=$(conf tier_input tier) ;;
     act.image) v=$(conf act.image catthehacker/ubuntu:act-24.04) ;;
     keep_max_gb) v=$(conf keep_max_gb 0) ;;
+    daemon.*) v=$(daemon_conf "$k") ;;
     *) v=$(conf "$k") ;;
     esac
     printf '%s = %s\n' "$k" "$v"
@@ -711,7 +734,18 @@ relabel() {
 
 manager() {
   need_repo
-  local bin=$bana_root/manager/target/release/bana-manager
+  local bin=$bana_root/manager/target/release/bana-manager port='' a h
+  # This project's daemon serves the same page (and more): open that one instead.
+  # shellcheck source=SCRIPTDIR/../lib/daemon.sh
+  source "$bana_root/lib/daemon.sh"
+  for a in "$@"; do [[ $port == next ]] && port=$a; [[ $a == --port ]] && port=next; done
+  [[ -n $port && $port != next ]] || port=$(d_port)
+  if h=$(d_health "$port"); then
+    d_is_ours "$h" || die "Another project's bana daemon serves port $port: pass --port"
+    say "$repo's daemon serves the page: $(d_url "$port")"
+    if [[ $os == Darwin ]]; then open "$(d_url "$port")" || true; fi
+    return 0
+  fi
   command -v cargo >/dev/null || [[ -x $bin ]] || die "cargo is needed to build the manager: https://rustup.rs"
   if command -v cargo >/dev/null; then
     say "Building the manager (the first time takes a minute)"
@@ -755,6 +789,11 @@ start | stop)
 usb) usb ;;
 relabel) relabel ;;
 manager) manager "$@" ;;
+daemon)
+  # shellcheck source=SCRIPTDIR/../lib/daemon.sh
+  source "$bana_root/lib/daemon.sh"
+  daemon_main "$@"
+  ;;
 settings) settings ;;
 ci)
   # shellcheck source=SCRIPTDIR/../lib/act.sh

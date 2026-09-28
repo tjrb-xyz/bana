@@ -1,6 +1,28 @@
 #!/bin/bash
-# Stand-in curl: serves the fake runner tarball for any download (-o FILE).
+# Stand-in curl: serves the fake runner tarball for any download (-o FILE), and plays a
+# daemon on 127.0.0.1: its health answers once launchd or systemd runs it (FAKE_HEALTH:
+# this answer instead), /ci/v1/local is $FAKE_STATE/local.json (then local.next, if
+# any), and what comes on stdin (-H @-: the token) goes to $FAKE_STATE/curl.stdin.
 echo "curl $*" >>"$FAKE_LOG"
+url=${*: -1}
+for a in "$@"; do [[ $a == @- ]] && cat >"$FAKE_STATE/curl.stdin"; done
+case $url in
+http://127.0.0.1:*/ci/v1/health)
+  if [[ -n ${FAKE_HEALTH:-} ]]; then echo "$FAKE_HEALTH"; exit 0; fi
+  for f in "$FAKE_STATE"/launchd-xyz.tjrb.bana.* "$FAKE_STATE"/systemd-bana-*.service; do
+    [[ -e $f ]] || continue
+    p=${f##*/} p=${p#launchd-xyz.tjrb.bana.} p=${p#systemd-bana-} p=${p%.service}
+    printf '{"ok":true,"service":"ci","api":1,"daemon":true,"repo":"acme/widget","prefix":"%s"}\n' "$p"
+    exit 0
+  done
+  exit 7 ;;
+http://127.0.0.1:*/ci/v1/local)
+  cat "$FAKE_STATE/local.json" 2>/dev/null || exit 22
+  [[ ! -e $FAKE_STATE/local.next ]] || mv "$FAKE_STATE/local.next" "$FAKE_STATE/local.json"
+  exit 0 ;;
+http://127.0.0.1:*/ci/v1/daemon/poll) echo '{"ok":true}'; exit 0 ;;
+http://127.0.0.1:*) exit 7 ;;
+esac
 while (($#)); do
   if [[ $1 == -o ]]; then cp "$FAKE_TARBALL" "$2"; exit 0; fi
   shift

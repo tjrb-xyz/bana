@@ -1,0 +1,5 @@
+#!/bin/sh
+# Stand-in plutil: -lint checks that the file is a property list (Python's plistlib).
+echo "plutil $*" >>"$FAKE_LOG"
+[ "$1" = -lint ] || exit 0
+python3 -c 'import plistlib, sys; plistlib.load(open(sys.argv[1], "rb"))' "$2" && echo "$2: OK"

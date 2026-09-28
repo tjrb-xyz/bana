@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # bana's tests: every command on stand-ins for the programs it drives (uname, orb,
-# tart, gh, ioreg, sudo, apt-get, the runner's config.sh and svc.sh), so the macOS
-# paths run on Linux too. BASH=/path/to/bash-3.2 tests with macOS's stock shell;
+# tart, gh, ioreg, sudo, apt-get, launchctl, systemctl, curl as a daemon's API, the runner's
+# config.sh and svc.sh), so the macOS paths run on Linux too. BASH=/path/to/bash-3.2 tests with macOS's stock shell;
 # AWK=original-awk with its BSD awk.
 #
 #   tests/run.sh            all of them (as root, it also tests a Proxmox container's root path)
@@ -28,7 +28,8 @@ fresh() {
   rm -rf "$T/w"
   mkdir -p "$T/w/project/.github" "$T/w/home" "$T/w/state/vmroot/run/systemd/system"
   export HOME=$T/w/home FAKE_STATE=$T/w/state FAKE_LOG=$T/w/log
-  unset FAKE_OS FAKE_ARCH FAKE_UID FAKE_IOREG BANA_SYS_ROOT BANA_TOKEN FAKE_GH FAKE_POOL FAKE_SVC_FAIL GITHUB_TOKEN
+  unset FAKE_OS FAKE_ARCH FAKE_UID FAKE_IOREG BANA_SYS_ROOT BANA_TOKEN FAKE_GH FAKE_POOL FAKE_SVC_FAIL GITHUB_TOKEN \
+    FAKE_HEALTH FAKE_LINGER FAKE_GH_SCOPES BANA_DAEMON_BIN BANA_DAEMON_STEP CARGO_TARGET_DIR
   : >"$FAKE_LOG"
   cd "$T/w/project"
   git init -q . && git remote add origin git@github.com:acme/widget.git
@@ -356,6 +357,278 @@ if [[ $(/usr/bin/id -u) == 0 ]]; then
   rm -rf /home/bana-test/.bana /etc/sudoers.d/bana-test
   unset FAKE_OS FAKE_ARCH FAKE_HOST FAKE_UID BANA_SYS_ROOT BANA_LINUX_USER
 fi
+
+# ---- bana daemon: CI on push, on this machine ---------------------------------------------------
+# A project whose workflow needs the doctor's three fixes, its GitHub (a bare repository
+# git reaches for https://github.com/acme/widget.git), a daemon binary and its token.
+daemon_world() {
+  mkdir -p .github/workflows
+  cat >.github/workflows/ci.yml <<'YML'
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tier: {type: string}
+jobs:
+  mac:
+    runs-on: [self-hosted, wid-macos]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ vars.NIGHTLY_REF }}
+      - if: runner.environment == 'self-hosted'
+        run: ./device-test
+      - if: runner.environment == 'self-hosted' || env.ACT == 'true'
+        run: ./mix-test
+YML
+  git add -A && git -c user.name=t -c user.email=t@t commit -q -m one
+  git clone -q --bare . "$T/w/origin.git"
+  git branch wip # only here, not on GitHub
+  git config --global url."file://$T/w/origin.git".insteadOf https://github.com/acme/widget.git
+  # shellcheck disable=SC2016 # the stand-in expands these when it runs
+  printf '#!/bin/sh\necho "bana-manager $*" >>"$FAKE_LOG"\n' >"$T/w/bana-manager"
+  chmod +x "$T/w/bana-manager"
+  mkdir -p "$HOME/.bana" && echo 0123456789abcdef0123 >"$HOME/.bana/manager-token"
+  export BANA_DAEMON_BIN=$T/w/bana-manager BANA_DAEMON_STEP=0
+}
+# A property list's key (or, without one, its keys), as JSON.
+plist() {
+  python3 -c 'import json, plistlib, sys
+d = plistlib.load(open(sys.argv[1], "rb"))
+print(json.dumps(d[sys.argv[2]] if len(sys.argv) > 2 else sorted(d), separators=(",", ":")))' "$@"
+}
+# The keys the daemon takes, from its source (any other key stops it).
+daemon_keys=$(sed -n '/^const KEYS/,/^];/p' "$here/../manager/src/daemon.rs" | grep -o '"[^"]*"' | tr -d '"')
+only_daemon_keys() { # SETTINGS
+  local k ok=0
+  while read -r k; do
+    grep -qx -- "$k" <<<"$daemon_keys" || { echo "  not a daemon key: $k" >&2; ok=1; }
+  done < <(awk '!/^#/ { k = substr($0, 1, index($0, "=") - 1); gsub(/[ \t]/, "", k); print k }' "$1")
+  return $ok
+}
+bana_root=$(cd "$here/.." && pwd)
+
+fresh
+daemon_world
+d=$HOME/.bana/wid
+export FAKE_OS=Darwin FAKE_ARCH=arm64 FAKE_HOST=MBP
+bash "$bana" daemon install --port 8471 --no-open >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "daemon: the doctor reads act's version" has "$T/out" "act: act version 0.2.89"
+check "daemon: the doctor warns of a push trigger (no pool here)" has "$T/out" "ci.yml:2: a push trigger"
+check "daemon: of a checkout ref:" has "$T/out" "ci.yml:13: a checkout ref:"
+check "daemon: of a runner.environment gate without env.ACT" has "$T/out" "ci.yml:14: act never sets runner.environment"
+check "daemon: not of one with env.ACT" lacks "$T/out" "ci.yml:16"
+check "daemon: git reads the repository through gh" has "$T/out" "git: reads acme/widget through gh"
+check "daemon: the snapshot's binary" cmp -s "$T/w/bana-manager" "$d/daemon/bana-manager"
+check "daemon: the snapshot's bana" cmp -s "$bana" "$d/daemon/bin/bana"
+check "daemon: the snapshot's lib" cmp -s "$here/../lib/daemon.sh" "$d/daemon/lib/daemon.sh"
+check "daemon: its clone's origin is GitHub" same "$(git -C "$d/src" config remote.origin.url)" "https://github.com/acme/widget.git"
+check "daemon: its clone knows GitHub's default branch" same "$(git -C "$d/src" symbolic-ref --short refs/remotes/origin/HEAD)" \
+  "origin/$(git symbolic-ref --short HEAD)"
+check "daemon: its clone has GitHub's branches, not your local ones" bash -c "! git -C '$d/src' rev-parse -q --verify refs/remotes/origin/wip"
+check "daemon: settings has only the keys the daemon takes" only_daemon_keys "$d/daemon/settings"
+cat >"$T/want" <<EOF
+repo = acme/widget
+prefix = wid
+workflow = ci.yml
+tiers = quick nightly release
+tier_input = tier
+daemon.branches = * !dependabot/* !renovate/*
+daemon.tags =
+daemon.tier = quick
+daemon.tag_tier = release
+daemon.poll = 30
+daemon.timeout = 120
+daemon.supersede = queued
+daemon.token = gh
+port = 8471
+host = mbp
+login = octo
+path = $HOME/.cargo/bin:$PATH
+tray = yes
+gh = $here/stand-ins/gh
+git = $(command -v git)
+docker = $here/stand-ins/docker
+bash = $T/path/bash
+caffeinate = $here/stand-ins/caffeinate
+script = $d/daemon/bin/bana
+EOF
+check "daemon: settings, resolved (bana.conf's path first, absolute programs)" same "$(grep -v '^#' "$d/daemon/settings")" "$(cat "$T/want")"
+p=$HOME/Library/LaunchAgents/xyz.tjrb.bana.wid.plist
+check "daemon: the LaunchAgent lints" has "$FAKE_LOG" "plutil -lint $p.new."
+check "daemon: the LaunchAgent's keys, and no others" same "$(plist "$p")" \
+  '["EnvironmentVariables","ExitTimeOut","KeepAlive","Label","LimitLoadToSessionType","ProcessType","ProgramArguments","RunAtLoad","StandardErrorPath","StandardOutPath","ThrottleInterval"]'
+check "daemon: its label" same "$(plist "$p" Label)" '"xyz.tjrb.bana.wid"'
+check "daemon: it runs the snapshot, daemon --dir" same "$(plist "$p" ProgramArguments)" "[\"$d/daemon/bana-manager\",\"daemon\",\"--dir\",\"$d\"]"
+check "daemon: with the captured PATH" same "$(plist "$p" EnvironmentVariables)" "{\"PATH\":\"$HOME/.cargo/bin:$PATH\"}"
+check "daemon: RunAtLoad" same "$(plist "$p" RunAtLoad)" true
+check "daemon: KeepAlive after a crash, not after Quit" same "$(plist "$p" KeepAlive)" '{"SuccessfulExit":false}'
+check "daemon: ThrottleInterval 10" same "$(plist "$p" ThrottleInterval)" 10
+check "daemon: ProcessType Interactive" same "$(plist "$p" ProcessType)" '"Interactive"'
+check "daemon: in the login session (Aqua)" same "$(plist "$p" LimitLoadToSessionType)" '"Aqua"'
+check "daemon: ExitTimeOut 60, for the shutdown ladder" same "$(plist "$p" ExitTimeOut)" 60
+check "daemon: its log" same "$(plist "$p" StandardOutPath)$(plist "$p" StandardErrorPath)" \
+  "\"$HOME/Library/Logs/bana/wid.log\"\"$HOME/Library/Logs/bana/wid.log\""
+check "daemon: launchctl bootout first (errors ignored)" has "$FAKE_LOG" "launchctl bootout gui/1000/xyz.tjrb.bana.wid"
+check "daemon: then bootstrap in the login session" has "$FAKE_LOG" "launchctl bootstrap gui/1000 $p"
+check "daemon: waits for its health, past any proxy" has "$FAKE_LOG" "--noproxy * --max-time 3 http://127.0.0.1:8471/ci/v1/health"
+check "daemon: says where its page is" has "$T/out" "Its page: http://127.0.0.1:8471/#token=0123456789abcdef0123"
+check "daemon: --no-open" lacks "$FAKE_LOG" "open http"
+
+# Again, while it builds: it waits for the build, keeps the port, and does not clone again.
+echo '{"now":100,"watcher":{},"running":{"id":7,"ref":"main","tier":"quick"},"queue":[],"last":null}' >"$FAKE_STATE/local.json"
+echo '{"now":100,"watcher":{},"running":null,"queue":[],"last":null}' >"$FAKE_STATE/local.next"
+: >"$FAKE_LOG"
+bash "$bana" daemon install --no-tray >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "daemon again: waits for the running build" has "$T/out" "Build #7 (main) runs: restarting the daemon when it ends"
+check "daemon again: asked until it ended" test ! -e "$FAKE_STATE/local.next"
+check "daemon again: asks with the token, on stdin (not in ps)" has "$FAKE_STATE/curl.stdin" "Authorization: Bearer 0123456789abcdef0123"
+check "daemon again: the token is on no curl command line" bash -c "! grep -q '^curl .*0123456789abcdef0123' '$FAKE_LOG'"
+check "daemon again: keeps the installed port" has "$d/daemon/settings" "port = 8471"
+check "daemon again: does not clone again" lacks "$T/out" "Cloning"
+check "daemon again: --no-tray" same "$(plist "$p" ProgramArguments)" "[\"$d/daemon/bana-manager\",\"daemon\",\"--dir\",\"$d\",\"--no-tray\"]"
+check "daemon again: and tray = no" has "$d/daemon/settings" "tray = no"
+check "daemon again: opens the page" has "$FAKE_LOG" "open http://127.0.0.1:8471/#token="
+echo '{"now":100,"watcher":{},"running":{"id":8,"ref":"main"},"queue":[],"last":null}' >"$FAKE_STATE/local.json"
+: >"$FAKE_LOG"
+bash "$bana" daemon install --now --no-open >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "daemon --now: restarts without waiting" lacks "$FAKE_LOG" "ci/v1/local"
+check "daemon --now: restarted" has "$FAKE_LOG" "launchctl bootstrap gui/1000 $p"
+
+cat >"$FAKE_STATE/local.json" <<'JSON'
+{"repo":"acme/widget","prefix":"wid","machine":"mbp","now":1000,
+ "watcher":{"fetched_at":980,"fetch_error":null,"paused":true,"docker":false,"lock_holder":null,"unposted":2,"post_error":"gh is signed out"},
+ "running":{"id":12,"ref":"main","sha":"abc","tier":"quick","trigger":"push","attempt":1,"state":"running","reason":null,
+   "started_at":800,"ended_at":null,"elapsed":190,"description":"running on mbp: linux","jobs":[{"key":"linux","state":"running"}]},
+ "queue":[{"id":13,"ref":"feat/x","sha":"def","tier":"quick","trigger":"push","queued_at":990,"waiting":null},{"id":14,"ref":"main"}],
+ "last":{"id":11,"ref":"main","state":"failure","description":"failed on mbp: mac (test)","jobs":[]},
+ "refs":["refs/heads/main"],"tiers":["quick"],"skipped":[],"port":8471}
+JSON
+bash "$bana" daemon status >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "daemon status: runs, and where" has "$T/out" "The daemon for acme/widget (launchd: loaded): http://127.0.0.1:8471/"
+check "daemon status: when it fetched" has "$T/out" "fetched 20 s ago"
+check "daemon status: paused" has "$T/out" "paused: new builds wait"
+check "daemon status: no Docker" has "$T/out" "Docker does not answer"
+check "daemon status: statuses not posted" has "$T/out" "statuses: gh is signed out (2 not posted)"
+check "daemon status: the running build" has "$T/out" "running: #12 main (quick, 3 min): running on mbp: linux"
+check "daemon status: the queue" has "$T/out" "queued: 2 (next: #13 feat/x)"
+check "daemon status: the last build" has "$T/out" "last: #11 main failure: failed on mbp: mac (test)"
+: >"$FAKE_LOG"
+bash "$bana" daemon poke >/dev/null
+check "daemon poke: asks it to fetch" has "$FAKE_LOG" "-X POST http://127.0.0.1:8471/ci/v1/daemon/poll"
+bash "$bana" daemon open
+check "daemon open: its page, with the token" has "$FAKE_LOG" "open http://127.0.0.1:8471/#token=0123456789abcdef0123"
+: >"$FAKE_LOG"
+bash "$bana" daemon run
+check "daemon run: the snapshot, in the foreground, without the menu bar" has "$FAKE_LOG" "bana-manager daemon --dir $d --no-tray"
+check "daemon run: builds nothing when installed" lacks "$FAKE_LOG" "cargo"
+
+: >"$FAKE_LOG"
+bash "$bana" manager >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "manager: this project's daemon runs: its page instead" has "$T/out" "acme/widget's daemon serves the page: http://127.0.0.1:8471/#token="
+check "manager: opens it" has "$FAKE_LOG" "open http://127.0.0.1:8471/#token="
+check "manager: builds and starts nothing" lacks "$FAKE_LOG" "cargo"
+FAKE_HEALTH='{"ok":true,"daemon":true,"repo":"o/other","prefix":"other"}' bash "$bana" manager >"$T/out" 2>&1 || true
+check "manager: another project's daemon on the port" has "$T/out" "Another project's bana daemon serves port 8471"
+FAKE_HEALTH='{"ok":true,"service":"ci","api":1}' bash "$bana" daemon install --no-open >"$T/out" 2>&1 || true
+check "daemon install: refuses a port that bana manager has" has "$T/out" "Something else serves port 8471"
+
+mkdir -p "$d/builds/1" "$d/act-cache" && echo '{}' >"$d/state.json" && echo 'K=v' >"$d/vars"
+: >"$FAKE_LOG"
+bash "$bana" daemon uninstall >"$T/out"
+check "daemon uninstall: launchd stops it" has "$FAKE_LOG" "launchctl bootout gui/1000/xyz.tjrb.bana.wid"
+check "daemon uninstall: the LaunchAgent goes" test ! -e "$p"
+check "daemon uninstall: the snapshot goes" test ! -e "$d/daemon"
+check "daemon uninstall: builds and clone stay" test -e "$d/builds/1" -a -e "$d/src/.git" -a -e "$d/state.json"
+bash "$bana" daemon uninstall --purge >"$T/out"
+check "daemon uninstall --purge: clone, builds, cache and state go" \
+  bash -c "! ls -d '$d/src' '$d/builds' '$d/act-cache' '$d/state.json' 2>/dev/null | grep -q ."
+check "daemon uninstall --purge: your vars file stays" test -e "$d/vars"
+bash "$bana" daemon status >"$T/out"
+check "daemon status: none installed" has "$T/out" "No daemon for wid here"
+unset FAKE_OS FAKE_ARCH FAKE_HOST
+
+# Linux: a systemd user service, built with cargo, a workflow the doctor has nothing to say about.
+fresh
+daemon_world
+d=$HOME/.bana/wid
+printf 'on:\n  workflow_dispatch:\n' >.github/workflows/ci.yml
+git -c user.name=t -c user.email=t@t commit -qam two
+unset BANA_DAEMON_BIN
+export CARGO_TARGET_DIR=$T/w/target
+bash "$bana" daemon install >"$T/out" 2>&1 || { cat "$T/out"; false; }
+u=$HOME/.config/systemd/user/bana-wid.service
+check "daemon (Linux): nothing to change in the workflow" has "$T/out" "ci.yml: runs as workflow_dispatch, nothing to change"
+check "daemon (Linux): built with cargo, locked" has "$FAKE_LOG" "cargo build -q --release --locked --manifest-path $bana_root/manager/Cargo.toml"
+check "daemon (Linux): that build is the snapshot" cmp -s "$CARGO_TARGET_DIR/release/bana-manager" "$d/daemon/bana-manager"
+check "daemon (Linux): the unit runs the snapshot without a tray" has "$u" \
+  "ExecStart=\"$d/daemon/bana-manager\" \"daemon\" \"--dir\" \"$d\" \"--no-tray\""
+check "daemon (Linux): with the captured PATH" has "$u" "Environment=\"PATH=$HOME/.cargo/bin:$PATH\""
+check "daemon (Linux): restarted after a crash" has "$u" "Restart=on-failure"
+check "daemon (Linux): RestartSec" has "$u" "RestartSec=5"
+check "daemon (Linux): SIGTERM to the daemon only" has "$u" "KillMode=mixed"
+check "daemon (Linux): time for the shutdown ladder" has "$u" "TimeoutStopSec=60"
+check "daemon (Linux): started with the session" has "$u" "WantedBy=default.target"
+check "daemon (Linux): systemd reads it" has "$FAKE_LOG" "systemctl --user daemon-reload"
+check "daemon (Linux): enable --now" has "$FAKE_LOG" "systemctl --user enable --now bana-wid.service"
+check "daemon (Linux): the linger hint, when lingering is off" has "$T/out" "sudo loginctl enable-linger"
+check "daemon (Linux): no menu bar, no caffeinate" bash -c "grep -qx 'tray = no' '$d/daemon/settings' && ! grep -q caffeinate '$d/daemon/settings'"
+check "daemon (Linux): settings has only the keys the daemon takes" only_daemon_keys "$d/daemon/settings"
+check "daemon (Linux): the default port" has "$d/daemon/settings" "port = 8470"
+: >"$FAKE_LOG"
+FAKE_LINGER=yes bash "$bana" daemon install >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "daemon (Linux) again: restarts the running service" has "$FAKE_LOG" "systemctl --user restart bana-wid.service"
+check "daemon (Linux) again: lingering: no hint" lacks "$T/out" "enable-linger"
+echo '{"now":100,"watcher":{},"running":null,"queue":[],"last":null}' >"$FAKE_STATE/local.json"
+bash "$bana" daemon status >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "daemon status (Linux): systemd's view" has "$T/out" "(systemd: active)"
+check "daemon status (Linux): idle" has "$T/out" "running: nothing"
+: >"$FAKE_LOG"
+bash "$bana" daemon log
+check "daemon log (Linux): the journal, followed" has "$FAKE_LOG" "journalctl --user -u bana-wid.service -n 200 -f"
+: >"$FAKE_LOG"
+bash "$bana" daemon run --build >/dev/null 2>&1
+check "daemon run --build: builds from this checkout first" has "$FAKE_LOG" "cargo build"
+check "daemon run --build: then runs it" has "$FAKE_LOG" "built bana-manager daemon --dir $d --no-tray"
+: >"$FAKE_LOG"
+bash "$bana" daemon uninstall >/dev/null
+check "daemon uninstall (Linux): stops and disables it" has "$FAKE_LOG" "systemctl --user disable --now bana-wid.service"
+check "daemon uninstall (Linux): the unit goes" test ! -e "$u"
+unset CARGO_TARGET_DIR
+
+# What the doctor stops at, and the settings it checks.
+fresh
+daemon_world
+d=$HOME/.bana/wid
+mkdir -p "$d/runners/wid-box-linux-x64-1" && touch "$d/runners/wid-box-linux-x64-1/.runner"
+FAKE_GH_SCOPES="'gist'" bash "$bana" daemon install >"$T/out" 2>&1 || true
+check "doctor: pool runners here" has "$T/out" "This machine has runners in acme/widget's pool (wid-box-linux-x64-1)"
+check "doctor: then no separate push warning" lacks "$T/out" "a push trigger"
+check "doctor: a token without the repo scope" has "$T/out" "lacks the repo scope"
+bash "$bana" daemon uninstall --purge >/dev/null
+FAKE_GH=0 bash "$bana" daemon install >"$T/out" 2>&1 || true
+check "doctor: gh signed out" has "$T/out" "gh auth login"
+echo 'on: push' >.github/workflows/ci.yml
+bash "$bana" daemon install >"$T/out" 2>&1 || true
+check "doctor: no workflow_dispatch, no daemon" has "$T/out" "ci.yml has no workflow_dispatch trigger"
+check "doctor: and nothing installed" test ! -e "$d/daemon/settings" -a ! -e "$HOME/.config/systemd/user/bana-wid.service"
+git checkout -q .github/workflows/ci.yml
+BANA_DAEMON_POLL=5 bash "$bana" daemon install >"$T/out" 2>&1 || true
+check "daemon install: checks daemon.poll" has "$T/out" "daemon.poll: seconds, at least 10"
+BANA_DAEMON_TIER=weekly bash "$bana" daemon install >"$T/out" 2>&1 || true
+check "daemon install: checks daemon.tier" has "$T/out" "daemon.tier: one of quick nightly release"
+printf 'daemon.tags = v*\ndaemon.tag_tier = nightly\n' >>.github/bana.conf
+bash "$bana" settings >"$T/out"
+check "settings: daemon.branches' default" has "$T/out" "daemon.branches = * !dependabot/* !renovate/*"
+check "settings: daemon.tier, the first tier" has "$T/out" "daemon.tier = quick"
+check "settings: daemon.tag_tier from bana.conf" has "$T/out" "daemon.tag_tier = nightly"
+check "settings: daemon.tags" has "$T/out" "daemon.tags = v*"
+check "settings: daemon.poll" has "$T/out" "daemon.poll = 30"
+check "settings: daemon.timeout" has "$T/out" "daemon.timeout = 120"
+check "settings: daemon.supersede" has "$T/out" "daemon.supersede = queued"
+check "settings: daemon.token" has "$T/out" "daemon.token = gh"
+unset BANA_DAEMON_BIN BANA_DAEMON_STEP
 
 # ---- Tart --------------------------------------------------------------------------------------
 fresh

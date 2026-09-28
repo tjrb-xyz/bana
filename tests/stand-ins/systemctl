@@ -1,0 +1,16 @@
+#!/bin/sh
+# Stand-in systemd (systemctl --user): remembers the units started, as systemd-UNIT in $FAKE_STATE.
+echo "systemctl $*" >>"$FAKE_LOG"
+[ "$1" = --user ] && shift
+case $1 in
+enable) [ "$2" = --now ] && touch "$FAKE_STATE/systemd-$3" ;;
+disable) [ "$2" = --now ] && rm -f "$FAKE_STATE/systemd-$3" ;;
+start | restart) touch "$FAKE_STATE/systemd-$2" ;;
+stop) rm -f "$FAKE_STATE/systemd-$2" ;;
+is-active)
+  u=$2
+  [ "$u" = --quiet ] && u=$3
+  if [ -e "$FAKE_STATE/systemd-$u" ]; then [ "$2" = --quiet ] || echo active
+  else [ "$2" = --quiet ] || echo inactive; exit 3; fi ;;
+esac
+exit 0

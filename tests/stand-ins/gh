@@ -1,9 +1,12 @@
 #!/bin/sh
-# Stand-in GitHub CLI: signed in when FAKE_GH=1; tokens, labels and the runner list.
+# Stand-in GitHub CLI: signed in when FAKE_GH=1 (FAKE_GH_SCOPES: its token's); tokens,
+# labels, the runner list and the user.
 echo "gh $*" >>"$FAKE_LOG"
 [ "${FAKE_GH:-1}" = 1 ] || exit 1
 case "$*" in
-"auth status") exit 0 ;;
+"auth status") echo "  - Token scopes: ${FAKE_GH_SCOPES-'gist', 'repo', 'workflow'}" ;;
+"auth git-credential"*) ;;
+"api user --jq .login") echo octo ;;
 "auth token") echo FAKE-GH-TOKEN ;;
 *registration-token*) echo REG-TOKEN ;;
 *remove-token*) echo REMOVE-TOKEN ;;

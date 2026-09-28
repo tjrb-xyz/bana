@@ -2,6 +2,7 @@
 # Stand-in act: records how bana calls it, and its pid and environment in $FAKE_STATE;
 # FAKE_ACT_SLEEP=N keeps it running N seconds (as the same pid).
 echo "act $*" >>"$FAKE_LOG"
+[ "$1" != --version ] || { echo "act version 0.2.89"; exit 0; }
 echo "$$" >"$FAKE_STATE/act.pid"
 env >"$FAKE_STATE/act.env"
 [ -z "${FAKE_ACT_SLEEP:-}" ] || exec sleep "$FAKE_ACT_SLEEP"

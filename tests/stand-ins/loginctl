@@ -1,0 +1,5 @@
+#!/bin/sh
+# Stand-in loginctl: show-user USER -p Linger says FAKE_LINGER (default no).
+echo "loginctl $*" >>"$FAKE_LOG"
+[ "$1" = show-user ] && echo "Linger=${FAKE_LINGER:-no}"
+exit 0
