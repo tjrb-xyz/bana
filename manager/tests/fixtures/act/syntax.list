@@ -1,0 +1,2 @@
+time="2026-09-28T13:07:11Z" level=info msg="Using docker host 'unix:///var/run/docker.sock', and daemon socket 'unix:///var/run/docker.sock'"
+Error: workflow is not valid. 'broken.yml': yaml: line 7: did not find expected '-' indicator

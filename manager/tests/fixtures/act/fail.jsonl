@@ -1,0 +1,28 @@
+{"level":"info","msg":"Using docker host 'unix:///var/run/docker.sock', and daemon socket '-'","time":"2026-09-28T13:01:12Z"}
+{"level":"info","msg":"Start server on http://192.0.2.2:0","time":"2026-09-28T13:01:12Z"}
+{"dryrun":false,"job":"ci/lint","jobID":"lint","level":"info","matrix":{},"msg":"⭐ Run Set up job","step":"Set up job","stepid":["--setup-job"],"time":"2026-09-28T13:01:12Z"}
+{"dryrun":false,"job":"ci/web ","jobID":"web","level":"info","matrix":{},"msg":"⭐ Run Set up job","step":"Set up job","stepid":["--setup-job"],"time":"2026-09-28T13:01:12Z"}
+{"dryrun":false,"job":"ci/web ","jobID":"web","level":"info","matrix":{},"msg":"  ✅  Success - Set up job","step":"Set up job","stepResult":"success","stepid":["--setup-job"],"time":"2026-09-28T13:01:12Z"}
+{"dryrun":false,"job":"ci/web ","jobID":"web","level":"info","matrix":{},"msg":"⭐ Run Main build","stage":"Main","step":"build","stepID":["0"],"time":"2026-09-28T13:01:12Z"}
+{"dryrun":false,"job":"ci/lint","jobID":"lint","level":"info","matrix":{},"msg":"  ✅  Success - Set up job","step":"Set up job","stepResult":"success","stepid":["--setup-job"],"time":"2026-09-28T13:01:12Z"}
+{"dryrun":false,"job":"ci/lint","jobID":"lint","level":"info","matrix":{},"msg":"⭐ Run Main fmt","stage":"Main","step":"fmt","stepID":["0"],"time":"2026-09-28T13:01:12Z"}
+{"dryrun":false,"job":"ci/lint","jobID":"lint","level":"info","matrix":{},"msg":"fmt ok\n","raw_output":true,"stage":"Main","step":"fmt","stepID":["0"],"time":"2026-09-28T13:01:12Z"}
+{"dryrun":false,"executionTime":3069392,"job":"ci/lint","jobID":"lint","level":"info","matrix":{},"msg":"  ✅  Success - Main fmt [3.069392ms]","stage":"Main","step":"fmt","stepID":["0"],"stepResult":"success","time":"2026-09-28T13:01:12Z"}
+{"dryrun":false,"job":"ci/lint","jobID":"lint","level":"info","matrix":{},"msg":"⭐ Run Main cargo clippy","stage":"Main","step":"cargo clippy","stepID":["1"],"time":"2026-09-28T13:01:12Z"}
+{"dryrun":false,"job":"ci/lint","jobID":"lint","level":"info","matrix":{},"msg":"error: unused variable: x\n","raw_output":true,"stage":"Main","step":"cargo clippy","stepID":["1"],"time":"2026-09-28T13:01:12Z"}
+{"dryrun":false,"executionTime":2425831,"job":"ci/lint","jobID":"lint","level":"info","matrix":{},"msg":"  ❌  Failure - Main cargo clippy [2.425831ms]","stage":"Main","step":"cargo clippy","stepID":["1"],"stepResult":"failure","time":"2026-09-28T13:01:12Z"}
+{"dryrun":false,"job":"ci/lint","jobID":"lint","level":"error","matrix":{},"msg":"exit status 3","stage":"Main","step":"cargo clippy","stepID":["1"],"time":"2026-09-28T13:01:12Z"}
+{"dryrun":false,"job":"ci/lint","jobID":"lint","level":"info","matrix":{},"msg":"⭐ Run Main cleanup","stage":"Main","step":"cleanup","stepID":["3"],"time":"2026-09-28T13:01:12Z"}
+{"dryrun":false,"job":"ci/lint","jobID":"lint","level":"info","matrix":{},"msg":"cleaned\n","raw_output":true,"stage":"Main","step":"cleanup","stepID":["3"],"time":"2026-09-28T13:01:12Z"}
+{"dryrun":false,"executionTime":3994049,"job":"ci/lint","jobID":"lint","level":"info","matrix":{},"msg":"  ✅  Success - Main cleanup [3.994049ms]","stage":"Main","step":"cleanup","stepID":["3"],"stepResult":"success","time":"2026-09-28T13:01:12Z"}
+{"dryrun":false,"job":"ci/lint","jobID":"lint","level":"info","matrix":{},"msg":"⭐ Run Complete job","step":"Complete job","stepid":["--complete-job"],"time":"2026-09-28T13:01:12Z"}
+{"dryrun":false,"job":"ci/lint","jobID":"lint","level":"info","matrix":{},"msg":"Cleaning up container for job lint","step":"Complete job","stepid":["--complete-job"],"time":"2026-09-28T13:01:12Z"}
+{"dryrun":false,"job":"ci/lint","jobID":"lint","level":"info","matrix":{},"msg":"  ✅  Success - Complete job","step":"Complete job","stepResult":"success","stepid":["--complete-job"],"time":"2026-09-28T13:01:12Z"}
+{"dryrun":false,"job":"ci/lint","jobID":"lint","jobResult":"failure","level":"info","matrix":{},"msg":"🏁  Job failed","time":"2026-09-28T13:01:12Z"}
+{"dryrun":false,"job":"ci/web ","jobID":"web","level":"info","matrix":{},"msg":"web ok\n","raw_output":true,"stage":"Main","step":"build","stepID":["0"],"time":"2026-09-28T13:01:13Z"}
+{"dryrun":false,"executionTime":1006519185,"job":"ci/web ","jobID":"web","level":"info","matrix":{},"msg":"  ✅  Success - Main build [1.006519185s]","stage":"Main","step":"build","stepID":["0"],"stepResult":"success","time":"2026-09-28T13:01:13Z"}
+{"dryrun":false,"job":"ci/web ","jobID":"web","level":"info","matrix":{},"msg":"⭐ Run Complete job","step":"Complete job","stepid":["--complete-job"],"time":"2026-09-28T13:01:13Z"}
+{"dryrun":false,"job":"ci/web ","jobID":"web","level":"info","matrix":{},"msg":"Cleaning up container for job web","step":"Complete job","stepid":["--complete-job"],"time":"2026-09-28T13:01:13Z"}
+{"dryrun":false,"job":"ci/web ","jobID":"web","level":"info","matrix":{},"msg":"  ✅  Success - Complete job","step":"Complete job","stepResult":"success","stepid":["--complete-job"],"time":"2026-09-28T13:01:13Z"}
+{"dryrun":false,"job":"ci/web ","jobID":"web","jobResult":"success","level":"info","matrix":{},"msg":"🏁  Job succeeded","time":"2026-09-28T13:01:13Z"}
+Error: Job 'lint' failed

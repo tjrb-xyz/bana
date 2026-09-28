@@ -1,0 +1,24 @@
+name: ci
+on:
+  workflow_dispatch:
+    inputs:
+      tier: {type: string, default: quick}
+jobs:
+  hw:
+    runs-on: [self-hosted, wid-macos]
+    steps:
+      - name: long test
+        run: |
+          echo "starting long test"
+          sleep 60
+      - name: remove aggregate
+        if: always()
+        run: |
+          echo "removing aggregate"
+          sleep 30
+          echo "aggregate removed"
+  rust:
+    runs-on: [self-hosted, wid-macos]
+    steps:
+      - name: test
+        run: echo ok

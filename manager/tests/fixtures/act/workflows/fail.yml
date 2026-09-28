@@ -1,0 +1,30 @@
+name: ci
+on:
+  workflow_dispatch:
+    inputs:
+      tier: {type: string, default: quick}
+jobs:
+  lint:
+    runs-on: [self-hosted, wid-macos]
+    steps:
+      - name: fmt
+        run: echo fmt ok
+      - name: cargo clippy
+        run: |
+          echo "error: unused variable: x"
+          exit 3
+      - name: docs
+        run: echo never
+      - name: cleanup
+        if: always()
+        run: echo cleaned
+  web:
+    runs-on: [self-hosted, wid-macos]
+    steps:
+      - name: build
+        run: sleep 1; echo web ok
+  package:
+    needs: lint
+    runs-on: [self-hosted, wid-macos]
+    steps:
+      - run: echo never

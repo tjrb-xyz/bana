@@ -1,0 +1,25 @@
+{"level":"info","msg":"Using docker host 'unix:///var/run/docker.sock', and daemon socket '-'","time":"2026-09-28T13:06:49Z"}
+{"level":"info","msg":"Start server on http://192.0.2.2:0","time":"2026-09-28T13:06:49Z"}
+{"dryrun":false,"job":"ci/linux","jobID":"linux","level":"info","matrix":{},"msg":"⭐ Run Set up job","step":"Set up job","stepid":["--setup-job"],"time":"2026-09-28T13:06:49Z"}
+{"dryrun":false,"job":"ci/linux","jobID":"linux","level":"info","matrix":{},"msg":"🚀  Start image=catthehacker/ubuntu:act-24.04","step":"Set up job","stepid":["--setup-job"],"time":"2026-09-28T13:06:49Z"}
+{"dryrun":false,"job":"ci/linux","jobID":"linux","level":"info","matrix":{},"msg":"  🐳  docker pull image=catthehacker/ubuntu:act-24.04 platform=linux/amd64 username= forcePull=false","step":"Set up job","stepid":["--setup-job"],"time":"2026-09-28T13:06:49Z"}
+{"dryrun":false,"job":"ci/linux","jobID":"linux","level":"info","matrix":{},"msg":"  🐳  docker create image=catthehacker/ubuntu:act-24.04 platform=linux/amd64 entrypoint=[\"tail\" \"-f\" \"/dev/null\"] cmd=[] network=\"host\"","step":"Set up job","stepid":["--setup-job"],"time":"2026-09-28T13:06:49Z"}
+{"dryrun":false,"job":"ci/linux","jobID":"linux","level":"info","matrix":{},"msg":"  🐳  docker run image=catthehacker/ubuntu:act-24.04 platform=linux/amd64 entrypoint=[\"tail\" \"-f\" \"/dev/null\"] cmd=[] network=\"host\"","step":"Set up job","stepid":["--setup-job"],"time":"2026-09-28T13:06:49Z"}
+{"dryrun":false,"job":"ci/linux","jobID":"linux","level":"info","matrix":{},"msg":"  🐳  docker exec cmd=[node --no-warnings -e console.log(process.execPath)] user= workdir=","step":"Set up job","stepid":["--setup-job"],"time":"2026-09-28T13:06:49Z"}
+{"dryrun":false,"job":"ci/linux","jobID":"linux","level":"info","matrix":{},"msg":"  ✅  Success - Set up job","step":"Set up job","stepResult":"success","stepid":["--setup-job"],"time":"2026-09-28T13:06:49Z"}
+{"dryrun":false,"job":"ci/linux","jobID":"linux","level":"info","matrix":{},"msg":"⭐ Run Main long test","stage":"Main","step":"long test","stepID":["0"],"time":"2026-09-28T13:06:49Z"}
+{"dryrun":false,"job":"ci/linux","jobID":"linux","level":"info","matrix":{},"msg":"  🐳  docker exec cmd=[bash -e /var/run/act/workflow/0] user= workdir=","stage":"Main","step":"long test","stepID":["0"],"time":"2026-09-28T13:06:49Z"}
+{"dryrun":false,"job":"ci/linux","jobID":"linux","level":"info","matrix":{},"msg":"starting long test\n","raw_output":true,"stage":"Main","step":"long test","stepID":["0"],"time":"2026-09-28T13:06:49Z"}
+{"dryrun":false,"job":"ci/linux","jobID":"linux","level":"info","matrix":{},"msg":"Reevaluate condition  due to cancellation","stage":"Main","step":"long test","stepID":["0"],"time":"2026-09-28T13:06:50Z"}
+{"dryrun":false,"job":"ci/linux","jobID":"linux","level":"info","matrix":{},"msg":"Result condition keepStepRunning=false","stage":"Main","step":"long test","stepID":["0"],"time":"2026-09-28T13:06:50Z"}
+{"dryrun":false,"executionTime":1144487256,"job":"ci/linux","jobID":"linux","level":"info","matrix":{},"msg":"  ❌  Failure - Main long test [1.144487256s]","stage":"Main","step":"long test","stepID":["0"],"stepResult":"failure","time":"2026-09-28T13:06:50Z"}
+{"dryrun":false,"job":"ci/linux","jobID":"linux","level":"error","matrix":{},"msg":"context canceled","stage":"Main","step":"long test","stepID":["0"],"time":"2026-09-28T13:06:51Z"}
+{"dryrun":false,"job":"ci/linux","jobID":"linux","level":"info","matrix":{},"msg":"⭐ Run Main cleanup","stage":"Main","step":"cleanup","stepID":["1"],"time":"2026-09-28T13:06:51Z"}
+{"dryrun":false,"job":"ci/linux","jobID":"linux","level":"info","matrix":{},"msg":"  🐳  docker exec cmd=[bash -e /var/run/act/workflow/1] user= workdir=","stage":"Main","step":"cleanup","stepID":["1"],"time":"2026-09-28T13:06:51Z"}
+{"dryrun":false,"job":"ci/linux","jobID":"linux","level":"info","matrix":{},"msg":"cleaned up\n","raw_output":true,"stage":"Main","step":"cleanup","stepID":["1"],"time":"2026-09-28T13:06:51Z"}
+{"dryrun":false,"executionTime":84525688,"job":"ci/linux","jobID":"linux","level":"info","matrix":{},"msg":"  ✅  Success - Main cleanup [84.525688ms]","stage":"Main","step":"cleanup","stepID":["1"],"stepResult":"success","time":"2026-09-28T13:06:51Z"}
+{"dryrun":false,"job":"ci/linux","jobID":"linux","level":"info","matrix":{},"msg":"⭐ Run Complete job","step":"Complete job","stepid":["--complete-job"],"time":"2026-09-28T13:06:51Z"}
+{"dryrun":false,"job":"ci/linux","jobID":"linux","level":"info","matrix":{},"msg":"Cleaning up container for job linux","step":"Complete job","stepid":["--complete-job"],"time":"2026-09-28T13:06:51Z"}
+{"dryrun":false,"job":"ci/linux","jobID":"linux","level":"info","matrix":{},"msg":"  ✅  Success - Complete job","step":"Complete job","stepResult":"success","stepid":["--complete-job"],"time":"2026-09-28T13:06:51Z"}
+{"dryrun":false,"job":"ci/linux","jobID":"linux","jobResult":"failure","level":"info","matrix":{},"msg":"🏁  Job failed","time":"2026-09-28T13:06:51Z"}
+Error: Job 'linux' failed

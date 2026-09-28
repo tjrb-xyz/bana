@@ -1,0 +1,5 @@
+time="2026-09-28T13:06:40Z" level=info msg="Using docker host 'unix:///var/run/docker.sock', and daemon socket 'unix:///var/run/docker.sock'"
+Stage  Job ID   Job name  Workflow name  Workflow file  Events           
+0      lint     lint      ci             fail.yml       workflow_dispatch
+0      web      web       ci             fail.yml       workflow_dispatch
+1      package  package   ci             fail.yml       workflow_dispatch

@@ -1,0 +1,16 @@
+name: ci
+on:
+  workflow_dispatch:
+    inputs:
+      tier: {type: string, default: quick}
+jobs:
+  linux:
+    runs-on: [self-hosted, wid-linux]
+    steps:
+      - name: long test
+        run: |
+          echo "starting long test"
+          sleep 60
+      - name: cleanup
+        if: always()
+        run: echo "cleaned up"

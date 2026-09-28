@@ -1,0 +1,15 @@
+{"level":"info","msg":"Using docker host 'unix:///var/run/docker.sock', and daemon socket '-'","time":"2026-09-28T13:02:06Z"}
+{"level":"info","msg":"Start server on http://192.0.2.2:0","time":"2026-09-28T13:02:06Z"}
+{"dryrun":false,"job":"ci/hw  ","jobID":"hw","level":"info","matrix":{},"msg":"⭐ Run Set up job","step":"Set up job","stepid":["--setup-job"],"time":"2026-09-28T13:02:06Z"}
+{"dryrun":false,"job":"ci/rust","jobID":"rust","level":"info","matrix":{},"msg":"⭐ Run Set up job","step":"Set up job","stepid":["--setup-job"],"time":"2026-09-28T13:02:06Z"}
+{"dryrun":false,"job":"ci/hw  ","jobID":"hw","level":"info","matrix":{},"msg":"  ✅  Success - Set up job","step":"Set up job","stepResult":"success","stepid":["--setup-job"],"time":"2026-09-28T13:02:06Z"}
+{"dryrun":false,"job":"ci/hw  ","jobID":"hw","level":"info","matrix":{},"msg":"⭐ Run Main long test","stage":"Main","step":"long test","stepID":["0"],"time":"2026-09-28T13:02:06Z"}
+{"dryrun":false,"job":"ci/hw  ","jobID":"hw","level":"info","matrix":{},"msg":"starting long test\n","raw_output":true,"stage":"Main","step":"long test","stepID":["0"],"time":"2026-09-28T13:02:06Z"}
+{"dryrun":false,"job":"ci/rust","jobID":"rust","level":"info","matrix":{},"msg":"  ✅  Success - Set up job","step":"Set up job","stepResult":"success","stepid":["--setup-job"],"time":"2026-09-28T13:02:06Z"}
+{"dryrun":false,"job":"ci/rust","jobID":"rust","level":"info","matrix":{},"msg":"⭐ Run Main test","stage":"Main","step":"test","stepID":["0"],"time":"2026-09-28T13:02:06Z"}
+{"dryrun":false,"job":"ci/rust","jobID":"rust","level":"info","matrix":{},"msg":"ok\n","raw_output":true,"stage":"Main","step":"test","stepID":["0"],"time":"2026-09-28T13:02:06Z"}
+{"dryrun":false,"executionTime":2258911,"job":"ci/rust","jobID":"rust","level":"info","matrix":{},"msg":"  ✅  Success - Main test [2.258911ms]","stage":"Main","step":"test","stepID":["0"],"stepResult":"success","time":"2026-09-28T13:02:06Z"}
+{"dryrun":false,"job":"ci/rust","jobID":"rust","level":"info","matrix":{},"msg":"⭐ Run Complete job","step":"Complete job","stepid":["--complete-job"],"time":"2026-09-28T13:02:06Z"}
+{"dryrun":false,"job":"ci/rust","jobID":"rust","level":"info","matrix":{},"msg":"Cleaning up container for job rust","step":"Complete job","stepid":["--complete-job"],"time":"2026-09-28T13:02:06Z"}
+{"dryrun":false,"job":"ci/rust","jobID":"rust","level":"info","matrix":{},"msg":"  ✅  Success - Complete job","step":"Complete job","stepResult":"success","stepid":["--complete-job"],"time":"2026-09-28T13:02:06Z"}
+{"dryrun":false,"job":"ci/rust","jobID":"rust","jobResult":"success","level":"info","matrix":{},"msg":"🏁  Job succeeded","time":"2026-09-28T13:02:06Z"}

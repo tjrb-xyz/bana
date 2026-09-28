@@ -1,0 +1,23 @@
+{"level":"info","msg":"Using docker host 'unix:///var/run/docker.sock', and daemon socket '-'","time":"2026-09-28T13:40:50Z"}
+{"level":"info","msg":"Start server on http://192.0.2.2:0","time":"2026-09-28T13:40:50Z"}
+{"dryrun":false,"job":"ci/package-1","jobID":"package","level":"info","matrix":{"target":"a"},"msg":"⭐ Run Set up job","step":"Set up job","stepid":["--setup-job"],"time":"2026-09-28T13:40:50Z"}
+{"dryrun":false,"job":"ci/package-2","jobID":"package","level":"info","matrix":{"target":"b"},"msg":"⭐ Run Set up job","step":"Set up job","stepid":["--setup-job"],"time":"2026-09-28T13:40:50Z"}
+{"dryrun":false,"job":"ci/package-2","jobID":"package","level":"info","matrix":{"target":"b"},"msg":"  ✅  Success - Set up job","step":"Set up job","stepResult":"success","stepid":["--setup-job"],"time":"2026-09-28T13:40:50Z"}
+{"dryrun":false,"job":"ci/package-2","jobID":"package","level":"info","matrix":{"target":"b"},"msg":"🧪  Matrix: map[target:b]","time":"2026-09-28T13:40:50Z"}
+{"dryrun":false,"job":"ci/package-2","jobID":"package","level":"info","matrix":{"target":"b"},"msg":"⭐ Run Main build","stage":"Main","step":"build","stepID":["0"],"time":"2026-09-28T13:40:50Z"}
+{"dryrun":false,"job":"ci/package-1","jobID":"package","level":"info","matrix":{"target":"a"},"msg":"  ✅  Success - Set up job","step":"Set up job","stepResult":"success","stepid":["--setup-job"],"time":"2026-09-28T13:40:50Z"}
+{"dryrun":false,"job":"ci/package-1","jobID":"package","level":"info","matrix":{"target":"a"},"msg":"🧪  Matrix: map[target:a]","time":"2026-09-28T13:40:50Z"}
+{"dryrun":false,"job":"ci/package-1","jobID":"package","level":"info","matrix":{"target":"a"},"msg":"⭐ Run Main build","stage":"Main","step":"build","stepID":["0"],"time":"2026-09-28T13:40:50Z"}
+{"dryrun":false,"executionTime":5433869,"job":"ci/package-1","jobID":"package","level":"info","matrix":{"target":"a"},"msg":"  ❌  Failure - Main build [5.433869ms]","stage":"Main","step":"build","stepID":["0"],"stepResult":"failure","time":"2026-09-28T13:40:50Z"}
+{"dryrun":false,"job":"ci/package-1","jobID":"package","level":"error","matrix":{"target":"a"},"msg":"exit status 3","stage":"Main","step":"build","stepID":["0"],"time":"2026-09-28T13:40:50Z"}
+{"dryrun":false,"job":"ci/package-1","jobID":"package","level":"info","matrix":{"target":"a"},"msg":"⭐ Run Complete job","step":"Complete job","stepid":["--complete-job"],"time":"2026-09-28T13:40:50Z"}
+{"dryrun":false,"job":"ci/package-1","jobID":"package","level":"info","matrix":{"target":"a"},"msg":"Cleaning up container for job package","step":"Complete job","stepid":["--complete-job"],"time":"2026-09-28T13:40:50Z"}
+{"dryrun":false,"job":"ci/package-1","jobID":"package","level":"info","matrix":{"target":"a"},"msg":"  ✅  Success - Complete job","step":"Complete job","stepResult":"success","stepid":["--complete-job"],"time":"2026-09-28T13:40:50Z"}
+{"dryrun":false,"job":"ci/package-1","jobID":"package","jobResult":"failure","level":"info","matrix":{"target":"a"},"msg":"🏁  Job failed","time":"2026-09-28T13:40:50Z"}
+{"dryrun":false,"job":"ci/package-2","jobID":"package","level":"info","matrix":{"target":"b"},"msg":"package b\n","raw_output":true,"stage":"Main","step":"build","stepID":["0"],"time":"2026-09-28T13:40:53Z"}
+{"dryrun":false,"executionTime":3006127915,"job":"ci/package-2","jobID":"package","level":"info","matrix":{"target":"b"},"msg":"  ✅  Success - Main build [3.006127915s]","stage":"Main","step":"build","stepID":["0"],"stepResult":"success","time":"2026-09-28T13:40:53Z"}
+{"dryrun":false,"job":"ci/package-2","jobID":"package","level":"info","matrix":{"target":"b"},"msg":"⭐ Run Complete job","step":"Complete job","stepid":["--complete-job"],"time":"2026-09-28T13:40:53Z"}
+{"dryrun":false,"job":"ci/package-2","jobID":"package","level":"info","matrix":{"target":"b"},"msg":"Cleaning up container for job package","step":"Complete job","stepid":["--complete-job"],"time":"2026-09-28T13:40:53Z"}
+{"dryrun":false,"job":"ci/package-2","jobID":"package","level":"info","matrix":{"target":"b"},"msg":"  ✅  Success - Complete job","step":"Complete job","stepResult":"success","stepid":["--complete-job"],"time":"2026-09-28T13:40:53Z"}
+{"dryrun":false,"job":"ci/package-2","jobID":"package","jobResult":"failure","level":"info","matrix":{"target":"b"},"msg":"🏁  Job failed","time":"2026-09-28T13:40:53Z"}
+Error: Job 'package' failed

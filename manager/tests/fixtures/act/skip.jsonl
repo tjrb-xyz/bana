@@ -1,0 +1,20 @@
+{"level":"info","msg":"Using docker host 'unix:///var/run/docker.sock', and daemon socket '-'","time":"2026-09-28T13:01:20Z"}
+{"level":"info","msg":"Start server on http://192.0.2.2:0","time":"2026-09-28T13:01:20Z"}
+{"dryrun":false,"job":"ci/plan   ","jobID":"plan","level":"info","matrix":{},"msg":"⭐ Run Set up job","step":"Set up job","stepid":["--setup-job"],"time":"2026-09-28T13:01:20Z"}
+{"dryrun":false,"job":"ci/plan   ","jobID":"plan","level":"info","matrix":{},"msg":"  ✅  Success - Set up job","step":"Set up job","stepResult":"success","stepid":["--setup-job"],"time":"2026-09-28T13:01:20Z"}
+{"dryrun":false,"job":"ci/plan   ","jobID":"plan","level":"info","matrix":{},"msg":"⭐ Run Main echo \"web=false\" \u003e\u003e \"$GITHUB_OUTPUT\"","stage":"Main","step":"echo \"web=false\" \u003e\u003e \"$GITHUB_OUTPUT\"","stepID":["p"],"time":"2026-09-28T13:01:20Z"}
+{"dryrun":false,"executionTime":3082951,"job":"ci/plan   ","jobID":"plan","level":"info","matrix":{},"msg":"  ✅  Success - Main echo \"web=false\" \u003e\u003e \"$GITHUB_OUTPUT\" [3.082951ms]","stage":"Main","step":"echo \"web=false\" \u003e\u003e \"$GITHUB_OUTPUT\"","stepID":["p"],"stepResult":"success","time":"2026-09-28T13:01:20Z"}
+{"arg":"false","command":"set-output","dryrun":false,"job":"ci/plan   ","jobID":"plan","level":"info","matrix":{},"msg":"  ⚙  ::set-output:: web=false","name":"web","stage":"Main","step":"echo \"web=false\" \u003e\u003e \"$GITHUB_OUTPUT\"","stepID":["p"],"time":"2026-09-28T13:01:20Z"}
+{"dryrun":false,"job":"ci/plan   ","jobID":"plan","level":"info","matrix":{},"msg":"⭐ Run Complete job","step":"Complete job","stepid":["--complete-job"],"time":"2026-09-28T13:01:20Z"}
+{"dryrun":false,"job":"ci/plan   ","jobID":"plan","level":"info","matrix":{},"msg":"Cleaning up container for job plan","step":"Complete job","stepid":["--complete-job"],"time":"2026-09-28T13:01:20Z"}
+{"dryrun":false,"job":"ci/plan   ","jobID":"plan","level":"info","matrix":{},"msg":"  ✅  Success - Complete job","step":"Complete job","stepResult":"success","stepid":["--complete-job"],"time":"2026-09-28T13:01:20Z"}
+{"dryrun":false,"job":"ci/plan   ","jobID":"plan","jobResult":"success","level":"info","matrix":{},"msg":"🏁  Job succeeded","time":"2026-09-28T13:01:20Z"}
+{"dryrun":false,"job":"ci/rust   ","jobID":"rust","level":"info","matrix":{},"msg":"⭐ Run Set up job","step":"Set up job","stepid":["--setup-job"],"time":"2026-09-28T13:01:20Z"}
+{"dryrun":false,"job":"ci/rust   ","jobID":"rust","level":"info","matrix":{},"msg":"  ✅  Success - Set up job","step":"Set up job","stepResult":"success","stepid":["--setup-job"],"time":"2026-09-28T13:01:20Z"}
+{"dryrun":false,"job":"ci/rust   ","jobID":"rust","level":"info","matrix":{},"msg":"⭐ Run Main test","stage":"Main","step":"test","stepID":["1"],"time":"2026-09-28T13:01:20Z"}
+{"dryrun":false,"job":"ci/rust   ","jobID":"rust","level":"info","matrix":{},"msg":"ok\n","raw_output":true,"stage":"Main","step":"test","stepID":["1"],"time":"2026-09-28T13:01:20Z"}
+{"dryrun":false,"executionTime":2652601,"job":"ci/rust   ","jobID":"rust","level":"info","matrix":{},"msg":"  ✅  Success - Main test [2.652601ms]","stage":"Main","step":"test","stepID":["1"],"stepResult":"success","time":"2026-09-28T13:01:20Z"}
+{"dryrun":false,"job":"ci/rust   ","jobID":"rust","level":"info","matrix":{},"msg":"⭐ Run Complete job","step":"Complete job","stepid":["--complete-job"],"time":"2026-09-28T13:01:20Z"}
+{"dryrun":false,"job":"ci/rust   ","jobID":"rust","level":"info","matrix":{},"msg":"Cleaning up container for job rust","step":"Complete job","stepid":["--complete-job"],"time":"2026-09-28T13:01:20Z"}
+{"dryrun":false,"job":"ci/rust   ","jobID":"rust","level":"info","matrix":{},"msg":"  ✅  Success - Complete job","step":"Complete job","stepResult":"success","stepid":["--complete-job"],"time":"2026-09-28T13:01:20Z"}
+{"dryrun":false,"job":"ci/rust   ","jobID":"rust","jobResult":"success","level":"info","matrix":{},"msg":"🏁  Job succeeded","time":"2026-09-28T13:01:20Z"}

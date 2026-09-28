@@ -11,8 +11,10 @@
 //!
 //! This module is the pure part: the programs' outputs in, the views out.
 
+pub mod actlog;
 pub mod guard;
 pub mod server;
+pub mod watch;
 
 use serde::Serialize;
 use serde_json::Value;

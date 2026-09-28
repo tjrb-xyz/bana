@@ -1,0 +1,22 @@
+name: ci
+on:
+  workflow_dispatch:
+    inputs:
+      tier: {type: string, default: quick}
+jobs:
+  plan:
+    runs-on: [self-hosted, wid-linux]
+    steps:
+      - uses: actions/checkout@v4
+      - name: plan
+        run: echo "tier=${{ inputs.tier }} sha=$GITHUB_SHA"
+  rust:
+    needs: plan
+    runs-on: [self-hosted, wid-macos]
+    steps:
+      - name: build
+        run: echo building
+      - name: test
+        run: |
+          echo "test a ... ok"
+          echo "test b ... ok"

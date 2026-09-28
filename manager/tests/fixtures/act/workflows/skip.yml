@@ -1,0 +1,33 @@
+name: ci
+on:
+  workflow_dispatch:
+    inputs:
+      tier: {type: string, default: quick}
+jobs:
+  plan:
+    runs-on: [self-hosted, wid-macos]
+    outputs:
+      web: ${{ steps.p.outputs.web }}
+    steps:
+      - id: p
+        run: echo "web=false" >> "$GITHUB_OUTPUT"
+  web:
+    needs: plan
+    if: needs.plan.outputs.web == 'true'
+    runs-on: [self-hosted, wid-macos]
+    steps:
+      - run: echo never
+  nightly:
+    if: inputs.tier == 'nightly'
+    runs-on: [self-hosted, wid-macos]
+    steps:
+      - run: echo never
+  rust:
+    needs: plan
+    runs-on: [self-hosted, wid-macos]
+    steps:
+      - name: only on nightly
+        if: inputs.tier == 'nightly'
+        run: echo never
+      - name: test
+        run: echo ok

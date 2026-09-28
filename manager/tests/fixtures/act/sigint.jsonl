@@ -1,0 +1,21 @@
+{"level":"info","msg":"Using docker host 'unix:///var/run/docker.sock', and daemon socket '-'","time":"2026-09-28T13:01:33Z"}
+{"level":"info","msg":"Start server on http://192.0.2.2:0","time":"2026-09-28T13:01:33Z"}
+{"dryrun":false,"job":"ci/hw","jobID":"hw","level":"info","matrix":{},"msg":"⭐ Run Set up job","step":"Set up job","stepid":["--setup-job"],"time":"2026-09-28T13:01:33Z"}
+{"dryrun":false,"job":"ci/hw","jobID":"hw","level":"info","matrix":{},"msg":"  ✅  Success - Set up job","step":"Set up job","stepResult":"success","stepid":["--setup-job"],"time":"2026-09-28T13:01:33Z"}
+{"dryrun":false,"job":"ci/hw","jobID":"hw","level":"info","matrix":{},"msg":"⭐ Run Main setup","stage":"Main","step":"setup","stepID":["0"],"time":"2026-09-28T13:01:33Z"}
+{"dryrun":false,"job":"ci/hw","jobID":"hw","level":"info","matrix":{},"msg":"ready\n","raw_output":true,"stage":"Main","step":"setup","stepID":["0"],"time":"2026-09-28T13:01:33Z"}
+{"dryrun":false,"executionTime":2683742,"job":"ci/hw","jobID":"hw","level":"info","matrix":{},"msg":"  ✅  Success - Main setup [2.683742ms]","stage":"Main","step":"setup","stepID":["0"],"stepResult":"success","time":"2026-09-28T13:01:33Z"}
+{"dryrun":false,"job":"ci/hw","jobID":"hw","level":"info","matrix":{},"msg":"⭐ Run Main long test","stage":"Main","step":"long test","stepID":["1"],"time":"2026-09-28T13:01:33Z"}
+{"dryrun":false,"job":"ci/hw","jobID":"hw","level":"info","matrix":{},"msg":"starting long test\n","raw_output":true,"stage":"Main","step":"long test","stepID":["1"],"time":"2026-09-28T13:01:33Z"}
+{"dryrun":false,"job":"ci/hw","jobID":"hw","level":"info","matrix":{},"msg":"Reevaluate condition  due to cancellation","stage":"Main","step":"long test","stepID":["1"],"time":"2026-09-28T13:01:34Z"}
+{"dryrun":false,"job":"ci/hw","jobID":"hw","level":"info","matrix":{},"msg":"Result condition keepStepRunning=false","stage":"Main","step":"long test","stepID":["1"],"time":"2026-09-28T13:01:34Z"}
+{"dryrun":false,"executionTime":1052313189,"job":"ci/hw","jobID":"hw","level":"info","matrix":{},"msg":"  ❌  Failure - Main long test [1.052313189s]","stage":"Main","step":"long test","stepID":["1"],"stepResult":"failure","time":"2026-09-28T13:01:34Z"}
+{"dryrun":false,"job":"ci/hw","jobID":"hw","level":"error","matrix":{},"msg":"this step has been cancelled: signal: killed","stage":"Main","step":"long test","stepID":["1"],"time":"2026-09-28T13:01:34Z"}
+{"dryrun":false,"job":"ci/hw","jobID":"hw","level":"info","matrix":{},"msg":"⭐ Run Main remove aggregate","stage":"Main","step":"remove aggregate","stepID":["2"],"time":"2026-09-28T13:01:34Z"}
+{"dryrun":false,"job":"ci/hw","jobID":"hw","level":"info","matrix":{},"msg":"aggregate removed\n","raw_output":true,"stage":"Main","step":"remove aggregate","stepID":["2"],"time":"2026-09-28T13:01:34Z"}
+{"dryrun":false,"executionTime":2910596,"job":"ci/hw","jobID":"hw","level":"info","matrix":{},"msg":"  ✅  Success - Main remove aggregate [2.910596ms]","stage":"Main","step":"remove aggregate","stepID":["2"],"stepResult":"success","time":"2026-09-28T13:01:34Z"}
+{"dryrun":false,"job":"ci/hw","jobID":"hw","level":"info","matrix":{},"msg":"⭐ Run Complete job","step":"Complete job","stepid":["--complete-job"],"time":"2026-09-28T13:01:34Z"}
+{"dryrun":false,"job":"ci/hw","jobID":"hw","level":"info","matrix":{},"msg":"Cleaning up container for job hw","step":"Complete job","stepid":["--complete-job"],"time":"2026-09-28T13:01:34Z"}
+{"dryrun":false,"job":"ci/hw","jobID":"hw","level":"info","matrix":{},"msg":"  ✅  Success - Complete job","step":"Complete job","stepResult":"success","stepid":["--complete-job"],"time":"2026-09-28T13:01:34Z"}
+{"dryrun":false,"job":"ci/hw","jobID":"hw","jobResult":"failure","level":"info","matrix":{},"msg":"🏁  Job failed","time":"2026-09-28T13:01:34Z"}
+Error: Job 'hw' failed

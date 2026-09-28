@@ -1,0 +1,16 @@
+name: ci
+on:
+  workflow_dispatch:
+    inputs:
+      tier: {type: string, default: quick}
+jobs:
+  linux:
+    runs-on: [self-hosted, wid-linux]
+    steps:
+      - name: test
+        run: echo linux ok
+  macos:
+    runs-on: [self-hosted, wid-macos]
+    steps:
+      - name: test
+        run: echo never

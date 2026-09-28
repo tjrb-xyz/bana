@@ -1,0 +1,14 @@
+name: ci
+on:
+  workflow_dispatch:
+    inputs:
+      tier: {type: string, default: quick}
+jobs:
+  package:
+    strategy:
+      matrix:
+        target: [linux-arm64, linux-x64]
+    runs-on: [self-hosted, wid-macos]
+    steps:
+      - name: build
+        run: echo "package ${{ matrix.target }}"

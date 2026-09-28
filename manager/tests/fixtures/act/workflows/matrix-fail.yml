@@ -1,0 +1,18 @@
+name: ci
+on:
+  workflow_dispatch:
+    inputs:
+      tier: {type: string, default: quick}
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [a, b]
+    runs-on: [self-hosted, wid-macos]
+    steps:
+      - name: build
+        run: |
+          if [ "${{ matrix.target }}" = a ]; then exit 3; fi
+          sleep 3
+          echo "package ${{ matrix.target }}"

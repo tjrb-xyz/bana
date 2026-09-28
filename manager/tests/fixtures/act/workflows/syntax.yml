@@ -1,0 +1,10 @@
+name: ci
+on:
+  workflow_dispatch:
+jobs:
+  rust:
+    runs-on: [self-hosted, wid-macos]
+    steps:
+      - name: build
+        run: echo hi
+       bad: indent

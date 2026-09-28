@@ -1,0 +1,19 @@
+name: ci
+on:
+  workflow_dispatch:
+    inputs:
+      tier: {type: string, default: quick}
+jobs:
+  hw:
+    runs-on: [self-hosted, wid-macos]
+    steps:
+      - name: setup
+        run: echo ready
+      - name: long test
+        run: |
+          echo "starting long test"
+          sleep 60
+          echo "done"
+      - name: remove aggregate
+        if: always()
+        run: echo "aggregate removed"
