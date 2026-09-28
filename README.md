@@ -29,7 +29,7 @@ bana ci -- --reuse               # anything after -- goes to act; --reuse keeps 
 | Job's `runs-on` | Where it runs |
 |---|---|
 | `<prefix>-linux`, `ubuntu-*` | a container from `act.image` (default `catthehacker/ubuntu:act-24.04`) |
-| `<prefix>-macos`, `macos-latest` | on a Mac, on the Mac itself (act's host mode, in your working tree); elsewhere skipped |
+| `<prefix>-macos`, `macos-latest` | on a Mac, on the Mac itself (act's host mode, in a copy of your working tree); elsewhere skipped |
 
 The run uses your working tree, uncommitted changes included, and the workflow's tier input (`tiers`,
 `tier_input` in bana.conf). Artifacts land in `~/.bana/act/artifacts`. With the GitHub CLI signed in, jobs get
@@ -41,8 +41,10 @@ Limits worth knowing:
 - act runs every Linux container at one architecture per run, so a matrix over CPUs needs `bana ci` and
   `bana ci --x64`.
 - act reimplements GitHub's runner. Most actions work, but it is not bit-for-bit GitHub.
-- On a Mac, macOS jobs run in your working tree, as you. bana's `keep-builds` does nothing under act, so it never
-  cleans your checkout.
+- On a Mac, macOS jobs run as you, but not in your working tree: the checkout step copies it into a fresh
+  directory under act's cache (`~/.cache/act/<random>/hostexecutor`), leaving out gitignored files such as
+  `target/`, so they build from scratch. act deletes the copy after the job (after a failed one only with
+  `-- --rm`). bana's `keep-builds` does nothing under `bana ci`.
 
 ## bana up: a runner pool (optional)
 

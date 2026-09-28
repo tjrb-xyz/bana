@@ -78,6 +78,8 @@ rm .github/bana.conf
 bash "$bana" settings >"$T/out"
 check "without bana.conf, the repository comes from git's origin" has "$T/out" "repo = acme/widget"
 check "and the prefix from its name" has "$T/out" "prefix = widget"
+(cd "$T" && BANA_PROJECT_ROOT=$T/w/project bash "$bana" settings) >"$T/out"
+check "BANA_PROJECT_ROOT names the checkout from elsewhere" has "$T/out" "repo = acme/widget"
 
 # ---- plan, changed, keep-builds -------------------------------------------------
 fresh
@@ -99,6 +101,10 @@ first=$(git rev-parse HEAD)
 mkdir -p crates && echo x >crates/a.rs && git add crates && git -c user.name=t -c user.email=t@t commit -q -m two
 check "changed: the files since the previous push" same "$(bash "$bana" changed "$first" main)" "crates/a.rs"
 check "changed: '*' when it cannot tell" same "$(bash "$bana" changed 0000000 main)" "*"
+# In act's containers the fetch has no credentials: the clone's own origin/main stands in.
+git remote set-url origin "$T/nowhere.git"
+git update-ref refs/remotes/origin/main "$first"
+check "changed: an unreachable remote falls back to origin/BRANCH" same "$(bash "$bana" changed 0000000 main)" "crates/a.rs"
 
 mkdir -p target/debug web/node_modules scratch && echo b >target/debug/big && echo m >web/node_modules/m && echo s >scratch/s
 RUNNER_ENVIRONMENT=github-hosted bash "$bana" keep-builds >/dev/null
@@ -109,15 +115,23 @@ check "keep-builds keeps the build caches" test -e target/debug/big -a -e web/no
 BANA_KEEP_MAX_GB=x RUNNER_ENVIRONMENT=self-hosted bash "$bana" keep-builds 2>"$T/err" || true
 check "keep-builds checks keep_max_gb" has "$T/err" "keep_max_gb"
 
+mkdir -p scratch && echo s >scratch/s
 RUNNER_ENVIRONMENT=self-hosted ACT=true bash "$bana" keep-builds >/dev/null
-check "keep-builds never cleans under act (it may be your own working tree)" test -e target/debug/big
+check "keep-builds never cleans under bana ci (its options may bind your working tree)" test -e scratch/s
+(cd crates && ACT=true BANA_DAEMON=1 GITHUB_WORKSPACE=$(pwd) bash "$bana" keep-builds >/dev/null)
+check "keep-builds under the daemon's act cleans only the job's checkout (not one above it)" test -e scratch/s
+(cd "$HOME" && ACT=true BANA_DAEMON=1 GITHUB_WORKSPACE=$HOME bash "$bana" keep-builds) >"$T/out" 2>&1
+check "keep-builds under the daemon's act, in a job with no checkout: nothing to keep" has "$T/out" "nothing to keep"
+ACT=true BANA_DAEMON=1 GITHUB_WORKSPACE=$(pwd) bash "$bana" keep-builds >/dev/null
+check "keep-builds cleans under the daemon's act (a reused container keeps deleted files)" test ! -e scratch/s
+check "keep-builds under the daemon's act keeps the build caches" test -e target/debug/big -a -e web/node_modules/m
 
 # ---- bana ci: the workflow here, with act ------------------------------------------
 fresh
 mkdir -p .github/workflows && echo 'on: workflow_dispatch' >.github/workflows/ci.yml
 FAKE_OS=Darwin FAKE_ARCH=arm64 bash "$bana" ci -j plan >/dev/null
 check "ci: the workflow, dispatched with the first tier" has "$FAKE_LOG" \
-  "act workflow_dispatch -W $(pwd -P)/.github/workflows/ci.yml --artifact-server-path $HOME/.bana/act/artifacts"
+  "act workflow_dispatch -C $(pwd -P) -W $(pwd -P)/.github/workflows/ci.yml --artifact-server-path $HOME/.bana/act/artifacts"
 check "ci: Linux jobs in act's Ubuntu image" has "$FAKE_LOG" "-P wid-linux=catthehacker/ubuntu:act-24.04"
 check "ci: on a Mac, macOS jobs on the Mac itself" has "$FAKE_LOG" "-P wid-macos=-self-hosted"
 check "ci: arm64 containers on Apple silicon" has "$FAKE_LOG" "--container-architecture linux/arm64 --input tier=quick"
@@ -134,6 +148,86 @@ check "ci: on Linux, no macOS jobs" lacks "$FAKE_LOG" "-self-hosted"
 check "ci: refuses an unknown tier" bash -c "! bash '$bana' ci weekly 2>/dev/null"
 FAKE_DOCKER=0 bash "$bana" ci >"$T/out" 2>&1 || true
 check "ci: says to start OrbStack when Docker is not running" has "$T/out" "start OrbStack"
+check "ci: and, act never started, leaves no lock" test ! -e "$HOME/.bana/act.lock"
+: >"$FAKE_LOG"
+(cd .github && bash "$bana" ci >/dev/null)
+check "ci: from a subdirectory, act still runs the whole checkout" has "$FAKE_LOG" "act workflow_dispatch -C $(pwd -P) -W"
+echo 'act.args = --reuse --pull=false' >>.github/bana.conf
+: >"$FAKE_LOG"
+bash "$bana" ci -- --secret-file my.secrets --rm >/dev/null
+check "ci: bana.conf's act.args, then act's own (their files relative to here)" has "$FAKE_LOG" \
+  "--reuse --pull=false --secret-file $(pwd -P)/my.secrets --rm"
+check "ci: a --secret-file brings the token, so none from gh" lacks "$FAKE_LOG" "GITHUB_TOKEN"
+
+# ---- bana ci for the daemon: its own checkout, an event, a secret file -----------------------
+fresh
+mkdir -p .github/workflows && echo 'on: workflow_dispatch' >.github/workflows/ci.yml
+echo 'act.args = --reuse' >>.github/bana.conf
+src=$(pwd -P)
+mkdir -p "$T/w/build" && cd "$T/w/build"
+build=$(pwd -P)
+echo '{"inputs":{"tier":"quick"}}' >event.json
+BANA_PROJECT_ROOT=$src BANA_ACT_LOCKED=1 bash "$bana" ci quick --event event.json -- --secret-file secrets --json >/dev/null
+check "daemon ci: act runs the checkout BANA_PROJECT_ROOT names" has "$FAKE_LOG" \
+  "act workflow_dispatch -C $src -W $src/.github/workflows/ci.yml"
+check "daemon ci: with its bana.conf" has "$FAKE_LOG" "-P wid-linux=catthehacker/ubuntu:act-24.04"
+check "daemon ci: the event, by its full path" has "$FAKE_LOG" "-e $build/event.json"
+check "daemon ci: no --input (act ignores it with an event)" lacks "$FAKE_LOG" "--input"
+check "daemon ci: the secret file has the token, not gh" lacks "$FAKE_LOG" "-s GITHUB_TOKEN"
+check "daemon ci: gh is not asked" lacks "$FAKE_LOG" "gh auth"
+check "daemon ci: act.args, then the daemon's options" has "$FAKE_LOG" "--reuse --secret-file $build/secrets --json"
+check "daemon ci: BANA_PROJECT_ROOT does not reach act's jobs" lacks "$FAKE_STATE/act.env" "BANA_PROJECT_ROOT="
+check "daemon ci: nor BANA_ACT_LOCKED" lacks "$FAKE_STATE/act.env" "BANA_ACT_LOCKED="
+check "daemon ci: BANA_ACT_LOCKED=1 leaves the lock to the daemon" test ! -e "$HOME/.bana/act.lock"
+check "daemon ci: the tier is still checked" bash -c "! BANA_PROJECT_ROOT='$src' bash '$bana' ci weekly --event event.json 2>/dev/null"
+BANA_PROJECT_ROOT=$src bash "$bana" ci --event nothing.json >"$T/out" 2>&1 || true
+check "daemon ci: a missing event file" has "$T/out" "--event: no file nothing.json"
+: >"$FAKE_LOG"
+BANA_PROJECT_ROOT=$src bash "$bana" ci --list >/dev/null
+check "daemon ci: --list, of that checkout" has "$FAKE_LOG" "act -l -C $src -W $src/.github/workflows/ci.yml"
+cd "$src"
+
+# ---- one act at a time on this machine ----------------------------------------------------
+fresh
+mkdir -p .github/workflows && echo 'on: workflow_dispatch' >.github/workflows/ci.yml
+lock=$HOME/.bana/act.lock
+FAKE_ACT_SLEEP=30 bash "$bana" ci >/dev/null 2>&1 &
+running=$!
+i=0
+while [[ ! -s $FAKE_STATE/act.pid ]] && ((i++ < 100)); do sleep 0.1; done
+check "lock: act holds it, with bana ci's pid (exec keeps it)" same "$(sed -n 1p "$lock/owner")" "$running"
+check "lock: that pid is act's" same "$(cat "$FAKE_STATE/act.pid")" "$running"
+check "lock: its label" same "$(sed -n 3p "$lock/owner")" "bana ci quick (wid)"
+bash "$bana" ci nightly >"$T/out" 2>&1 || true
+check "lock: another bana ci is refused" has "$T/out" "act is busy here: bana ci quick (wid)"
+: >"$FAKE_LOG"
+BANA_ACT_LOCKED=1 bash "$bana" ci >/dev/null
+check "lock: BANA_ACT_LOCKED=1 (the daemon has it) runs anyway" has "$FAKE_LOG" "act workflow_dispatch"
+check "lock: and leaves it as it was" same "$(sed -n 1p "$lock/owner")" "$running"
+kill "$running"
+wait "$running" 2>/dev/null || true
+: >"$FAKE_LOG"
+bash "$bana" ci >/dev/null
+check "lock: act gone, the next bana ci takes it over" has "$FAKE_LOG" "act workflow_dispatch"
+check "lock: as its own" same "$(sed -n 1p "$lock/owner")" "$(cat "$FAKE_STATE/act.pid")"
+# The daemon's: a live owner; then the same pid with another start time (reused).
+sleep 30 &
+sleeper=$!
+printf '%s\n' "$sleeper" "$(LC_ALL=C ps -o lstart= -p "$sleeper" | awk '{ $1 = $1; print }')" "build 7 of wid" >"$lock/owner"
+bash "$bana" ci >"$T/out" 2>&1 || true
+check "lock: a live owner (a daemon's build) refuses bana ci" has "$T/out" "act is busy here: build 7 of wid"
+printf '%s\n' "$sleeper" "Thu Jan 1 00:00:00 1970" "build 7 of wid" >"$lock/owner"
+: >"$FAKE_LOG"
+bash "$bana" ci >/dev/null
+check "lock: a pid that started at another time is someone else's: taken over" has "$FAKE_LOG" "act workflow_dispatch"
+kill "$sleeper"
+wait "$sleeper" 2>/dev/null || true
+# An act that cannot start: its pid is gone, so its lock is stale.
+mkdir -p "$T/w/badact" && printf '#!/nonexistent/interpreter\n' >"$T/w/badact/act" && chmod +x "$T/w/badact/act"
+PATH=$T/w/badact:$PATH bash "$bana" ci >/dev/null 2>&1 || true
+: >"$FAKE_LOG"
+bash "$bana" ci >/dev/null
+check "lock: an act that never started holds nothing" has "$FAKE_LOG" "act workflow_dispatch"
 
 # ---- USB audio --------------------------------------------------------------------
 fresh

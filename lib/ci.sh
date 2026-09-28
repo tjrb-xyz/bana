@@ -8,13 +8,15 @@ ci_root=${BANA_PROJECT_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 # The files changed since BEFORE (a push's previous head), else since where HEAD
 # left BRANCH; '*' when that cannot be told.
 ci_changed() { # BEFORE [BRANCH]
-  local before=${1:-} branch=${2:-main} base=
+  local before=${1:-} branch=${2:-main} base='' head=FETCH_HEAD
   if [[ -n $before && ! $before =~ ^0+$ ]] && git -C "$ci_root" cat-file -e "$before^{commit}" 2>/dev/null; then
     base=$before
   else
-    # A new branch, or history rewritten: compare with where it left BRANCH.
-    git -C "$ci_root" fetch -q --depth=200 origin "$branch" 2>/dev/null || true
-    base=$(git -C "$ci_root" merge-base HEAD FETCH_HEAD 2>/dev/null || true)
+    # A new branch, or history rewritten: compare with where it left BRANCH. Without
+    # credentials (in act's containers) the fetch fails: then the clone's own origin/BRANCH.
+    GIT_TERMINAL_PROMPT=0 git -C "$ci_root" fetch -q --depth=200 origin "$branch" 2>/dev/null ||
+      head=refs/remotes/origin/$branch
+    base=$(git -C "$ci_root" merge-base HEAD "$head" 2>/dev/null || true)
   fi
   if [[ -n $base ]]; then
     git -C "$ci_root" diff --name-only "$base" HEAD
@@ -77,8 +79,23 @@ ci_plan() { # TIER [--json]
 # the build caches bana.conf's keep names (git clean -e patterns: /target/, node_modules/).
 # A kept top-level directory past keep_max_gb starts over.
 ci_keep_builds() {
-  # Under act (bana ci) a job may run in your own working tree: never clean it.
-  if [[ ${RUNNER_ENVIRONMENT:-} != self-hosted || ${ACT:-} == true ]]; then
+  local ws
+  # Under act a job runs in act's copy of the tree, and a container reused (--reuse) keeps
+  # the files deleted since. The daemon's builds clean it; a bana ci by hand never does, as
+  # its options may bind your own working tree (--bind).
+  if [[ ${ACT:-} == true ]]; then
+    if [[ ${BANA_DAEMON:-} != 1 ]]; then
+      echo "Under act: nothing to keep."
+      return 0
+    fi
+    # Only that copy, the job's workspace: in a job with no checkout, git would find
+    # whatever repository is above it (your home's, say).
+    ws=$(cd "${GITHUB_WORKSPACE:-/nonexistent}" 2>/dev/null && pwd -P) || ws=
+    if [[ -z $ws || $ci_root != "$ws" || $(git -C "$ws" rev-parse --show-toplevel 2>/dev/null) != "$ws" ]]; then
+      echo "No checkout in the job's workspace: nothing to keep."
+      return 0
+    fi
+  elif [[ ${RUNNER_ENVIRONMENT:-} != self-hosted ]]; then
     echo "Not a self-hosted runner: nothing to keep."
     return 0
   fi
