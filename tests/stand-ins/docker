@@ -1,0 +1,7 @@
+#!/bin/sh
+# Stand-in docker: running unless FAKE_DOCKER=0.
+echo "docker $*" >>"$FAKE_LOG"
+case $1 in
+info) [ "${FAKE_DOCKER:-1}" = 1 ] ;;
+context) echo "unix://$FAKE_STATE/orbstack.sock" ;;
+esac

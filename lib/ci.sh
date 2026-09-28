@@ -77,7 +77,8 @@ ci_plan() { # TIER [--json]
 # the build caches bana.conf's keep names (git clean -e patterns: /target/, node_modules/).
 # A kept top-level directory past keep_max_gb starts over.
 ci_keep_builds() {
-  if [[ ${RUNNER_ENVIRONMENT:-} != self-hosted ]]; then
+  # Under act (bana ci) a job may run in your own working tree: never clean it.
+  if [[ ${RUNNER_ENVIRONMENT:-} != self-hosted || ${ACT:-} == true ]]; then
     echo "Not a self-hosted runner: nothing to keep."
     return 0
   fi

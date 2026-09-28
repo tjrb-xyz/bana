@@ -1,15 +1,50 @@
 # bana
 
-bana turns your own machines into one pool of self-hosted GitHub Actions runners, for projects whose CI is too
-long, too big or too hardware-bound for GitHub's runners. Each machine runs `bana up` once. GitHub then gives
-each job to a free runner whose labels match, so a MacBook, a Mac mini and a Linux PC share the work with no
-setup between them. A small web page, the manager, shows the pool and drives it.
+bana runs a project's GitHub Actions workflow on your own machines, for CI that is too long, too big or too
+hardware-bound for GitHub's runners. It is small on purpose, and it works in two ways:
+
+- **`bana ci`: the workflow here, when you ask for it.** It runs the jobs with
+  [act](https://github.com/nektos/act) in OrbStack's Docker: Linux jobs in containers, and on a Mac the macOS jobs
+  on the Mac itself, with its real CoreAudio and USB devices. Nothing stays running, and no machine has to stay
+  awake. Use it before you push.
+- **`bana up`: a runner pool, if you want it.** Your machines register as self-hosted runners and GitHub gives
+  them the jobs from each push. That needs them awake and online, so it is opt-in, and `bana down` undoes it.
 
 It runs on macOS (Apple silicon, the stock bash 3.2 and BSD tools, Xcode's command line tools) and on Debian or
 Ubuntu. It was extracted from [dsper](https://github.com/tjrb-xyz/dsper), which is its first user and the
 worked example below.
 
-## How it works
+## bana ci: the workflow on this machine
+
+```sh
+brew install act                 # and OrbStack, for Docker
+bana ci                          # every job, with the first tier (quick)
+bana ci nightly                  # another tier
+bana ci -j rust                  # one job, and the jobs it needs
+bana ci --x64                    # Linux containers as x86_64 (Rosetta, on Apple silicon)
+bana ci --list                   # the jobs
+bana ci -- --reuse               # anything after -- goes to act; --reuse keeps containers, and their builds
+```
+
+| Job's `runs-on` | Where it runs |
+|---|---|
+| `<prefix>-linux`, `ubuntu-*` | a container from `act.image` (default `catthehacker/ubuntu:act-24.04`) |
+| `<prefix>-macos`, `macos-latest` | on a Mac, on the Mac itself (act's host mode, in your working tree); elsewhere skipped |
+
+The run uses your working tree, uncommitted changes included, and the workflow's tier input (`tiers`,
+`tier_input` in bana.conf). Artifacts land in `~/.bana/act/artifacts`. With the GitHub CLI signed in, jobs get
+its token as `GITHUB_TOKEN`.
+
+Limits worth knowing:
+- act uses your working tree only for a checkout step without `ref:` (or with `ref:` equal to the current ref).
+  A checkout with any other `ref:` clones from GitHub instead.
+- act runs every Linux container at one architecture per run, so a matrix over CPUs needs `bana ci` and
+  `bana ci --x64`.
+- act reimplements GitHub's runner. Most actions work, but it is not bit-for-bit GitHub.
+- On a Mac, macOS jobs run in your working tree, as you. bana's `keep-builds` does nothing under act, so it never
+  cleans your checkout.
+
+## bana up: a runner pool (optional)
 
 | On | `bana up` makes | Labels |
 |---|---|---|
@@ -22,6 +57,7 @@ adds `usb-audio` and `usb-<vid>-<pid>` for each (see [USB audio](#usb-audio)). `
 bana.conf, so several projects can share one machine without their runners mixing.
 
 A runner runs one job at a time. `--linux N` gives a machine more runners, and each one keeps its own build caches.
+Jobs wait in GitHub's queue while no runner is online, so leave the pool (`bana down`) when you stop using it.
 
 On a Mac, OrbStack's command line (`orb`) makes and runs the Linux machines. Without OrbStack, bana uses Lima
 for the arm64 machine and makes no x86_64 one. A [Tart VM](#more-machines) is an optional extra.
@@ -54,7 +90,8 @@ Every key can be overridden by `BANA_<KEY>` in the environment (`plan.path.rust`
 | `vm`, `vm_x64` | `bana`, `bana-x64` | the OrbStack machines on a Mac (shared by projects) |
 | `linux_user` | `bana` | who runners run as when `bana up` starts as root |
 | `runner_version` | the newest | an actions/runner version to pin |
-| `workflow`, `tiers`, `tier_input` | `ci.yml`, `quick nightly release`, `tier` | what the manager's *Start a run* dispatches |
+| `workflow`, `tiers`, `tier_input` | `ci.yml`, `quick nightly release`, `tier` | the workflow `bana ci` and the manager's *Start a run* run, and its tier input |
+| `act.image` | `catthehacker/ubuntu:act-24.04` | the image `bana ci` runs Linux jobs in |
 | `keep`, `keep_max_gb` | , `0` | what `keep-builds` keeps (git clean `-e` patterns), and the size that starts one over |
 | `plan.*` | | how `plan` picks jobs ([Tiers and plan](#tiers-and-plan)) |
 
@@ -78,7 +115,8 @@ jobs:
 Jobs see `BANA_MACHINE` and, on a machine joined with `--dedicated`, `BANA_DEDICATED=1`: use it to guard
 invasive tests (installing drivers, restarting services) that should not run on someone's laptop.
 
-**4. Join machines:** on each one, in the project's checkout, `tools/bana/bin/bana up` ([Commands](#commands)).
+**4. Run it:** `tools/bana/bin/bana ci` in the project's checkout. For a pool, `tools/bana/bin/bana up` on each
+machine ([Commands](#commands)).
 
 ### Reusable workflow pieces
 
@@ -126,7 +164,13 @@ beside it. The mac hook installs Homebrew's scons and dsper's audio driver and c
 installs rustup. Its `plan.*` keys are the path rules that were in `scripts/ci.sh`, and `plan` gives the same
 outputs as before.
 
-Its workflow changes little:
+To run dsper's CI locally with `bana ci`, its workflow needs one change: its checkouts pass
+`ref: ${{ github.event_name == 'schedule' && vars.DSPER_NIGHTLY_REF || '' }}`, and act clones from GitHub for
+any checkout with a `ref:`. Dropping those lines (and with them `DSPER_NIGHTLY_REF`) lets act use the working
+tree; dsper's `plan` job then runs under `bana ci` as it does on GitHub. If dsper uses no runner pool, its
+push trigger only queues jobs that no runner takes, so `on:` could keep just `workflow_dispatch`.
+
+For the runner pool, its workflow changes little:
 
 - `runs-on` stays `[self-hosted, dsper-linux]` and `[self-hosted, dsper-macos]`, and packaging per CPU stays
   `[self-hosted, dsper-linux, linux-x64]` and so on: bana makes the same labels.
@@ -143,6 +187,7 @@ Moving a machine over: `scripts/ci-runner.sh down` with the old script (it remov
 ## Commands
 
 ```sh
+bana ci [TIER] [-j JOB] [--x64] [--list] [-- ACT-OPTIONS]
 bana up [--linux N] [--x64 N] [--no-mac] [--dedicated] [--label L] [--no-usb] [--token T]
 bana status          # this machine's runners and USB audio devices, and the pool
 bana usb             # the USB audio devices here, and the labels they give

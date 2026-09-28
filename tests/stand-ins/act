@@ -1,0 +1,3 @@
+#!/bin/sh
+# Stand-in act: records how bana calls it.
+echo "act $*" >>"$FAKE_LOG"

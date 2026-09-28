@@ -109,6 +109,31 @@ check "keep-builds keeps the build caches" test -e target/debug/big -a -e web/no
 BANA_KEEP_MAX_GB=x RUNNER_ENVIRONMENT=self-hosted bash "$bana" keep-builds 2>"$T/err" || true
 check "keep-builds checks keep_max_gb" has "$T/err" "keep_max_gb"
 
+RUNNER_ENVIRONMENT=self-hosted ACT=true bash "$bana" keep-builds >/dev/null
+check "keep-builds never cleans under act (it may be your own working tree)" test -e target/debug/big
+
+# ---- bana ci: the workflow here, with act ------------------------------------------
+fresh
+mkdir -p .github/workflows && echo 'on: workflow_dispatch' >.github/workflows/ci.yml
+FAKE_OS=Darwin FAKE_ARCH=arm64 bash "$bana" ci -j plan >/dev/null
+check "ci: the workflow, dispatched with the first tier" has "$FAKE_LOG" \
+  "act workflow_dispatch -W $(pwd -P)/.github/workflows/ci.yml --artifact-server-path $HOME/.bana/act/artifacts"
+check "ci: Linux jobs in act's Ubuntu image" has "$FAKE_LOG" "-P wid-linux=catthehacker/ubuntu:act-24.04"
+check "ci: on a Mac, macOS jobs on the Mac itself" has "$FAKE_LOG" "-P wid-macos=-self-hosted"
+check "ci: arm64 containers on Apple silicon" has "$FAKE_LOG" "--container-architecture linux/arm64 --input tier=quick"
+check "ci: the token from gh, by name only" has "$FAKE_LOG" "-s GITHUB_TOKEN -j plan"
+: >"$FAKE_LOG"
+FAKE_OS=Darwin FAKE_ARCH=arm64 BANA_ACT_IMAGE=my/image bash "$bana" ci nightly --x64 -- --reuse >/dev/null
+check "ci: --x64, a tier, act.image, and act's own options" has "$FAKE_LOG" "-P wid-linux=my/image"
+check "ci: x86_64 containers" has "$FAKE_LOG" "--container-architecture linux/amd64 --input tier=nightly"
+check "ci: after --, act's own options" has "$FAKE_LOG" "-s GITHUB_TOKEN --reuse"
+: >"$FAKE_LOG"
+FAKE_OS=Linux FAKE_ARCH=x86_64 bash "$bana" ci >/dev/null
+check "ci: on Linux, no macOS jobs" lacks "$FAKE_LOG" "-self-hosted"
+check "ci: refuses an unknown tier" bash -c "! bash '$bana' ci weekly 2>/dev/null"
+FAKE_DOCKER=0 bash "$bana" ci >"$T/out" 2>&1 || true
+check "ci: says to start OrbStack when Docker is not running" has "$T/out" "start OrbStack"
+
 # ---- USB audio --------------------------------------------------------------------
 fresh
 BANA_SYS_ROOT=$here/fixtures/linux-sys bash "$bana" usb >"$T/out"
