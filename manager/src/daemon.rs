@@ -1203,19 +1203,7 @@ impl Shared {
         cwd: &Path,
         secs: u64,
     ) -> Result<std::process::Output, String> {
-        let run = Command::new(program)
-            .args(args)
-            .current_dir(cwd)
-            .env("PATH", &self.settings.path)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .output();
-        match tokio::time::timeout(Duration::from_secs(secs), run).await {
-            Err(_) => Err(format!("{program} took longer than {secs} s")),
-            Ok(Err(e)) => Err(format!("{program}: {e}")),
-            Ok(Ok(o)) => Ok(o),
-        }
+        output(program, args, cwd, &self.settings.path, secs).await
     }
 
     /// git in src: its output, or what it said went wrong.
@@ -2267,36 +2255,13 @@ impl Shared {
         p: &Posting,
         url: Option<&str>,
     ) -> Result<(), String> {
-        let path = format!("repos/{}/statuses/{sha}", self.settings.repo);
-        let fields = [
-            format!("state={}", p.state.as_str()),
-            format!("context={context}"),
-            format!("description={}", p.description),
-        ];
-        let mut args = vec!["api", "-X", "POST", path.as_str()];
-        for f in &fields {
-            args.extend(["-f", f.as_str()]);
-        }
-        let url = url.map(|u| format!("target_url={u}"));
-        if let Some(u) = &url {
-            args.extend(["-f", u.as_str()]);
-        }
-        let o = self
-            .output(&self.settings.gh, &args, &self.settings.dir, 30)
-            .await?;
-        if o.status.success() {
-            return Ok(());
-        }
-        // gh prints GitHub's answer on stdout, and its own note on stderr.
-        let body = String::from_utf8_lossy(&o.stdout);
-        let e = failure(&o);
-        Err(
-            if body.contains("target_url") && !e.contains("target_url") {
-                format!("{e} (target_url)")
-            } else {
-                e
-            },
-        )
+        let s = &self.settings;
+        let status = Status {
+            context: context.to_string(),
+            state: p.state,
+            description: p.description.clone(),
+        };
+        post_status(&s.gh, &s.path, &s.dir, &s.repo, sha, &status, url).await
     }
 
     // ---- pruning ------------------------------------------------------------------
@@ -2473,6 +2438,73 @@ fn retry_eligible(r: &Request, heads: &Heads) -> bool {
         && (matches!(r.trigger, Trigger::Manual | Trigger::Rerun)
             || watch::is_tag(&r.git_ref)
             || heads.get(&r.git_ref) == Some(&r.sha))
+}
+
+/// Posts one commit status to `repo`'s `sha` with the GitHub CLI (`gh api`),
+/// as the poster does. An error is what went wrong; it has `target_url` in it
+/// when GitHub's answer named the link. `bana-manager post-status` runs this
+/// alone: bana's own CI asks GitHub whether it takes a loopback link.
+pub async fn post_status(
+    gh: &str,
+    path: &str,
+    cwd: &Path,
+    repo: &str,
+    sha: &str,
+    status: &Status,
+    url: Option<&str>,
+) -> Result<(), String> {
+    let api = format!("repos/{repo}/statuses/{sha}");
+    let fields = [
+        format!("state={}", status.state.as_str()),
+        format!("context={}", status.context),
+        format!("description={}", status.description),
+    ];
+    let mut args = vec!["api", "-X", "POST", api.as_str()];
+    for f in &fields {
+        args.extend(["-f", f.as_str()]);
+    }
+    let url = url.map(|u| format!("target_url={u}"));
+    if let Some(u) = &url {
+        args.extend(["-f", u.as_str()]);
+    }
+    let o = output(gh, &args, cwd, path, 30).await?;
+    if o.status.success() {
+        return Ok(());
+    }
+    // gh prints GitHub's answer on stdout, and its own note on stderr.
+    let body = String::from_utf8_lossy(&o.stdout);
+    let e = failure(&o);
+    Err(
+        if body.contains("target_url") && !e.contains("target_url") {
+            format!("{e} (target_url)")
+        } else {
+            e
+        },
+    )
+}
+
+/// `program args` in `cwd`, with `path` as PATH: its output, unless it
+/// could not run, or took longer than `secs`.
+async fn output(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    path: &str,
+    secs: u64,
+) -> Result<std::process::Output, String> {
+    let run = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .env("PATH", path)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(Duration::from_secs(secs), run).await {
+        Err(_) => Err(format!("{program} took longer than {secs} s")),
+        Ok(Err(e)) => Err(format!("{program}: {e}")),
+        Ok(Ok(o)) => Ok(o),
+    }
 }
 
 /// A port nobody listens on now, for act's artifact server (its default is

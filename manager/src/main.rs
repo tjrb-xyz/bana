@@ -13,8 +13,17 @@
 //! `bana daemon install` wrote to <dir>/daemon/settings. It serves the same
 //! page, with the daemon's builds, on the settings' port, and on a Mac shows
 //! 🧱 in the menu bar (bana_manager::tray) unless --no-tray or `tray = no`.
+//!
+//!   bana-manager post-status --repo OWNER/REPO --sha SHA --context C
+//!                --state pending|success|failure|error --description D
+//!                [--target-url URL] [--gh PATH]
+//!
+//! (hidden) posts one commit status as the daemon's poster does, and says
+//! GitHub's error if any: bana's own CI asks GitHub whether it takes a
+//! loopback target_url.
 
-use bana_manager::daemon::{Daemon, Settings};
+use bana_manager::actlog::{Status, StatusState};
+use bana_manager::daemon::{post_status, Daemon, Settings};
 use bana_manager::guard::Access;
 use bana_manager::server::{daemon_router, health_at, router, Manager, Tools};
 use bana_manager::{valid_repo, valid_tier, valid_workflow};
@@ -90,6 +99,11 @@ fn main() {
         .enable_all()
         .build()
         .unwrap_or_else(|e| fail(&format!("tokio: {e}")));
+    if args.peek().is_some_and(|a| a == "post-status") {
+        args.next();
+        rt.block_on(post_one(args));
+        return;
+    }
     if !daemon_mode {
         rt.block_on(manager(args));
         return;
@@ -208,6 +222,67 @@ async fn daemon(
     let _ = stop_http.send(());
     let _ = tokio::time::timeout(Duration::from_secs(5), http).await;
     stopped();
+}
+
+/// `post-status`: one status, through the poster's own code.
+async fn post_one(mut args: impl Iterator<Item = String>) {
+    let (mut repo, mut sha, mut context, mut state, mut description, mut url) =
+        (None, None, None, None, String::new(), None);
+    let mut gh = "gh".to_string();
+    while let Some(a) = args.next() {
+        let mut value = || args.next().unwrap_or_else(|| usage());
+        match a.as_str() {
+            "--repo" => repo = Some(value()),
+            "--sha" => sha = Some(value()),
+            "--context" => context = Some(value()),
+            "--state" => {
+                state = Some(match value().as_str() {
+                    "pending" => StatusState::Pending,
+                    "success" => StatusState::Success,
+                    "failure" => StatusState::Failure,
+                    "error" => StatusState::Error,
+                    _ => fail("--state: pending, success, failure or error"),
+                })
+            }
+            "--description" => description = value(),
+            "--target-url" => url = Some(value()),
+            "--gh" => gh = value(),
+            _ => usage(),
+        }
+    }
+    let (Some(repo), Some(sha), Some(context), Some(state)) = (repo, sha, context, state) else {
+        usage()
+    };
+    if !valid_repo(&repo) {
+        fail("--repo: OWNER/REPO");
+    }
+    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into());
+    let status = Status {
+        context,
+        state,
+        description,
+    };
+    match post_status(
+        &gh,
+        &path,
+        Path::new("."),
+        &repo,
+        &sha,
+        &status,
+        url.as_deref(),
+    )
+    .await
+    {
+        Ok(()) => println!(
+            "posted {} {} to {repo}@{sha}",
+            status.context,
+            state.as_str()
+        ),
+        Err(e) => {
+            eprintln!("bana-manager: not posted: {e}");
+            std::process::exit(1)
+        }
+    }
 }
 
 async fn manager(mut args: impl Iterator<Item = String>) {

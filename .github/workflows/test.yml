@@ -1,11 +1,17 @@
 name: test
 # bana's own tests, on GitHub's runners (bana should not need itself to be
 # tested). macOS: its stock bash 3.2 and BSD tools, where bana has to work.
+# macOS minutes cost 10x on a private repo: its jobs are few and short.
 on:
   push:
   pull_request:
 permissions:
   contents: read
+env:
+  # act, pinned: its release tarballs and their sha256 (checksums.txt of the release).
+  ACT_VERSION: 0.2.89
+  ACT_SHA256_LINUX_X86_64: 0191d6f1f3b716b5c55820032605d05fc3c1cdbf581ebeff655019e5dd1524c0
+  ACT_SHA256_DARWIN_ARM64: 48ae218af96725f7635a66de2b87e1e346893b02add0f16b92f560296b2151fc
 jobs:
   scripts:
     strategy:
@@ -16,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: shellcheck
         if: runner.os == 'Linux'
-        run: shellcheck -x bin/bana lib/*.sh install.sh tests/run.sh tests/stand-ins/* tests/fixtures/runner/*.sh examples/dsper/*.sh
+        run: shellcheck -x bin/bana lib/*.sh install.sh tests/run.sh tests/e2e-daemon.sh tests/stand-ins/* tests/fixtures/runner/*.sh examples/dsper/*.sh
       - name: tests (macOS's /bin/bash 3.2 and awk)
         if: runner.os == 'macOS'
         run: BASH_UNDER_TEST=/bin/bash tests/run.sh
@@ -33,3 +39,137 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+
+  # The daemon end to end: real act and Docker, pushes to a local origin, statuses
+  # through the gh stand-in, a cancel from the API, kill -9 and a restart.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: act ${{ env.ACT_VERSION }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/act"
+          curl -fsSL -o "$RUNNER_TEMP/act.tar.gz" "https://github.com/nektos/act/releases/download/v$ACT_VERSION/act_Linux_x86_64.tar.gz"
+          echo "$ACT_SHA256_LINUX_X86_64  $RUNNER_TEMP/act.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/act.tar.gz" -C "$RUNNER_TEMP/act" act
+          "$RUNNER_TEMP/act/act" --version
+      - name: tests/e2e-daemon.sh
+        run: BANA_E2E=1 BANA_E2E_ACT="$RUNNER_TEMP/act/act" tests/e2e-daemon.sh
+
+  # On a Mac: the manager with its menu bar compiled, a real LaunchAgent install, and
+  # the daemon end to end with host jobs only (no Docker on GitHub's Macs). One job,
+  # so one build of the manager.
+  macos-daemon:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo clippy (with the tray)
+        working-directory: manager
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: cargo test (with the tray)
+        if: ${{ !cancelled() }}
+        working-directory: manager
+        run: cargo test --locked
+      - name: cargo build
+        if: ${{ !cancelled() }}
+        working-directory: manager
+        run: cargo build --locked && echo "BANA_DAEMON_BIN=$PWD/target/debug/bana-manager" >>"$GITHUB_ENV"
+      - name: bana daemon install, as a LaunchAgent, in a temporary home
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          bana=$PWD/bin/bana
+          T=$(cd "$(mktemp -d)" && pwd -P)
+          # A temporary home (launchd gives the daemon the real HOME: BANA_HOME says
+          # where bana's home is); GitHub is a local bare repository.
+          export HOME=$T/home BANA_HOME=$T/home/.bana FAKE_LOG=$T/log FAKE_STATE=$T/state
+          mkdir -p "$HOME" "$FAKE_STATE" "$T/bin"
+          git init -q --bare "$T/origin.git"
+          printf '[user]\n  name = ci\n  email = ci@example.com\n[url "file://%s"]\n  insteadOf = https://github.com/acme/wid.git\n' "$T/origin.git" >"$HOME/.gitconfig"
+          ln -s "$PWD/tests/stand-ins/gh" "$T/bin/gh"
+          ln -s "$PWD/tests/stand-ins/act" "$T/bin/act"
+          # shellcheck disable=SC2016 # the stub's own $1
+          printf '#!/bin/sh\ncase $1 in info) exit 0 ;; esac\n' >"$T/bin/docker"
+          chmod +x "$T/bin/docker"
+          export PATH=$T/bin:$PATH
+          mkdir -p "$T/work/.github/workflows"
+          cd "$T/work"
+          git init -q -b main .
+          git remote add origin https://github.com/acme/wid.git
+          printf 'repo = acme/wid\nprefix = wid\n' >.github/bana.conf
+          printf 'on:\n  workflow_dispatch:\njobs:\n  a:\n    runs-on: [self-hosted, wid-macos]\n    steps:\n      - run: "true"\n' >.github/workflows/ci.yml
+          git add -A && git commit -q -m one && git push -q origin HEAD:main
+
+          bash "$bana" daemon install --no-tray --no-open
+          plist=$HOME/Library/LaunchAgents/xyz.tjrb.bana.wid.plist
+          plutil -lint "$plist"
+          launchctl print "gui/$(id -u)/xyz.tjrb.bana.wid" | tee "$T/print" | head -n 40
+          grep -q 'state = running' "$T/print"
+          curl -fsS --noproxy '*' http://127.0.0.1:8470/ci/v1/health | tee "$T/health"
+          echo
+          grep -q '"prefix":"wid"' "$T/health"
+          bash "$bana" daemon status
+          bash "$bana" daemon uninstall --purge
+          if launchctl print "gui/$(id -u)/xyz.tjrb.bana.wid" >/dev/null 2>&1; then
+            echo "still loaded after uninstall" >&2
+            exit 1
+          fi
+          test ! -e "$plist"
+      - name: act ${{ env.ACT_VERSION }}
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/act"
+          curl -fsSL -o "$RUNNER_TEMP/act.tar.gz" "https://github.com/nektos/act/releases/download/v$ACT_VERSION/act_Darwin_arm64.tar.gz"
+          echo "$ACT_SHA256_DARWIN_ARM64  $RUNNER_TEMP/act.tar.gz" | shasum -a 256 -c -
+          tar -xzf "$RUNNER_TEMP/act.tar.gz" -C "$RUNNER_TEMP/act" act
+          "$RUNNER_TEMP/act/act" --version
+      - name: tests/e2e-daemon.sh, host jobs only (the ps -Eww marker sweep, caffeinate)
+        if: ${{ !cancelled() }}
+        run: BANA_E2E=1 BANA_E2E_DOCKER=0 BANA_E2E_ACT="$RUNNER_TEMP/act/act" tests/e2e-daemon.sh
+
+  # Does GitHub take a status whose target_url is a loopback link (the daemon's page)?
+  # The daemon's own poster posts to this commit, with one and then without, and reads
+  # both back. Not on pull requests from forks: their token cannot write statuses.
+  status-selftest:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      statuses: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo build
+        working-directory: manager
+        run: cargo build --locked
+      - name: post-status, with a loopback target_url, then without
+        run: |
+          set -euo pipefail
+          bin=manager/target/debug/bana-manager
+          post() { "$bin" post-status --repo "$GITHUB_REPOSITORY" --sha "$SHA" --context bana-selftest "$@"; }
+          back() {
+            gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/status" \
+              --jq '.statuses[] | select(.context == "bana-selftest") | "\(.state) \(.target_url // "none")"'
+          }
+          url="http://127.0.0.1:8470/#build=1&job=selftest"
+          if post --state pending --description "bana's self-test: a loopback link" --target-url "$url" 2>"$RUNNER_TEMP/err"; then
+            got=$(back)
+            echo "read back: $got"
+            if [ "$got" = "pending $url" ]; then verdict="GitHub accepts a loopback target_url"
+            else verdict="GitHub took the status, but its target_url reads back as: $got"; fi
+          else
+            cat "$RUNNER_TEMP/err"
+            grep -q target_url "$RUNNER_TEMP/err" || exit 1
+            verdict="GitHub refuses a loopback target_url: $(cat "$RUNNER_TEMP/err")"
+          fi
+          echo "$verdict"
+          echo "$verdict" >>"$GITHUB_STEP_SUMMARY"
+          post --state success --description "bana's self-test: no link"
+          got=$(back)
+          echo "read back: $got"
+          test "$got" = "success none"
