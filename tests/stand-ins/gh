@@ -4,6 +4,7 @@ echo "gh $*" >>"$FAKE_LOG"
 [ "${FAKE_GH:-1}" = 1 ] || exit 1
 case "$*" in
 "auth status") exit 0 ;;
+"auth token") echo FAKE-GH-TOKEN ;;
 *registration-token*) echo REG-TOKEN ;;
 *remove-token*) echo REMOVE-TOKEN ;;
 *"-X PUT"*labels*) echo '{}' ;;

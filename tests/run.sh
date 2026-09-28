@@ -28,7 +28,7 @@ fresh() {
   rm -rf "$T/w"
   mkdir -p "$T/w/project/.github" "$T/w/home" "$T/w/state/vmroot/run/systemd/system"
   export HOME=$T/w/home FAKE_STATE=$T/w/state FAKE_LOG=$T/w/log
-  unset FAKE_OS FAKE_ARCH FAKE_UID FAKE_IOREG BANA_SYS_ROOT BANA_TOKEN FAKE_GH FAKE_POOL FAKE_SVC_FAIL
+  unset FAKE_OS FAKE_ARCH FAKE_UID FAKE_IOREG BANA_SYS_ROOT BANA_TOKEN FAKE_GH FAKE_POOL FAKE_SVC_FAIL GITHUB_TOKEN
   : >"$FAKE_LOG"
   cd "$T/w/project"
   git init -q . && git remote add origin git@github.com:acme/widget.git
@@ -122,6 +122,7 @@ check "ci: Linux jobs in act's Ubuntu image" has "$FAKE_LOG" "-P wid-linux=catth
 check "ci: on a Mac, macOS jobs on the Mac itself" has "$FAKE_LOG" "-P wid-macos=-self-hosted"
 check "ci: arm64 containers on Apple silicon" has "$FAKE_LOG" "--container-architecture linux/arm64 --input tier=quick"
 check "ci: the token from gh, by name only" has "$FAKE_LOG" "-s GITHUB_TOKEN -j plan"
+check "ci: the token itself is not on act's command line" lacks "$FAKE_LOG" "FAKE-GH-TOKEN"
 : >"$FAKE_LOG"
 FAKE_OS=Darwin FAKE_ARCH=arm64 BANA_ACT_IMAGE=my/image bash "$bana" ci nightly --x64 -- --reuse >/dev/null
 check "ci: --x64, a tier, act.image, and act's own options" has "$FAKE_LOG" "-P wid-linux=my/image"
