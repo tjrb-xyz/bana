@@ -1,0 +1,19 @@
+#!/bin/bash
+# Stand-in OrbStack: machines are directories; `orb -m M cmd` runs cmd as Linux in M,
+# which sees the Mac's files at the same paths (as OrbStack's machines do).
+state=$FAKE_STATE/orb
+mkdir -p "$state"
+echo "orb $*" >>"$FAKE_LOG"
+case $1 in
+list) ls "$state" ;;
+create)
+  arch=aarch64
+  [[ $2 == --arch ]] && arch=x86_64
+  m=${*: -1}
+  mkdir -p "$state/$m/home"; echo "$arch" >"$state/$m/arch" ;;
+start) ;;
+-m)
+  m=$2; shift 2
+  FAKE_OS=Linux FAKE_ARCH=$(cat "$state/$m/arch") FAKE_UID=1000 HOME=$state/$m/home \
+    BANA_SYS_ROOT=$FAKE_STATE/vmroot "$@" ;;
+esac

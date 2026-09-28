@@ -1,0 +1,8 @@
+#!/bin/bash
+# Stand-in curl: serves the fake runner tarball for any download (-o FILE).
+echo "curl $*" >>"$FAKE_LOG"
+while (($#)); do
+  if [[ $1 == -o ]]; then cp "$FAKE_TARBALL" "$2"; exit 0; fi
+  shift
+done
+exit 22

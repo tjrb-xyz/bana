@@ -1,0 +1,744 @@
+#!/usr/bin/env bash
+# bana: your own machines as one pool of self-hosted GitHub Actions runners.
+# Each machine runs `bana up` once; GitHub gives each job to a free runner whose
+# labels match, so Macs, Linux PCs and VMs share the work. README.md has the details.
+#
+# Machines:
+#   bana up [options]        join the pool
+#       on a Mac:   a macOS runner (in your login session: real CoreAudio, real USB
+#                   devices) and Linux runners in OrbStack machines (Lima without OrbStack)
+#       on Linux:   Linux runners as systemd services (a Proxmox VM or container, Debian/Ubuntu)
+#     --linux N       Linux runners on this machine's own CPU (default 1; 0 for none)
+#     --x64 N         on an Apple-silicon Mac with OrbStack: x86_64 Linux runners (Rosetta)
+#                     (default 1; 0 for none)
+#     --no-mac        on a Mac: no macOS runner
+#     --dedicated     a machine only for CI: jobs see BANA_DEDICATED=1 and may do invasive tests
+#     --label L       another label for this machine's runners (repeatable)
+#     --no-usb        no USB audio labels (usb-audio, usb-VID-PID)
+#     --token T       a registration token (else the GitHub CLI fetches one)
+#   bana down [--token T]    leave the pool: remove this machine's runners
+#   bana status              this machine's runners, its USB audio devices, and the pool
+#   bana status-json         the same for programs (the manager), one JSON object per line
+#   bana start|stop NAME     one of this machine's runners
+#   bana usb                 the USB audio devices here, and the labels they give
+#   bana relabel             update this machine's runner labels (after plugging a device in)
+#   bana manager [--port N]  the dev manager: a page that shows and drives all this
+#   bana tart up|status|log|shell|down   a Linux VM in Tart on a Mac (bana tart help)
+# In workflows (and by hand):
+#   bana changed BEFORE [BRANCH]   files changed since BEFORE, else since BRANCH ('*': unknown)
+#   bana plan TIER [--json] < FILES   which jobs a run needs (bana.conf's plan.* keys)
+#   bana keep-builds         on a self-hosted runner: a clean checkout that keeps build caches
+#   bana apt PACKAGE...      installs the Debian packages that are missing
+#   bana settings            the settings in effect, and where they came from
+#
+# Settings come from bana.conf (or .github/bana.conf) in your repository; any key
+# can be overridden by BANA_<KEY> in the environment (plan.path.x: BANA_PLAN_PATH_X).
+set -euo pipefail
+
+BANA_VERSION=0.1.0
+
+say() { printf '\033[1m%s\033[0m\n' "$*"; }
+warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
+die() { printf '\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$self" >&2; exit 2; }
+
+# Where bana is, through any symlink (~/.local/bin/bana), without GNU readlink -f.
+self=$0
+while [[ -L $self ]]; do
+  link=$(readlink "$self")
+  case $link in /*) self=$link ;; *) self=$(dirname "$self")/$link ;; esac
+done
+bana_root=$(cd "$(dirname "$self")/.." && pwd)
+self=$bana_root/bin/$(basename "$self")
+
+os=$(uname -s)
+lower() { tr '[:upper:]' '[:lower:]'; }
+host=${BANA_HOST:-$( (hostname -s 2>/dev/null || uname -n) | lower | tr -c 'a-z0-9-\n' '-')}
+host=${host%%.*}
+cpu() { case $(uname -m) in arm64 | aarch64) echo arm64 ;; x86_64 | amd64) echo x64 ;; *) uname -m ;; esac; }
+
+# ---- settings ------------------------------------------------------------------
+
+# bana.conf: in the repository you run bana from, else in the one bana is a submodule of.
+# BANA_CONFIG names it (empty: none, as inside a VM, where settings come as BANA_*).
+find_config() {
+  if [[ -n ${BANA_CONFIG+x} ]]; then
+    [[ -z $BANA_CONFIG || -f $BANA_CONFIG ]] || die "BANA_CONFIG: no file $BANA_CONFIG"
+    echo "$BANA_CONFIG"
+    return
+  fi
+  local d f
+  for d in "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" \
+    "$(git -C "$bana_root" rev-parse --show-superproject-working-tree 2>/dev/null || true)"; do
+    [[ -n $d ]] || continue
+    for f in "$d/bana.conf" "$d/.github/bana.conf"; do
+      [[ -f $f ]] && { echo "$f"; return; }
+    done
+  done
+  true
+}
+conf_file=$(find_config)
+conf_dir=
+[[ -z $conf_file ]] || conf_dir=$(cd "$(dirname "$conf_file")" && pwd)
+
+# `key = value` lines; '#' starts a comment line. Prints the value, or fails.
+conf_lookup() {
+  [[ -n $conf_file && -f $conf_file ]] || return 1
+  awk -v k="$1" '
+    /^[ \t]*#/ { next }
+    { i = index($0, "=") } i == 0 { next }
+    { key = substr($0, 1, i - 1); gsub(/^[ \t]+|[ \t]+$/, "", key) }
+    key == k { v = substr($0, i + 1); gsub(/^[ \t]+|[ \t\r]+$/, "", v); found = 1 }
+    END { if (found) print v; exit !found }' "$conf_file"
+}
+env_name() { printf 'BANA_%s' "$(printf '%s' "$1" | tr 'a-z.-' 'A-Z__')"; }
+# conf KEY [DEFAULT]: BANA_<KEY> first, then bana.conf, then DEFAULT.
+conf() {
+  local e v
+  e=$(env_name "$1")
+  if [[ -n ${!e+x} ]]; then printf '%s\n' "${!e}"; return; fi
+  if v=$(conf_lookup "$1"); then printf '%s\n' "$v"; return; fi
+  printf '%s\n' "${2:-}"
+}
+# The keys under PREFIX. (in bana.conf, in order): plan.path. gives rust, web, ...
+conf_keys() {
+  [[ -n $conf_file && -f $conf_file ]] || return 0
+  awk -v p="$1" '
+    /^[ \t]*#/ { next }
+    { i = index($0, "=") } i == 0 { next }
+    { key = substr($0, 1, i - 1); gsub(/^[ \t]+|[ \t]+$/, "", key) }
+    index(key, p) == 1 && !seen[key]++ { print substr(key, length(p) + 1) }' "$conf_file"
+}
+# A path setting: relative to bana.conf's directory; ~ is your home.
+conf_path() {
+  local v
+  v=$(conf "$1")
+  case $v in
+  '') ;;
+  "~"/*) echo "$HOME/${v#\~/}" ;;
+  /*) echo "$v" ;;
+  *) echo "${conf_dir:-$PWD}/$v" ;;
+  esac
+}
+
+# The repository a checkout came from: owner/repo, from git's origin.
+repo_from_git() {
+  local url
+  url=$(git -C "${conf_dir:-$PWD}" remote get-url origin 2>/dev/null) || return 0
+  url=${url%.git}
+  case $url in
+  *github.com[:/]*/*) url=${url#*github.com}; url=${url#?}; echo "$url" ;;
+  esac
+}
+
+repo=$(conf repo)
+[[ -n $repo ]] || repo=$(repo_from_git)
+prefix=$(conf prefix "$(printf '%s' "${repo##*/}" | lower | tr -c 'a-z0-9-\n' '-')")
+[[ -n $prefix ]] || prefix=bana
+[[ $prefix =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "prefix: lowercase letters, digits and '-', not '$prefix'"
+base_home=${BANA_HOME:-$HOME/.bana}
+home=$base_home/$prefix
+vm=$(conf vm bana)          # the Linux machine on a Mac (its own CPU); shared by projects
+vm_x64=$(conf vm_x64 bana-x64) # the x86_64 one (OrbStack only)
+linux_user=$(conf linux_user bana) # who runners run as on a Linux machine entered as root
+
+need_repo() {
+  [[ -n $repo ]] || die "Which repository? Set repo = owner/name in bana.conf (no bana.conf found${conf_file:+; using $conf_file})"
+  [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "repo: owner/name, not '$repo'"
+}
+
+settings() {
+  local k v
+  echo "# bana $BANA_VERSION at $bana_root"
+  echo "# bana.conf: ${conf_file:-none}"
+  for k in repo prefix labels vm vm_x64 linux_user packages.linux path hook.mac hook.linux \
+    runner_version workflow tiers tier_input keep keep_max_gb; do
+    case $k in
+    repo) v=$repo ;; prefix) v=$prefix ;; vm) v=$vm ;; vm_x64) v=$vm_x64 ;; linux_user) v=$linux_user ;;
+    hook.*) v=$(conf_path "$k") ;;
+    *) v=$(conf "$k") ;;
+    esac
+    printf '%s = %s\n' "$k" "$v"
+  done
+}
+
+# ---- tokens and the GitHub CLI -----------------------------------------------
+
+gh_ok() { command -v gh >/dev/null && gh auth status >/dev/null 2>&1; }
+
+token_for() { # registration|remove
+  if [[ -n ${BANA_TOKEN:-} ]]; then
+    echo "$BANA_TOKEN"
+  elif gh_ok; then
+    gh api -X POST "repos/$repo/actions/runners/$1-token" --jq .token
+  else
+    die "No token: sign in with 'gh auth login' (a repository admin), or pass --token (README: Tokens)"
+  fi
+}
+
+# ---- USB audio -------------------------------------------------------------------
+
+# One line per USB audio device this machine can use: VID:PID<TAB>name.
+usb_audio() {
+  if [[ $os == Darwin ]]; then usb_audio_mac; else usb_audio_linux; fi | sort -u
+}
+
+# ALSA's USB cards (snd-usb-audio writes usbid), counted only when their device node
+# is here: a container sees the host's /proc/asound, but only the /dev/snd it was given.
+usb_audio_linux() {
+  local r=${BANA_SYS_ROOT:-} c n id name
+  for c in "$r"/proc/asound/card[0-9]*; do
+    [[ -r $c/usbid ]] || continue
+    n=${c##*card}
+    [[ -e $r/dev/snd/controlC$n ]] || continue
+    id=$(head -1 "$c/usbid" | lower)
+    [[ $id =~ ^[0-9a-f]{4}:[0-9a-f]{4}$ ]] || continue
+    name=$(awk -v n="$n" '$1 == n && /\]:/ { sub(/^[^]]*\]: */, ""); sub(/^[^ ]+ - /, ""); print; exit }' \
+      "$r/proc/asound/cards" 2>/dev/null)
+    [[ -n $name ]] || name=$(cat "$c/id" 2>/dev/null || echo "card $n")
+    printf '%s\t%s\n' "$id" "$name"
+  done
+}
+
+# macOS: USB devices with an audio interface (class 1), from the I/O Registry.
+usb_audio_mac() {
+  ioreg -r -c IOUSBHostDevice -l -w0 2>/dev/null | awk '
+    function dev(i) { while (i > 0 && cls[i] !~ /^IOUSB(Host)?Device$/) i--; return i }
+    /\+-o / {
+      d = index($0, "+-o")
+      while (top > 0 && ind[top] >= d) top--
+      top++; ind[top] = d; c = $0; sub(/.*<class /, "", c); sub(/[,>].*/, "", c); cls[top] = c
+      key[top] = ""; next
+    }
+    top == 0 { next }
+    /"idVendor" = / { v = $0; sub(/.*= /, "", v); vid[top] = v + 0 }
+    /"idProduct" = / { v = $0; sub(/.*= /, "", v); pid[top] = v + 0 }
+    /"USB Product Name" = / { v = $0; sub(/.*= "/, "", v); sub(/"$/, "", v); nm[top] = v }
+    /"bInterfaceClass" = 1$/ {
+      i = dev(top)
+      if (i > 0) printf "%04x:%04x\t%s\n", vid[i], pid[i], (nm[i] == "" ? "USB audio device" : nm[i])
+    }'
+}
+
+usb_labels() { # the labels the devices give, comma-separated
+  local id out=
+  while IFS=$'\t' read -r id _; do
+    [[ -n $id ]] || continue
+    out=${out:-usb-audio}
+    out+=",usb-${id/:/-}"
+  done < <(usb_audio)
+  echo "$out"
+}
+
+# ---- one runner ------------------------------------------------------------------
+
+runner_version() {
+  local v
+  v=$(conf runner_version)
+  [[ -n $v ]] && { echo "$v"; return; }
+  v=$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest 2>/dev/null |
+    sed -n 's/.*"tag_name": *"v\([0-9.]*\)".*/\1/p' | head -1) || true
+  [[ -n $v ]] || v=$(curl -fsSI https://github.com/actions/runner/releases/latest 2>/dev/null |
+    sed -n 's|^[Ll]ocation: .*/tag/v\([0-9.]*\).*|\1|p' | tr -d '\r' | head -1) || true
+  [[ -n $v ]] || die "Cannot find the newest runner release; set BANA_RUNNER_VERSION (e.g. 2.328.0)"
+  echo "$v"
+}
+
+# The runner's tarball, downloaded once per version into ~/.bana/cache.
+runner_tarball() { # KIND ARCH
+  local version f
+  version=$(runner_version)
+  f=$base_home/cache/actions-runner-$1-$2-$version.tar.gz
+  if [[ ! -s $f ]]; then
+    mkdir -p "$base_home/cache"
+    curl -fsSL -o "$f.part" "https://github.com/actions/runner/releases/download/v$version/actions-runner-$1-$2-$version.tar.gz" ||
+      die "Cannot download actions/runner $version for $1-$2"
+    mv "$f.part" "$f"
+  fi
+  echo "$f"
+}
+
+# The labels of a runner here, without self-hosted: <prefix>-<os>, <os>-<cpu>, the
+# host, --label ones, and (for the runner that holds them) the USB audio devices.
+labels_for() { # KIND(linux|macos) USB(1|'')
+  local kind=$1 l
+  l="$prefix-$kind,$([[ $kind == macos ]] && echo osx || echo linux)-$(cpu),$host"
+  [[ -z $extra_labels ]] || l+=",$extra_labels"
+  if [[ -n $2 && -z $no_usb ]]; then
+    local u
+    u=$(usb_labels)
+    [[ -z $u ]] || l+=",$u"
+  fi
+  echo "$l"
+}
+
+# Downloads, registers and starts one runner as a service. A failure leaves nothing behind.
+add_runner() { # NAME LABELS
+  local name=$1 labels=$2 dir kind arch tarball
+  dir=$home/runners/$name
+  if [[ -e $dir/.runner ]]; then
+    say "$name is already registered ($dir)"
+    update_labels "$dir" "$labels"
+    return
+  fi
+  case $os in Darwin) kind=osx ;; Linux) kind=linux ;; *) die "unsupported system: $os" ;; esac
+  case $(cpu) in arm64 | x64) arch=$(cpu) ;; *) die "unsupported CPU: $(uname -m)" ;; esac
+  tarball=$(runner_tarball "$kind" "$arch")
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  say "Runner $name: $(basename "$tarball" .tar.gz), labels self-hosted,$labels"
+  tar xzf "$tarball" -C "$dir"
+  echo "self-hosted,$labels" >"$dir/.bana-labels"
+  # The runner reads .env when it starts: what every job on this machine sees.
+  {
+    echo "BANA_MACHINE=$host"
+    [[ -z $dedicated ]] || echo "BANA_DEDICATED=1"
+  } >>"$dir/.env"
+  if ! (cd "$dir" && ./config.sh --unattended --url "https://github.com/$repo" --token "$(token_for registration)" \
+    --name "$name" --labels "$labels" --work _work --replace); then
+    rm -rf "$dir"
+    die "GitHub refused to register $name: the token may be wrong or expired (README: Tokens)"
+  fi
+  if ! (cd "$dir" && if [[ $kind == osx ]]; then
+    ./svc.sh install && ./svc.sh start # a LaunchAgent: it runs in your login session
+  else
+    sudo ./svc.sh install "$(id -un)" && sudo ./svc.sh start
+  fi); then
+    warn "$name is registered but its service did not start; removing it again"
+    remove_runner "$dir"
+    die "Could not start $name as a service"
+  fi
+}
+
+remove_runner() { # DIR
+  local dir=$1
+  [[ -e $dir/.runner ]] || { rm -rf "$dir"; return 0; }
+  say "Removing $(basename "$dir")"
+  (
+    cd "$dir"
+    if [[ $os == Darwin ]]; then ./svc.sh stop || true; ./svc.sh uninstall || true
+    else sudo ./svc.sh stop || true; sudo ./svc.sh uninstall || true; fi
+  )
+  if ! (cd "$dir" && ./config.sh remove --token "$(token_for remove)"); then
+    warn "GitHub did not remove $(basename "$dir"): delete it under Settings → Actions → Runners"
+  fi
+  rm -rf "$dir"
+}
+
+runner_id() { sed -n 's/.*"agentId": *\([0-9][0-9]*\).*/\1/p' "$1/.runner" 2>/dev/null | head -1; }
+
+# Sets a registered runner's labels through the API when they changed (a device came or went).
+update_labels() { # DIR LABELS
+  local dir=$1 want=$2 id l args=()
+  [[ $(cat "$dir/.bana-labels" 2>/dev/null) == "self-hosted,$want" ]] && return 0
+  id=$(runner_id "$dir")
+  if [[ -z $id ]] || ! gh_ok; then
+    warn "$(basename "$dir"): its labels should now be self-hosted,$want; sign in with 'gh auth login' and run 'bana relabel'"
+    return 0
+  fi
+  local list=()
+  IFS=, read -r -a list <<<"$want"
+  for l in "${list[@]}"; do args+=(-f "labels[]=$l"); done
+  if gh api -X PUT "repos/$repo/actions/runners/$id/labels" "${args[@]}" >/dev/null; then
+    echo "self-hosted,$want" >"$dir/.bana-labels"
+    say "$(basename "$dir"): labels now self-hosted,$want"
+  else
+    warn "$(basename "$dir"): GitHub did not take the new labels"
+  fi
+}
+
+# ---- a Linux machine ---------------------------------------------------------------
+
+apt_missing() { # PACKAGE...: installs those not installed
+  local p missing=()
+  for p in "$@"; do
+    dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'install ok installed' || missing+=("$p")
+  done
+  ((${#missing[@]})) || return 0
+  sudo apt-get update -q
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${missing[@]}"
+}
+
+words() { printf '%s\n' "$*" | tr ',' ' '; } # a list setting, commas or spaces
+
+run_hook() { # mac|linux: the project's own machine setup, before its runners register
+  local f
+  f=$(conf_path "hook.$1")
+  [[ -n $f ]] || return 0
+  [[ -f $f ]] || die "hook.$1: no file $f"
+  say "Running the project's $1 setup: $f"
+  (cd "$(dirname "$f")" && BANA_DEDICATED=$dedicated BANA_PREFIX=$prefix BANA_REPO=$repo BANA_MACHINE=$host bash "$f") ||
+    die "hook.$1 ($f) failed"
+}
+
+# What runners and most jobs need, then the project's packages and hook.
+linux_prepare() {
+  # libicu, libkrb5 and zlib: the runner (.NET) needs them, and its own
+  # installdependencies.sh knows libicu only up to 72 (Ubuntu 24.04 has 74, Debian 13 76).
+  local need=(ca-certificates curl git sudo tar unzip xz-utils python3 build-essential pkg-config
+    libicu-dev libkrb5-3 zlib1g) extra=()
+  command -v apt-get >/dev/null || die "a Debian or Ubuntu system is needed"
+  [[ -d ${BANA_SYS_ROOT:-}/run/systemd/system ]] || die "runners run as systemd services, and systemd is not running here (a Proxmox container: Options → Features → nesting)"
+  read -r -a extra <<<"$(words "$(conf packages.linux)")" || true
+  apt_missing "${need[@]}" ${extra[@]+"${extra[@]}"}
+  run_hook linux
+  add_paths
+}
+
+# A runner's service keeps the PATH it was configured with: bana.conf's path goes first.
+add_paths() {
+  local d
+  for d in $(words "$(conf path)"); do
+    case $d in "~"/*) d=$HOME/${d#\~/} ;; esac
+    PATH=$d:$PATH
+  done
+  export PATH
+}
+
+# The settings, as BANA_* for bana in another machine or as another user.
+settings_env() {
+  local k
+  printf '%s\n' "BANA_CONFIG=" "BANA_REPO=$repo" "BANA_PREFIX=$prefix" "BANA_HOST=$host" \
+    "BANA_LINUX_USER=$linux_user" "BANA_TOKEN=${BANA_TOKEN:-}" "BANA_LABELS=$extra_labels"
+  for k in packages.linux path runner_version; do printf '%s=%s\n' "$(env_name "$k")" "$(conf "$k")"; done
+  [[ -z $no_usb ]] || echo "BANA_NO_USB=1"
+}
+
+linux_up() { # N
+  local n=$1 k
+  if [[ $(id -u) == 0 ]]; then
+    # Runners refuse to run as root (a Proxmox container starts as root): make a user.
+    command -v sudo >/dev/null || { apt-get update -q && apt-get install -y -q sudo; }
+    id "$linux_user" >/dev/null 2>&1 || useradd -m -s /bin/bash "$linux_user"
+    # audio: USB audio devices passed through (/dev/snd) are the audio group's.
+    ! getent group audio >/dev/null || usermod -aG audio "$linux_user"
+    echo "$linux_user ALL=(ALL) NOPASSWD:ALL" >"/etc/sudoers.d/$linux_user"
+    chmod 0440 "/etc/sudoers.d/$linux_user"
+    local uhome copy hook envs=() line
+    uhome=$(getent passwd "$linux_user" | cut -d: -f6)
+    copy=$uhome/.bana/bin/bana
+    install -d -o "$linux_user" "$uhome/.bana" "$uhome/.bana/bin"
+    install -m 0755 -o "$linux_user" "$self" "$copy"
+    hook=$(conf_path hook.linux)
+    if [[ -n $hook ]]; then
+      install -m 0644 -o "$linux_user" "$hook" "$uhome/.bana/bin/hook-linux.sh"
+      hook=$uhome/.bana/bin/hook-linux.sh
+    fi
+    while IFS= read -r line; do envs+=("$line"); done < <(settings_env)
+    exec sudo -iu "$linux_user" env "${envs[@]}" BANA_HOOK_LINUX="$hook" BANA_DEDICATED_UP="$dedicated" \
+      bash "$copy" linux-here "$n"
+  fi
+  linux_prepare
+  for ((k = 1; k <= n; k++)); do
+    # The USB audio labels go to the first runner only: two jobs never share a device.
+    add_runner "$prefix-$host-linux-$(cpu)-$k" "$(labels_for linux "$([[ $k == 1 ]] && echo 1)")"
+  done
+}
+
+# ---- a Linux machine on a Mac ------------------------------------------------------
+
+vm_kind() {
+  local k=${BANA_VM:-}
+  [[ -n $k ]] || { command -v orb >/dev/null && k=orbstack || k=lima; }
+  echo "$k"
+}
+
+vm_run() { # MACHINE command... (it sees your Mac's files at the same paths)
+  local m=$1
+  shift
+  case $(vm_kind) in
+  orbstack) orb -m "$m" "$@" ;;
+  lima) limactl shell "$m" "$@" ;;
+  esac
+}
+
+# bana itself in MACHINE, with this project's settings.
+vm_bana() { # MACHINE COMMAND...
+  local m=$1 envs=() line
+  shift
+  while IFS= read -r line; do envs+=("$line"); done < <(settings_env)
+  vm_run "$m" env "${envs[@]}" BANA_NO_USB=1 BANA_HOOK_LINUX="$(conf_path hook.linux)" \
+    BANA_DEDICATED_UP="$dedicated" bash "$self" "$@"
+}
+
+# The Linux machines this Mac has, of the two bana may make.
+vms() {
+  local m
+  for m in "$vm" "$vm_x64"; do
+    case $(vm_kind) in
+    orbstack) command -v orb >/dev/null && orb list 2>/dev/null | awk '{print $1}' | grep -qx "$m" && echo "$m" ;;
+    lima) command -v limactl >/dev/null && limactl list -q 2>/dev/null | grep -qx "$m" && echo "$m" ;;
+    esac
+  done
+  true
+}
+
+vm_up() { # MACHINE ARCH(native|amd64)
+  local m=$1 arch=$2
+  case $(vm_kind) in
+  orbstack)
+    command -v orb >/dev/null || die "OrbStack's 'orb' is not on PATH (https://orbstack.dev), or use --linux 0 --x64 0"
+    if ! orb list 2>/dev/null | awk '{print $1}' | grep -qx "$m"; then
+      say "Creating the OrbStack machine $m (Ubuntu 24.04, $([[ $arch == amd64 ]] && echo "x86_64 through Rosetta" || echo "this Mac's CPU"); it takes CPU and memory only as used)"
+      if [[ $arch == amd64 ]]; then orb create --arch amd64 ubuntu:noble "$m"; else orb create ubuntu:noble "$m"; fi
+    fi
+    orb start "$m" >/dev/null 2>&1 || true
+    ;;
+  lima)
+    [[ $arch == native ]] || die "x86_64 runners on a Mac need OrbStack (Lima would emulate the whole machine)"
+    command -v limactl >/dev/null || { command -v brew >/dev/null && brew install lima; } ||
+      die "Neither OrbStack nor Lima is installed (https://orbstack.dev), or use --linux 0"
+    if ! limactl list -q 2>/dev/null | grep -qx "$m"; then
+      say "Creating the Lima VM $m (4 CPUs, 8 GiB, a disk that grows to 80 GiB)"
+      limactl create --name "$m" --cpus 4 --memory 8 --disk 80 --tty=false template://ubuntu-lts
+    fi
+    limactl start "$m" >/dev/null 2>&1 || true
+    ;;
+  *) die "BANA_VM is orbstack or lima, not '$(vm_kind)'" ;;
+  esac
+}
+
+vm_runners() { # MACHINE ARCH N
+  local m=$1 k
+  (($3 > 0)) || return 0
+  vm_up "$m" "$2"
+  # A token each: the Linux machine may not have the GitHub CLI.
+  for ((k = 1; k <= $3; k++)); do
+    BANA_TOKEN=${BANA_TOKEN:-$(token_for registration)} vm_bana "$m" linux-one "$k"
+  done
+}
+
+# ---- what runs -----------------------------------------------------------------------
+
+json_str() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\000-\037')"; }
+
+# One JSON object per line: each runner here (its processes say what it does: the
+# listener waits for jobs, a worker runs one), and each USB audio device.
+status_json_here() { # MACHINE [usb]
+  local d name listener worker labels
+  for d in "$home"/runners/*/; do
+    [[ -e $d/.runner ]] || continue
+    d=${d%/}
+    name=$(basename "$d")
+    listener=$(pgrep -f "$d/bin/Runner.Listener" | head -1 || true)
+    worker=$(pgrep -f "$d/bin/Runner.Worker" | head -1 || true)
+    labels=$(cat "$d/.bana-labels" 2>/dev/null || true)
+    printf '{"kind":"runner","name":%s,"machine":%s,"dir":%s,"labels":%s,"listener_pid":%s,"worker_pid":%s,"dedicated":%s}\n' \
+      "$(json_str "$name")" "$(json_str "$1")" "$(json_str "$d")" "$(json_str "$labels")" \
+      "${listener:-null}" "${worker:-null}" \
+      "$(grep -q '^BANA_DEDICATED=1' "$d/.env" 2>/dev/null && echo true || echo false)"
+  done
+  [[ ${2:-} == usb ]] || return 0
+  local id dname
+  while IFS=$'\t' read -r id dname; do
+    [[ -n $id ]] || continue
+    printf '{"kind":"usb","machine":%s,"id":%s,"name":%s,"label":%s}\n' \
+      "$(json_str "$1")" "$(json_str "$id")" "$(json_str "$dname")" "$(json_str "usb-${id/:/-}")"
+  done < <(usb_audio)
+}
+
+service() { # start|stop NAME
+  local dir=$home/runners/$2
+  cd "$dir"
+  if [[ $os == Darwin ]]; then ./svc.sh "$1"; else sudo ./svc.sh "$1"; fi
+}
+
+valid_name() { [[ $1 =~ ^[A-Za-z0-9._-]+$ && $1 != *..* ]]; }
+
+# ---- commands --------------------------------------------------------------------------
+
+extra_labels=$(words "$(conf labels)" | tr -s ' ' ',' | sed 's/^,//; s/,$//')
+no_usb=${BANA_NO_USB:-}
+dedicated=${BANA_DEDICATED_UP:-}
+
+up() {
+  local linux=1 x64=1 mac=1
+  while (($#)); do
+    case $1 in
+    --linux) linux=${2:?--linux N}; shift ;;
+    --x64) x64=${2:?--x64 N}; shift ;;
+    --no-mac) mac=0 ;;
+    --dedicated) dedicated=1 ;;
+    --label)
+      [[ ${2:-} =~ ^[A-Za-z0-9._-]+$ ]] || die "--label: letters, digits, '.', '_' and '-'"
+      extra_labels=${extra_labels:+$extra_labels,}$2
+      shift
+      ;;
+    --no-usb) no_usb=1 ;;
+    --token) export BANA_TOKEN=${2:?--token T}; shift ;;
+    *) usage ;;
+    esac
+    shift
+  done
+  need_repo
+  [[ $linux =~ ^[0-9]+$ && $x64 =~ ^[0-9]+$ ]] || die "--linux and --x64 take a number"
+  [[ $os == Darwin && $(vm_kind) == orbstack && $(cpu) == arm64 ]] || x64=0 # native elsewhere
+  say "Joining $repo's pool as $host (prefix $prefix)"
+  case $os in
+  Darwin)
+    if ((mac)); then
+      xcode-select -p >/dev/null 2>&1 || die "Xcode's command line tools are needed: xcode-select --install"
+      run_hook mac
+      add_paths
+      add_runner "$prefix-$host-macos" "$(labels_for macos 1)"
+    fi
+    vm_runners "$vm" native "$linux"
+    vm_runners "$vm_x64" amd64 "$x64"
+    if ((linux + x64 > 0)) && [[ $(vm_kind) == orbstack ]]; then
+      say "OrbStack → Settings → Start at login keeps the Linux runners up."
+    fi
+    ;;
+  Linux) linux_up "$linux" ;;
+  *) die "unsupported system: $os" ;;
+  esac
+  say "Done. 'bana status' shows the pool."
+}
+
+status() {
+  local d m id name
+  need_repo
+  say "This machine ($host), $repo:"
+  for d in "$home"/runners/*/; do
+    [[ -e $d/.runner ]] || continue
+    printf '  %-36s %s\n' "$(basename "$d")" \
+      "$(cd "$d" && { ./svc.sh status 2>/dev/null | grep -Eio 'active \(running\)|inactive|started|stopped|not installed' | head -1; } || echo '?')"
+  done
+  while IFS=$'\t' read -r id name; do
+    [[ -n $id ]] && printf '  USB audio: %s (%s): label usb-%s\n' "$name" "$id" "${id/:/-}"
+  done < <(usb_audio)
+  if [[ $os == Darwin ]]; then
+    for m in $(vms); do
+      say "Its Linux machine $m:"
+      vm_bana "$m" status-here 2>/dev/null || true
+    done
+  fi
+  if gh_ok; then
+    say "The pool ($repo):"
+    gh api "repos/$repo/actions/runners?per_page=100" --jq \
+      '.runners[] | "  \(.name)\t\(.status)\(if .busy then ", busy" else "" end)\t\([.labels[].name] | join(","))"'
+  fi
+}
+
+down() {
+  local d m
+  need_repo
+  for d in "$home"/runners/*/; do [[ -d $d ]] && remove_runner "${d%/}"; done
+  if [[ $os == Darwin ]]; then
+    for m in $(vms); do
+      BANA_TOKEN=${BANA_TOKEN:-$(token_for remove)} vm_bana "$m" down-here || true
+      say "The Linux machine $m stays (other projects may use it): 'orb delete -f $m' (or 'limactl delete -f $m') removes it."
+    done
+  fi
+  say "This machine's $prefix runners have left the pool."
+}
+
+usb() {
+  local id name n=0
+  while IFS=$'\t' read -r id name; do
+    [[ -n $id ]] || continue
+    n=$((n + 1))
+    printf '%s  %s  (label usb-%s)\n' "$id" "$name" "${id/:/-}"
+  done < <(usb_audio)
+  if ((n)); then
+    echo "Runner labels: $(usb_labels)"
+  else
+    echo "No USB audio devices here."
+    [[ $os == Linux && -d /proc/asound && ! -d /dev/snd ]] && echo "(No /dev/snd here: in a container, pass it through; README: USB audio.)"
+  fi
+  true
+}
+
+# Hardware labels follow the devices: re-reads them and updates the runners that hold them.
+relabel() {
+  local d name
+  need_repo
+  for d in "$home"/runners/*/; do
+    [[ -e $d/.runner ]] || continue
+    d=${d%/}
+    name=$(basename "$d")
+    case $name in
+    "$prefix-$host-macos") update_labels "$d" "$(labels_for macos 1)" ;;
+    "$prefix-$host-linux-"*-1) update_labels "$d" "$(labels_for linux 1)" ;;
+    "$prefix-$host-linux-"*) update_labels "$d" "$(labels_for linux '')" ;;
+    esac
+  done
+  say "Labels are up to date."
+}
+
+manager() {
+  need_repo
+  local bin=$bana_root/manager/target/release/bana-manager
+  command -v cargo >/dev/null || [[ -x $bin ]] || die "cargo is needed to build the manager: https://rustup.rs"
+  if command -v cargo >/dev/null; then
+    say "Building the manager (the first time takes a minute)"
+    cargo build -q --release --locked --manifest-path "$bana_root/manager/Cargo.toml"
+  fi
+  export BANA_CONFIG=$conf_file # its tasks run bana with this project's settings
+  exec "$bin" --script "$self" --repo "$repo" --workflow "$(conf workflow ci.yml)" \
+    --tiers "$(words "$(conf tiers "quick nightly release")" | tr -s ' ' ',')" \
+    --tier-input "$(conf tier_input tier)" "$@"
+}
+
+cmd=${1:-}
+shift || true
+case $cmd in
+up) up "$@" ;;
+down)
+  [[ ${1:-} == --token ]] && export BANA_TOKEN=${2:?--token T}
+  down
+  ;;
+status) status ;;
+status-json)
+  need_repo
+  status_json_here "$host" usb
+  if [[ $os == Darwin ]]; then
+    for m in $(vms); do vm_bana "$m" status-json-here "$host ($m)" 2>/dev/null || true; done
+  fi
+  ;;
+start | stop)
+  name=${1:?runner name}
+  valid_name "$name" || die "no runner $name on this machine"
+  if [[ -e $home/runners/$name/.runner ]]; then service "$cmd" "$name"
+  elif [[ $os == Darwin ]]; then
+    # Runner names carry their CPU: linux-x64 ones live in the x86_64 machine.
+    m=$vm
+    [[ $name == *-linux-x64-* ]] && m=$vm_x64
+    vm_bana "$m" "$cmd-here" "$name"
+  else die "no runner $name on this machine"; fi
+  ;;
+usb) usb ;;
+relabel) relabel ;;
+manager) manager "$@" ;;
+settings) settings ;;
+tart)
+  # shellcheck source=SCRIPTDIR/../lib/tart.sh
+  source "$bana_root/lib/tart.sh"
+  tart_main "$@"
+  ;;
+changed | plan | keep-builds)
+  # shellcheck source=SCRIPTDIR/../lib/ci.sh
+  source "$bana_root/lib/ci.sh"
+  ci_main "$cmd" "$@"
+  ;;
+apt) apt_missing "$@" ;;
+version | --version) echo "bana $BANA_VERSION" ;;
+# Used by the commands above, inside a Linux machine:
+linux-one) # K: the K-th Linux runner of a Mac's Linux machine
+  [[ $(id -u) == 0 ]] && die "run as a normal user"
+  linux_prepare
+  add_runner "$prefix-$host-linux-$(cpu)-${1:?K}" "$(labels_for linux '')"
+  ;;
+linux-here) linux_up "${1:-1}" ;;
+status-here)
+  for d in "$home"/runners/*/; do [[ -e $d/.runner ]] && printf '  %s\n' "$(basename "$d")"; done
+  true
+  ;;
+status-json-here) status_json_here "${1:-$host}" ;;
+start-here | stop-here)
+  if ! valid_name "${1:-}" || [[ ! -e $home/runners/$1/.runner ]]; then die "no runner ${1:-} on this machine"; fi
+  service "${cmd%-here}" "$1"
+  ;;
+down-here) for d in "$home"/runners/*/; do [[ -d $d ]] && remove_runner "${d%/}"; done; true ;;
+help | -h | --help | '') usage ;;
+*) usage ;;
+esac

@@ -1,0 +1,8 @@
+#!/bin/sh
+# Stand-in launchd: remembers what was bootstrapped.
+echo "launchctl $*" >>"$FAKE_LOG"
+case $1 in
+bootstrap) touch "$FAKE_STATE/launchd-$(basename "$3" .plist)" ;;
+bootout) rm -f "$FAKE_STATE/launchd-${2##*/}" ;;
+print) [ -e "$FAKE_STATE/launchd-${2##*/}" ] ;;
+esac

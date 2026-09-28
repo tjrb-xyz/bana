@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bana</title>
+<style>
+:root {
+  --bg: #f4f6f8; --panel: #ffffff; --ink: #16202a; --muted: #5b6875; --line: #d9e0e6;
+  --accent: #2c6e8f; --ok: #237a4b; --warn: #a66a00; --bad: #b3261e; --idle: #7a8793;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0f1419; --panel: #172029; --ink: #e3e9ee; --muted: #93a1ae; --line: #2a3643;
+    --accent: #79b4d4; --ok: #5cc48a; --warn: #e0a642; --bad: #f07b72; --idle: #75828e; color-scheme: dark; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.5 ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif; }
+main { max-width: 1100px; margin: 0 auto; padding: 20px 16px 48px; display: grid; gap: 16px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 16px; }
+h1 { font-size: 20px; margin: 0; }
+h2 { font-size: 15px; margin: 0 0 8px; }
+.muted { color: var(--muted); }
+.mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px; }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+.cols { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+table { width: 100%; border-collapse: collapse; }
+td, th { text-align: left; padding: 6px 8px 6px 0; border-top: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 600; font-size: 12px; color: var(--muted); border-top: 0; }
+.wrap { overflow-x: auto; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--idle); }
+.dot.busy, .dot.in_progress { background: var(--warn); }
+.dot.idle, .dot.online, .dot.success { background: var(--ok); }
+.dot.failure, .dot.stopped, .dot.offline, .dot.cancelled { background: var(--bad); }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.chip { border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; font-size: 12px; white-space: nowrap; }
+.chip.success { border-color: var(--ok); } .chip.failure { border-color: var(--bad); }
+.chip.in_progress, .chip.queued { border-color: var(--warn); }
+.chip.hw { border-color: var(--accent); color: var(--accent); }
+ul.plain { list-style: none; margin: 8px 0 0; padding: 0; }
+ul.plain li { padding: 3px 0; }
+form, .row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+  border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.danger { color: var(--bad); }
+button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+input, select { font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 3px 6px; }
+input[type=number] { width: 4em; }
+pre { margin: 6px 0 0; max-height: 220px; overflow: auto; background: var(--bg); border-radius: 6px; padding: 8px;
+  white-space: pre-wrap; word-break: break-word; }
+.error { color: var(--bad); }
+details summary { cursor: pointer; }
+a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>bana</h1>
+    <span class="muted" id="where"></span>
+    <span class="muted" id="updated"></span>
+  </header>
+  <p class="error" id="fatal" hidden></p>
+
+  <div class="cols">
+    <section>
+      <h2>This machine's runners</h2>
+      <p class="muted" id="local-empty" hidden>No runners here yet.</p>
+      <p class="error" id="local-error" hidden></p>
+      <div class="wrap"><table id="local"></table></div>
+      <h2 style="margin-top:12px">USB audio here</h2>
+      <p class="muted" id="usb-empty">None found. Devices plugged into this machine (or passed through to it) give its runner a label per device; <span class="mono">bana relabel</span> updates it.</p>
+      <ul class="plain" id="usb"></ul>
+      <form id="join">
+        <label>Linux runners <input type="number" id="linux" min="0" max="8" value="1"></label>
+        <label title="On a Mac with OrbStack: in an x86_64 machine (Rosetta), for x86_64 builds">x86_64 <input type="number" id="x64" min="0" max="8" value="1"></label>
+        <label><input type="checkbox" id="mac" checked> macOS runner</label>
+        <label title="A machine for CI only: jobs see BANA_DEDICATED=1 and may do invasive tests"><input type="checkbox" id="dedicated"> dedicated</label>
+        <button class="primary" type="submit">Join the pool</button>
+      </form>
+      <div class="row">
+        <button class="danger" id="leave" type="button">Leave the pool…</button>
+        <span id="leave-confirm" hidden>Remove every runner on this machine?
+          <button class="danger" id="leave-yes" type="button">Remove them</button>
+          <button id="leave-no" type="button">Keep them</button></span>
+      </div>
+    </section>
+
+    <section>
+      <h2>The pool</h2>
+      <p class="error" id="pool-error" hidden></p>
+      <div class="wrap"><table id="pool"></table></div>
+    </section>
+  </div>
+
+  <section>
+    <h2>Runs</h2>
+    <form id="run">
+      <label id="tier-label">Tier <select id="tier"></select></label>
+      <label>on <input id="ref" value="main" size="14" autocomplete="off"></label>
+      <button class="primary" type="submit">Start a run</button>
+    </form>
+    <p class="error" id="runs-error" hidden></p>
+    <div class="wrap"><table id="runs"></table></div>
+  </section>
+
+  <section>
+    <h2>Tasks on this machine</h2>
+    <p class="muted" id="tasks-empty">Nothing started from here yet.</p>
+    <div id="tasks"></div>
+  </section>
+</main>
+<script>
+"use strict";
+const token = (() => {
+  const m = /token=([A-Za-z0-9_-]{16,})/.exec(location.hash);
+  if (m) { try { sessionStorage.setItem("bana", m[1]); } catch (e) {} history.replaceState(null, "", location.pathname); return m[1]; }
+  try { return sessionStorage.getItem("bana"); } catch (e) { return null; }
+})();
+const $ = (id) => document.getElementById(id);
+const chip = (l) => `<span class="chip${/^usb-/.test(l) ? " hw" : ""}">${esc(l)}</span>`;
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+function show(id, text) { const el = $(id); el.hidden = !text; el.textContent = text || ""; }
+
+async function api(method, path, body) {
+  const r = await fetch("/ci/v1" + path, {
+    method, headers: { authorization: "Bearer " + token, ...(body ? { "content-type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+let busy = false;
+async function act(method, path, body) {
+  try { await api(method, path, body); show("fatal", ""); } catch (e) { show("fatal", e.message); }
+  refresh();
+}
+
+function localRows(s) {
+  if (!s.local.length) return "";
+  return "<tr><th>Runner</th><th>Where</th><th>Doing</th><th></th></tr>" + s.local.map((r) => {
+    const doing = r.state === "busy" ? `running a job <span class="mono">(worker ${r.worker_pid})</span>`
+      : r.state === "idle" ? `waiting for a job <span class="mono">(listener ${r.listener_pid})</span>` : "stopped";
+    const btn = r.state === "stopped"
+      ? `<button data-act="start" data-name="${esc(r.name)}">Start</button>`
+      : `<button data-act="stop" data-name="${esc(r.name)}">Stop</button>`;
+    const hw = r.labels.filter((l) => /^usb-/.test(l)).map(chip).join("");
+    return `<tr><td><span class="dot ${r.state}"></span>${esc(r.name)}${r.dedicated ? ' <span class="chip">dedicated</span>' : ""}${hw ? `<div class="chips">${hw}</div>` : ""}</td>
+      <td>${esc(r.machine)}</td><td>${doing}</td><td>${btn}</td></tr>`;
+  }).join("");
+}
+
+function poolRows(s) {
+  if (!s.pool.length) return s.pool_error ? "" : `<tr><td class="muted">No runners registered yet.</td></tr>`;
+  return "<tr><th>Runner</th><th>State</th><th>Labels</th></tr>" + s.pool.map((r) => {
+    const st = r.status !== "online" ? "offline" : r.busy ? "busy" : "idle";
+    const words = st === "busy" ? (r.job ? "running " + esc(r.job) : "running a job") : st === "idle" ? "online, idle" : "offline";
+    const labels = r.labels.filter((l) => l !== "self-hosted").map(chip).join("");
+    return `<tr><td><span class="dot ${st}"></span>${esc(r.name)}</td><td>${words}</td><td><div class="chips">${labels}</div></td></tr>`;
+  }).join("");
+}
+
+function runRows(s) {
+  if (!s.runs.length) return "";
+  return "<tr><th>Run</th><th>What</th><th>Jobs (and the runner each is on)</th><th></th></tr>" + s.runs.map((r) => {
+    const st = r.status === "completed" ? (r.conclusion || "completed") : r.status;
+    const jobs = r.jobs.map((j) => {
+      const js = j.status === "completed" ? (j.conclusion || "") : j.status;
+      return `<span class="chip ${esc(js)}" title="${esc(js)}">${esc(j.name)}${j.runner ? " · " + esc(j.runner) : ""}</span>`;
+    }).join("");
+    const cancel = r.status !== "completed" ? `<button data-cancel="${r.id}">Cancel</button>` : "";
+    return `<tr><td><span class="dot ${esc(st)}"></span><a href="${esc(r.url)}" target="_blank" rel="noopener">#${r.number}</a> <span class="muted">${esc(st)}</span></td>
+      <td>${esc(r.title)}<br><span class="muted">${esc(r.event)} · ${esc(r.branch)} · ${esc(r.created_at.replace("T", " ").replace("Z", " UTC"))}</span></td>
+      <td><div class="chips">${jobs || '<span class="muted">…</span>'}</div></td><td>${cancel}</td></tr>`;
+  }).join("");
+}
+
+function usbItems(s) {
+  return s.usb.map((d) => `<li>${esc(d.name)} <span class="mono muted">${esc(d.id)}</span> → ${chip(d.label)}${d.machine !== s.machine ? ` <span class="muted">(${esc(d.machine)})</span>` : ""}</li>`).join("");
+}
+
+function taskBlocks(s) {
+  return s.tasks.map((t) => {
+    const st = t.running ? "running" : t.ok ? "done" : "failed";
+    return `<details ${t.running || !t.ok ? "open" : ""}><summary><span class="dot ${t.running ? "busy" : t.ok ? "success" : "failure"}"></span>${esc(t.what)} <span class="muted">${st}</span></summary><pre class="mono">${esc(t.log)}</pre></details>`;
+  }).join("");
+}
+
+async function refresh() {
+  if (busy) return;
+  busy = true;
+  try {
+    const s = await api("GET", "/state");
+    $("where").textContent = `${s.machine} · ${s.repo}`;
+    $("updated").textContent = "updated " + new Date().toLocaleTimeString();
+    $("local").innerHTML = localRows(s);
+    show("local-error", s.local_error);
+    $("usb").innerHTML = usbItems(s);
+    $("usb-empty").hidden = s.usb.length > 0;
+    $("local-empty").hidden = !!(s.local.length || s.local_error);
+    $("pool").innerHTML = poolRows(s);
+    show("pool-error", s.pool_error);
+    $("runs").innerHTML = runRows(s);
+    show("runs-error", s.runs_error);
+    $("tier-label").hidden = !s.tiers.length;
+    if (!$("tier").options.length) $("tier").innerHTML = s.tiers.map((t, i) => `<option ${i === Math.min(1, s.tiers.length - 1) ? "selected" : ""}>${esc(t)}</option>`).join("");
+    document.title = `bana · ${s.repo}`;
+    const open = new Set([...document.querySelectorAll("#tasks details")].map((d, i) => d.open ? i : -1));
+    $("tasks").innerHTML = taskBlocks(s);
+    $("tasks-empty").hidden = s.tasks.length > 0;
+    if (!token) show("fatal", "Open the link bana-manager printed (it carries the token).");
+  } catch (e) {
+    show("fatal", e.message === "missing or wrong token" ? "Open the link bana-manager printed (it carries the token)." : "Cannot reach bana-manager: " + e.message);
+  } finally { busy = false; }
+}
+
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  if (b.dataset.act) act("POST", `/runners/${encodeURIComponent(b.dataset.name)}/${b.dataset.act}`);
+  if (b.dataset.cancel) act("POST", `/runs/${b.dataset.cancel}/cancel`);
+});
+$("join").addEventListener("submit", (e) => {
+  e.preventDefault();
+  act("POST", "/pool/join", { linux: Number($("linux").value), x64: Number($("x64").value), mac: $("mac").checked, dedicated: $("dedicated").checked });
+});
+$("leave").addEventListener("click", () => { $("leave-confirm").hidden = false; });
+$("leave-no").addEventListener("click", () => { $("leave-confirm").hidden = true; });
+$("leave-yes").addEventListener("click", () => { $("leave-confirm").hidden = true; act("POST", "/pool/leave"); });
+$("run").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const body = { ref: $("ref").value.trim() };
+  if (!$("tier-label").hidden) body.tier = $("tier").value;
+  act("POST", "/runs", body);
+});
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

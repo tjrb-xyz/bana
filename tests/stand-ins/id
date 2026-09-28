@@ -1,0 +1,3 @@
+#!/bin/sh
+# Stand-in: FAKE_UID for -u (root on a Proxmox container, a user in a VM).
+if [ "${1:-}" = -u ] && [ $# = 1 ]; then echo "${FAKE_UID:-1000}"; else exec /usr/bin/id "$@"; fi

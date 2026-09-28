@@ -1,0 +1,3 @@
+#!/bin/sh
+# Stand-in for launchctl, apt-get, brew: records the call.
+echo "$(basename "$0") $*" >>"$FAKE_LOG"

@@ -1,0 +1,14 @@
+#!/bin/bash
+# Stand-in Tart: records every call; `exec` copies files into $FAKE_STATE/tartfs.
+echo "tart $*" >>"$FAKE_LOG"
+case $1 in
+list) [[ -e $FAKE_STATE/tart-vm ]] && cat "$FAKE_STATE/tart-vm" ;;
+clone) echo "$3" >"$FAKE_STATE/tart-vm" ;;
+delete) rm -f "$FAKE_STATE/tart-vm" ;;
+exec)
+  case "$*" in
+  *"cat >/tmp/bana-copy"*) cat >"$FAKE_STATE/tart-copy" ;;
+  *"install -D"*) f=$FAKE_STATE/tartfs${*: -1}; mkdir -p "$(dirname "$f")"; cp "$FAKE_STATE/tart-copy" "$f" ;;
+  esac ;;
+esac
+exit 0

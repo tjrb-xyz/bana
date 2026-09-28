@@ -1,0 +1,12 @@
+#!/bin/sh
+# Stand-in GitHub CLI: signed in when FAKE_GH=1; tokens, labels and the runner list.
+echo "gh $*" >>"$FAKE_LOG"
+[ "${FAKE_GH:-1}" = 1 ] || exit 1
+case "$*" in
+"auth status") exit 0 ;;
+*registration-token*) echo REG-TOKEN ;;
+*remove-token*) echo REMOVE-TOKEN ;;
+*"-X PUT"*labels*) echo '{}' ;;
+*"-X DELETE"*) ;;
+*actions/runners*) printf '%s\n' "${FAKE_POOL:-}" ;;
+esac

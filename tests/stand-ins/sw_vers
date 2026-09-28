@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "${FAKE_MACOS:-15.4}"

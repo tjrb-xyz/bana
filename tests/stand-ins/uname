@@ -1,0 +1,8 @@
+#!/bin/sh
+# Stand-in: the system bana thinks it is on (FAKE_OS, FAKE_ARCH, FAKE_HOST).
+case ${1:-} in
+-s) echo "${FAKE_OS:-Linux}" ;;
+-m) echo "${FAKE_ARCH:-x86_64}" ;;
+-n) echo "${FAKE_HOST:-box}" ;;
+*) echo "${FAKE_OS:-Linux}" ;;
+esac

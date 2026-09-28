@@ -1,0 +1,10 @@
+#!/bin/sh
+# Stand-in: runs the command as the caller; `sudo -iu USER` becomes that user's login (FAKE_UID 1000).
+echo "sudo $*" >>"$FAKE_LOG"
+if [ "${1:-}" = -iu ]; then
+  u=$2; shift 2
+  HOME=$(getent passwd "$u" | cut -d: -f6)
+  export FAKE_UID=1000 HOME
+  cd "$HOME" || exit 1
+fi
+exec env "$@"

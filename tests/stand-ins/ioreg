@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stand-in: the I/O Registry of a Mac with the devices in $FAKE_IOREG.
+[ -n "${FAKE_IOREG:-}" ] && cat "$FAKE_IOREG"
+exit 0

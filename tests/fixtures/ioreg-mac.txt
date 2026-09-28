@@ -1,0 +1,62 @@
++-o Root  <class IORegistryEntry, id 0x100000100, retain 20>
++-o MiniFuse 2@01100000  <class IOUSBHostDevice, id 0x100000a01, registered, matched, active, busy 0 (5 ms), retain 30>
+  | {
+  |   "sessionID" = 1234567
+  |   "idProduct" = 44912
+  |   "USB Product Name" = "MiniFuse 2"
+  |   "idVendor" = 7285
+  |   "bDeviceClass" = 239
+  | }
+  | 
+  +-o AppleUSBHostCompositeDevice  <class AppleUSBHostCompositeDevice, id 0x100000a02, !registered, !matched, active, busy 0, retain 5>
+  | {
+  | }
+  | 
+  +-o MiniFuse 2@0  <class IOUSBHostInterface, id 0x100000a03, registered, matched, active, busy 0 (1 ms), retain 8>
+  | {
+  |   "bInterfaceClass" = 1
+  |   "bInterfaceSubClass" = 1
+  | }
+  | 
+  +-o MiniFuse 2@1  <class IOUSBHostInterface, id 0x100000a04, registered, matched, active, busy 0 (1 ms), retain 8>
+    {
+      "bInterfaceClass" = 1
+      "bInterfaceSubClass" = 2
+    }
+    
++-o USB Keyboard@02100000  <class IOUSBHostDevice, id 0x100000b01, registered, matched, active, busy 0 (3 ms), retain 20>
+  | {
+  |   "idProduct" = 591
+  |   "USB Product Name" = "USB Keyboard"
+  |   "idVendor" = 1452
+  | }
+  | 
+  +-o USB Keyboard@0  <class IOUSBHostInterface, id 0x100000b02, registered, matched, active, busy 0, retain 8>
+    {
+      "bInterfaceClass" = 3
+    }
+    
++-o USB2.0 Hub@03100000  <class IOUSBHostDevice, id 0x100000c01, registered, matched, active, busy 0 (9 ms), retain 22>
+  | {
+  |   "idProduct" = 2069
+  |   "USB Product Name" = "USB2.0 Hub"
+  |   "idVendor" = 3141
+  | }
+  | 
+  +-o USB2.0 Hub@0  <class IOUSBHostInterface, id 0x100000c02, registered, matched, active, busy 0, retain 8>
+  | {
+  |   "bInterfaceClass" = 9
+  | }
+  | 
+  +-o USB Audio Device@03110000  <class IOUSBHostDevice, id 0x100000c03, registered, matched, active, busy 0 (4 ms), retain 20>
+    {
+      "idProduct" = 20
+      "USB Product Name" = "USB Audio Device"
+      "idVendor" = 3468
+    }
+    
+    +-o USB Audio Device@0  <class IOUSBHostInterface, id 0x100000c04, registered, matched, active, busy 0, retain 8>
+      {
+        "bInterfaceClass" = 1
+      }
+      

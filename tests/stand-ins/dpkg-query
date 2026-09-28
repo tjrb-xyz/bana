@@ -1,0 +1,5 @@
+#!/bin/sh
+# Stand-in: every package is installed except those in FAKE_MISSING.
+p=$(eval echo "\${$#}")
+case " ${FAKE_MISSING:-} " in *" $p "*) exit 1 ;; esac
+printf 'install ok installed'
