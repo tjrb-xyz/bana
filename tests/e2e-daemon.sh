@@ -77,6 +77,8 @@ until_ok() { # SECONDS WHAT COMMAND...
 
 # ---- the world: a home, bin, an origin and a checkout --------------------------------------
 
+# rustup and cargo find their toolchains through HOME: keep yours for the daemon's build.
+export RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup} CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}
 export HOME=$T/home FAKE_LOG=$T/gh.log FAKE_STATE=$T/state
 mkdir -p "$HOME" "$FAKE_STATE" "$T/bin"
 : >"$FAKE_LOG"
@@ -207,13 +209,19 @@ api() { # PATH [CURL-OPTIONS...]
 # A value from JSON on stdin: a Python expression of j.
 jq_() { python3 -c 'import json,sys; j=json.load(sys.stdin); v=eval(sys.argv[1]); print("" if v is None else v)' "$1"; }
 healthy() { curl -fsS --noproxy '*' --max-time 3 "http://127.0.0.1:$port/ci/v1/health" | grep -q '"daemon":true'; }
+# Healthy, or given up: a daemon that could not start (its build failed) stops the wait.
+up_or_gone() {
+  healthy && return 0
+  ! kill -0 "$daemon_pid" 2>/dev/null
+}
 
 start_daemon() {
   # bana daemon run: the checks, the snapshot, the clone and the settings the first time
   # (it takes the port already in the settings), then the daemon in the foreground.
   (cd "$w" && exec bash "$bana" daemon run >>"$T/daemon.log" 2>&1) &
   daemon_pid=$!
-  until_ok 600 "the daemon's health" healthy
+  until_ok 600 "the daemon's health" up_or_gone
+  healthy || { echo "e2e-daemon: the daemon exited before it was healthy" >&2; return 1; }
 }
 stop_daemon() {
   [[ -n $daemon_pid ]] || return 0
