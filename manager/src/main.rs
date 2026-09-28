@@ -6,17 +6,24 @@
 //!                [--gh PATH] [--token T]
 //!
 //! Prints `http://127.0.0.1:8470/#token=…`; open it. Loopback only.
+//!
+//!   bana-manager daemon --dir ~/.bana/<prefix> [--no-tray]
+//!
+//! runs the project's CI on push (bana_manager::daemon), with the settings
+//! `bana daemon install` wrote to <dir>/daemon/settings.
 
+use bana_manager::daemon::{Daemon, Settings};
 use bana_manager::guard::Access;
 use bana_manager::server::{router, Manager, Tools};
 use bana_manager::{valid_repo, valid_tier, valid_workflow};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::signal::unix::{signal, SignalKind};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: bana-manager --script PATH --repo OWNER/REPO [--port N] [--workflow FILE] [--tiers A,B] [--tier-input NAME] [--gh PATH] [--token T]"
+        "usage: bana-manager --script PATH --repo OWNER/REPO [--port N] [--workflow FILE] [--tiers A,B] [--tier-input NAME] [--gh PATH] [--token T]\n       bana-manager daemon --dir DIR [--no-tray]"
     );
     std::process::exit(2)
 }
@@ -72,14 +79,59 @@ fn fail(msg: &str) -> ! {
     std::process::exit(2)
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let mut args = std::env::args().skip(1).peekable();
+    let daemon_mode = args.peek().is_some_and(|a| a == "daemon");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| fail(&format!("tokio: {e}")));
+    if daemon_mode {
+        args.next();
+        rt.block_on(daemon(args));
+    } else {
+        rt.block_on(manager(args));
+    }
+}
+
+/// `daemon --dir D`: runs until SIGTERM or Ctrl-C, then stops the build it runs.
+async fn daemon(mut args: impl Iterator<Item = String>) {
+    let mut dir = None;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--dir" => dir = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
+            // The menu bar comes later; without it the daemon is the same.
+            "--no-tray" => {}
+            _ => usage(),
+        }
+    }
+    let Some(dir) = dir else { usage() };
+    let settings = Settings::load(&dir).unwrap_or_else(|e| fail(&e));
+    let (repo, prefix) = (settings.repo.clone(), settings.prefix.clone());
+    // Caught from here: a stop during the start (its recovery takes a while)
+    // waits for it, then stops cleanly.
+    let mut term =
+        signal(SignalKind::terminate()).unwrap_or_else(|e| fail(&format!("SIGTERM: {e}")));
+    let mut int = signal(SignalKind::interrupt()).unwrap_or_else(|e| fail(&format!("SIGINT: {e}")));
+    let d = Daemon::start(settings).await.unwrap_or_else(|e| fail(&e));
+    println!(
+        "bana-manager: CI on push for {repo} ({prefix}), in {}",
+        dir.display()
+    );
+    tokio::select! {
+        _ = int.recv() => {}
+        _ = term.recv() => {}
+    }
+    println!("bana-manager: stopping");
+    d.shutdown().await;
+}
+
+async fn manager(mut args: impl Iterator<Item = String>) {
     let mut port = 8470u16;
     let (mut repo, mut script, mut token) = (None, None, None);
     let (mut gh, mut workflow, mut tier_input) =
         ("gh".to_string(), "ci.yml".to_string(), "tier".to_string());
     let mut tiers: Vec<String> = ["quick", "nightly", "release"].map(String::from).into();
-    let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut value = || args.next().unwrap_or_else(|| usage());
         match a.as_str() {

@@ -12,8 +12,10 @@
 //! This module is the pure part: the programs' outputs in, the views out.
 
 pub mod actlog;
+pub mod daemon;
 pub mod guard;
 pub mod server;
+pub mod sweep;
 pub mod watch;
 
 use serde::Serialize;
