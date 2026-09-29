@@ -280,7 +280,16 @@ mod tests {
         // SAFETY: getuid cannot fail.
         let uid = unsafe { libc::getuid() };
         if cfg!(target_os = "linux") {
-            let found = proc_marker_pids(Path::new("/proc"), uid, &marker);
+            // spawn returns once the child's exec has begun, which is before the kernel
+            // records where its environment is: /proc/<pid>/environ reads empty until then.
+            let mut found = Vec::new();
+            for _ in 0..100 {
+                found = proc_marker_pids(Path::new("/proc"), uid, &marker);
+                if !found.is_empty() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
             assert_eq!(found, [child.id()]);
             assert!(proc_marker_pids(Path::new("/proc"), uid.wrapping_add(1), &marker).is_empty());
         }

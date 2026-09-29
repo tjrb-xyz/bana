@@ -129,6 +129,10 @@ check "keep-builds under the daemon's act, in a job with no checkout: nothing to
 ACT=true BANA_DAEMON=1 GITHUB_WORKSPACE=$(pwd) bash "$bana" keep-builds >/dev/null
 check "keep-builds cleans under the daemon's act (a reused container keeps deleted files)" test ! -e scratch/s
 check "keep-builds under the daemon's act keeps the build caches" test -e target/debug/big -a -e web/node_modules/m
+# act copies an action's whole repository into a macOS job (host mode) at each of the
+# action's steps, and cannot copy a symlink twice: bana's own repository has none.
+check "bana has no symlinks (act on a Mac fails a job whose action repository has one)" \
+  same "$(git -C "$here/.." ls-files -s | awk '$1 == "120000" { print $4 }')" ""
 
 # ---- bana ci: the workflow here, with act ------------------------------------------
 fresh

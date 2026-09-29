@@ -1,1 +1,5 @@
-log-only
+#!/bin/sh
+# Stand-in for apt-get, brew, modprobe, useradd, usermod: records the call. Copies, not
+# symlinks: act copies an action's whole repository, and on a Mac (host mode) a second
+# copy of a symlink fails, so bana's actions would fail every macOS job.
+echo "$(basename "$0") $*" >>"$FAKE_LOG"
