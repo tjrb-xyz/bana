@@ -152,9 +152,15 @@ git submodule add https://github.com/tjrb-xyz/bana tools/bana
 git -C tools/bana checkout <commit or tag>
 ```
 
-Other ways: `sh install.sh [REF]` puts a pinned checkout in `~/.bana/src` and `bana` on your PATH, per machine.
-`install.sh` also works as `curl … | sh` once bana is public; while it is private, clone it with
-`gh repo clone tjrb-xyz/bana ~/.bana/src` and run `~/.bana/src/install.sh`.
+Or install it per machine, with a checkout in `~/.bana/src` and `bana` on your PATH (run it again to update;
+`sh -s -- REF` pins a tag or commit):
+
+```sh
+curl -fsSL -H "Authorization: token $(gh auth token)" \
+  https://raw.githubusercontent.com/tjrb-xyz/bana/main/install.sh | sh
+```
+
+The header is there because bana is private; with gh signed in, the script also fetches bana through gh.
 
 **2. Write `.github/bana.conf`** (or `bana.conf` at the root). `key = value` lines; `#` starts a comment line.
 Every key can be overridden by `BANA_<KEY>` in the environment (`plan.path.rust` is `BANA_PLAN_PATH_RUST`).
@@ -284,7 +290,8 @@ On the MacBook, in dsper's checkout, on that branch:
 ```sh
 brew install act gh                          # and OrbStack, running; rustup is there already
 gh auth login
-gh repo clone tjrb-xyz/bana ~/.bana/src && ~/.bana/src/install.sh   # bana on the PATH
+curl -fsSL -H "Authorization: token $(gh auth token)" \
+  https://raw.githubusercontent.com/tjrb-xyz/bana/main/install.sh | sh   # bana on the PATH
 cp ~/.bana/src/examples/dsper/bana.conf .github/bana.conf
 bana ci nightly                              # every job once, by hand; fix what fails
 bana daemon install                          # its warnings name what is left in ci.yml
