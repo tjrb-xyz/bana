@@ -418,6 +418,11 @@ d=$HOME/.bana/wid
 export FAKE_OS=Darwin FAKE_ARCH=arm64 FAKE_HOST=MBP
 bash "$bana" daemon install --port 8471 --no-open >"$T/out" 2>&1 || { cat "$T/out"; false; }
 check "daemon: the doctor reads act's version" has "$T/out" "act: act version 0.2.89"
+hook=$(git rev-parse --git-path hooks)/reference-transaction
+check "daemon: a push hook in this checkout" test -x "$hook"
+check "daemon: it pokes this daemon's port" has "$hook" "http://127.0.0.1:8471/ci/v1/daemon/poll"
+check "daemon: only after a push (origin/ refs, committed)" has "$hook" 'refs/remotes/origin/'
+check "daemon: with the token from its file, not in the hook" lacks "$hook" "$(cat "$HOME/.bana/manager-token" 2>/dev/null || echo no-token)"
 check "daemon: the doctor warns of a push trigger (no pool here)" has "$T/out" "ci.yml:2: a push trigger"
 check "daemon: of a checkout ref:" has "$T/out" "ci.yml:13: a checkout ref:"
 check "daemon: of a runner.environment gate without env.ACT" has "$T/out" "ci.yml:14: act never sets runner.environment"
@@ -547,6 +552,7 @@ mkdir -p "$d/builds/1" "$d/act-cache" && echo '{}' >"$d/state.json" && echo 'K=v
 bash "$bana" daemon uninstall >"$T/out"
 check "daemon uninstall: launchd stops it" has "$FAKE_LOG" "launchctl bootout gui/1000/xyz.tjrb.bana.wid"
 check "daemon uninstall: the LaunchAgent goes" test ! -e "$p"
+check "daemon uninstall: the push hook goes" test ! -e "$hook"
 check "daemon uninstall: the snapshot goes" test ! -e "$d/daemon"
 check "daemon uninstall: builds and clone stay" test -e "$d/builds/1" -a -e "$d/src/.git" -a -e "$d/state.json"
 bash "$bana" daemon uninstall --purge >"$T/out"

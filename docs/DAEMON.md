@@ -1,6 +1,7 @@
 # CI on push: bana daemon
 
-`bana daemon install` makes a machine a project's CI. A daemon fetches the repository every 30 seconds, runs each
+`bana daemon install` makes a machine a project's CI. A daemon fetches the repository every 30 seconds (and at
+once after a push from your checkout, through a git hook install adds; `--no-hook` leaves it out), runs each
 eligible push through `bana ci` (act, in OrbStack's Docker) and posts commit statuses to GitHub with the GitHub
 CLI. On a Mac it is a LaunchAgent in your login session, with 🧱 in the menu bar; on Linux it is a systemd user
 service with no menu bar. It builds in its own clone, `~/.bana/<prefix>/src`, so your checkout stays yours.

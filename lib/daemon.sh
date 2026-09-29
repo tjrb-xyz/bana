@@ -10,12 +10,17 @@
 #     --no-tray        on a Mac: no menu bar item
 #     --no-open        on a Mac: don't open the page afterwards
 #     --now            restart at once, even while a build runs (it runs again once)
+#     --no-hook        don't add the git hook that tells the daemon about your pushes at once
 #   bana daemon uninstall [--purge]  stop and remove it; --purge also its clone, builds and state
 #   bana daemon run [--build]   in the foreground, for debugging (--build: from this checkout first)
 #   bana daemon status          whether it runs, and what it builds
 #   bana daemon log             its log, followed
 #   bana daemon open            its page
 #   bana daemon poke            fetch now, rather than at the next poll
+#
+# The daemon fetches every daemon.poll seconds. Pushes from this checkout reach it at once:
+# install adds a reference-transaction hook here, which git runs when a push updates
+# origin/<branch>, and which then asks the daemon to fetch (as bana daemon poke does).
 #
 # bana.conf's daemon.* keys say which pushes run (`bana settings` lists them). They and
 # the rest of the settings are read at install: run install again after changing them.
@@ -424,6 +429,44 @@ d_service() { # PATH TRAY
 }
 
 # Everything the daemon needs but its service: checks, build, snapshot, clone, settings.
+# The push hook: git runs reference-transaction for every ref change; a push that went
+# through updates refs/remotes/origin/*, "committed". It must never fail (a non-zero exit
+# in "prepared" aborts the change) and never make the push wait, so it pokes in the
+# background, with the token on stdin.
+d_hook_mark='# bana: tells the daemon about your pushes'
+d_hook_file() { # ROOT
+  local dir
+  dir=$(git -C "$1" rev-parse --git-path hooks) || return 1
+  case $dir in /*) ;; *) dir=$1/$dir ;; esac
+  echo "$dir/reference-transaction"
+}
+d_hook_install() { # ROOT PORT
+  local f
+  f=$(d_hook_file "$1") || return 0
+  if [[ -f $f ]] && ! grep -qF "$d_hook_mark" "$f"; then
+    warn "$f is your own hook: pushes reach the daemon at its next poll (or: bana daemon poke)"
+    return 0
+  fi
+  mkdir -p "$(dirname "$f")"
+  cat >"$f.bana" <<HOOK
+#!/bin/sh
+$d_hook_mark (bana daemon install added it; bana daemon uninstall removes it).
+[ "\$1" = committed ] || exit 0
+case "\$(cat)" in *" refs/remotes/origin/"*) ;; *) exit 0 ;; esac
+( printf 'Authorization: Bearer %s\\n' "\$(cat '$base_home/manager-token' 2>/dev/null)" |
+  curl -fsS --noproxy '*' --max-time 5 -H @- -X POST http://127.0.0.1:$2/ci/v1/daemon/poll ) >/dev/null 2>&1 &
+exit 0
+HOOK
+  chmod 0755 "$f.bana"
+  mv "$f.bana" "$f"
+  echo "  push hook: $f"
+}
+d_hook_remove() { # ROOT
+  local f
+  f=$(d_hook_file "$1" 2>/dev/null) || return 0
+  if [[ -f $f ]] && grep -qF "$d_hook_mark" "$f"; then rm -f "$f"; fi
+}
+
 d_prepare() { # PORT TRAY
   local root bin gh path
   root=$(d_root)
@@ -438,7 +481,7 @@ d_prepare() { # PORT TRAY
 }
 
 daemon_install() {
-  local port='' tray=yes open=1 now='' h k path
+  local port='' tray=yes open=1 now='' hook=1 h k path
   [[ $os == Darwin ]] || tray=no
   while (($#)); do
     case $1 in
@@ -446,6 +489,7 @@ daemon_install() {
     --no-tray) tray=no ;;
     --no-open) open='' ;;
     --now) now=1 ;;
+    --no-hook) hook='' ;;
     *) daemon_usage ;;
     esac
     shift
@@ -459,6 +503,7 @@ daemon_install() {
     fi
   fi
   d_prepare "$port" "$tray"
+  if [[ -n $hook ]]; then d_hook_install "$(d_root)" "$port"; else d_hook_remove "$(d_root)"; fi
   path=$(d_setting path)
   [[ -n $now ]] || ! d_installed || d_wait_build "$port"
   d_service "$path" "$tray"
@@ -488,6 +533,7 @@ daemon_uninstall() {
     systemctl --user daemon-reload 2>/dev/null || true
   fi
   rm -rf "$d_snap"
+  d_hook_remove "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   if [[ -n $purge ]]; then
     for d in src builds act-cache state.json daemon.lock; do rm -rf "${home:?}/$d"; done
     rm -f "$d_logfile"

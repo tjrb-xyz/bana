@@ -36,6 +36,13 @@ Install checks the machine and warns about what in the workflow would go wrong u
 checkout. It starts from the branches as they are: the next push builds. Its settings (bana.conf's `daemon.*`
 keys) are read at install, so run it again after changing them.
 
+**How a push reaches it.** The daemon fetches every 30 seconds; that is one small git request, and it catches up
+by itself after the Mac sleeps. A push from your checkout arrives at once: install adds a git hook there
+(`reference-transaction`) that, when a push goes through, asks the daemon to fetch now. A push from elsewhere (a
+merge on GitHub, another machine) waits for the next fetch. No webhook is needed, so nothing on your Mac is
+reachable from the internet and no GitHub Actions minutes are spent. `--no-hook` leaves the hook out, and a
+hook of your own by that name is left alone.
+
 **On GitHub** each build posts the statuses `bana` for the build and `bana/<job>` for each job that starts:
 `running on mbp (quick)`, then `passed on mbp in 12m · 5 jobs` or `rust failed at "cargo clippy" · 3m40s on
 mbp`. A nightly run by hand posts `bana nightly` instead. The *Details* link opens the build on the daemon's
