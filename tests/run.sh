@@ -141,6 +141,12 @@ check "ci: on a Mac, macOS jobs on the Mac itself" has "$FAKE_LOG" "-P wid-macos
 check "ci: arm64 containers on Apple silicon" has "$FAKE_LOG" "--container-architecture linux/arm64 --input tier=quick"
 check "ci: the token from gh, by name only" has "$FAKE_LOG" "-s GITHUB_TOKEN -j plan"
 check "ci: the token itself is not on act's command line" lacks "$FAKE_LOG" "FAKE-GH-TOKEN"
+check "ci: act gets a Docker config of its own (no Keychain prompts)" has "$FAKE_STATE/act.env" "DOCKER_CONFIG=$HOME/.bana/docker"
+check "ci: with no logins in it" same "$(cat "$HOME/.bana/docker/config.json")" '{}'
+mkdir -p "$HOME/.docker"
+# shellcheck disable=SC2088 # a literal ~, as bana.conf has it
+BANA_ACT_DOCKER_CONFIG='~/.docker' FAKE_OS=Darwin FAKE_ARCH=arm64 bash "$bana" ci -j plan >/dev/null
+check "ci: act.docker_config = ~/.docker gives act yours" has "$FAKE_STATE/act.env" "DOCKER_CONFIG=$HOME/.docker"
 : >"$FAKE_LOG"
 FAKE_OS=Darwin FAKE_ARCH=arm64 BANA_ACT_IMAGE=my/image bash "$bana" ci nightly --x64 -- --reuse >/dev/null
 check "ci: --x64, a tier, act.image, and act's own options" has "$FAKE_LOG" "-P wid-linux=my/image"

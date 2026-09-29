@@ -63,7 +63,7 @@ act_lock() { # LABEL
 
 act_main() {
   local tier='' x64='' list='' dry='' event='' secrets='' locked jobs=() pass=() args=() extra=()
-  local wf root here tiers image arch i o
+  local wf root here tiers image arch i o dc
   while (($#)); do
     case $1 in
     -j | --job) jobs=(-j "${2:?-j JOB}"); shift ;;
@@ -143,6 +143,15 @@ act_main() {
     fi
     [[ -z ${GITHUB_TOKEN:-} ]] || args+=(-s GITHUB_TOKEN)
   fi
+  # act pulls with Docker's logins, which on a Mac sit in the Keychain: macOS then asks for
+  # your password whenever act reads them. The images CI needs are public, so act gets a
+  # Docker config of its own, without logins (act.docker_config = ~/.docker for yours).
+  dc=$(conf act.docker_config)
+  case $dc in
+  '') dc=$base_home/docker; mkdir -p "$dc"; [[ -s $dc/config.json ]] || echo '{}' >"$dc/config.json" ;;
+  "~"/*) dc=$HOME/${dc#\~/} ;;
+  esac
+  export DOCKER_CONFIG=$dc
   # The commit's own act options; those after -- come later, so they win.
   read -r -a extra <<<"$(conf act.args)" || true
   say "act: ${tier:-the workflow} from $(basename "$wf"), Linux jobs in $image ($arch)$([[ $os == Darwin ]] && echo ", macOS jobs on this Mac")"
