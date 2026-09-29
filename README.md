@@ -186,6 +186,7 @@ Every key can be overridden by `BANA_<KEY>` in the environment (`plan.path.rust`
 | `runner_version` | the newest | an actions/runner version to pin |
 | `workflow`, `tiers`, `tier_input` | `ci.yml`, `quick nightly release`, `tier` | the workflow `bana ci`, the daemon and the manager's *Start a run* run, and its tier input |
 | `act.image` | `catthehacker/ubuntu:act-24.04` | the image `bana ci` runs Linux jobs in |
+| `act.network` | `bridge` | the Docker network of Linux jobs: `bridge` gives each job a localhost of its own, as on GitHub; `host` (act's default) shares the Docker host's between all of them |
 | `act.args` | | more act options for `bana ci` and the daemon's builds (`--reuse`) |
 | `act.docker_config` | `~/.bana/docker` | the Docker config act pulls with: bana's own, without your logins, so macOS never asks for your Keychain password; `~/.docker` for private images |
 | `daemon.*` | | which pushes the daemon builds, and how ([docs/DAEMON.md](docs/DAEMON.md#settings)) |

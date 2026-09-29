@@ -142,7 +142,8 @@ check "ci: the workflow, dispatched with the first tier" has "$FAKE_LOG" \
   "act workflow_dispatch -C $(pwd -P) -W $(pwd -P)/.github/workflows/ci.yml --artifact-server-path $HOME/.bana/act/artifacts"
 check "ci: Linux jobs in act's Ubuntu image" has "$FAKE_LOG" "-P wid-linux=catthehacker/ubuntu:act-24.04"
 check "ci: on a Mac, macOS jobs on the Mac itself" has "$FAKE_LOG" "-P wid-macos=-self-hosted"
-check "ci: arm64 containers on Apple silicon" has "$FAKE_LOG" "--container-architecture linux/arm64 --input tier=quick"
+check "ci: arm64 containers on Apple silicon" has "$FAKE_LOG" "--container-architecture linux/arm64 --network bridge --input tier=quick"
+check "ci: each Linux job has a localhost of its own, as on GitHub" has "$FAKE_LOG" "--network bridge"
 check "ci: the token from gh, by name only" has "$FAKE_LOG" "-s GITHUB_TOKEN -j plan"
 check "ci: the token itself is not on act's command line" lacks "$FAKE_LOG" "FAKE-GH-TOKEN"
 check "ci: act gets a Docker config of its own (no Keychain prompts)" has "$FAKE_STATE/act.env" "DOCKER_CONFIG=$HOME/.bana/docker"
@@ -151,10 +152,12 @@ mkdir -p "$HOME/.docker"
 # shellcheck disable=SC2088 # a literal ~, as bana.conf has it
 BANA_ACT_DOCKER_CONFIG='~/.docker' FAKE_OS=Darwin FAKE_ARCH=arm64 bash "$bana" ci -j plan >/dev/null
 check "ci: act.docker_config = ~/.docker gives act yours" has "$FAKE_STATE/act.env" "DOCKER_CONFIG=$HOME/.docker"
+BANA_ACT_NETWORK=host FAKE_OS=Darwin FAKE_ARCH=arm64 bash "$bana" ci -j plan >/dev/null
+check "ci: act.network = host shares the Docker host's" has "$FAKE_LOG" "--network host"
 : >"$FAKE_LOG"
 FAKE_OS=Darwin FAKE_ARCH=arm64 BANA_ACT_IMAGE=my/image bash "$bana" ci nightly --x64 -- --reuse >/dev/null
 check "ci: --x64, a tier, act.image, and act's own options" has "$FAKE_LOG" "-P wid-linux=my/image"
-check "ci: x86_64 containers" has "$FAKE_LOG" "--container-architecture linux/amd64 --input tier=nightly"
+check "ci: x86_64 containers" has "$FAKE_LOG" "--container-architecture linux/amd64 --network bridge --input tier=nightly"
 check "ci: after --, act's own options" has "$FAKE_LOG" "-s GITHUB_TOKEN --reuse"
 : >"$FAKE_LOG"
 FAKE_OS=Linux FAKE_ARCH=x86_64 bash "$bana" ci >/dev/null

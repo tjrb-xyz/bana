@@ -113,6 +113,10 @@ act_main() {
   elif [[ $(cpu) == arm64 ]]; then arch=linux/arm64
   else arch=linux/amd64; fi
   args+=(--container-architecture "$arch")
+  # Each job gets a localhost of its own, as on GitHub, where each job has its own machine:
+  # act's default (host) gives all of a run's Linux jobs the Docker host's, so the servers
+  # of jobs running side by side answer each other (act.network = host for that).
+  args+=(--network "$(conf act.network bridge)")
 
   # act reads its files relative to -C: relative paths stay relative to where bana ci runs.
   here=$(pwd -P)

@@ -336,8 +336,11 @@ check "pass: the build succeeded" same "$(state_of "$a")" success
 check "pass: bana pending first" same "$(posts "$a" | head -n 1 | cut -d'|' -f1-2)" "bana|pending"
 check "pass: then bana success" same "$(last "$a" bana | cut -d'|' -f1)" success
 check "pass: per-job contexts, and none for the if: false job" same "$(contexts "$a")" "bana bana/broken bana/host bana/linux "
+# A context's newest state is what goes out: a job that ends before the poster gets to its
+# pending (a host job can take 0 s) posts only its success.
 for j in linux host broken; do
-  check "pass: bana/$j pending, then success" same "$(posts "$a" | grep "^bana/$j|" | cut -d'|' -f2 | tr '\n' ' ')" "pending success "
+  check "pass: bana/$j success (after pending, unless the job was quicker)" same \
+    "$(posts "$a" | grep "^bana/$j|" | cut -d'|' -f2 | tr '\n' ' ' | sed 's/^pending //')" "success "
 done
 check "pass: statuses link to the daemon's page" has "$FAKE_LOG" "target_url=http://127.0.0.1:$port/#build=$id"
 check "pass: in the job, HEAD is the pushed commit" has <(build_log "$id") "HEAD $a"
