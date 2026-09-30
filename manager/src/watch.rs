@@ -238,7 +238,7 @@ pub enum Supersede {
     /// It replaces only the ref's queued build.
     #[default]
     Queued,
-    /// It also cancels the ref's running push build, as dsper's old
+    /// It also cancels the ref's running push build, as example's old
     /// `cancel-in-progress` did.
     Running,
 }
@@ -1583,7 +1583,7 @@ not a ref line
 
     fn project() -> Project {
         Project {
-            repo: "tjrb-xyz/dsper".into(),
+            repo: "tjrb-xyz/example".into(),
             default_branch: "main".into(),
             login: "tjrb".into(),
             tier_input: "tier".into(),
@@ -1606,7 +1606,7 @@ not a ref line
         assert_eq!(e["inputs"], json!({"tier": "quick"}));
         assert_eq!(
             e["compare"],
-            "https://github.com/tjrb-xyz/dsper/compare/aaaaaaaaaaaa...430770d10a9a"
+            "https://github.com/tjrb-xyz/example/compare/aaaaaaaaaaaa...430770d10a9a"
         );
         assert_eq!(e["head_commit"]["id"], head.sha);
         assert_eq!(e["head_commit"]["message"], "second [skip ci]\n\nbody");
@@ -1617,7 +1617,7 @@ not a ref line
         );
         assert_eq!(
             e["repository"],
-            json!({"full_name": "tjrb-xyz/dsper", "name": "dsper", "owner": {"login": "tjrb-xyz"},
+            json!({"full_name": "tjrb-xyz/example", "name": "example", "owner": {"login": "tjrb-xyz"},
                    "default_branch": "main", "private": true})
         );
         assert_eq!(e["sender"]["login"], "tjrb");
@@ -1635,7 +1635,7 @@ not a ref line
         assert_eq!(e["forced"], false);
         assert_eq!(
             e["compare"],
-            "https://github.com/tjrb-xyz/dsper/commit/430770d10a9af81a6d5e766905005710a3cd496a"
+            "https://github.com/tjrb-xyz/example/commit/430770d10a9af81a6d5e766905005710a3cd496a"
         );
 
         // The tier under the workflow's own input name, and none without tiers.

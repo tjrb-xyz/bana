@@ -1,0 +1,48 @@
+name: hosted
+# Runner shapes of public workflows on GitHub's own runners, and others'.
+on: push
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - run: make lint
+  windows:
+    runs-on: windows-latest
+    steps:
+      - run: make test
+  mac:
+    runs-on: macos-14
+    steps:
+      - if: runner.environment == 'self-hosted'
+        run: ./device-test
+      - run: make test
+  old:
+    runs-on: ubuntu-20.04
+    steps:
+      - run: make test
+  depot:
+    runs-on: depot-ubuntu-24.04-4
+    steps:
+      - run: make bench
+  pool:
+    runs-on: [self-hosted, 1ES.Pool=x]
+    steps:
+      - run: make e2e
+  build:
+    strategy:
+      matrix:
+        job:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-24.04 }
+          - { target: aarch64-apple-darwin, os: macos-14 }
+    runs-on: ${{ matrix.job.os }}
+    steps:
+      - run: make dist
+  report:
+    needs: [lint, build]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: make report

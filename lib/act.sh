@@ -42,6 +42,54 @@ act_conf() { # KEY [DEFAULT]
   local conf_file=$round_conf v
   if v=$(conf_lookup "$1"); then printf '%s\n' "$v"; else printf '%s\n' "${2:-}"; fi
 }
+act_conf_keys() { # PREFIX.
+  [[ -n ${round_conf:-} ]] || { conf_keys "$1"; return; }
+  # shellcheck disable=SC2034 # conf_keys reads it
+  local conf_file=$round_conf
+  conf_keys "$1"
+}
+
+# Where a job runs, by the first of its runs-on labels that has a place (act's rule): bana.conf's
+# act.platform.<label> (lowercase) is linux (a container of act.image), mac (this Mac, in act's
+# host mode; elsewhere the job is not run), skip [reason] (not run), or an image of its own.
+# LABEL<TAB>VALUE lines: the built-in ones, then bana.conf's, which win (but for self-hosted,
+# which would take every self-hosted job, and a label with '=', which act cannot map).
+act_platform_table() {
+  local l v e
+  {
+    printf '%s\t%s\n' "$prefix-linux" linux ubuntu-latest linux ubuntu-24.04 linux ubuntu-22.04 linux \
+      ubuntu-20.04 catthehacker/ubuntu:act-20.04 ubuntu-18.04 "skip no act image for 18.04" \
+      "$prefix-macos" mac macos-latest mac
+    for l in $(act_conf_keys act.platform.); do printf '%s\t%s\n' "$l" "$(act_conf "act.platform.$l")"; done
+  } | awk -F'\t' '{ l = tolower($1) } l == "self-hosted" || index(l, "=") { next } !(l in v) { o[++n] = l } { v[l] = $2 }
+    END { for (i = 1; i <= n; i++) printf "%s\t%s\n", o[i], v[o[i]] }' |
+    while IFS=$'\t' read -r l v; do
+      # BANA_ACT_PLATFORM_<LABEL> overrides a built-in one too.
+      e=$(env_name "act.platform.$l")
+      [[ ! $e =~ ^[A-Za-z0-9_]+$ || -z ${!e+x} ]] || v=${!e}
+      printf '%s\t%s\n' "$l" "$v"
+    done
+}
+
+# The -P options for act_platform_table. A skipped label gets an empty image, so that act
+# tries the job's next label, and its own defaults (node:16 for ubuntu-20.04) take nothing.
+act_platforms() { # IMAGE
+  local l v
+  for l in $(act_conf_keys act.platform.); do
+    case $(lower <<<"$l") in
+    self-hosted) warn "act.platform.$l: left out: act would run every self-hosted job there" ;;
+    *=*) warn "act.platform.$l: left out: act cannot map a label with '='" ;;
+    esac
+  done
+  while IFS=$'\t' read -r l v; do
+    case $v in
+    linux) v=$1 ;;
+    mac) if [[ $os == Darwin ]]; then v=-self-hosted; else v=; fi ;;
+    skip | "skip "*) v= ;;
+    esac
+    printf '%s\n' -P "$l=$v"
+  done < <(act_platform_table)
+}
 act_started() { LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | awk '{ $1 = $1; print }'; }
 
 # One act at a time on this machine, for bana ci and the daemon's builds: act names its
@@ -120,9 +168,11 @@ act_main() {
 
   image=$(act_conf act.image catthehacker/ubuntu:act-24.04)
   args=(-C "$root" -W "$wf" --artifact-server-path "$base_home/act/artifacts")
-  for l in "$prefix-linux" ubuntu-latest ubuntu-24.04 ubuntu-22.04; do args+=(-P "$l=$image"); done
-  # A macOS job runs here on a Mac (act's host mode); elsewhere act skips it.
-  [[ $os != Darwin ]] || args+=(-P "$prefix-macos=-self-hosted" -P macos-latest=-self-hosted)
+  # Linux jobs in act.image, macOS jobs on this Mac (act's host mode; elsewhere act skips
+  # them), and the rest as act.platform.* says.
+  while IFS= read -r l; do args+=("$l"); done < <(act_platforms "$image")
+  # vars.* as the daemon has them (its own --var-file comes later, and wins).
+  [[ ! -f $home/vars ]] || args+=(--var-file "$home/vars")
   if [[ -n $x64 ]]; then arch=linux/amd64
   elif [[ $(cpu) == arm64 ]]; then arch=linux/arm64
   else arch=linux/amd64; fi
@@ -216,9 +266,30 @@ act_logged() { # ACT-ARGUMENT...
     "stopped=${stopped:-0}" >"$dir/last.env.part"
   mv -f "$dir/last.log.part" "$dir/last.log"
   mv -f "$dir/last.env.part" "$dir/last.env"
+  act_unmapped "$dir/last.log"
   if ((status)) && [[ -z $stopped ]]; then
     echo "act's output: $dir/last.log"
     say "bana fix: hand this failure to Claude Code on a fix branch"
   fi
   exit "$status"
+}
+
+# The jobs act skipped for want of a place, when no act.platform key says so (a label bana
+# does not know): a warning each, since the run still passes without them.
+act_unmapped() { # LOG
+  local keys job labels l known
+  keys=" $(act_platform_table | cut -f1 | tr '\n' ' ') "
+  # [workflow/job] ... Skipping unsupported platform -- Try running with `-P LABEL=...`
+  # shellcheck disable=SC2016 # act's backquotes
+  sed -n 's/^[^[]*\[\(.*\)\].*Skipping unsupported platform -- Try running with `-P \(.*\)=\.\.\.`.*/\1	\2/p' "$1" |
+    awk -F'\t' '{ j = $1; sub(/.*\//, "", j); sub(/ +$/, "", j) } !(j in l) { o[++n] = j }
+      !((j, $2) in s) { s[j, $2]; l[j] = l[j] (l[j] == "" ? "" : " ") $2 }
+      END { for (i = 1; i <= n; i++) printf "%s\t%s\n", o[i], l[o[i]] }' |
+    while IFS=$'\t' read -r job labels; do
+      known=
+      for l in $labels; do
+        case $keys in *" $(lower <<<"$l") "*) known=1 ;; esac
+      done
+      [[ -n $known ]] || warn "not run here: $job (runs-on: $labels): see bana init"
+    done
 }

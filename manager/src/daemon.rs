@@ -3905,11 +3905,11 @@ exec git \"$@\"
 
         // What Fix with Claude needs, as install writes it.
         let text =
-            "repo = o/r\nprefix = w\ncheckout = /Users/me/src/dsper\nbana_commit = b1df450\n";
+            "repo = o/r\nprefix = w\ncheckout = /Users/me/src/example\nbana_commit = b1df450\n";
         let s = Settings::parse(text, dir, env.clone()).unwrap();
         assert_eq!(
             (s.checkout.as_deref(), s.bana_commit.as_deref()),
-            (Some(Path::new("/Users/me/src/dsper")), Some("b1df450"))
+            (Some(Path::new("/Users/me/src/example")), Some("b1df450"))
         );
 
         let text = "repo=o/r\nprefix=wid\ntiers=\ndaemon.timeout = 90s\ndaemon.token = none\nhome = /h\ndaemon.supersede = running\ndaemon.tags = v*\n";
@@ -3971,7 +3971,10 @@ exec git \"$@\"
                 "repo = o/r\nprefix = w\ndaemon.supersede = always\n",
                 "daemon.supersede",
             ),
-            ("repo = o/r\nprefix = w\ncheckout = src/dsper\n", "checkout"),
+            (
+                "repo = o/r\nprefix = w\ncheckout = src/example\n",
+                "checkout",
+            ),
             (
                 "repo = o/r\nprefix = w\nbana_commit = main\n",
                 "bana_commit",

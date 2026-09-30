@@ -176,13 +176,20 @@ running build and does not run it again.
 The daemon runs the workflow as `workflow_dispatch`, with an event shaped like the push (`github.ref`,
 `github.sha`, `github.event.before`, and the tier in `inputs`). The doctor warns about each of these:
 
-- **`on:` keeps only `workflow_dispatch`.** With `push` too and no runner pool, GitHub queues self-hosted jobs
-  that no runner takes. With only `workflow_dispatch`, GitHub runs nothing itself on a push. A workflow without
-  `workflow_dispatch` cannot be installed.
+- **`on:` keeps only `workflow_dispatch`, or pushes are gated.** With `push` too and no runner pool, GitHub
+  queues self-hosted jobs that no runner takes. With only `workflow_dispatch`, GitHub runs nothing itself on a
+  push. A `push` is fine too when the root jobs run only
+  `if: (github.event_name != 'push' && github.event_name != 'schedule') || vars.<PREFIX>_CI_AUTO != 'false'`
+  (bana init's gate; `vars.<PREFIX>_CI_AUTO != 'false' || github.event_name == 'workflow_dispatch'` does too,
+  for a workflow with no other trigger) and that variable is `false` on GitHub. A workflow without `workflow_dispatch` cannot be installed.
 - **No checkout `ref:`.** act builds the pushed commit only for a checkout without `ref:`; with one it clones
   from GitHub instead.
 - **`runner.environment == 'self-hosted'` gates need `|| env.ACT == 'true'`.** act never sets
   `runner.environment`, so such a step is skipped under the daemon.
+  `$RUNNER_ENVIRONMENT` in a script is empty for the same reason.
+- **Every job has a place.** The doctor runs `bana init --check`: a job whose runs-on label has no place here
+  is not run, and the build still passes. Run `bana init` before install; the `act.platform.*` keys it writes
+  come through `bana ci`, so each build takes them from the commit it builds.
 
 act ignores `on.push.branches`, `paths` and `concurrency`: the daemon's own rules and its one-build-at-a-time
 replace them. act enforces only a step's `timeout-minutes`; `daemon.timeout` guards the build.

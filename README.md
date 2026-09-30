@@ -15,8 +15,8 @@ hardware-bound for GitHub's runners. It is small on purpose, and it works in thr
   A project uses the daemon or the pool, not both.
 
 It runs on macOS (Apple silicon, the stock bash 3.2 and BSD tools, Xcode's command line tools) and on Debian or
-Ubuntu. It was extracted from [dsper](https://github.com/tjrb-xyz/dsper), which is its first user and the
-worked example below.
+Ubuntu. It was extracted from its first user, a project kept here as [the worked example](#the-worked-example),
+`example`.
 
 ## CI on push: bana daemon
 
@@ -24,8 +24,10 @@ In the project's checkout, with act, OrbStack (running), the GitHub CLI signed i
 daemon the first time):
 
 ```sh
-brew install act gh              # and OrbStack, for Docker
+brew install act gh yq           # and OrbStack, for Docker
 gh auth login
+bana init                        # where each job runs here; bana.conf and workflow changes, if you say y
+git add .github && git commit -m "bana as CI"   # the daemon builds commits, with their bana.conf
 bana ci                          # once by hand: the workflow works under act
 bana daemon install              # check, build, start; on a Mac it opens the page
 git push                         # builds on this Mac
@@ -89,13 +91,17 @@ running it on Linux, and the trust boundary in full.
 
 The daemon runs the workflow as `workflow_dispatch`, with an event shaped like the push (`github.ref`,
 `github.sha`, `github.event.before` and the tier input as a push would have them). Install warns about each of
-these:
+these, and `bana init` proposes the changes:
 
-- `on:` keeps only `workflow_dispatch`, so GitHub itself runs nothing on a push. With `push` too and no runner
-  pool, GitHub queues self-hosted jobs that no runner ever takes.
+- GitHub itself runs nothing on a push: `on:` keeps only `workflow_dispatch`, or its root jobs are gated on a
+  variable, `if: (github.event_name != 'push' && github.event_name != 'schedule') || vars.<PREFIX>_CI_AUTO != 'false'`,
+  set to `false` (`gh variable set <PREFIX>_CI_AUTO --body false`); pull requests still run on GitHub. Otherwise,
+  with no runner pool, GitHub queues self-hosted jobs that no runner ever takes.
 - No checkout `ref:`: act builds the pushed commit only for a checkout without one.
 - A step gated on `runner.environment == 'self-hosted'` also needs `|| env.ACT == 'true'`: act never sets
-  `runner.environment`, so the step would be skipped.
+  `runner.environment`, so the step would be skipped. `$RUNNER_ENVIRONMENT` in a script is empty too.
+- Every job has a place here: a runs-on label bana does not know is not run, and the build still passes
+  (`act.platform.*`, below).
 
 macOS jobs run in a fresh copy of the commit, without `target/` or other gitignored files, so they build from
 scratch. Linux jobs run in fresh containers unless bana.conf has `act.args = --reuse`.
@@ -114,8 +120,15 @@ bana ci -- --reuse               # anything after -- goes to act; --reuse keeps 
 
 | Job's `runs-on` | Where it runs |
 |---|---|
-| `<prefix>-linux`, `ubuntu-*` | a container from `act.image` (default `catthehacker/ubuntu:act-24.04`) |
+| `<prefix>-linux`, `ubuntu-latest`, `ubuntu-24.04`, `ubuntu-22.04` | a container from `act.image` (default `catthehacker/ubuntu:act-24.04`) |
+| `ubuntu-20.04` | a container from `catthehacker/ubuntu:act-20.04` |
 | `<prefix>-macos`, `macos-latest` | on a Mac, on the Mac itself (act's host mode, in a copy of your working tree); elsewhere skipped |
+| `ubuntu-18.04`, and any other label | not run (act has no image for 18.04), unless an `act.platform.<label>` key gives it a place |
+
+A job takes the first of its labels that has a place, as act does. `act.platform.<label>` (lowercase) in
+bana.conf is `linux` (a container from `act.image`), `mac` (the Mac itself; elsewhere not run), `skip [reason]`
+(not run) or an image of its own; `bana init` asks and writes these. `self-hosted` and a label with `=` cannot
+be keys. After a run, bana names the jobs that had no place: *not run here: JOB (runs-on: ...): see bana init*.
 
 The run uses your working tree, uncommitted changes included, and the workflow's tier input (`tiers`,
 `tier_input` in bana.conf). Artifacts land in `~/.bana/act/artifacts`. With the GitHub CLI signed in, jobs get
@@ -123,7 +136,8 @@ its token as `GITHUB_TOKEN`.
 
 act's output also goes to `~/.bana/<prefix>/ci/last.log`, and what ran to `last.env` (commit, changed files,
 tier, job, network, versions, exit status, and whether Ctrl-C stopped it), for `bana fix`, which a failed run
-points to. `ci.log = no` skips it.
+points to. `ci.log = no` skips it. The workflow's `vars.*` come from `~/.bana/<prefix>/vars` (`KEY=value`
+lines) if you write one, as under the daemon.
 
 Limits worth knowing:
 - act uses your working tree only for a checkout step without `ref:` (or with `ref:` equal to the current ref).
@@ -193,7 +207,36 @@ Jobs wait in GitHub's queue while no runner is online, so leave the pool (`bana 
 On a Mac, OrbStack's command line (`orb`) makes and runs the Linux machines. Without OrbStack, bana uses Lima
 for the arm64 machine and makes no x86_64 one. A [Tart VM](#more-machines) is an optional extra.
 
+## bana init: bana as the project's CI
+
+```sh
+bana init                        # the report, then what it proposes, asked about on a terminal
+bana init --check                # the report only; exit 1 when a job would have no place here
+bana init --diff | git apply     # only the workflow changes, as a patch
+bana init --workflow test.yml    # another workflow in .github/workflows
+```
+
+In the project's checkout, `bana init` has act evaluate every job's `runs-on` (matrix entries one by one) and
+says where each would run: here, under `bana ci` and the daemon, and in a pool of `bana up` runners. The
+workflow is bana.conf's `workflow`, else `ci.yml`, else the only one with `workflow_dispatch`. A job whose
+`runs-on` or matrix reads `needs.` is decided at run time. A label
+bana does not know is asked about on a terminal (`linux`, `mac`, `skip` or an image) and becomes an
+`act.platform.*` key; without a terminal it is proposed as `skip unknown label`. Notes follow, with the file and
+line: a matrix whose entries go to different places here, a step that needs systemd, a CPU a container cannot give, `$RUNNER_ENVIRONMENT`
+in a script, a checkout `ref:`.
+
+It then proposes `.github/bana.conf` (a new file, or an appended `# bana init DATE` block of the keys it lacks)
+and a patch to the workflow: `workflow_dispatch:` in `on:`, the `env.ACT` and `RUNNER_ENVIRONMENT` gates, the
+`vars.<PREFIX>_CI_AUTO` gate on pushes and nightlies of root jobs (and of jobs that run after skipped needs,
+`always()`), and `runs-on`
+a variable can move to a pool, `${{ fromJSON(vars.<PREFIX>_RUNNER_LINUX || '["self-hosted","<prefix>-linux"]') }}`.
+It writes bana.conf and runs `git apply` only after you say y, and never on a workflow with uncommitted changes.
+No branch, no commit: review with `git diff`. A second run asks only about what is new. It needs act, and
+mikefarah's yq (else the one in `act.image`, through Docker).
+
 ## Adopt bana in a project
+
+`bana init` does steps 2 to 4 for you, or shows what they are.
 
 **1. Add bana.** Pin it as a git submodule, so each checkout of your project has the bana it was tested with:
 
@@ -231,12 +274,14 @@ Every key can be overridden by `BANA_<KEY>` in the environment (`plan.path.rust`
 | `act.image` | `catthehacker/ubuntu:act-24.04` | the image `bana ci` runs Linux jobs in |
 | `act.network` | `bridge` | the Docker network of Linux jobs: `bridge` gives each job a localhost of its own, as on GitHub; `host` (act's default) shares the Docker host's between all of them |
 | `act.args` | | more act options for `bana ci` and the daemon's builds (`--reuse`) |
+| `act.platform.<label>` | see [bana ci](#bana-ci-the-workflow-on-this-machine) | where `bana ci` and the daemon run jobs with this runs-on label: `linux`, `mac`, `skip [reason]` or an image (`bana init` writes these) |
 | `act.docker_config` | `~/.bana/docker` | the Docker config act pulls with: bana's own, without your logins, so macOS never asks for your Keychain password; `~/.docker` for private images |
 | `ci.log` | `yes` | `bana ci` keeps act's output in `~/.bana/<prefix>/ci/last.log` for `bana fix`, through a pipe, so Linux jobs print without colours; `no` gives act your terminal, and keeps nothing |
 | `daemon.*` | | which pushes the daemon builds, and how ([docs/DAEMON.md](docs/DAEMON.md#settings)) |
 | `fix.*` | | a fix's rounds and their token ([docs/DAEMON.md](docs/DAEMON.md#settings)), and `bana fix --headless`'s limits ([docs/FIX.md](docs/FIX.md#headless)) |
 | `keep`, `keep_max_gb` | , `0` | what `keep-builds` keeps (git clean `-e` patterns), and the size that starts one over |
 | `plan.*` | | how `plan` picks jobs ([Tiers and plan](#tiers-and-plan)) |
+| `tart_name` | `bana-tart` | the Tart VM `bana tart up` makes ([More machines](#more-machines)) |
 
 Hooks are paths relative to bana.conf. They get `BANA_DEDICATED`, `BANA_PREFIX`, `BANA_REPO` and
 `BANA_MACHINE`, and a failing hook stops `up`.
@@ -259,7 +304,12 @@ Jobs see `BANA_MACHINE` and, on a machine joined with `--dedicated`, `BANA_DEDIC
 invasive tests (installing drivers, restarting services) that should not run on someone's laptop.
 
 Under `bana ci` and the daemon, act maps `<prefix>-linux` to a container and `<prefix>-macos` to the Mac; the
-other labels matter only to a pool.
+other labels matter only to a pool. To move jobs between the daemon's machines and a pool without editing the
+workflow, take `runs-on` from a variable, as the worked example does:
+
+```yaml
+    runs-on: ${{ fromJSON(vars.MYPROJ_RUNNER_LINUX || '["self-hosted","myproj-linux"]') }}
+```
 
 **4. Run it:** `tools/bana/bin/bana ci` in the project's checkout, then `tools/bana/bin/bana daemon install` for CI
 on push. For a pool instead, `tools/bana/bin/bana up` on each machine ([Commands](#commands)).
@@ -303,74 +353,77 @@ plan.tier.package = nightly release      # package=true on these tiers only
 
 When the changes cannot be told (a new branch with no common history), every path job runs.
 
-## dsper, the worked example
+## The worked example
 
-dsper keeps [examples/dsper/bana.conf](examples/dsper/bana.conf) as `.github/bana.conf`, with its two hooks
-beside it. The mac hook installs Homebrew's scons and dsper's audio driver and checks for rustup. The linux hook
-installs rustup. Its `plan.*` keys are the path rules that were in `scripts/ci.sh`, and `plan` gives the same
-outputs as before. Its `daemon.*` keys build every branch but the bots', at `quick`, and no tags yet.
+`example` is bana's first user: a Rust and web project with a macOS audio driver, Linux services and packages
+for several CPUs. [examples/example](examples/example) has its `.github/bana.conf` and the two hooks beside it,
+and `ci.yml`, its workflow trimmed to where the jobs run (`bana init`'s tests run on it). The mac hook installs
+Homebrew's SCons, ragel and CMake and the project's audio driver, and checks for rustup. The linux hook installs
+rustup and checks that sudo does not ask. Its `plan.*` keys are its path rules. Its `daemon.*` keys build every
+branch but the bots', at `quick`, and no tags.
 
-### CI on push for dsper
+On a Mac, `bana init --check` finds a place for every job of it, and still exits 1: `package`'s matrix splits
+over machines (the Linux targets in containers, `osx-arm64` on the Mac itself), and act runs every Linux
+container at one CPU, so a run there builds only the arm64 targets. Its notes also name `background-linux`,
+which needs systemd that act's containers do not have, and a `$RUNNER_ENVIRONMENT` check in a script.
 
-bana does not push to dsper. These are the changes dsper's maintainer makes, in a dsper branch, for the daemon
-to be dsper's push CI:
+### CI on push for the example
 
-1. `.github/workflows/ci.yml`: `on:` keeps only `workflow_dispatch` with its `tier` input; `push` and
-   `schedule` go, and so does the `concurrency:` block (act ignores it; the daemon builds one at a time and
-   replaces queued pushes). Nightly runs from the page's *Run now* for now.
-2. Every checkout `ref:` goes: the eight `vars.DSPER_NIGHTLY_REF` lines, and `package`'s
-   `ref: ${{ needs.plan.outputs.commit }}`. Any `ref:` makes act clone from GitHub instead of building the
-   pushed commit.
+The daemon on a Mac is the example's push CI, and the pool is one variable away. These are the changes its
+workflow made:
+
+1. `on:` keeps `push`, `schedule` and tags, and the `plan` job, which every other job needs, runs only
+   `if: vars.EXAMPLE_CI_AUTO != 'false' || github.event_name == 'workflow_dispatch'`. With
+   `EXAMPLE_CI_AUTO=false` set on GitHub, GitHub queues nothing; the daemon's builds are `workflow_dispatch`
+   under act, so they always run.
+2. No checkout has a `ref:`: every job tests the run's own commit. Any `ref:` makes act clone from GitHub
+   instead of building the pushed commit.
 3. The three `if: runner.environment == 'self-hosted' || ...` gates in the macos job get `|| env.ACT == 'true'`,
-   or the real-CoreAudio device, mix and cpal checks are skipped under bana. `DSPER_CI_DEDICATED` stays unset on
+   or the real-CoreAudio device, mix and cpal checks are skipped under bana. Every checkout has
+   `clean: ${{ runner.environment != 'self-hosted' && env.ACT != 'true' }}`. `BANA_DEDICATED` stays unset on
    the laptop, so the driver install and LaunchAgent tests stay off.
-4. The macos job gets a last step, `if: always() && env.ACT == 'true'`, that removes the `dsper mix · CI`
-   aggregate device, so a cancel or a failure does not leave it on the Mac:
-   `[[ -x target/release/dsper-coreaudio ]] && printf '{"id":1,"op":"destroy_aggregate","uid":"xyz.tjrb.dsper.agg.mix.ci"}\n' | target/release/dsper-coreaudio || true`.
-5. `scripts/ci.sh changed`: when `git fetch origin "$branch"` fails (act's containers have no credentials), it
-   falls back to `refs/remotes/origin/$branch`, as bana's `changed` does. Otherwise a new branch plans every job.
-6. If Linux builds turn out too slow and `act.args = --reuse` goes in: `scripts/ci.sh keep-builds` cleans under
-   act when `BANA_DAEMON=1`, as bana's does.
-7. `.github/bana.conf` gets the example's `daemon.*` keys.
-8. `docs/CI.md`'s "CI on your Mac" becomes `bana daemon install`, then push: where the statuses and logs are,
-   what the menu bar shows, and that the pool is the optional path.
+4. The macos job's last step, `if: always()`, removes the `example mix · CI` aggregate device, so a cancel or a
+   failure does not leave it on the Mac:
+   `[[ -x target/release/example-coreaudio ]] && printf '{"id":1,"op":"destroy_aggregate","uid":"xyz.tjrb.example.agg.mix.ci"}\n' | target/release/example-coreaudio || true`.
+5. `plan` uses bana's plan action (`tjrb-xyz/bana/actions/plan@<commit>`), whose `changed` falls back to
+   `refs/remotes/origin/<branch>` when act's containers cannot fetch, and the jobs start with `keep-builds`.
+6. Jobs that share a machine keep apart: pnpm/action-setup installs into `${{ runner.temp }}`, the end-to-end
+   tests take a free port, and `background-linux`, which installs the user's one service, takes a per-user
+   `flock`.
+7. `package` checks the machine's CPU is its target's. Under act a target of another CPU is left out with a
+   notice rather than built mislabelled; on a pool a mismatch fails the job.
+8. `.github/bana.conf` has the `daemon.*` keys.
 
-Only dsper's plan job has run under act so far. The first full run will likely need fixes in the rust, web
-(pnpm, setup-node's cache, Playwright), streaming and sdk jobs, which is why `bana ci nightly` runs by hand once
-before the daemon is installed.
-
-On the MacBook, in dsper's checkout, on that branch:
+On the MacBook, in the example's checkout:
 
 ```sh
-brew install act gh                          # and OrbStack, running; rustup is there already
+brew install act gh yq                       # and OrbStack, running; rustup is there already
 gh auth login
 curl -fsSL -H "Authorization: token $(gh auth token)" \
   https://raw.githubusercontent.com/tjrb-xyz/bana/main/install.sh | sh   # bana on the PATH
-cp ~/.bana/src/examples/dsper/bana.conf .github/bana.conf
+bana init --check                            # every job has a place; exits 1 for package's SPLIT matrix
 bana ci nightly                              # every job once, by hand; fix what fails
 bana daemon install                          # its warnings name what is left in ci.yml
+gh variable set EXAMPLE_CI_AUTO --body false # GitHub queues nothing for a pool not there
 git push                                     # 🧱 4m in the menu bar, then bana on the commit
 ```
 
 A pull request's checks then show `bana` and `bana/<job>` from the MacBook. A nightly runs from the page:
 *Run now*, a branch at `nightly`, which posts `bana nightly`.
 
-### A runner pool for dsper instead
+### A runner pool for the example instead
 
-If dsper goes back to a pool (`bana up`), `on:` gets its `push` trigger back and the daemon goes
-(`bana daemon uninstall`): the two must not both take its pushes. Its workflow then changes little:
+If the example goes back to a pool (`bana up` on each machine), `EXAMPLE_CI_AUTO` goes (`gh variable delete
+EXAMPLE_CI_AUTO`) and so does the daemon (`bana daemon uninstall`): the two must not both take its pushes. The
+workflow stays as it is. Its jobs run on
 
-- `runs-on` stays `[self-hosted, dsper-linux]` and `[self-hosted, dsper-macos]`, and packaging per CPU stays
-  `[self-hosted, dsper-linux, linux-x64]` and so on: bana makes the same labels.
-- `scripts/ci.sh keep-builds` becomes `tjrb-xyz/bana/actions/keep-builds@<commit>`, and `plan`'s step pipes
-  `changed` into `plan` as before (or uses the plan action, with `fromJSON` for each output).
-- `DSPER_CI_DEDICATED` becomes `BANA_DEDICATED`.
-- `camilladsp`, `package` and `nightly-done` stay in dsper's `scripts/ci.sh`.
+```yaml
+    runs-on: ${{ fromJSON(vars.EXAMPLE_RUNNER_LINUX || '["self-hosted","example-linux"]') }}
+```
 
-Moving a machine over: `scripts/ci-runner.sh down` with the old script (it removes the old runners and their
-`~/.dsper-ci`), then `git submodule update --init` and `tools/bana/bin/bana up`. The old OrbStack machines
-`dsper-ci` and `dsper-ci-x64` can go (`orb delete -f dsper-ci dsper-ci-x64`), or be kept with
-`vm = dsper-ci` and `vm_x64 = dsper-ci-x64` in bana.conf.
+and `[self-hosted, example-macos]` likewise, and packaging per CPU on `[self-hosted, example-linux, linux-x64]`
+and so on: bana makes the same labels. `EXAMPLE_RUNNER_LINUX` and `EXAMPLE_RUNNER_MACOS` (JSON label lists)
+send the jobs elsewhere without a change to the workflow.
 
 ## Commands
 
@@ -409,7 +462,7 @@ first time) and starts a page on `http://127.0.0.1:8470`:
 - **runs**: the latest ten, each job with the runner it landed on; *Start a run* and *Cancel*;
 - **tasks**: what the page started, with its output.
 
-*Join the pool* runs `bana up` without a terminal, so a hook that asks for a password (dsper's driver install)
+*Join the pool* runs `bana up` without a terminal, so a hook that asks for a password (the example's driver install)
 has to run once from a terminal first. It serves loopback only, behind a token kept in `~/.bana/manager-token`, and runs only `bana` and `gh`, with
 arguments it checks, one runner change at a time. To see another machine's page:
 `ssh -L 8471:127.0.0.1:8470 mac-mini.local`, then open `http://127.0.0.1:8471/#token=…` with that machine's token.
@@ -454,4 +507,4 @@ own devices reach only its macOS runner.
 macOS (stock bash 3.2), plus shellcheck and the manager's tests. On a private repository the macOS job's
 minutes count ten times.
 
-License: GPL-3.0-only, as dsper.
+License: GPL-3.0-only.

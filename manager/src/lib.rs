@@ -296,24 +296,24 @@ mod tests {
 
     #[test]
     fn local_runners_say_what_their_processes_do() {
-        let text = r#"{"kind":"runner","name":"dsper-mbp-macos","machine":"mbp","dir":"/x","labels":"self-hosted,dsper-macos,usb-audio,usb-1c75-af70","listener_pid":41,"worker_pid":42,"dedicated":false}
-{"kind":"runner","name":"dsper-mbp-linux-1","machine":"mbp (bana)","dir":"/y","labels":"self-hosted,dsper-linux","listener_pid":7,"worker_pid":null,"dedicated":true}
+        let text = r#"{"kind":"runner","name":"example-mbp-macos","machine":"mbp","dir":"/x","labels":"self-hosted,example-macos,usb-audio,usb-1c75-af70","listener_pid":41,"worker_pid":42,"dedicated":false}
+{"kind":"runner","name":"example-mbp-linux-1","machine":"mbp (bana)","dir":"/y","labels":"self-hosted,example-linux","listener_pid":7,"worker_pid":null,"dedicated":true}
 not json
 {"kind":"usb","machine":"mbp","id":"1c75:af70","name":"Arturia MiniFuse 2","label":"usb-1c75-af70"}
-{"name":"dsper-mbp-linux-2","machine":"mbp (bana)","dir":"/z","labels":"","listener_pid":null,"worker_pid":null,"dedicated":false}"#;
+{"name":"example-mbp-linux-2","machine":"mbp (bana)","dir":"/z","labels":"","listener_pid":null,"worker_pid":null,"dedicated":false}"#;
         let Local { runners: r, usb } = parse_local(text);
         let states: Vec<_> = r.iter().map(|x| (x.name.as_str(), x.state)).collect();
         assert_eq!(
             states,
             [
-                ("dsper-mbp-macos", "busy"),
-                ("dsper-mbp-linux-1", "idle"),
-                ("dsper-mbp-linux-2", "stopped")
+                ("example-mbp-macos", "busy"),
+                ("example-mbp-linux-1", "idle"),
+                ("example-mbp-linux-2", "stopped")
             ]
         );
         assert_eq!(
             r[0].labels,
-            ["self-hosted", "dsper-macos", "usb-audio", "usb-1c75-af70"]
+            ["self-hosted", "example-macos", "usb-audio", "usb-1c75-af70"]
         );
         assert!(r[1].dedicated && r[2].labels.is_empty());
         assert_eq!(usb.len(), 1);
@@ -330,7 +330,7 @@ not json
     #[test]
     fn the_pool_shows_who_runs_what() {
         let pool = json!({"runners": [
-            {"name": "b", "status": "online", "busy": true, "labels": [{"name": "self-hosted"}, {"name": "dsper-linux"}]},
+            {"name": "b", "status": "online", "busy": true, "labels": [{"name": "self-hosted"}, {"name": "example-linux"}]},
             {"name": "a", "status": "offline", "busy": false, "labels": []}
         ]});
         let runs = json!({"workflow_runs": [
@@ -369,7 +369,7 @@ not json
         ] {
             assert!(!valid_ref(bad), "{bad}");
         }
-        assert!(valid_runner("dsper-mac-mini-linux-arm64-2"));
+        assert!(valid_runner("example-mac-mini-linux-arm64-2"));
         for bad in ["", "../x", "a/b", "a b", "..", "x;y"] {
             assert!(!valid_runner(bad), "{bad}");
         }
@@ -377,7 +377,7 @@ not json
         for bad in ["", "a=b", "a b", "x;y"] {
             assert!(!valid_tier(bad), "{bad}");
         }
-        assert!(valid_repo("tjrb-xyz/dsper") && valid_repo("o/r.js"));
+        assert!(valid_repo("tjrb-xyz/example") && valid_repo("o/r.js"));
         for bad in ["", "o", "o/", "/r", "o/r/x", "-o/r", "o/r;x", "o/.."] {
             assert!(!valid_repo(bad), "{bad}");
         }

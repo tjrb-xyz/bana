@@ -1,7 +1,9 @@
 #!/bin/sh
-# Stand-in docker: running unless FAKE_DOCKER=0.
+# Stand-in docker: running unless FAKE_DOCKER=0; with FAKE_DOCKER_NOIMAGE=1 it has no image.
 echo "docker $*" >>"$FAKE_LOG"
 case $1 in
 info) [ "${FAKE_DOCKER:-1}" = 1 ] ;;
 context) echo "unix://$FAKE_STATE/orbstack.sock" ;;
+image) [ "${FAKE_DOCKER_NOIMAGE:-0}" != 1 ] ;;
+pull) echo "$2: Pulling from the registry" ;;
 esac

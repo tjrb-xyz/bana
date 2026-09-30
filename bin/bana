@@ -3,6 +3,9 @@
 # Each machine runs `bana up` once; GitHub gives each job to a free runner whose
 # labels match, so Macs, Linux PCs and VMs share the work. README.md has the details.
 #
+# Making bana the project's CI:
+#   bana init [--check] [--diff] [--workflow F]   map its runners to this machine and to a pool,
+#                            and propose bana.conf and workflow changes (bana init --help)
 # On this machine, when you want it (act, in OrbStack's Docker; nothing stays running):
 #   bana ci [TIER] [-j JOB] [--x64] [--list] [--event FILE]   the workflow's jobs here (bana ci --help);
 #                            act's output stays in ~/.bana/<prefix>/ci/last.log, for bana fix
@@ -189,7 +192,7 @@ settings() {
   for k in repo prefix labels vm vm_x64 linux_user packages.linux path hook.mac hook.linux \
     runner_version workflow tiers tier_input act.image act.network act.args act.docker_config ci.log keep keep_max_gb \
     daemon.branches daemon.tags daemon.tier daemon.tag_tier daemon.poll daemon.timeout \
-    daemon.supersede daemon.token fix.rounds fix.token fix.allow fix.turns fix.budget_usd; do
+    daemon.supersede daemon.token fix.rounds fix.token fix.allow fix.turns fix.budget_usd tart_name; do
     case $k in
     repo) v=$repo ;; prefix) v=$prefix ;; vm) v=$vm ;; vm_x64) v=$vm_x64 ;; linux_user) v=$linux_user ;;
     hook.*) v=$(conf_path "$k") ;;
@@ -208,10 +211,18 @@ settings() {
     fix.token) v=$(conf "$k" none) ;;
     fix.turns) v=$(conf "$k" 60) ;;
     fix.budget_usd) v=$(conf "$k" 5) ;;
+    tart_name) v=$(conf "$k" bana-tart) ;;
     *) v=$(conf "$k") ;;
     esac
     printf '%s = %s\n' "$k" "$v"
+    [[ $k != act.image ]] || settings_platforms
   done
+}
+# Where each runs-on label runs (lib/act.sh), built-in and bana.conf's.
+settings_platforms() {
+  # shellcheck source=SCRIPTDIR/../lib/act.sh
+  source "$bana_root/lib/act.sh"
+  act_platform_table | awk -F'\t' '{ printf "act.platform.%s = %s\n", $1, $2 }'
 }
 
 # ---- tokens and the GitHub CLI -----------------------------------------------
@@ -832,6 +843,11 @@ ci)
   # shellcheck source=SCRIPTDIR/../lib/act.sh
   source "$bana_root/lib/act.sh"
   act_main "$@"
+  ;;
+init)
+  # shellcheck source=SCRIPTDIR/../lib/init.sh
+  source "$bana_root/lib/init.sh"
+  init_main "$@"
   ;;
 mcp)
   # Claude Code starts it; stdout is the protocol's alone.

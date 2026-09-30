@@ -818,7 +818,7 @@ fn digits(s: &str) -> Option<i64> {
 pub struct Summary {
     /// `owner/repo`.
     pub repo: String,
-    /// bana.conf's prefix: the project's name here (`dsper`).
+    /// bana.conf's prefix: the project's name here (`example`).
     pub prefix: String,
     pub machine: String,
     /// Unix seconds when it was made; ages count from it.
@@ -1913,8 +1913,8 @@ mod tests {
 
     fn summary() -> Summary {
         Summary {
-            repo: "tjrb-xyz/dsper".into(),
-            prefix: "dsper".into(),
+            repo: "tjrb-xyz/example".into(),
+            prefix: "example".into(),
             machine: "mbp".into(),
             now: 10_000,
             watcher: Watcher {
@@ -2059,9 +2059,12 @@ mod tests {
         assert_eq!(v.title, "🧱 4m +2");
         assert_eq!(
             v.tooltip,
-            "bana: building dsper main 1a2b3c4 (quick) · rust, macos · 4m · 2 queued"
+            "bana: building example main 1a2b3c4 (quick) · rust, macos · 4m · 2 queued"
         );
-        assert_eq!(v.status_line, "dsper: building main 1a2b3c4 · rust, macos");
+        assert_eq!(
+            v.status_line,
+            "example: building main 1a2b3c4 · rust, macos"
+        );
         assert_eq!(
             v.last_line.as_deref(),
             Some("Last: passed main 1a2b3c4 · 12 min ago")
@@ -2074,9 +2077,9 @@ mod tests {
         assert_eq!(v.title, BRICK);
         assert_eq!(
             v.tooltip,
-            "bana: dsper idle · last: passed main 1a2b3c4, 12 min ago"
+            "bana: example idle · last: passed main 1a2b3c4, 12 min ago"
         );
-        assert_eq!(v.status_line, "dsper: idle");
+        assert_eq!(v.status_line, "example: idle");
         assert_eq!(v.open_build, Some(3), "else the latest");
 
         let mut s = summary();
@@ -2088,9 +2091,9 @@ mod tests {
         assert_eq!(v.title, "🧱 no Docker");
         assert_eq!(
             v.tooltip,
-            "bana: dsper waiting for Docker · 1 queued · last: failed main 1a2b3c4, 16 min ago · statuses not posted: gh is signed out · fetch failed: could not resolve host"
+            "bana: example waiting for Docker · 1 queued · last: failed main 1a2b3c4, 16 min ago · statuses not posted: gh is signed out · fetch failed: could not resolve host"
         );
-        assert_eq!(v.status_line, "dsper: waiting for Docker (1 queued)");
+        assert_eq!(v.status_line, "example: waiting for Docker (1 queued)");
         assert_eq!(
             v.last_line.as_deref(),
             Some("Last: failed main 1a2b3c4 · 16 min ago")
@@ -2101,12 +2104,12 @@ mod tests {
             (v.title.as_str(), v.last_line, v.open_build, v.fix_line),
             (BRICK, None, None, None)
         );
-        assert_eq!(v.tooltip, "bana: dsper idle");
+        assert_eq!(v.tooltip, "bana: example idle");
         let mut s = summary();
         s.queue = queued(3);
-        assert_eq!(tray_view(&s).status_line, "dsper: 3 queued");
+        assert_eq!(tray_view(&s).status_line, "example: 3 queued");
         s.watcher.paused = true;
-        assert_eq!(tray_view(&s).status_line, "dsper: paused (3 queued)");
+        assert_eq!(tray_view(&s).status_line, "example: paused (3 queued)");
     }
 
     #[test]

@@ -1,0 +1,82 @@
+name: ci
+# The example project's .github/workflows/ci.yml, trimmed to where its jobs run: bana's
+# daemon runs pushes through act as workflow_dispatch, a pool of bana up runners takes them
+# on GitHub, and EXAMPLE_CI_AUTO=false stops GitHub queueing them for a pool not there.
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  schedule:
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: What to run
+        type: choice
+        options: [quick, nightly, release]
+        default: nightly
+jobs:
+  plan:
+    runs-on: ${{ fromJSON(vars.EXAMPLE_RUNNER_LINUX || '["self-hosted","example-linux"]') }}
+    if: vars.EXAMPLE_CI_AUTO != 'false' || github.event_name == 'workflow_dispatch'
+    outputs:
+      rust: ${{ steps.plan.outputs.rust }}
+      mac_full: ${{ steps.plan.outputs.mac_full }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: ${{ runner.environment != 'self-hosted' && env.ACT != 'true' }}
+      - id: plan
+        run: printf 'rust=true\nmac_full=false\n' >>"$GITHUB_OUTPUT"
+  rust:
+    needs: plan
+    if: needs.plan.outputs.rust == 'true'
+    runs-on: ${{ fromJSON(vars.EXAMPLE_RUNNER_LINUX || '["self-hosted","example-linux"]') }}
+    steps:
+      - run: cargo test --workspace
+  web:
+    needs: plan
+    runs-on: ${{ fromJSON(vars.EXAMPLE_RUNNER_LINUX || '["self-hosted","example-linux"]') }}
+    steps:
+      - uses: pnpm/action-setup@v4
+        with: { package_json_file: web/package.json, dest: "${{ runner.temp }}/setup-pnpm" }
+      - name: Chromium (its system libraries only the first time on your own runner)
+        run: |
+          deps=--with-deps
+          if [[ $RUNNER_ENVIRONMENT == self-hosted ]] && compgen -G "$HOME/.cache/ms-playwright/chromium-*" >/dev/null; then deps=; fi
+          npx playwright install $deps chromium
+  macos:
+    needs: plan
+    runs-on: ${{ fromJSON(vars.EXAMPLE_RUNNER_MACOS || '["self-hosted","example-macos"]') }}
+    steps:
+      - run: cargo build --release -p example-coreaudio
+      - name: The example's devices appear in CoreAudio
+        if: runner.environment == 'self-hosted' || env.ACT == 'true' || needs.plan.outputs.mac_full == 'true'
+        run: target/release/example-coreaudio devices
+      - name: On a dedicated CI Mac only
+        run: |
+          if [[ ${BANA_DEDICATED:-} == 1 || $RUNNER_ENVIRONMENT == github-hosted ]]; then macos/driver/install.sh; fi
+  background-linux:
+    needs: plan
+    runs-on: ${{ fromJSON(vars.EXAMPLE_RUNNER_LINUX || '["self-hosted","example-linux"]') }}
+    steps:
+      - name: install, serve, stop cleanly on SIGTERM, uninstall
+        run: |
+          sudo loginctl enable-linger "$USER"
+          scripts/linux.sh install -- --port 18480
+          systemctl --user stop exampled
+  package:
+    needs: [plan, rust, web, macos, background-linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(vars.EXAMPLE_PACKAGE_TARGETS || '["linux-arm64","linux-x64","macos-arm64"]') }}
+    runs-on: ${{ fromJSON(format('["self-hosted","{0}","{1}"]', startsWith(matrix.target, 'macos') && 'example-macos' || 'example-linux', startsWith(matrix.target, 'macos') && 'osx-arm64' || matrix.target)) }}
+    steps:
+      - name: This machine's CPU is the target's
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          case $(uname -m) in x86_64 | amd64) cpu=x64 ;; arm64 | aarch64) cpu=arm64 ;; *) cpu=$(uname -m) ;; esac
+          [[ $cpu == "${TARGET#*-}" || ${ACT:-} == true ]]
+      - run: scripts/ci.sh package "$RUNNER_TEMP/example"

@@ -6,9 +6,9 @@ a job can ask for it:
 
 ```yaml
   hardware:
-    runs-on: [self-hosted, dsper-linux, usb-1c75-af70]   # this device, on any Linux machine that has it
+    runs-on: [self-hosted, example-linux, usb-1c75-af70]   # this device, on any Linux machine that has it
   any-interface:
-    runs-on: [self-hosted, dsper-macos, usb-audio]       # any Mac with a USB audio device
+    runs-on: [self-hosted, example-macos, usb-audio]       # any Mac with a USB audio device
 ```
 
 `bana usb` lists what a machine has and the labels it gives. Labels are set when a runner registers. After you

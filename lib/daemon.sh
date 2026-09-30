@@ -174,6 +174,10 @@ d_doctor() { # ROOT
   if ((${#runners[@]})); then
     warn "  This machine has runners in $repo's pool (${runners[*]}): with the daemon too, pushes run twice. 'bana down' first."
     n=$((n + 1))
+  elif v=$(grep -o 'vars\.[A-Za-z0-9_]*_CI_AUTO' "$wf" | head -1) &&
+    grep -qE "github\.event_name (== 'workflow_dispatch'|!= 'push')" "$wf"; then
+    # The jobs run on push only while the variable is not 'false' (bana init proposes it).
+    echo "  $name: pushes are gated by ${v#vars.}: gh variable set ${v#vars.} --body false, once the daemon runs"
   else
     # grep -n: LINE:TEXT.
     while IFS= read -r line; do
@@ -192,6 +196,29 @@ d_doctor() { # ROOT
     warn "  $name:${line%%:*}: act never sets runner.environment, so this gate skips under the daemon: add || env.ACT == 'true'"
     n=$((n + 1))
   done < <(grep -n 'runner\.environment' "$wf" | grep -v 'env\.ACT' || true)
+  # shellcheck disable=SC2016 # the workflow's
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    warn "  $name:${line%%:*}: \$RUNNER_ENVIRONMENT is empty under act (neither self-hosted nor github-hosted); \${ACT:-} is true there"
+    n=$((n + 1))
+  done < <(grep -nE '\$\{?RUNNER_ENVIRONMENT' "$wf" | grep -v '\${ACT' || true)
+  # Where each job runs here (bana init): a job with no place is left out, and the build passes.
+  line=$(cd "$root" && bash "$self" init --check --workflow "$name" </dev/null 2>/dev/null) && v=0 || v=$?
+  # bana init --check: N jobs with no place here, M split matrices, workflow_dispatch: yes
+  line=$(sed -n 's/^bana init --check: \([0-9]*\) jobs[^,]*, \([0-9]*\) split.*/\1 \2/p' <<<"$line")
+  # Exit 2: no yq or act, which the daemon does without; else it ended before its report.
+  if [[ -z $line && $v != 2 ]]; then
+    warn "  $name: bana init --check failed, so where each job runs here is not checked: bana init says why"
+    n=$((n + 1))
+  fi
+  if [[ -n $line && ${line% *} != 0 ]]; then
+    warn "  $name: ${line% *} jobs would not run here, and the build would still pass: bana init"
+    n=$((n + 1))
+  fi
+  if [[ -n $line && ${line#* } != 0 ]]; then
+    warn "  $name: ${line#* } matrices put entries on other runners, and act runs them all on the first one's: bana init"
+    n=$((n + 1))
+  fi
   ((n)) || echo "  $name: runs as workflow_dispatch, nothing to change"
 }
 

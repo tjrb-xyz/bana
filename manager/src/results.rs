@@ -136,7 +136,7 @@ pub struct Step {
     pub tests: Vec<Count>,
     /// Each test's own line, in order.
     pub cases: Vec<Case>,
-    /// What cargo says to pass to rerun what failed (`-p dsper-engine --test facts`).
+    /// What cargo says to pass to rerun what failed (`-p example-engine --test facts`).
     pub reruns: Vec<String>,
     pub annotations: Vec<Annotation>,
     /// A failed step's last lines, ANSI-stripped.
@@ -197,7 +197,7 @@ pub struct Case {
     /// cargo's test binary (`tests/facts.rs`, `Doc-tests demo`) or nextest's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binary: Option<String>,
-    /// Where it panicked: `crates/dsper-engine/tests/facts.rs:457:18`.
+    /// Where it panicked: `crates/example-engine/tests/facts.rs:457:18`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub at: Option<String>,
     /// The panic's message.
@@ -1700,12 +1700,12 @@ impl Results {
 mod tests {
     use super::*;
 
-    /// The owner's log of a failed dsper run under act on a Mac, as pasted (its
+    /// The owner's log of a failed example run under act on a Mac, as pasted (its
     /// repeated "Error occurred running finally" shortened); and the same lines
     /// as act.jsonl would have them (the text is the paste's; the ids and times
     /// around it are made up in act's shape).
-    const PASTE: &str = include_str!("../tests/fixtures/results/dsper-paste.txt");
-    const PASTE_JSON: &str = include_str!("../tests/fixtures/results/dsper-paste.jsonl");
+    const PASTE: &str = include_str!("../tests/fixtures/results/example-paste.txt");
+    const PASTE_JSON: &str = include_str!("../tests/fixtures/results/example-paste.jsonl");
     /// A real act 0.2.89 run of act-run1.yml (research's run 1): a host-mode
     /// job's cargo test, through a PTY, and nextest; a node job with
     /// annotations and step summaries; a matrix; artifacts.
@@ -1769,11 +1769,11 @@ mod tests {
             );
             assert_eq!(
                 bad[0].at.as_deref(),
-                Some("crates/dsper-engine/tests/facts.rs:457:18")
+                Some("crates/example-engine/tests/facts.rs:457:18")
             );
             assert_eq!(bad[0].message.as_deref(), Some("accepted"));
             assert_eq!(s.cases.len(), 7, "the paste starts at the last tests");
-            assert_eq!(s.reruns, ["-p dsper-engine --test facts"]);
+            assert_eq!(s.reruns, ["-p example-engine --test facts"]);
             assert_eq!(s.tests, [count("cargo", 21, 1, 0, true)]);
             assert!(
                 s.incomplete(),
@@ -1782,7 +1782,7 @@ mod tests {
             assert_eq!(s.tail.len(), 23, "every line before act's");
             assert_eq!(
                 s.tail.last().map(String::as_str),
-                Some("error: test failed, to rerun pass `-p dsper-engine --test facts`")
+                Some("error: test failed, to rerun pass `-p example-engine --test facts`")
             );
             let post = step(r, "rust", &format!("Post {KEEP_BUILDS}"));
             assert_eq!(
@@ -2384,7 +2384,7 @@ test result: FAILED. 0 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; 
         for (t, ok) in [
             ("--lib", true),
             ("--doc", true),
-            ("-p dsper-engine --test facts", true),
+            ("-p example-engine --test facts", true),
             ("-p a --bin b", true),
             ("--example x_1", true),
             ("-p a", false),
@@ -2440,7 +2440,7 @@ time=\"2026-09-29T07:30:01Z\" level=info msg=\"Using docker host 'unix:///var/ru
 [ci/rust]   ✅  Success - Main t [1ms]
 [ci/rust] 🏁  Job succeeded
 time=\"2026-09-29T07:30:09Z\" level=error msg=\"failed to remove \\\"act-ci-rust\\\"\"
-\x1b[31mact is busy here: bana ci quick (dsper)\x1b[0m
+\x1b[31mact is busy here: bana ci quick (example)\x1b[0m
 Error: Job 'rust' failed
 Error: copy /Users/l/.cache/act/tjrb-xyz-bana-actions-plan@1a2b3c4/x: file exists
 ";
@@ -2455,7 +2455,7 @@ Error: copy /Users/l/.cache/act/tjrb-xyz-bana-actions-plan@1a2b3c4/x: file exist
             errors,
             [
                 (Owner::Act, "failed to remove \"act-ci-rust\""),
-                (Owner::Bana, "act is busy here: bana ci quick (dsper)"),
+                (Owner::Bana, "act is busy here: bana ci quick (example)"),
                 (
                     Owner::Bana,
                     "copy /Users/l/.cache/act/tjrb-xyz-bana-actions-plan@1a2b3c4/x: file exists"
@@ -2681,7 +2681,7 @@ Error: copy /Users/l/.cache/act/tjrb-xyz-bana-actions-plan@1a2b3c4/x: file exist
             [1, 4, 1, 7, 1, 1, 1]
         );
         let test = lines.iter().find(|v| v["kind"] == "test").unwrap();
-        assert_eq!(test["at"], "crates/dsper-engine/tests/facts.rs:457:18");
+        assert_eq!(test["at"], "crates/example-engine/tests/facts.rs:457:18");
         assert_eq!(test["key"], "rust");
         assert_eq!(test["step"], "cargo test --workspace");
         let error = lines.last().unwrap();

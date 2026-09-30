@@ -384,7 +384,7 @@ fn a_fixs_tools_answer_from_its_files_without_the_daemon() {
     // The owner's pasted log, folded as bana fix folds it.
     let folded = Command::new(BIN)
         .args(["results", "--text"])
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/results/dsper-paste.txt"))
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/results/example-paste.txt"))
         .output()
         .unwrap();
     assert!(folded.status.success());

@@ -3210,10 +3210,10 @@ mod tests {
     use crate::results::{Annotation, Count};
     use std::process::Command as Std;
 
-    /// The owner's pasted log of a failed dsper run (results.rs has the same),
+    /// The owner's pasted log of a failed example run (results.rs has the same),
     /// and those lines as the daemon's act.jsonl.
-    const PASTE: &str = include_str!("../tests/fixtures/results/dsper-paste.txt");
-    const PASTE_JSON: &str = include_str!("../tests/fixtures/results/dsper-paste.jsonl");
+    const PASTE: &str = include_str!("../tests/fixtures/results/example-paste.txt");
+    const PASTE_JSON: &str = include_str!("../tests/fixtures/results/example-paste.jsonl");
     const PIN: &str = "a4b6f87212d190304c530041b9bbd5fed72f0dd3";
     const BANA_HERE: &str = "b1df450aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -3277,7 +3277,7 @@ mod tests {
 
         fn prepare(&self, source: Source) -> Result<Prepared, Error> {
             let mut p = Prepare::new(&self.dir, &self.work, source);
-            p.repo = Some("tjrb-xyz/dsper".into());
+            p.repo = Some("tjrb-xyz/example".into());
             p.machine = Some("mbp".into());
             prepare(&p)
         }
@@ -3403,12 +3403,12 @@ mod tests {
         assert_eq!(
             lines[0],
             format!(
-                "bana's CI failed for tjrb-xyz/dsper in a log the owner pasted (speaker-check, quick; bana a4b6f87 in the workflow). You are in a git worktree of the owner's checkout, on the new branch bana/fix-{fix} at its HEAD, {fix}; the log does not say which commit it ran."
+                "bana's CI failed for tjrb-xyz/example in a log the owner pasted (speaker-check, quick; bana a4b6f87 in the workflow). You are in a git worktree of the owner's checkout, on the new branch bana/fix-{fix} at its HEAD, {fix}; the log does not say which commit it ran."
             )
         );
         assert_eq!(
             lines[1],
-            "Failed (the project's): `rust › cargo test --workspace`: `real_c3_the_engine_accepts_only_its_token_and_no_origin` panicked at `crates/dsper-engine/tests/facts.rs:457:18`: `accepted`. Rerun: `cargo test -p dsper-engine --test facts`. Cargo stopped at this binary, so later test binaries did not run."
+            "Failed (the project's): `rust › cargo test --workspace`: `real_c3_the_engine_accepts_only_its_token_and_no_origin` panicked at `crates/example-engine/tests/facts.rs:457:18`: `accepted`. Rerun: `cargo test -p example-engine --test facts`. Cargo stopped at this binary, so later test binaries did not run."
         );
         assert_eq!(
             lines[2],
@@ -3444,13 +3444,13 @@ mod tests {
             "### `rust › cargo test --workspace`",
             "The project's step failed after 4m58s.",
             "Tests (cargo): 21 passed, 1 failed, 0 skipped; incomplete: cargo stopped",
-            "- `real_c3_the_engine_accepts_only_its_token_and_no_origin`, panicked at `crates/dsper-engine/tests/facts.rs:457:18`\n\n  ```text\n  accepted\n  ```\n",
-            "Rerun: `cargo test -p dsper-engine --test facts`",
+            "- `real_c3_the_engine_accepts_only_its_token_and_no_origin`, panicked at `crates/example-engine/tests/facts.rs:457:18`\n\n  ```text\n  accepted\n  ```\n",
+            "Rerun: `cargo test -p example-engine --test facts`",
             "## Not the project's",
             "### An error outside the jobs (bana's)\n\n```text\nError occurred running finally: Error occurred running finally",
             "file exists (original error: <nil>) (original error: <nil>) (original error: <nil>)\n```\n\nThe workflow pins bana a4b6f87.\n",
             "Its last 23 lines:\n\n```text\ntest real_c3_the_engine_accepts_only_its_token_and_no_origin ... FAILED\n",
-            "error: test failed, to rerun pass `-p dsper-engine --test facts`\n```\n",
+            "error: test failed, to rerun pass `-p example-engine --test facts`\n```\n",
             "- Run: a log the owner pasted",
             "- Tier: quick",
             "- bana the workflow pins: a4b6f87 (.github/workflows/ci.yml)",
@@ -3832,7 +3832,7 @@ mod tests {
         }
         let prompt = r.state(fix, "prompt.txt");
         assert!(prompt.starts_with(&format!(
-            "bana's CI failed for tjrb-xyz/dsper at {fix} (speaker-check, quick, on mbp; act network host; bana a4b6f87 in the workflow). You are in a git worktree of the owner's checkout, on the new branch bana/fix-{fix} at that commit. The run had uncommitted changes in 3 files, which this branch lacks: `src/lib.rs`, `my notes.txt`, `café \"1\".txt`.\n"
+            "bana's CI failed for tjrb-xyz/example at {fix} (speaker-check, quick, on mbp; act network host; bana a4b6f87 in the workflow). You are in a git worktree of the owner's checkout, on the new branch bana/fix-{fix} at that commit. The run had uncommitted changes in 3 files, which this branch lacks: `src/lib.rs`, `my notes.txt`, `café \"1\".txt`.\n"
         )), "{prompt}");
         assert!(
             prompt
@@ -3921,7 +3921,7 @@ mod tests {
             fix: "d4b5174",
             sha: "d4b5174aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             branch: "bana/fix-d4b5174",
-            worktree: Path::new("/Users/lilly/.bana/dsper/fix/d4b5174"),
+            worktree: Path::new("/Users/lilly/.bana/example/fix/d4b5174"),
             reused: false,
             ahead: 0,
             paste: false,
@@ -3934,8 +3934,8 @@ mod tests {
             job: None,
             notes: &[],
             log: None,
-            bana: "/Users/lilly/src/dsper/tools/bana/bin/bana",
-            brief: Path::new("/Users/lilly/.bana/dsper/fix/d4b5174.d/brief.md"),
+            bana: "/Users/lilly/src/example/tools/bana/bin/bana",
+            brief: Path::new("/Users/lilly/.bana/example/fix/d4b5174.d/brief.md"),
             rounds: None,
             recheck: false,
             jobs: &[],
@@ -3945,7 +3945,7 @@ mod tests {
     #[test]
     fn the_prompt_fits_the_link_with_twenty_failures() {
         let mut r = Results::default();
-        r.build.repo = Some("tjrb-xyz/dsper".into());
+        r.build.repo = Some("tjrb-xyz/example".into());
         r.build.git_ref = Some("refs/heads/speaker-check".into());
         for i in 0..20 {
             r.jobs.push(Job {
@@ -3970,7 +3970,7 @@ mod tests {
         let v = view(&r, &pins);
         let prompt = render_prompt(&v);
         assert!(units(&prompt) <= PROMPT_MAX, "{}", units(&prompt));
-        assert!(prompt.starts_with("bana's CI failed for tjrb-xyz/dsper at d4b5174 (speaker-check; bana a4b6f87 in the workflow)."));
+        assert!(prompt.starts_with("bana's CI failed for tjrb-xyz/example at d4b5174 (speaker-check; bana a4b6f87 in the workflow)."));
         assert!(prompt.contains("\n- `job-0 › cargo test -p crate0 --features a,b,c`: `module_0::"));
         assert!(!prompt.contains('…'), "NFKC makes it three characters");
         assert!(prompt.contains("more: see the brief."), "{prompt}");
@@ -3980,7 +3980,7 @@ mod tests {
         );
         let q = query(&link(&v.worktree.to_string_lossy(), &prompt));
         assert_eq!(q["q"], prompt);
-        assert_eq!(q["cwd"], "/Users/lilly/.bana/dsper/fix/d4b5174");
+        assert_eq!(q["cwd"], "/Users/lilly/.bana/example/fix/d4b5174");
 
         // With the daemon's rounds, the loop's words: bana's tools, and round 0
         // (of the project's failed jobs: macos failed in bana's step alone).
@@ -4011,7 +4011,7 @@ mod tests {
         step.tests.clear();
         step.reruns.clear();
         step.tail
-            .push("error: could not compile `dsper-engine` (lib) due to 1 previous error".into());
+            .push("error: could not compile `example-engine` (lib) due to 1 previous error".into());
         step.tail.push(String::new());
         let one = Results {
             jobs: vec![Job {
@@ -4029,7 +4029,7 @@ mod tests {
             "`lint › cargo test -p crate1 --features a,b,c` failed. Its last lines (log data):\n```\nline 49 "
         ), "{prompt}");
         assert!(prompt.contains(
-            "\nerror: could not compile `dsper-engine` (lib) due to 1 previous error\n```\n"
+            "\nerror: could not compile `example-engine` (lib) due to 1 previous error\n```\n"
         ));
         assert!(prompt.contains("\n2. Reproduce it in this worktree as the failing step runs it (.github/workflows/ci.yml)."));
         let brief = render_brief(&v);
@@ -4126,8 +4126,8 @@ mod tests {
         assert_eq!(code("x ``` y"), "```` x ``` y ````");
         assert_eq!(code("two\nlines"), "`two lines`");
         assert_eq!(
-            sh_word("/Users/lilly/src/dsper/tools/bana/bin/bana"),
-            "/Users/lilly/src/dsper/tools/bana/bin/bana"
+            sh_word("/Users/lilly/src/example/tools/bana/bin/bana"),
+            "/Users/lilly/src/example/tools/bana/bin/bana"
         );
         assert_eq!(sh_word("/Users/l/My src/bana"), "'/Users/l/My src/bana'");
         assert_eq!(
@@ -5012,8 +5012,10 @@ Error: {say} /Users/l/.cache/act/x-bana-actions-plan@1/y
         assert_eq!(
             p.compare.as_deref(),
             Some(
-                format!("https://github.com/tjrb-xyz/dsper/compare/speaker-check...bana/fix-{fix}")
-                    .as_str()
+                format!(
+                    "https://github.com/tjrb-xyz/example/compare/speaker-check...bana/fix-{fix}"
+                )
+                .as_str()
             )
         );
         let head = format!("refs/heads/{}", f.branch);

@@ -10,7 +10,7 @@ failures:
 
 ---- real_c3_the_engine_accepts_only_its_token_and_no_origin stdout ----
 
-thread 'real_c3_the_engine_accepts_only_its_token_and_no_origin' (10194) panicked at crates/dsper-engine/tests/facts.rs:457:18:
+thread 'real_c3_the_engine_accepts_only_its_token_and_no_origin' (10194) panicked at crates/example-engine/tests/facts.rs:457:18:
 accepted
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 
@@ -20,7 +20,7 @@ failures:
 
 test result: FAILED. 21 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.84s
 
-error: test failed, to rerun pass `-p dsper-engine --test facts`
+error: test failed, to rerun pass `-p example-engine --test facts`
 [ci/rust            ]   ❌  Failure - Main cargo test --workspace [4m58.608749125s]
 [ci/rust            ] exitcode '101': failure
 [ci/rust            ] ⭐ Run Post dtolnay/rust-toolchain@stable
