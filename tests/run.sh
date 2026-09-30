@@ -1144,7 +1144,7 @@ d = plistlib.load(open(sys.argv[1], "rb"))
 print(json.dumps(d[sys.argv[2]] if len(sys.argv) > 2 else sorted(d), separators=(",", ":")))' "$@"
 }
 # The keys the daemon takes, from its source (any other key stops it).
-daemon_keys=$(sed -n '/^const KEYS/,/^];/p' "$here/../manager/src/daemon.rs" | grep -o '"[^"]*"' | tr -d '"')
+daemon_keys=$(sed -n -e '/^pub const PROJECT_KEYS/,/^];/p' -e '/^pub const MACHINE_KEYS/,/^];/p' "$here/../manager/src/daemon.rs" | grep -o '"[^"]*"' | tr -d '"')
 only_daemon_keys() { # SETTINGS
   local k ok=0
   while read -r k; do

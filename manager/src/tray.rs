@@ -5,7 +5,7 @@
 //! - left click: opens the page on the running build (else the latest);
 //! - right click: the menu (the status, the last result, Publish vX… while
 //!   bana asks to publish a release, Fix #N with Claude… while the last build
-//!   failed, Open bana, Cancel build, Pause new builds, Quit bana).
+//!   failed, Open bana, Cancel build, Pause automatic builds, Quit bana).
 //!
 //! Publish vX… opens the page on the release's card, where the notes are
 //! read first: nothing is published from the menu.
@@ -15,12 +15,15 @@
 //! terminal in the fix's worktree with the prompt typed. If the fix cannot be
 //! made, the page opens on the build instead: its button says why.
 //!
+//! It shows one project: the one whose build runs, else the first.
+//!
 //! It runs in the daemon's process, on the main thread (AppKit wants it),
-//! while the daemon runs on tokio's threads. A task forwards the daemon's
-//! summary to the event loop; a 60 s tick keeps the elapsed time current.
+//! while the daemon runs on tokio's threads. A task forwards the projects'
+//! changes to the event loop; a 60 s tick keeps the elapsed time current.
 
-use crate::actlog::{tray_view, Summary, BRICK};
+use crate::actlog::{tray_view, BRICK};
 use crate::daemon::Daemon;
+use crate::registry::Registry;
 use std::cell::Cell;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -39,9 +42,9 @@ const RELEASE_AT: usize = 2;
 const FIX_AT: usize = 2;
 
 pub enum Wake {
-    /// The daemon runs; the page's URL, with the token, and the runtime the
-    /// menu's longer actions run on.
-    Ready(Daemon, String, Handle),
+    /// The daemon runs: its projects, the page's URL, with the token, and
+    /// the runtime the menu's longer actions run on.
+    Ready(Arc<Registry>, String, Handle),
     Changed,
     Stopped,
     Menu(MenuEvent),
@@ -53,13 +56,13 @@ pub enum Wake {
 pub struct Tray(EventLoopProxy<Wake>);
 
 impl Tray {
-    /// The daemon runs: the menu bar follows its summary from now on.
+    /// The daemon runs: the menu bar follows its projects from now on.
     /// Called on the runtime.
-    pub fn ready(&self, d: &Daemon, url: String) {
+    pub fn ready(&self, r: &Arc<Registry>, url: String) {
         let _ = self
             .0
-            .send_event(Wake::Ready(d.clone(), url, Handle::current()));
-        let (mut rx, proxy) = (d.subscribe(), self.0.clone());
+            .send_event(Wake::Ready(r.clone(), url, Handle::current()));
+        let (mut rx, proxy) = (r.subscribe(), self.0.clone());
         tokio::spawn(async move {
             while rx.changed().await.is_ok() {
                 if proxy.send_event(Wake::Changed).is_err() {
@@ -97,8 +100,10 @@ struct Items {
 
 /// What the menu bar knows of the daemon.
 struct Shown {
-    daemon: Daemon,
-    summary: tokio::sync::watch::Receiver<Summary>,
+    registry: Arc<Registry>,
+    /// The project shown, and its prefix.
+    daemon: Option<Daemon>,
+    prefix: String,
     url: String,
     rt: Handle,
     running: Option<u64>,
@@ -115,7 +120,7 @@ fn menu() -> (Menu, Items) {
     let last = MenuItem::new("Last: none yet", false, None);
     let open = MenuItem::new("Open bana", false, None);
     let cancel = MenuItem::new("Cancel build", false, None);
-    let pause = CheckMenuItem::new("Pause new builds", false, false, None);
+    let pause = CheckMenuItem::new("Pause automatic builds", false, false, None);
     let quit = MenuItem::new("Quit bana (local CI stops until next login)", true, None);
     let menu = Menu::with_items(&[
         &status,
@@ -144,10 +149,30 @@ fn menu() -> (Menu, Items) {
     (menu, it)
 }
 
-/// The summary last published, into the title, the tooltip and the menu.
-/// (Not `Daemon::summary`: that publishes, and would wake us again.)
+/// The shown project's summary last published, into the title, the tooltip
+/// and the menu. (Not `Daemon::summary`: that publishes, and would wake us
+/// again.)
 fn show(tray: &TrayIcon, it: &Items, s: &mut Shown) {
-    let summary = s.summary.borrow().clone();
+    let all = s.registry.daemons();
+    let shown = all
+        .iter()
+        .find(|(_, d)| d.running().is_some())
+        .or(all.first())
+        .cloned();
+    let Some((prefix, d)) = shown else {
+        s.daemon = None;
+        tray.set_title(Some(BRICK));
+        let _ = tray.set_tooltip(Some("bana: no projects yet"));
+        it.status
+            .set_text("bana: no projects yet (bana add in a checkout)");
+        for i in [&it.last, &it.cancel] {
+            i.set_enabled(false);
+        }
+        it.pause.set_enabled(false);
+        return;
+    };
+    let summary = d.published();
+    (s.daemon, s.prefix) = (Some(d), prefix);
     let v = tray_view(&summary);
     s.running = summary.running.as_ref().map(|b| b.id);
     s.last = summary.last.as_ref().map(|b| b.id);
@@ -194,11 +219,11 @@ fn show(tray: &TrayIcon, it: &Items, s: &mut Shown) {
     it.pause.set_checked(v.paused);
 }
 
-/// Opens the page (on build `id`) in the default browser; or, with no build,
-/// any URL (Claude Code's link).
-fn open(url: &str, id: Option<u64>) {
+/// Opens the page (on project `p`'s build `id`) in the default browser; or,
+/// with no build, any URL (Claude Code's link).
+fn open(url: &str, p: &str, id: Option<u64>) {
     let url = match id {
-        Some(id) => format!("{url}&build={id}"),
+        Some(id) => format!("{url}&p={p}&build={id}"),
         None => url.to_string(),
     };
     match std::process::Command::new("open").arg(&url).spawn() {
@@ -210,22 +235,24 @@ fn open(url: &str, id: Option<u64>) {
     }
 }
 
-/// Publish `tag`…: the page, on the release's card (a tag is `[A-Za-z0-9._-]`).
-fn open_release(url: &str, tag: &str) {
-    open(&format!("{url}&release={tag}"), None);
+/// Publish `tag`…: the page, on project `p`'s release's card (a tag is
+/// `[A-Za-z0-9._-]`).
+fn open_release(url: &str, p: &str, tag: &str) {
+    open(&format!("{url}&p={p}&release={tag}"), p, None);
 }
 
 /// Fix #`id` with Claude…: the daemon makes the fix (git may take a while, so
 /// on the runtime, not this thread), then its link goes to Claude Code's
 /// handler. When it cannot, the page opens on the build.
 fn fix(s: &Shown, id: u64) {
-    let (d, url) = (s.daemon.clone(), s.url.clone());
+    let Some(d) = s.daemon.clone() else { return };
+    let (url, p) = (s.url.clone(), s.prefix.clone());
     s.rt.spawn(async move {
         match d.fix(id).await {
-            Ok(made) => open(&made.link, None),
+            Ok(made) => open(&made.link, &p, None),
             Err(e) => {
                 eprintln!("bana-manager: fix #{id}: {e}");
-                open(&url, Some(id));
+                open(&url, &p, Some(id));
             }
         }
     });
@@ -285,7 +312,9 @@ pub fn run(quit: Arc<Notify>, start: impl FnOnce(Tray)) -> ! {
             Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
                 tick = Instant::now() + TICK;
                 if let Some(s) = &shown {
-                    s.daemon.summary();
+                    for (_, d) in s.registry.daemons() {
+                        d.summary();
+                    }
                 }
                 false
             }
@@ -294,10 +323,11 @@ pub fn run(quit: Arc<Notify>, start: impl FnOnce(Tray)) -> ! {
                 *flow = ControlFlow::Exit;
                 return;
             }
-            Event::UserEvent(Wake::Ready(d, url, rt)) => {
+            Event::UserEvent(Wake::Ready(registry, url, rt)) => {
                 shown = Some(Shown {
-                    summary: d.subscribe(),
-                    daemon: d,
+                    registry,
+                    daemon: None,
+                    prefix: String::new(),
                     url,
                     rt,
                     running: None,
@@ -311,7 +341,7 @@ pub fn run(quit: Arc<Notify>, start: impl FnOnce(Tray)) -> ! {
             Event::UserEvent(Wake::Changed) => true,
             Event::UserEvent(Wake::LeftClick) => {
                 if let Some(s) = &shown {
-                    open(&s.url, s.open);
+                    open(&s.url, &s.prefix, s.open);
                 }
                 false
             }
@@ -338,26 +368,28 @@ pub fn run(quit: Arc<Notify>, start: impl FnOnce(Tray)) -> ! {
                     shown = None;
                 } else if let Some(s) = &shown {
                     if e.id == it.open.id() {
-                        open(&s.url, s.open);
+                        open(&s.url, &s.prefix, s.open);
                     } else if e.id == it.last.id() {
-                        open(&s.url, s.last);
+                        open(&s.url, &s.prefix, s.last);
                     } else if e.id == it.release.id() {
                         if let Some(tag) = &s.release {
-                            open_release(&s.url, tag);
+                            open_release(&s.url, &s.prefix, tag);
                         }
                     } else if e.id == it.fix.id() {
                         if let Some(id) = s.fix {
                             fix(s, id);
                         }
                     } else if e.id == it.cancel.id() {
-                        if let Some(id) = s.running {
-                            if let Err(e) = s.daemon.cancel(id, "cancelled from the menu bar") {
+                        if let (Some(id), Some(d)) = (s.running, &s.daemon) {
+                            if let Err(e) = d.cancel(id, "cancelled from the menu bar") {
                                 eprintln!("bana-manager: {e}");
                             }
                         }
                     } else if e.id == it.pause.id() {
                         // The check mark already shows the new choice.
-                        s.daemon.set_paused(it.pause.is_checked());
+                        if let Some(d) = &s.daemon {
+                            d.set_paused(it.pause.is_checked());
+                        }
                     }
                 }
                 false

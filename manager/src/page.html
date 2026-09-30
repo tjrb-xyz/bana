@@ -265,6 +265,8 @@ const token = (() => {
   try { return localStorage.getItem("bana-token") || sessionStorage.getItem("bana"); } catch (e) { return null; }
 })();
 let daemon = false;
+// The project shown (#p=…): the daemon serves each under /ci/v1/p/<prefix>.
+let project = "";
 const noToken = () => daemon
   ? "Click the bana icon in the menu bar once (or run `bana daemon open`): that gives this browser the page's token."
   : "Open the link bana-manager printed (it carries the token).";
@@ -273,8 +275,9 @@ const chip = (l) => `<span class="chip${/^usb-/.test(l) ? " hw" : ""}">${esc(l)}
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 function show(id, text) { const el = $(id); el.hidden = !text; el.textContent = text || ""; }
 
+const apiBase = () => daemon ? "/ci/v1/p/" + encodeURIComponent(project) : "/ci/v1";
 async function api(method, path, body) {
-  const r = await fetch("/ci/v1" + path, {
+  const r = await fetch(apiBase() + path, {
     method, headers: { authorization: "Bearer " + token, ...(body ? { "content-type": "application/json" } : {}) },
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -594,7 +597,7 @@ function renderFiles(id, dist) {
 async function download(id, name, button) {
   button.disabled = true;
   try {
-    const r = await fetch(`/ci/v1/builds/${id}/files/${encodeURIComponent(name)}`, { headers: { authorization: "Bearer " + token } });
+    const r = await fetch(`${apiBase()}/builds/${id}/files/${encodeURIComponent(name)}`, { headers: { authorization: "Bearer " + token } });
     if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
     const a = document.createElement("a");
     a.href = URL.createObjectURL(await r.blob());
@@ -1113,11 +1116,20 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden && da
   let h = {};
   try { h = await (await fetch("/ci/v1/health")).json(); } catch (e) {}
   daemon = h.daemon === true;
+  if (daemon && token) {
+    // The project in the address, else the one whose build runs, else the first.
+    let rows = [];
+    try { rows = await (await fetch("/ci/v1/projects", { headers: { authorization: "Bearer " + token } })).json(); } catch (e) {}
+    const want = new URLSearchParams(location.hash.slice(1)).get("p");
+    const row = rows.find((r) => r.prefix === want) || rows.find((r) => r.running) || rows[0];
+    project = row ? row.prefix : "";
+  }
   if (daemon) {
     $("ci").hidden = false;
     $("pool-box").open = false;
-    document.title = `bana · ${h.prefix}`;
-    if (token) { refreshLocal(); setInterval(pumpLog, 2000); }
+    document.title = project ? `bana · ${project}` : "bana";
+    if (token && !project) show("fatal", "No projects yet: run bana add in a project's checkout.");
+    else if (token) { refreshLocal(); setInterval(pumpLog, 2000); }
   }
   if (!token) show("fatal", noToken());
   else if ($("pool-box").open) refresh();
