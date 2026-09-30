@@ -844,6 +844,8 @@ daemon.poll = 30
 daemon.timeout = 120
 daemon.supersede = queued
 daemon.token = gh
+fix.rounds = 5
+fix.token = none
 port = 8471
 host = mbp
 login = octo
@@ -1028,6 +1030,10 @@ BANA_DAEMON_POLL=5 bash "$bana" daemon install >"$T/out" 2>&1 || true
 check "daemon install: checks daemon.poll" has "$T/out" "daemon.poll: seconds, at least 10"
 BANA_DAEMON_TIER=weekly bash "$bana" daemon install >"$T/out" 2>&1 || true
 check "daemon install: checks daemon.tier" has "$T/out" "daemon.tier: one of quick nightly release"
+BANA_FIX_ROUNDS=0 bash "$bana" daemon install >"$T/out" 2>&1 || true
+check "daemon install: checks fix.rounds" has "$T/out" "fix.rounds: a number from 1 to 100, not '0'"
+BANA_FIX_TOKEN=pat bash "$bana" daemon install >"$T/out" 2>&1 || true
+check "daemon install: checks fix.token" has "$T/out" "fix.token: gh or none"
 printf 'daemon.tags = v*\ndaemon.tag_tier = nightly\n' >>.github/bana.conf
 bash "$bana" settings >"$T/out"
 check "settings: daemon.branches' default" has "$T/out" "daemon.branches = * !dependabot/* !renovate/*"

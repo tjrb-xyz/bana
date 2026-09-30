@@ -308,6 +308,10 @@ pub enum Trigger {
     Rerun,
     /// Again after the daemon was interrupted mid-build (attempt 2).
     Retry,
+    /// One job of a fix's round ([`crate::rounds`]): the failing commit, or a
+    /// snapshot of the fix's worktree. It posts nothing and counts as built
+    /// nowhere.
+    Fix,
 }
 
 impl Trigger {
@@ -317,6 +321,7 @@ impl Trigger {
             Self::Manual => "manual",
             Self::Rerun => "rerun",
             Self::Retry => "retry",
+            Self::Fix => "fix",
         }
     }
 }
@@ -341,6 +346,14 @@ pub struct Request {
     /// What its plan job diffs against ([`before_for`]): set when it starts, or
     /// when a re-run or a retry is queued (the build it runs again had it).
     pub before: Option<String>,
+    /// A fix's build (its sha7), and a retry of one: the job it runs
+    /// (`bana ci -j`) and its round.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
 }
 
 impl Request {
@@ -348,6 +361,11 @@ impl Request {
     /// ref): it is dropped when its turn comes, as it would not be queued now.
     pub fn already_built(&self, built: &Built) -> bool {
         self.trigger == Trigger::Push && built.contains(&self.sha, &self.tier)
+    }
+
+    /// A round's build (or its retry): no statuses, not built, no green.
+    pub fn is_fix(&self) -> bool {
+        self.fix.is_some()
     }
 
     /// How the page and the menu bar show it while it waits.
@@ -1351,7 +1369,12 @@ not a ref line
         let mut built = Built::default();
         built.add(D, "quick", BuildState::Success);
         assert!(q[0].already_built(&built));
-        for t in [Trigger::Manual, Trigger::Rerun, Trigger::Retry] {
+        for t in [
+            Trigger::Manual,
+            Trigger::Rerun,
+            Trigger::Retry,
+            Trigger::Fix,
+        ] {
             assert!(!request(9, t, "main", D, "quick").already_built(&built));
         }
         assert!(!request(9, Trigger::Push, "main", D, "nightly").already_built(&built));
@@ -1364,6 +1387,8 @@ not a ref line
             request(2, Trigger::Retry, "main", A, "quick"),
             request(3, Trigger::Rerun, "main", A, "quick"),
             request(4, Trigger::Manual, "old", A, "quick"),
+            request(5, Trigger::Fix, "main", A, "quick"),
+            request(6, Trigger::Fix, "old", A, "quick"),
         ];
         let changes = [
             Change::Moved {
@@ -1429,6 +1454,13 @@ not a ref line
                 "a manual build",
                 running_rules.clone(),
                 request(5, Trigger::Manual, "main", B, "quick"),
+                "main",
+                vec![enqueue("main", C, "quick")],
+            ),
+            (
+                "a fix's round, never superseded",
+                running_rules.clone(),
+                request(5, Trigger::Fix, "main", B, "quick"),
                 "main",
                 vec![enqueue("main", C, "quick")],
             ),
@@ -1632,10 +1664,10 @@ not a ref line
             #[serde(flatten)]
             build: crate::actlog::Build,
         }
-        let mut request = request(12, Trigger::Retry, "feature/x", A, "quick");
-        (request.attempt, request.queued_at, request.before) = (2, 1_790_600_454, Some(B.into()));
+        let mut req = request(12, Trigger::Retry, "feature/x", A, "quick");
+        (req.attempt, req.queued_at, req.before) = (2, 1_790_600_454, Some(B.into()));
         let rec = Record {
-            request,
+            request: req,
             build: crate::actlog::Build::new(&[(0, "rust".into())], 1_790_600_460),
         };
         let v = serde_json::to_value(&rec).unwrap();
@@ -1643,11 +1675,25 @@ not a ref line
         assert_eq!(v["trigger"], "retry");
         assert_eq!(v["state"], "running");
         assert_eq!(v["jobs"][0]["key"], "rust");
+        assert!(v.get("fix").is_none() && v.get("round").is_none(), "{v}");
         let back: Record = serde_json::from_value(v).unwrap();
         assert_eq!(back, rec);
         let old: Request =
             serde_json::from_str(r#"{"id":3,"ref":"refs/tags/v1","sha":"x"}"#).unwrap();
+        assert!(!old.is_fix());
         assert_eq!((old.trigger, old.before), (Trigger::Push, None));
+
+        // A round's build says whose, which job and which round.
+        let mut round = request(13, Trigger::Fix, "main", A, "quick");
+        (round.fix, round.job, round.round) =
+            (Some("aaaaaaa".into()), Some("rust".into()), Some(2));
+        let v = serde_json::to_value(&round).unwrap();
+        assert_eq!(
+            (&v["trigger"], &v["fix"], &v["job"], &v["round"]),
+            (&json!("fix"), &json!("aaaaaaa"), &json!("rust"), &json!(2))
+        );
+        assert_eq!(serde_json::from_value::<Request>(v).unwrap(), round);
+        assert!(round.is_fix());
 
         let q = rec.request.view(Some("waiting for Docker".into()));
         assert_eq!(
@@ -1664,6 +1710,7 @@ not a ref line
             Trigger::Manual,
             Trigger::Rerun,
             Trigger::Retry,
+            Trigger::Fix,
         ] {
             assert_eq!(serde_json::to_value(t).unwrap(), t.as_str());
         }

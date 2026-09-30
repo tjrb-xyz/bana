@@ -17,6 +17,16 @@
 //! the job containers too. A build the daemon left running (a stop, a crash) is
 //! ended at the next start, and run again once if nothing moved on.
 //!
+//! A fix's rounds ([`crate::rounds`]) are builds too: one per failed job
+//! (`bana ci <tier> -j <job>`), with the fix's ref and before, at the failing
+//! commit (round 0, queued when the fix is made or registered) or at a
+//! snapshot the MCP pushed to `refs/bana/fix/<sha7>/…` in src. They go to the
+//! front of the queue, behind the running build, and post nothing: they count
+//! as built nowhere, move no green head and are never superseded. act gets
+//! `--action-offline-mode` and an empty GITHUB_TOKEN unless `fix.token = gh`,
+//! since Claude's code runs in them. They are kept apart from the 100 builds,
+//! until their fix goes or 14 days after its last round.
+//!
 //! Under the directory:
 //! - `daemon/settings`: written by `bana daemon install` (below);
 //! - `src/`: the clone builds check out, with `refs/bana/green/*` pins;
@@ -30,7 +40,8 @@
 //! - `daemon.lock`: locked (flock) while a daemon runs here;
 //! - `vars`: optional, the owner's `KEY=value` lines for `vars.*`;
 //! - `fix/`: the fixes Fix with Claude made in the owner's checkout
-//!   ([`crate::fix`]): `<sha7>/`, the worktree, and `<sha7>.d/`.
+//!   ([`crate::fix`]): `<sha7>/`, the worktree, and `<sha7>.d/`, where the
+//!   daemon keeps `rounds.json`.
 //!
 //! JSON goes to a temporary file, is synced, then renamed over the old one.
 //!
@@ -50,6 +61,8 @@
 //!   daemon.timeout    120: minutes of awake time a build may take (`90s`: seconds)
 //!   daemon.supersede  queued, or running: a newer push cancels its ref's build
 //!   daemon.token      gh (the jobs' GITHUB_TOKEN is gh's), or none (empty)
+//!   fix.rounds        5: rounds a fix may run after round 0 (More rounds adds as many)
+//!   fix.token         none (rounds get an empty token and act's offline mode), or gh
 //!   port              8470: the page's port, which target_url links to
 //!   host              this machine's name in descriptions (hostname -s)
 //!   login             the GitHub user the daemon runs for (the event's sender)
@@ -66,6 +79,7 @@ use crate::actlog::{
     self, Build, BuildState, BuildView, Event, Report, Status, StatusState, Summary, Watcher,
 };
 use crate::fix;
+use crate::rounds::{self, Ask, Round, RoundBuild, Rounds};
 use crate::sweep;
 use crate::watch::{
     self, Action, Built, Heads, Project, Pushed, Request, Rules, Supersede, Trigger,
@@ -84,8 +98,14 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
-/// Build directories kept; older ones go after each build.
+/// Build directories kept; older ones go after each build. Fix rounds are
+/// not counted.
 const KEEP_BUILDS: usize = 100;
+/// A fix's rounds are kept this long after its last one (seconds), or until
+/// the fix goes.
+const KEEP_ROUNDS: i64 = 14 * 86_400;
+/// A round's long poll waits at most this long (seconds).
+pub const ROUND_WAIT: u64 = 55;
 /// A build's artifacts are kept this long (seconds).
 const KEEP_ARTIFACTS: i64 = 7 * 86_400;
 /// The longest wait between tries to post statuses.
@@ -113,6 +133,8 @@ const KEYS: &[&str] = &[
     "daemon.timeout",
     "daemon.supersede",
     "daemon.token",
+    "fix.rounds",
+    "fix.token",
     "port",
     "host",
     "login",
@@ -138,6 +160,47 @@ pub enum JobToken {
     Empty,
 }
 
+/// Why a fix's round could not be asked for, or read.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RoundError {
+    /// No such fix, or round.
+    Missing(String),
+    /// The request does not say what to run.
+    Bad(String),
+    /// A limit, or the snapshot: `running` names a round that still runs.
+    Refused { why: String, running: Option<u32> },
+    /// git, or the disk, said no.
+    Failed(String),
+}
+
+impl RoundError {
+    fn refused(why: impl Into<String>) -> Self {
+        Self::Refused {
+            why: why.into(),
+            running: None,
+        }
+    }
+}
+
+impl std::fmt::Display for RoundError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing(m) | Self::Bad(m) | Self::Failed(m) => f.write_str(m),
+            Self::Refused { why, .. } => f.write_str(why),
+        }
+    }
+}
+
+impl From<fix::Error> for RoundError {
+    fn from(e: fix::Error) -> Self {
+        match e {
+            fix::Error::Missing(m) => Self::Missing(m),
+            fix::Error::NotFailed(m) => Self::refused(m),
+            fix::Error::Failed(m) => Self::Failed(m),
+        }
+    }
+}
+
 /// The daemon's settings file, read once at start.
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -152,6 +215,10 @@ pub struct Settings {
     pub poll: Duration,
     pub timeout: Duration,
     pub token: JobToken,
+    /// `fix.rounds`: rounds a fix may run after round 0.
+    pub fix_rounds: u32,
+    /// `fix.token`: the rounds' GITHUB_TOKEN; an empty one also runs act offline.
+    pub fix_token: JobToken,
     pub port: u16,
     pub machine: String,
     pub login: String,
@@ -265,6 +332,15 @@ impl Settings {
             "none" => JobToken::Empty,
             _ => return Err(bad("daemon.token", "gh or none")),
         };
+        let fix_rounds = match get("fix.rounds").unwrap_or("5").parse::<u32>() {
+            Ok(n) if (1..=100).contains(&n) => n,
+            _ => return Err(bad("fix.rounds", "a number from 1 to 100")),
+        };
+        let fix_token = match get("fix.token").unwrap_or("none") {
+            "gh" => JobToken::Gh,
+            "none" => JobToken::Empty,
+            _ => return Err(bad("fix.token", "gh or none")),
+        };
         let port = match get("port").unwrap_or("8470").parse::<u16>() {
             Ok(p) if p > 0 => p,
             _ => return Err(bad("port", "a port number")),
@@ -305,6 +381,8 @@ impl Settings {
             poll,
             timeout,
             token,
+            fix_rounds,
+            fix_token,
             port,
             machine: get("host").map(String::from).unwrap_or_else(machine_name),
             login: or("login", ""),
@@ -553,6 +631,8 @@ struct Shared {
     run: Notify,
     post: Notify,
     post_now: Notify,
+    /// Counts the changes to rounds.json files: a round's long poll waits on it.
+    rounds: tokio::sync::watch::Sender<u64>,
     stop: tokio::sync::watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// daemon.lock, locked while this daemon runs ([`claim`]).
@@ -633,6 +713,7 @@ impl Daemon {
             run: Notify::new(),
             post: Notify::new(),
             post_now: Notify::new(),
+            rounds: tokio::sync::watch::Sender::new(0),
             stop,
             tasks: Mutex::new(Vec::new()),
             claimed: Mutex::new(Some(claimed)),
@@ -841,6 +922,11 @@ impl Daemon {
         if !r.build.state.finished() {
             return Err(format!("build {id} has not finished"));
         }
+        if let Some(fix) = &r.request.fix {
+            return Err(format!(
+                "build {id} is a round of fix {fix}: its rounds run through Claude's run_jobs"
+            ));
+        }
         let req = Request {
             trigger: Trigger::Rerun,
             git_ref: r.request.git_ref.clone(),
@@ -932,6 +1018,11 @@ impl Daemon {
             let Some(r) = inner.records.get(&id) else {
                 return Err(fix::Error::Missing(format!("no build {id}")));
             };
+            if let Some(fix) = &r.request.fix {
+                return Err(fix::Error::NotFailed(format!(
+                    "build {id} is a round of fix {fix}, not a push"
+                )));
+            }
             // Said before the checkout is asked for, as fix::prepare says it.
             let b = &r.build;
             let why = match b.state {
@@ -947,9 +1038,14 @@ impl Daemon {
             }
         }
         let p = fix::Prepare::for_daemon(&self.0.settings, fix::Source::Build(id))?;
-        tokio::task::spawn_blocking(move || fix::prepare(&p))
+        let made = tokio::task::spawn_blocking(move || fix::prepare(&p))
             .await
-            .unwrap_or_else(|e| Err(fix::Error::Failed(format!("the fix: {e}"))))
+            .unwrap_or_else(|e| Err(fix::Error::Failed(format!("the fix: {e}"))))?;
+        // The fix is made even if its recheck cannot run.
+        if let Err(e) = self.recheck(&made.fix).await {
+            eprintln!("bana daemon: fix {}: no round 0: {e}", made.fix);
+        }
+        Ok(made)
     }
 
     /// The fixes (their fix.json), the last prepared first.
@@ -983,6 +1079,280 @@ impl Daemon {
         })
         .await
         .unwrap_or_else(|e| Err(fix::Error::Failed(format!("the fix: {e}"))))
+        .map(|mut v| {
+            let rounds = self.rounds(v["fix"].as_str().unwrap_or(""));
+            v["recheck"] = rounds["rounds"]
+                .as_array()
+                .and_then(|a| a.iter().find(|r| r["n"] == 0))
+                .cloned()
+                .unwrap_or(Value::Null);
+            v["rounds_left"] = rounds["left"].clone();
+            v["rounds"] = rounds;
+            v
+        })
+    }
+
+    /// The builds that are fixes' rounds: their fix, round and job.
+    pub fn round_builds(&self) -> BTreeMap<u64, (String, Option<u32>, Option<String>)> {
+        self.0
+            .lock()
+            .records
+            .values()
+            .filter_map(|r| {
+                let q = &r.request;
+                Some((q.id, (q.fix.clone()?, q.round, q.job.clone())))
+            })
+            .collect()
+    }
+
+    /// A fix's rounds.json, with how many rounds are used and left: none
+    /// before its first round.
+    pub fn rounds(&self, fix: &str) -> Value {
+        let path = rounds::path(&self.0.settings.dir, fix);
+        let rs = rounds::load(&path)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| Rounds::new(self.0.settings.fix_rounds));
+        json!({"limit": rs.limit, "used": rs.used(), "left": rs.left(), "rounds": rs.rounds})
+    }
+
+    /// Registers a fix that `bana fix` made in the owner's terminal (from a
+    /// hand run, a pasted log, or a build), once it pushed the failing commit
+    /// into src: its round 0 is queued, unless it has rounds already.
+    pub async fn register(&self, name: &str) -> Result<Value, RoundError> {
+        let f = self.find_fix(name)?;
+        let recheck = self.recheck(&f.fix).await?;
+        Ok(json!({"fix": f.fix, "recheck": recheck, "rounds": self.rounds(&f.fix)}))
+    }
+
+    /// run_jobs: a round of `jobs` (the fix's failed ones by default) at the
+    /// snapshot `sha`, which must be under `refs/bana/fix/<sha7>/` in src and
+    /// build on the failing commit. One build per job, at the front of the
+    /// queue, within the limits ([`Rounds::ask`]); the same tree as the last
+    /// finished round gets that round back, unless `repeat`.
+    pub async fn ask_round(
+        &self,
+        name: &str,
+        sha: &str,
+        jobs: Option<Vec<String>>,
+        repeat: bool,
+    ) -> Result<Value, RoundError> {
+        let s = &self.0;
+        let f = self.find_fix(name)?;
+        if !matches!(sha.len(), 40 | 64) || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(RoundError::Bad("sha: a snapshot's full commit".into()));
+        }
+        let mut want: Vec<String> = Vec::new();
+        for j in jobs
+            .filter(|j| !j.is_empty())
+            .unwrap_or_else(|| f.jobs.clone())
+        {
+            if !rounds::valid_job(&j) {
+                return Err(RoundError::Bad(format!("jobs: {j:?} is not a job id")));
+            }
+            if !want.contains(&j) {
+                want.push(j);
+            }
+        }
+        if want.is_empty() {
+            return Err(RoundError::Bad(
+                "no jobs to run: the fix knows none that failed, so name them (jobs)".into(),
+            ));
+        }
+        let short = &sha[..7];
+        let place = format!("refs/bana/fix/{}", f.fix);
+        let refs = s
+            .git(
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    &format!("--points-at={sha}"),
+                    &place,
+                ],
+                30,
+            )
+            .await
+            .unwrap_or_default();
+        if refs.trim().is_empty() {
+            return Err(RoundError::refused(format!(
+                "{short} is not a snapshot of fix {} here: push it to {place}/{short} in {} first",
+                f.fix,
+                s.src().display()
+            )));
+        }
+        let o = s
+            .output(
+                &s.settings.git,
+                &["merge-base", "--is-ancestor", &f.sha, sha],
+                &s.src(),
+                30,
+            )
+            .await
+            .map_err(RoundError::Failed)?;
+        if !o.status.success() {
+            return Err(RoundError::refused(format!(
+                "{short} does not build on the failing commit {}",
+                f.fix
+            )));
+        }
+        let tree = s.tree(sha).await?;
+        let mut inner = s.lock();
+        let path = rounds::path(&s.settings.dir, &f.fix);
+        let mut rs = rounds::load(&path)
+            .map_err(RoundError::Failed)?
+            .unwrap_or_else(|| Rounds::new(s.settings.fix_rounds));
+        match rs.ask(&tree, repeat, inner.state.paused) {
+            Err(r) => Err(RoundError::Refused {
+                why: r.why,
+                running: r.running,
+            }),
+            Ok(Ask::Same(n)) => Ok(json!({
+                "fix": f.fix, "round": n, "reused": true, "tree": tree, "rounds_left": rs.left(),
+            })),
+            Ok(Ask::New(n)) => {
+                s.queue_round(&mut inner, &f, &mut rs, n, sha, &tree, &want, repeat);
+                s.write_rounds(&path, &rs).map_err(RoundError::Failed)?;
+                let round = rs.get(n).cloned().unwrap_or_default();
+                Ok(json!({
+                    "fix": f.fix, "round": n, "reused": false, "tree": tree,
+                    "builds": round.builds, "rounds_left": rs.left(),
+                }))
+            }
+        }
+    }
+
+    /// One round: its builds, and once it ended, what failed in the brief's
+    /// shape. It waits up to `wait` for the round to end (a long poll).
+    pub async fn round(&self, name: &str, n: u32, wait: Duration) -> Result<Value, RoundError> {
+        let fix = self.find_fix(name)?.fix;
+        let path = rounds::path(&self.0.settings.dir, &fix);
+        let mut changed = self.0.rounds.subscribe();
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            changed.borrow_and_update();
+            let rs = rounds::load(&path)
+                .map_err(RoundError::Failed)?
+                .unwrap_or_default();
+            let round = rs
+                .get(n)
+                .cloned()
+                .ok_or_else(|| RoundError::Missing(format!("fix {fix} has no round {n}")))?;
+            if round.state.finished() || tokio::time::Instant::now() >= deadline {
+                return Ok(self.0.round_view(&fix, &rs, &round).await);
+            }
+            let _ = tokio::time::timeout_at(deadline, changed.changed()).await;
+        }
+    }
+
+    /// More rounds (the fix card): `fix.rounds` more.
+    pub fn more_rounds(&self, name: &str) -> Result<Value, RoundError> {
+        let s = &self.0;
+        let fix = self.find_fix(name)?.fix;
+        let path = rounds::path(&s.settings.dir, &fix);
+        // rounds.json's writers hold the lock.
+        let _inner = s.lock();
+        let mut rs = rounds::load(&path)
+            .map_err(RoundError::Failed)?
+            .unwrap_or_else(|| Rounds::new(s.settings.fix_rounds));
+        rs.limit += s.settings.fix_rounds;
+        s.write_rounds(&path, &rs).map_err(RoundError::Failed)?;
+        Ok(json!({"fix": fix, "limit": rs.limit, "rounds_left": rs.left()}))
+    }
+
+    /// A fix goes (Discard): its rounds' builds too, a running one cancelled
+    /// (pruning takes it once it ends), and its refs in src. Says how many
+    /// builds went.
+    pub async fn forget_fix(&self, fix: &str) -> usize {
+        let s = &self.0;
+        let n = {
+            let mut inner = s.lock();
+            let inner = &mut *inner;
+            let mine: Vec<u64> = inner
+                .records
+                .values()
+                .filter(|r| r.request.fix.as_deref() == Some(fix))
+                .map(|r| r.request.id)
+                .collect();
+            let mut n = 0;
+            for id in mine {
+                if inner.running.as_ref().is_some_and(|r| r.id == id) {
+                    if let Some(r) = &inner.running {
+                        let _ = r.cancel.send(format!("fix {fix} was dropped"));
+                    }
+                } else {
+                    inner.state.queue.retain(|q| *q != id);
+                    inner.records.remove(&id);
+                    let _ = std::fs::remove_dir_all(s.build_dir(id));
+                    n += 1;
+                }
+            }
+            s.save_state(&inner.state);
+            s.publish(inner);
+            n
+        };
+        let refs = s
+            .git(
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    &format!("refs/bana/fix/{fix}"),
+                ],
+                30,
+            )
+            .await
+            .unwrap_or_default();
+        for r in refs.lines().filter(|r| !r.is_empty()) {
+            let _ = s.git(&["update-ref", "-d", r], 30).await;
+        }
+        n
+    }
+
+    /// The fix a name means (its sha7, or 4 to 64 hex digits of its commit).
+    fn find_fix(&self, name: &str) -> Result<fix::Fix, RoundError> {
+        let dir = &self.0.settings.dir;
+        let sha7 = fix::find(dir, Some(name), None)?;
+        fix::fixes(dir)
+            .into_iter()
+            .find(|f| f.fix == sha7)
+            .ok_or_else(|| RoundError::Missing(format!("no fix {name}")))
+    }
+
+    /// Round 0, the recheck: the fix's failed jobs at the failing commit, as
+    /// the fix is made or registered; pinned at `refs/bana/fix/<sha7>/base` in
+    /// src. None when it has rounds already, or knows no failed job.
+    async fn recheck(&self, fix: &str) -> Result<Option<u32>, RoundError> {
+        let s = &self.0;
+        let f = self.find_fix(fix)?;
+        if f.jobs.is_empty() {
+            return Ok(None);
+        }
+        let base = format!("refs/bana/fix/{}/base", f.fix);
+        if s.git(&["cat-file", "-e", &format!("{}^{{commit}}", f.sha)], 30)
+            .await
+            .is_err()
+        {
+            return Err(RoundError::refused(format!(
+                "{}: the failing commit is not in the daemon's clone: push it to {base} in {} first",
+                f.fix,
+                s.src().display()
+            )));
+        }
+        s.git(&["update-ref", &base, &f.sha], 30)
+            .await
+            .map_err(RoundError::Failed)?;
+        let tree = s.tree(&f.sha).await?;
+        let mut inner = s.lock();
+        let path = rounds::path(&s.settings.dir, &f.fix);
+        let mut rs = rounds::load(&path)
+            .map_err(RoundError::Failed)?
+            .unwrap_or_else(|| Rounds::new(s.settings.fix_rounds));
+        if !rs.rounds.is_empty() {
+            return Ok(None);
+        }
+        let jobs = f.jobs.clone();
+        s.queue_round(&mut inner, &f, &mut rs, 0, &f.sha, &tree, &jobs, false);
+        s.write_rounds(&path, &rs).map_err(RoundError::Failed)?;
+        Ok(Some(0))
     }
 
     /// Stops fetching and starting builds, stops the running build (the short
@@ -1122,11 +1492,12 @@ impl Shared {
                 .filter_map(|id| inner.records.get(id))
                 .map(|r| r.request.view(waiting.clone()))
                 .collect(),
+            // A fix's rounds show on its card, not as the project's last build.
             last: inner
                 .records
                 .values()
                 .rev()
-                .find(|r| r.build.state.finished())
+                .find(|r| r.build.state.finished() && !r.request.is_fix())
                 .map(|r| self.view(inner, r)),
             failed: newest_failed(&inner.records),
         };
@@ -1134,7 +1505,8 @@ impl Shared {
     }
 
     /// Queues a build: at the back, or at the front (after the other builds
-    /// asked for by hand).
+    /// asked for by hand). A fix's round goes before those, after the rounds
+    /// already queued.
     fn enqueue(&self, inner: &mut Inner, mut req: Request, front: bool) -> u64 {
         let id = inner.state.next_id;
         inner.state.next_id += 1;
@@ -1148,6 +1520,7 @@ impl Shared {
         };
         self.save(&rec);
         inner.records.insert(id, rec);
+        let fix = inner.records[&id].request.is_fix();
         let at = if front {
             let records = &inner.records;
             inner
@@ -1155,9 +1528,13 @@ impl Shared {
                 .queue
                 .iter()
                 .position(|q| {
-                    records
-                        .get(q)
-                        .is_none_or(|r| r.request.trigger == Trigger::Push)
+                    records.get(q).is_none_or(|r| {
+                        if fix {
+                            !r.request.is_fix()
+                        } else {
+                            r.request.trigger == Trigger::Push
+                        }
+                    })
                 })
                 .unwrap_or(inner.state.queue.len())
         } else {
@@ -1182,10 +1559,14 @@ impl Shared {
             return;
         };
         let retry = (rec.request.trigger == Trigger::Retry).then(|| rec.request.clone());
+        let fix = rec.request.fix.clone();
         inner.records.remove(&id);
         let _ = std::fs::remove_dir_all(self.build_dir(id));
         if let Some(req) = retry {
             self.settle_interrupted(inner, &req);
+        }
+        if let Some(fix) = fix {
+            self.sync_rounds(inner, &fix);
         }
     }
 
@@ -1195,8 +1576,10 @@ impl Shared {
     fn settle_interrupted(&self, inner: &mut Inner, req: &Request) {
         let Inner { records, seq, .. } = inner;
         let first = records.range_mut(..req.id).rev().map(|(_, r)| r).find(|r| {
-            (&r.request.git_ref, &r.request.sha, &r.request.tier)
-                == (&req.git_ref, &req.sha, &req.tier)
+            let q = &r.request;
+            // A round's jobs share its commit: the job says which.
+            (&q.git_ref, &q.sha, &q.tier, &q.fix, &q.job)
+                == (&req.git_ref, &req.sha, &req.tier, &req.fix, &req.job)
                 && r.build.reason.as_deref() == Some(INTERRUPTED)
         });
         if let Some(r) = first {
@@ -1292,10 +1675,244 @@ impl Shared {
                 };
                 let new = self.enqueue(inner, req, true);
                 eprintln!("bana daemon: build {id} was interrupted; retried as build {new}");
+                // The round waits for the retry: its job counts by it.
+                if let (Some(fix), Some(n), Some(job)) =
+                    (&rec.request.fix, rec.request.round, &rec.request.job)
+                {
+                    self.add_round_build(fix, n, new, job);
+                }
             }
         }
         self.clear_stale_lock().await;
-        self.save_state(&self.lock().state);
+        let inner = self.lock();
+        let fixes: std::collections::BTreeSet<String> = inner
+            .records
+            .values()
+            .filter_map(|r| r.request.fix.clone())
+            .collect();
+        for fix in fixes {
+            self.sync_rounds(&inner, &fix);
+        }
+        self.save_state(&inner.state);
+    }
+
+    // ---- fix rounds ----------------------------------------------------------
+
+    /// A commit's tree, in src.
+    async fn tree(&self, sha: &str) -> Result<String, RoundError> {
+        self.git(&["rev-parse", "--verify", &format!("{sha}^{{tree}}")], 30)
+            .await
+            .map(|t| t.trim().to_string())
+            .map_err(|e| RoundError::Failed(format!("{}: {e}", &sha[..7.min(sha.len())])))
+    }
+
+    /// Queues round `n` of fix `f`: one build per job at `sha`, with the fix's
+    /// ref, tier and before, at the front of the queue. The caller writes
+    /// `rs`.
+    #[allow(clippy::too_many_arguments)]
+    fn queue_round(
+        &self,
+        inner: &mut Inner,
+        f: &fix::Fix,
+        rs: &mut Rounds,
+        n: u32,
+        sha: &str,
+        tree: &str,
+        jobs: &[String],
+        repeat: bool,
+    ) {
+        let s = &self.settings;
+        // The tier the failure ran at, if the daemon has it; else its pushes'.
+        let tier = f
+            .tier
+            .clone()
+            .filter(|t| s.tiers.contains(t))
+            .unwrap_or_else(|| s.rules.tier.clone());
+        let git_ref = f
+            .git_ref
+            .clone()
+            .filter(|r| r.starts_with("refs/"))
+            .unwrap_or_else(|| format!("refs/heads/{}", f.branch));
+        let before = f.before.clone().unwrap_or_else(|| watch::zeros(sha));
+        let mut builds = Vec::new();
+        for job in jobs {
+            let req = Request {
+                trigger: Trigger::Fix,
+                git_ref: git_ref.clone(),
+                sha: sha.to_string(),
+                tier: tier.clone(),
+                before: Some(before.clone()),
+                fix: Some(f.fix.clone()),
+                job: Some(job.clone()),
+                round: Some(n),
+                ..Request::default()
+            };
+            let id = self.enqueue(inner, req, true);
+            builds.push(RoundBuild {
+                id,
+                job: job.clone(),
+                state: BuildState::Queued,
+            });
+        }
+        eprintln!(
+            "bana daemon: fix {} round {n}: builds {:?}",
+            f.fix,
+            builds.iter().map(|b| b.id).collect::<Vec<_>>()
+        );
+        rs.rounds.push(Round {
+            n,
+            sha: sha.to_string(),
+            tree: tree.to_string(),
+            jobs: jobs.to_vec(),
+            builds,
+            state: BuildState::Queued,
+            repeat,
+            queued_at: now(),
+            ended_at: None,
+        });
+        self.run.notify_one();
+    }
+
+    /// rounds.json, whole; a round's long poll looks again.
+    fn write_rounds(&self, path: &Path, rs: &Rounds) -> Result<(), String> {
+        rounds::save(path, rs)?;
+        self.rounds.send_modify(|n| *n += 1);
+        Ok(())
+    }
+
+    /// Brings `fix`'s unfinished rounds up to date with their builds: running,
+    /// or how they ended. A build that is gone (cancelled while queued) ended
+    /// in error.
+    fn sync_rounds(&self, inner: &Inner, fix: &str) {
+        let path = rounds::path(&self.settings.dir, fix);
+        let mut rs = match rounds::load(&path) {
+            Ok(Some(rs)) => rs,
+            Ok(None) => return,
+            Err(e) => {
+                eprintln!("bana daemon: {e}");
+                return;
+            }
+        };
+        let running = inner.running.as_ref().map(|r| r.id);
+        let mut changed = false;
+        for round in rs.rounds.iter_mut().filter(|r| !r.state.finished()) {
+            for b in &mut round.builds {
+                let state = match inner.records.get(&b.id) {
+                    _ if running == Some(b.id) => BuildState::Running,
+                    Some(r) => r.build.state,
+                    None => BuildState::Error,
+                };
+                changed |= b.state != state;
+                b.state = state;
+            }
+            let state = rounds::state_of(&round.builds);
+            if state != round.state {
+                (round.state, changed) = (state, true);
+                if state.finished() {
+                    round.ended_at = Some(now());
+                }
+            }
+        }
+        if changed {
+            if let Err(e) = self.write_rounds(&path, &rs) {
+                eprintln!("bana daemon: {e}");
+            }
+        }
+    }
+
+    /// The same for build `id`'s fix, if it is a round's.
+    fn sync_rounds_of(&self, inner: &Inner, id: u64) {
+        if let Some(fix) = inner.records.get(&id).and_then(|r| r.request.fix.clone()) {
+            self.sync_rounds(inner, &fix);
+        }
+    }
+
+    /// A retry joins its round: its job counts by it from now on.
+    fn add_round_build(&self, fix: &str, n: u32, id: u64, job: &str) {
+        let path = rounds::path(&self.settings.dir, fix);
+        let Ok(Some(mut rs)) = rounds::load(&path) else {
+            return;
+        };
+        if let Some(r) = rs.get_mut(n) {
+            r.builds.push(RoundBuild {
+                id,
+                job: job.to_string(),
+                state: BuildState::Queued,
+            });
+            if let Err(e) = self.write_rounds(&path, &rs) {
+                eprintln!("bana daemon: {e}");
+            }
+        }
+    }
+
+    /// A round as GET …/rounds/{n} says it: its builds, each job's last one
+    /// with why it stopped, and once it ended, what failed (each failed
+    /// build's act.jsonl, folded).
+    async fn round_view(&self, fix: &str, rs: &Rounds, r: &Round) -> Value {
+        let mut last: BTreeMap<String, u64> = BTreeMap::new();
+        for b in &r.builds {
+            last.insert(b.job.clone(), b.id);
+        }
+        let builds: Vec<Value> = {
+            let inner = self.lock();
+            r.builds
+                .iter()
+                .map(|b| {
+                    let rec = inner.records.get(&b.id);
+                    json!({
+                        "id": b.id,
+                        "job": b.job,
+                        "state": b.state,
+                        "attempt": rec.map_or(1, |x| x.request.attempt),
+                        "reason": rec.and_then(|x| x.build.reason.clone()),
+                        "last": last.get(&b.job) == Some(&b.id),
+                    })
+                })
+                .collect()
+        };
+        let failed: Vec<u64> = r
+            .builds
+            .iter()
+            .filter(|b| last.get(&b.job) == Some(&b.id))
+            .filter(|b| matches!(b.state, BuildState::Failure | BuildState::Error))
+            .map(|b| b.id)
+            .collect();
+        let dir = self.settings.dir.join("builds");
+        let (failures, errors) = tokio::task::spawn_blocking(move || {
+            let (mut failures, mut errors) = (Vec::new(), Vec::new());
+            for id in failed {
+                let log =
+                    std::fs::read(dir.join(id.to_string()).join("act.jsonl")).unwrap_or_default();
+                let (f, e) =
+                    rounds::failures(&crate::results::fold_json(&String::from_utf8_lossy(&log)));
+                let from = |mut x: Value| {
+                    x["build"] = json!(id);
+                    x
+                };
+                failures.extend(f.into_iter().map(from));
+                errors.extend(e.into_iter().map(from));
+            }
+            (failures, errors)
+        })
+        .await
+        .unwrap_or_default();
+        json!({
+            "fix": fix,
+            "n": r.n,
+            "state": r.state,
+            "green": r.state == BuildState::Success,
+            "sha": r.sha,
+            "tree": r.tree,
+            "jobs": r.jobs,
+            "repeat": r.repeat,
+            "queued_at": r.queued_at,
+            "ended_at": r.ended_at,
+            "builds": builds,
+            "failures": failures,
+            "errors": errors,
+            "limit": rs.limit,
+            "rounds_left": rs.left(),
+        })
     }
 
     // ---- running programs ----------------------------------------------------
@@ -1623,6 +2240,7 @@ impl Shared {
             cancel: tx,
         });
         self.save_state(&inner.state);
+        self.sync_rounds_of(&inner, id);
         self.publish(&inner);
         Some((id, rx))
     }
@@ -1645,6 +2263,7 @@ impl Shared {
         if let Some(req) = retried {
             self.settle_interrupted(&mut inner, &req);
         }
+        self.sync_rounds_of(&inner, id);
         self.prune(&mut inner);
         self.save_state(&inner.state);
         self.publish(&inner);
@@ -1760,7 +2379,7 @@ impl Shared {
         let event = watch::event_payload(&project, &req, &before, forced, &head);
         write_json(&dir.join("event.json"), &event).map_err(|e| e.to_string())?;
 
-        let token = match s.token {
+        let token = match if req.is_fix() { s.fix_token } else { s.token } {
             JobToken::Gh => self
                 .output(&s.gh, &["auth", "token"], &dir, 30)
                 .await
@@ -1809,7 +2428,7 @@ impl Shared {
     ) {
         let s = &self.settings;
         let dir = self.build_dir(id);
-        let tier = {
+        let (tier, fix_job) = {
             let mut inner = self.lock();
             let inner = &mut *inner;
             let Some(rec) = inner.records.get_mut(&id) else {
@@ -1835,8 +2454,9 @@ impl Shared {
             want(rec, updates, &mut inner.seq);
             self.save(rec);
             let tier = rec.request.tier.clone();
+            let fix_job = rec.request.fix.as_ref().and(rec.request.job.clone());
             self.publish(inner);
-            tier
+            (tier, fix_job)
         };
         self.post.notify_one();
 
@@ -1846,9 +2466,17 @@ impl Shared {
         if !tier.is_empty() {
             cmd.arg(&tier);
         }
+        if let Some(job) = &fix_job {
+            cmd.args(["-j", job]);
+        }
         cmd.args(["--event", "event.json", "--"])
-            .args(s.act_flags(id, port))
-            .env_clear()
+            .args(s.act_flags(id, port));
+        // A round runs Claude's code: without a token, act does not fetch
+        // actions either, and uses those the daemon's builds cached.
+        if fix_job.is_some() && s.fix_token == JobToken::Empty {
+            cmd.arg("--action-offline-mode");
+        }
+        cmd.env_clear()
             .envs(s.child_env(id))
             .current_dir(&dir)
             .stdin(Stdio::null())
@@ -2008,7 +2636,8 @@ impl Shared {
             } else {
                 &rules.tier
             };
-            (state == BuildState::Success && rec.request.tier == *push_tier).then(|| {
+            let green = state == BuildState::Success && !rec.request.is_fix();
+            (green && rec.request.tier == *push_tier).then(|| {
                 inner.state.green.insert(git_ref.clone(), sha.clone());
                 self.save_state(&inner.state);
                 (git_ref, sha)
@@ -2387,19 +3016,15 @@ impl Shared {
 
     // ---- pruning ------------------------------------------------------------------
 
-    /// Keeps the newest builds, and a week of artifacts.
+    /// Keeps the newest builds, a fix's rounds while it lasts, and a week of
+    /// artifacts.
     fn prune(&self, inner: &mut Inner) {
-        let busy = |id: &u64| {
-            inner.state.queue.contains(id) || inner.running.as_ref().is_some_and(|r| r.id == *id)
+        let busy = |id: u64| {
+            inner.state.queue.contains(&id) || inner.running.as_ref().is_some_and(|r| r.id == id)
         };
-        let old: Vec<u64> = inner
-            .records
-            .keys()
-            .rev()
-            .filter(|id| !busy(id))
-            .skip(KEEP_BUILDS)
-            .copied()
-            .collect();
+        let fixes = self.settings.dir.join("fix");
+        let gone = |fix: &str| !fixes.join(format!("{fix}.d/fix.json")).exists();
+        let old = to_prune(&inner.records, busy, gone, now());
         for id in old {
             inner.records.remove(&id);
             let _ = std::fs::remove_dir_all(self.build_dir(id));
@@ -2413,8 +3038,47 @@ impl Shared {
     }
 }
 
+/// The builds pruning removes: those past the newest [`KEEP_BUILDS`], not
+/// counting fix rounds, and a fix's rounds once the fix is `gone` or its last
+/// round ended [`KEEP_ROUNDS`] ago. A `busy` build (queued, running) stays.
+fn to_prune(
+    records: &BTreeMap<u64, Record>,
+    busy: impl Fn(u64) -> bool,
+    gone: impl Fn(&str) -> bool,
+    now: i64,
+) -> Vec<u64> {
+    let mut out: Vec<u64> = records
+        .values()
+        .rev()
+        .filter(|r| !r.request.is_fix() && !busy(r.request.id))
+        .skip(KEEP_BUILDS)
+        .map(|r| r.request.id)
+        .collect();
+    let mut last: BTreeMap<&str, i64> = BTreeMap::new();
+    for r in records.values() {
+        if let Some(fix) = &r.request.fix {
+            let at = r.build.ended_at.unwrap_or(r.request.queued_at);
+            let l = last.entry(fix.as_str()).or_insert(at);
+            *l = (*l).max(at);
+        }
+    }
+    for r in records.values() {
+        let Some(fix) = r.request.fix.as_deref() else {
+            continue;
+        };
+        if !busy(r.request.id) && (gone(fix) || last[fix] < now - KEEP_ROUNDS) {
+            out.push(r.request.id);
+        }
+    }
+    out
+}
+
 /// Records the statuses a build wants now; each gets the next sequence number.
 fn want(rec: &mut Record, updates: Vec<Status>, seq: &mut u64) {
+    // A fix's round: its commit is not on GitHub, and it is not a push.
+    if rec.request.is_fix() {
+        return;
+    }
     for s in updates {
         *seq += 1;
         rec.statuses.insert(
@@ -2470,6 +3134,7 @@ fn newest_failed(records: &BTreeMap<u64, Record>) -> Option<u64> {
     records
         .values()
         .rev()
+        .filter(|r| !r.request.is_fix())
         .find(|r| matches!(r.build.state, BuildState::Success | BuildState::Failure))
         .filter(|r| r.build.state == BuildState::Failure)
         .map(|r| r.request.id)
@@ -2477,7 +3142,7 @@ fn newest_failed(records: &BTreeMap<u64, Record>) -> Option<u64> {
 
 fn built(records: &BTreeMap<u64, Record>) -> Built {
     let mut b = Built::default();
-    for r in records.values() {
+    for r in records.values().filter(|r| !r.request.is_fix()) {
         b.add(&r.request.sha, &r.request.tier, r.build.state);
     }
     b
@@ -2564,11 +3229,11 @@ async fn claim(dir: &Path) -> Result<std::fs::File, String> {
 }
 
 /// A build interrupted by a restart runs again when nothing moved on: its
-/// first attempt, and its commit still its ref's head (a tag's, or one asked
-/// for by hand, always).
+/// first attempt, and its commit still its ref's head (a tag's, a fix's round,
+/// or one asked for by hand, always).
 fn retry_eligible(r: &Request, heads: &Heads) -> bool {
     r.attempt < 2
-        && (matches!(r.trigger, Trigger::Manual | Trigger::Rerun)
+        && (matches!(r.trigger, Trigger::Manual | Trigger::Rerun | Trigger::Fix)
             || watch::is_tag(&r.git_ref)
             || heads.get(&r.git_ref) == Some(&r.sha))
 }
@@ -2697,7 +3362,7 @@ fn url_encode(s: &str) -> String {
 }
 
 /// JSON, whole or not at all: a temporary file, synced, then renamed.
-fn write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
     let mut text = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
     text.push(b'\n');
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
@@ -4263,12 +4928,35 @@ exec git \"$@\"
             "{brief}"
         );
 
+        // Round 0, the recheck: the failed job again at the failing commit.
+        let r0 = finished(&d, 3).await;
+        let q = &r0.request;
+        assert_eq!(
+            (q.trigger, q.fix.as_deref(), q.job.as_deref(), q.round),
+            (Trigger::Fix, Some(sha7), Some("lint"), Some(0))
+        );
+        assert_eq!(
+            (q.sha.as_str(), r0.build.state),
+            (c.as_str(), BuildState::Failure)
+        );
+        let rs = d.rounds(sha7);
+        assert_eq!(
+            (
+                &rs["rounds"][0]["n"],
+                &rs["rounds"][0]["state"],
+                &rs["left"]
+            ),
+            (&json!(0), &json!("failure"), &json!(5))
+        );
+        assert_eq!(d.summary().failed, Some(2), "a round is no build of main");
+
         // A second click goes on with it.
         let again = d.fix(2).await.unwrap();
         assert_eq!(
             (again.fix.as_str(), again.worktree.as_str(), again.reused),
             (sha7, made.worktree.as_str(), true)
         );
+        assert_eq!(d.0.lock().records.len(), 3, "round 0 is not queued again");
         let fixes = d.fixes();
         assert_eq!(fixes.len(), 1);
         assert_eq!(
@@ -4303,12 +4991,12 @@ exec git \"$@\"
         p.commit("syntax", "d");
         p.push("main");
         poll(&d).await;
-        let r3 = finished(&d, 3).await;
-        assert_eq!(r3.build.state, BuildState::Error);
-        match d.fix(3).await {
+        let r4 = finished(&d, 4).await;
+        assert_eq!(r4.build.state, BuildState::Error);
+        match d.fix(4).await {
             Err(fix::Error::NotFailed(why)) => {
                 assert!(
-                    why.starts_with("build 3 did not fail: could not start"),
+                    why.starts_with("build 4 did not fail: could not start"),
                     "{why}"
                 )
             }
@@ -4322,8 +5010,12 @@ exec git \"$@\"
         p.commit("pass", "e");
         p.push("main");
         poll(&d).await;
-        assert_eq!(finished(&d, 4).await.build.state, BuildState::Success);
+        assert_eq!(finished(&d, 5).await.build.state, BuildState::Success);
         assert_eq!(d.summary().failed, None, "a pass since");
+        match d.fix(3).await {
+            Err(fix::Error::NotFailed(why)) => assert!(why.contains("a round of fix"), "{why}"),
+            other => panic!("{other:?}"),
+        }
         assert_eq!(actlog::tray_view(&d.summary()).fix_line, None);
 
         // A daemon installed before fixes names no checkout.
@@ -4331,5 +5023,360 @@ exec git \"$@\"
         assert!(e.to_string().contains("bana daemon install again"), "{e}");
         d.shutdown().await;
         p.remove();
+    }
+
+    /// What run_jobs does: a snapshot of the worktree `wt` after it wrote
+    /// `fixture` (without touching its index), pushed into src for fix `sha7`.
+    fn snapshot(p: &Project, wt: &Path, sha7: &str, fixture: &str) -> String {
+        std::fs::write(wt.join("fixture"), fixture).unwrap();
+        git(wt, &["add", "-A"]);
+        let tree = git(wt, &["write-tree"]);
+        let snap = git(wt, &["commit-tree", &tree, "-p", "HEAD", "-m", "snapshot"]);
+        git(wt, &["reset", "-q"]);
+        let src = p.dir.join("src");
+        let to = format!("{snap}:refs/bana/fix/{sha7}/{}", &snap[..7]);
+        git(
+            wt,
+            &["push", "-q", "--no-verify", &src.to_string_lossy(), &to],
+        );
+        snap
+    }
+
+    /// A failed push build of main and its fix, whose round 0 is left to run.
+    async fn failed_and_fixed(p: &Project, d: &Daemon) -> (String, fix::Prepared) {
+        let a = p.commit("pass", "a");
+        p.push("main");
+        poll(d).await;
+        assert_eq!(finished(d, 1).await.build.state, BuildState::Success);
+        let c = p.commit("fail", "c");
+        p.push("main");
+        poll(d).await;
+        assert_eq!(finished(d, 2).await.build.state, BuildState::Failure);
+        assert_eq!(d.0.lock().state.green.get("refs/heads/main"), Some(&a));
+        (c, d.fix(2).await.unwrap())
+    }
+
+    fn refused(r: Result<Value, RoundError>) -> (String, Option<u32>) {
+        match r {
+            Err(RoundError::Refused { why, running }) => (why, running),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fixs_rounds_run_its_jobs_first_offline_and_post_nothing() {
+        let p = Project::new("rounds");
+        let extra = format!("checkout = {}\nfix.rounds = 2\n", p.checkout().display());
+        let d = start(&p, &extra).await;
+        let (c, made) = failed_and_fixed(&p, &d).await;
+        let sha7 = &c[..7];
+        let wt = PathBuf::from(&made.worktree);
+        let r0 = finished(&d, 3).await;
+        assert_eq!(r0.request.round, Some(0));
+        posted(&d).await;
+        let posts = p.posts().len();
+
+        // Round 0 ran lint alone, at the failing commit, with main's ref and
+        // before, offline and without a token.
+        let argv: Vec<String> = p.read("argv.3").lines().map(String::from).collect();
+        assert_eq!(argv[..3], ["quick", "-j", "lint"], "{argv:?}");
+        assert!(
+            argv.iter().any(|a| a == "--action-offline-mode"),
+            "{argv:?}"
+        );
+        assert_eq!(p.read("secrets.3").trim(), "GITHUB_TOKEN=");
+        let event: Value = serde_json::from_str(&p.read("event.3")).unwrap();
+        let before2 = d.0.lock().records[&2].request.before.clone().unwrap();
+        assert_eq!(
+            (&event["after"], &event["ref"], &event["before"]),
+            (&json!(c), &json!("refs/heads/main"), &json!(before2))
+        );
+        let v = d.round(sha7, 0, Duration::ZERO).await.unwrap();
+        assert_eq!(
+            (&v["state"], &v["green"]),
+            (&json!("failure"), &json!(false))
+        );
+        assert_eq!(v["failures"][0]["job"], "lint", "{v}");
+        assert!(
+            v["failures"][0]["step"]
+                .as_str()
+                .unwrap()
+                .contains("cargo clippy"),
+            "{v}"
+        );
+
+        // A snapshot that was not pushed, or that is not the fix's, is refused.
+        let (why, _) = refused(d.ask_round(sha7, &"a".repeat(40), None, false).await);
+        assert!(why.contains("is not a snapshot of fix"), "{why}");
+        let bad = d.ask_round(sha7, "abc", None, false).await.unwrap_err();
+        assert!(matches!(bad, RoundError::Bad(_)), "{bad:?}");
+        let bad = d.ask_round(sha7, &c, Some(vec!["x;y".into()]), false).await;
+        assert!(matches!(bad, Err(RoundError::Bad(_))), "{bad:?}");
+        assert!(matches!(
+            d.ask_round("0000000", &c, None, false).await,
+            Err(RoundError::Missing(_))
+        ));
+
+        // Round 1 waits behind a running push build, then goes before a queued one.
+        p.set("hold", true);
+        let e = p.commit("pass", "e");
+        p.push("other");
+        poll(&d).await;
+        until("build 4", || !p.read("pid.4").is_empty()).await;
+        let snap = snapshot(&p, &wt, sha7, "pass");
+        let r1 = d.ask_round(sha7, &snap, None, false).await.unwrap();
+        assert_eq!(
+            (&r1["round"], &r1["reused"]),
+            (&json!(1), &json!(false)),
+            "{r1}"
+        );
+        assert_eq!(r1["builds"][0]["id"], 5);
+        let (why, running) = refused(d.ask_round(sha7, &snap, None, true).await);
+        assert_eq!(running, Some(1), "{why}");
+        p.commit("pass", "f");
+        p.push("third");
+        poll(&d).await;
+        let queue: Vec<u64> = d.summary().queue.iter().map(|q| q.id).collect();
+        assert_eq!(queue, [5, 6]);
+        assert_eq!(d.0.lock().running.as_ref().map(|r| r.id), Some(4));
+        // The long poll waits, and ends with the round.
+        let waiting = {
+            let d = d.clone();
+            let sha7 = sha7.to_string();
+            tokio::spawn(async move { d.round(&sha7, 1, Duration::from_secs(30)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished());
+        p.set("hold", false);
+        let v = waiting.await.unwrap().unwrap();
+        assert_eq!(
+            (&v["state"], &v["green"]),
+            (&json!("success"), &json!(true)),
+            "{v}"
+        );
+        assert_eq!((&v["sha"], &v["rounds_left"]), (&json!(snap), &json!(1)));
+        assert_eq!(
+            finished(&d, 4).await.build.state,
+            BuildState::Success,
+            "not cancelled"
+        );
+        assert_eq!(finished(&d, 5).await.request.round, Some(1));
+        assert_eq!(finished(&d, 6).await.build.state, BuildState::Success);
+
+        // Rounds post nothing, count as built nowhere and move no green head.
+        posted(&d).await;
+        let shas: Vec<String> = p.posts()[posts..].iter().map(|x| x.sha.clone()).collect();
+        assert!(!shas.contains(&snap) && !shas.contains(&c), "{shas:?}");
+        assert!(shas.contains(&e));
+        assert!(!built(&d.0.lock().records).contains(&snap, "quick"));
+        let green = d.0.lock().state.green.clone();
+        assert!(green.values().all(|g| *g != snap && *g != c), "{green:?}");
+        assert_eq!(d.summary().last.map(|l| l.id), Some(6));
+        assert!(d.rerun(5).is_err());
+
+        // The same tree again gets its result back, unless repeat.
+        let again = d.ask_round(sha7, &snap, None, false).await.unwrap();
+        assert_eq!(
+            (&again["round"], &again["reused"]),
+            (&json!(1), &json!(true))
+        );
+        let r2 = d.ask_round(sha7, &snap, Some(vec!["lint".into(), "web".into()]), true);
+        let r2 = r2.await.unwrap();
+        assert_eq!(r2["round"], 2);
+        let v = d.round(sha7, 2, Duration::from_secs(30)).await.unwrap();
+        assert_eq!(
+            (&v["state"], &v["jobs"]),
+            (&json!("success"), &json!(["lint", "web"]))
+        );
+        assert_eq!(
+            p.read("argv.8")[..].lines().take(3).collect::<Vec<_>>(),
+            ["quick", "-j", "web"]
+        );
+
+        // Rounds run out, and the owner gives more; none while paused.
+        let other = snapshot(&p, &wt, sha7, "fail");
+        let (why, running) = refused(d.ask_round(sha7, &other, None, false).await);
+        assert!(
+            why.starts_with("all 2 rounds of this fix are used"),
+            "{why}"
+        );
+        assert_eq!(running, None);
+        let more = d.more_rounds(sha7).unwrap();
+        assert_eq!(
+            (&more["limit"], &more["rounds_left"]),
+            (&json!(4), &json!(2))
+        );
+        d.set_paused(true);
+        let (why, _) = refused(d.ask_round(sha7, &other, None, false).await);
+        assert!(why.contains("paused"), "{why}");
+        d.set_paused(false);
+        let r3 = d.ask_round(sha7, &other, None, false).await.unwrap();
+        let v = d.round(
+            sha7,
+            r3["round"].as_u64().unwrap() as u32,
+            Duration::from_secs(30),
+        );
+        let v = v.await.unwrap();
+        assert_eq!(v["state"], "failure", "{v}");
+        assert_eq!(d.fix_state(sha7).await.unwrap()["rounds_left"], 1);
+        let on_disk = rounds::load(&rounds::path(&p.dir, sha7)).unwrap().unwrap();
+        assert_eq!(
+            on_disk.rounds.iter().map(|r| r.n).collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        // A registered fix with rounds already queues no round 0.
+        let reg = d.register(sha7).await.unwrap();
+        assert_eq!(reg["recheck"], Value::Null);
+        d.shutdown().await;
+
+        // With fix.token = gh, a round gets gh's token and fetches actions.
+        let d = start(&p, &format!("{extra}fix.token = gh\n")).await;
+        let n = d.ask_round(sha7, &other, None, true).await.unwrap();
+        let id = n["builds"][0]["id"].as_u64().unwrap();
+        finished(&d, id).await;
+        assert_eq!(
+            p.read(&format!("secrets.{id}")).trim(),
+            "GITHUB_TOKEN=gho_fromgh"
+        );
+        assert!(!p
+            .read(&format!("argv.{id}"))
+            .contains("--action-offline-mode"));
+
+        // A fix that goes takes its rounds along at the next prune.
+        let dir = PathBuf::from(&made.dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        p.commit("pass", "g");
+        p.push("main");
+        poll(&d).await;
+        let last = *d.0.lock().records.keys().last().unwrap();
+        finished(&d, last).await;
+        let left: Vec<u64> =
+            d.0.lock()
+                .records
+                .values()
+                .filter(|r| r.request.is_fix())
+                .map(|r| r.request.id)
+                .collect();
+        assert!(left.is_empty(), "{left:?}");
+        assert!(!p.dir.join("builds/3").exists());
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_round_cut_short_by_a_crash_is_retried_and_its_long_poll_says_how() {
+        let p = Project::new("round-crash");
+        let extra = format!("checkout = {}\n", p.checkout().display());
+        let s = p.settings(&extra);
+        let d = start_with(s.clone()).await;
+        p.set("hold", true);
+        let a = p.commit("pass", "a");
+        p.push("main");
+        poll(&d).await;
+        p.set("hold", false);
+        finished(&d, 1).await;
+        let c = p.commit("fail", "c");
+        p.push("main");
+        poll(&d).await;
+        finished(&d, 2).await;
+        let sha7 = &c[..7];
+        p.set("hold", true);
+        d.fix(2).await.unwrap();
+        until("round 0", || !p.read("pid.3").is_empty()).await;
+        d.crash();
+
+        let d = start_with(s).await;
+        until("the retry", || !p.read("pid.4").is_empty()).await;
+        let four = d.0.lock().records[&4].request.clone();
+        assert_eq!(
+            (
+                four.trigger,
+                four.fix.as_deref(),
+                four.job.as_deref(),
+                four.round
+            ),
+            (Trigger::Retry, Some(sha7), Some("lint"), Some(0))
+        );
+        let waiting = {
+            let d = d.clone();
+            let sha7 = sha7.to_string();
+            tokio::spawn(async move { d.round(&sha7, 0, Duration::from_secs(30)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished(), "the round waits for its retry");
+        p.set("hold", false);
+        let v = waiting.await.unwrap().unwrap();
+        assert_eq!(v["state"], "failure", "{v}");
+        let builds: Vec<(u64, bool)> = v["builds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| (b["id"].as_u64().unwrap(), b["last"].as_bool().unwrap()))
+            .collect();
+        assert_eq!(builds, [(3, false), (4, true)]);
+        assert_eq!(v["builds"][0]["reason"], INTERRUPTED);
+        assert!(v["failures"]
+            .as_array()
+            .is_some_and(|f| f.iter().all(|x| x["build"] == 4)));
+        posted(&d).await;
+        assert!(p.posts().iter().all(|x| x.sha == a || x.sha == c));
+        assert!(
+            p.posts()
+                .iter()
+                .filter(|x| x.sha == c)
+                .all(|x| x.description != INTERRUPTED),
+            "a round's retry posts nothing"
+        );
+
+        // A fix bana fix made in a terminal is registered: its round 0 is queued.
+        std::fs::remove_file(rounds::path(&p.dir, sha7)).unwrap();
+        let reg = d.register(sha7).await.unwrap();
+        assert_eq!(reg["recheck"], 0, "{reg}");
+        let v = d.round(sha7, 0, Duration::from_secs(30)).await.unwrap();
+        assert_eq!(
+            (&v["state"], &v["builds"][0]["id"]),
+            (&json!("failure"), &json!(5))
+        );
+        assert!(matches!(
+            d.register("0000000").await,
+            Err(RoundError::Missing(_))
+        ));
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[test]
+    fn rounds_are_pruned_with_their_fix_not_with_the_builds() {
+        let rec = |id: u64, fix: Option<&str>, ended: i64| Record {
+            request: Request {
+                id,
+                fix: fix.map(String::from),
+                ..Request::default()
+            },
+            build: Build {
+                ended_at: Some(ended),
+                ..Build::default()
+            },
+            ..Record::default()
+        };
+        let now = 1_790_000_000;
+        let mut records = BTreeMap::new();
+        records.insert(1, rec(1, Some("aaaaaaa"), now - KEEP_ROUNDS - 10));
+        records.insert(2, rec(2, Some("aaaaaaa"), now - 10));
+        records.insert(3, rec(3, Some("bbbbbbb"), now - KEEP_ROUNDS - 10));
+        records.insert(4, rec(4, Some("ccccccc"), now));
+        for id in 10..10 + KEEP_BUILDS as u64 + 2 {
+            records.insert(id, rec(id, None, now));
+        }
+        let idle = |_: u64| false;
+        let mut out = to_prune(&records, idle, |f| f == "ccccccc", now);
+        out.sort();
+        // a's last round is recent; b's is old; c's fix is gone; two pushes are past the cap.
+        assert_eq!(out, [3, 4, 10, 11]);
+        let out = to_prune(&records, |id| id == 4 || id == 10, |f| f == "ccccccc", now);
+        assert!(
+            !out.contains(&4) && !out.contains(&10),
+            "busy builds stay: {out:?}"
+        );
     }
 }

@@ -184,6 +184,8 @@ In bana.conf, read at install (`bana settings` shows them):
 | `daemon.timeout` | `120` | minutes of awake time a build may take (`90s`: seconds) |
 | `daemon.supersede` | `queued` | `queued`: a newer push replaces only a queued build of its branch; `running`: it also cancels the running one |
 | `daemon.token` | `gh` | the jobs' `GITHUB_TOKEN`: `gh` (the GitHub CLI's token, as `bana ci` gives it) or `none` (empty) |
+| `fix.rounds` | `5` | the rounds a fix may run after round 0 (1 to 100); *More rounds* adds as many again |
+| `fix.token` | `none` | a fix round's `GITHUB_TOKEN`: `none` (empty, and act runs with `--action-offline-mode`) or `gh` |
 
 `act.args` (act options for `bana ci` and the daemon's builds, such as `--reuse`), `act.image` and `act.network` are read from
 the commit being built, like the workflow. `repo`, `prefix`, `workflow`, `tiers`, `tier_input` and `path` are

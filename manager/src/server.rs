@@ -4,11 +4,12 @@
 //!
 //! In daemon mode ([`daemon_router`]) the same page and pool routes, plus the
 //! daemon's: its summary, the builds and their logs, what the page's buttons
-//! do, and the fixes Fix with Claude makes. Those call [`Daemon`]'s methods,
-//! with numeric ids, refs among the heads fetched, tiers from the settings
-//! and fixes by their commit's hex digits.
+//! do, the fixes Fix with Claude makes, and their rounds (run_jobs). Those
+//! call [`Daemon`]'s methods, with numeric ids, refs among the heads fetched,
+//! tiers from the settings, fixes by their commit's hex digits and jobs by
+//! their ids.
 
-use crate::daemon::Daemon;
+use crate::daemon::{Daemon, RoundError, ROUND_WAIT};
 use crate::fix;
 use crate::guard::{err, guarded, health, Access};
 use crate::{
@@ -526,8 +527,11 @@ fn local_routes(d: Daemon) -> Router {
         .route("/builds/{id}/cancel", post(cancel_build))
         .route("/builds/{id}/rerun", post(rerun))
         .route("/builds/{id}/fix", post(fix_build))
-        .route("/fixes", get(fixes))
+        .route("/fixes", get(fixes).post(register_fix))
         .route("/fixes/{fix}", get(fix_state))
+        .route("/fixes/{fix}/rounds", post(ask_round))
+        .route("/fixes/{fix}/rounds/{n}", get(round))
+        .route("/fixes/{fix}/more", post(more_rounds))
         .route("/daemon", post(set_daemon))
         .route("/daemon/poll", post(poll))
         .route("/queue/clear", post(clear_queue))
@@ -558,9 +562,11 @@ struct Page {
     limit: Option<usize>,
 }
 
-/// The history, each build with its statuses posted and waiting.
+/// The history, each build with its statuses posted and waiting; a fix's
+/// round with its fix, round and job.
 async fn builds(State(d): D, Query(q): Query<Page>) -> Json<Value> {
     let statuses = d.statuses();
+    let rounds = d.round_builds();
     let builds: Vec<Value> = d
         .builds(q.before, q.limit.unwrap_or(100).min(100))
         .into_iter()
@@ -569,6 +575,9 @@ async fn builds(State(d): D, Query(q): Query<Page>) -> Json<Value> {
             let mut v = json!(b);
             v["posted"] = json!(posted);
             v["unposted"] = json!(unposted);
+            if let Some((fix, round, job)) = rounds.get(&b.id) {
+                (v["fix"], v["round"], v["job"]) = (json!(fix), json!(round), json!(job));
+            }
             v
         })
         .collect();
@@ -645,11 +654,17 @@ async fn rerun(State(d): D, Path(id): Path<u64>) -> Response {
 
 /// Fix with Claude: the fix for a failed build, made or gone on with, as
 /// `bana-manager fix prepare` prints it: {fix, worktree, branch, link,
-/// command, dir, reused}. 404 for no such build, 409 for one that did not
-/// fail (it passed, was cancelled, timed out, could not start, or runs).
+/// command, dir, reused}, and its rounds (round 0, the recheck, is queued
+/// with a new fix). 404 for no such build, 409 for one that did not fail (it
+/// passed, was cancelled, timed out, could not start, or runs) or is a
+/// fix's round.
 async fn fix_build(State(d): D, Path(id): Path<u64>) -> Response {
     match d.fix(id).await {
-        Ok(made) => Json(made).into_response(),
+        Ok(made) => {
+            let mut v = json!(made);
+            v["rounds"] = d.rounds(&made.fix);
+            Json(v).into_response()
+        }
         Err(e) => fix_error(e),
     }
 }
@@ -658,14 +673,112 @@ async fn fixes(State(d): D) -> Json<Value> {
     Json(json!({ "fixes": d.fixes() }))
 }
 
+/// A fix's name: 4 to 64 hex digits of its commit (its sha7).
+fn fix_name(name: &str) -> bool {
+    (4..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// One fix, by its sha7 (4 to 64 hex digits of its commit).
 async fn fix_state(State(d): D, Path(name): Path<String>) -> Response {
-    if !(4..=64).contains(&name.len()) || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !fix_name(&name) {
         return err(StatusCode::BAD_REQUEST, "fix: its commit's hex digits");
     }
     match d.fix_state(&name).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => fix_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Register {
+    fix: String,
+}
+
+/// A fix `bana fix` prepared in a terminal (a hand run, a pasted log), once it
+/// pushed the failing commit into the daemon's clone: its round 0 is queued.
+async fn register_fix(State(d): D, Json(b): Json<Register>) -> Response {
+    if !fix_name(&b.fix) {
+        return err(StatusCode::BAD_REQUEST, "fix: its commit's hex digits");
+    }
+    match d.register(&b.fix).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => round_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AskRound {
+    /// The snapshot, pushed to refs/bana/fix/<sha7>/… in src.
+    sha: String,
+    #[serde(default)]
+    jobs: Option<Vec<String>>,
+    #[serde(default)]
+    repeat: bool,
+}
+
+/// run_jobs: a round at a snapshot. {fix, round, reused, tree, builds,
+/// rounds_left}; 409 with the reason (and `running`, the round that runs)
+/// when the limits say no or the snapshot is not the fix's.
+async fn ask_round(State(d): D, Path(name): Path<String>, Json(b): Json<AskRound>) -> Response {
+    if !fix_name(&name) {
+        return err(StatusCode::BAD_REQUEST, "fix: its commit's hex digits");
+    }
+    if !matches!(b.sha.len(), 40 | 64) || !b.sha.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return err(StatusCode::BAD_REQUEST, "sha: a snapshot's full commit");
+    }
+    if b.jobs.as_ref().is_some_and(|j| j.len() > 32) {
+        return err(StatusCode::BAD_REQUEST, "jobs: at most 32");
+    }
+    match d.ask_round(&name, &b.sha, b.jobs, b.repeat).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => round_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct Wait {
+    wait: Option<u64>,
+}
+
+/// One round; `?wait=55` waits up to that many seconds for it to end.
+async fn round(
+    State(d): D,
+    Path((name, n)): Path<(String, u32)>,
+    Query(q): Query<Wait>,
+) -> Response {
+    if !fix_name(&name) {
+        return err(StatusCode::BAD_REQUEST, "fix: its commit's hex digits");
+    }
+    let wait = Duration::from_secs(q.wait.unwrap_or(0).min(ROUND_WAIT));
+    match d.round(&name, n, wait).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => round_error(e),
+    }
+}
+
+/// More rounds, from the fix card.
+async fn more_rounds(State(d): D, Path(name): Path<String>) -> Response {
+    if !fix_name(&name) {
+        return err(StatusCode::BAD_REQUEST, "fix: its commit's hex digits");
+    }
+    match d.more_rounds(&name) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => round_error(e),
+    }
+}
+
+fn round_error(e: RoundError) -> Response {
+    match e {
+        RoundError::Missing(m) => err(StatusCode::NOT_FOUND, m),
+        RoundError::Bad(m) => err(StatusCode::BAD_REQUEST, m),
+        RoundError::Refused { why, running } => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": why, "running": running})),
+        )
+            .into_response(),
+        RoundError::Failed(m) => err(StatusCode::INTERNAL_SERVER_ERROR, m),
     }
 }
 
@@ -1070,6 +1183,10 @@ esac"#,
             ("POST", "/ci/v1/builds/1/fix"),
             ("GET", "/ci/v1/fixes"),
             ("GET", "/ci/v1/fixes/abcd123"),
+            ("POST", "/ci/v1/fixes"),
+            ("POST", "/ci/v1/fixes/abcd123/rounds"),
+            ("GET", "/ci/v1/fixes/abcd123/rounds/0?wait=55"),
+            ("POST", "/ci/v1/fixes/abcd123/more"),
             ("POST", "/ci/v1/daemon"),
             ("POST", "/ci/v1/daemon/poll"),
             ("POST", "/ci/v1/queue/clear"),
@@ -1411,6 +1528,78 @@ esac"#,
             let (c, e) = call(&app, "GET", &format!("/ci/v1/fixes/{name}"), None, true).await;
             assert_eq!(c, code, "{name}: {e}");
         }
+
+        // Round 0 ran at the failing commit; its long poll gives the result.
+        let path = format!("/ci/v1/fixes/{sha7}/rounds/0?wait=30");
+        let (code, r0) = call(&app, "GET", &path, None, true).await;
+        assert_eq!(code, 200, "{r0}");
+        assert_eq!((&r0["state"], &r0["sha"]), (&json!("failure"), &json!(sha)));
+        let (code, one) = call(&app, "GET", &format!("/ci/v1/fixes/{sha7}"), None, true).await;
+        assert_eq!(
+            (code, &one["recheck"]["n"], &one["rounds_left"]),
+            (200, &json!(0), &json!(5))
+        );
+        let (_, b) = call(&app, "GET", "/ci/v1/builds", None, true).await;
+        let round0 = b["builds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["id"] == 4)
+            .unwrap();
+        assert_eq!(
+            (&round0["fix"], &round0["round"], &round0["job"]),
+            (&json!(sha7), &json!(0), &json!("lint"))
+        );
+
+        // Registered again, it has rounds: no second round 0.
+        let reg = Some(json!({"fix": sha7}));
+        let (code, v) = call(&app, "POST", "/ci/v1/fixes", reg, true).await;
+        assert_eq!((code, &v["recheck"]), (200, &Value::Null), "{v}");
+        for (path, body, code) in [
+            ("/ci/v1/fixes", json!({"fix": other}), 404),
+            ("/ci/v1/fixes", json!({"fix": "x/y"}), 400),
+            ("/ci/v1/fixes", json!({"fix": sha7, "more": 1}), 422),
+            (
+                &format!("/ci/v1/fixes/{sha7}/rounds") as &str,
+                json!({"sha": "abc"}),
+                400,
+            ),
+            (
+                &format!("/ci/v1/fixes/{sha7}/rounds"),
+                json!({"sha": "a".repeat(40)}),
+                409,
+            ),
+            (
+                &format!("/ci/v1/fixes/{other}/rounds"),
+                json!({"sha": "a".repeat(40)}),
+                404,
+            ),
+        ] {
+            let (c, e) = call(&app, "POST", path, Some(body.clone()), true).await;
+            assert_eq!(c, code, "{path} {body}: {e}");
+        }
+        let (code, e) = call(
+            &app,
+            "GET",
+            &format!("/ci/v1/fixes/{sha7}/rounds/7"),
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(code, 404, "{e}");
+        let (code, m) = call(
+            &app,
+            "POST",
+            &format!("/ci/v1/fixes/{sha7}/more"),
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(
+            (code, &m["limit"], &m["rounds_left"]),
+            (200, &json!(10), &json!(10)),
+            "{m}"
+        );
         d.shutdown().await;
         p.remove();
     }

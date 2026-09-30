@@ -267,6 +267,10 @@ d_write_settings() { # PORT TRAY PATH GH ROOT
   [[ $(daemon_conf daemon.timeout) =~ ^[1-9][0-9]*s?$ ]] || die "daemon.timeout: minutes (or seconds, as 90s)"
   case $(daemon_conf daemon.supersede) in queued | running) ;; *) die "daemon.supersede: queued or running" ;; esac
   case $(daemon_conf daemon.token) in gh | none) ;; *) die "daemon.token: gh or none" ;; esac
+  # A fix's rounds (run_jobs): how many, and their GITHUB_TOKEN (none: act runs offline).
+  v=$(conf fix.rounds 5)
+  if ! [[ $v =~ ^[0-9]+$ ]] || ((v < 1 || v > 100)); then die "fix.rounds: a number from 1 to 100, not '$v'"; fi
+  case $(conf fix.token none) in gh | none) ;; *) die "fix.token: gh or none" ;; esac
   login=$(gh api user --jq .login 2>/dev/null || true)
   # The bana commit the snapshot is of (a fix's brief names it), unless bana is a copy
   # inside another repository.
@@ -286,6 +290,8 @@ d_write_settings() { # PORT TRAY PATH GH ROOT
       v=$(daemon_conf "$k")
       echo "$k =${v:+ $v}"
     done
+    echo "fix.rounds = $(conf fix.rounds 5)"
+    echo "fix.token = $(conf fix.token none)"
     echo "port = $port"
     echo "host = $host"
     [[ ! $login =~ ^[A-Za-z0-9-]+$ ]] || echo "login = $login"
