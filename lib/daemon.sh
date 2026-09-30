@@ -250,7 +250,7 @@ d_snapshot() { # BIN
   local f
   d_put "$1" "$d_snap/bana-manager" 755
   d_put "$bana_root/bin/bana" "$d_snap/bin/bana" 755
-  for f in "$bana_root"/lib/*.sh; do d_put "$f" "$d_snap/lib/$(basename "$f")" 644; done
+  for f in "$bana_root"/lib/*.sh "$bana_root"/lib/*.awk; do d_put "$f" "$d_snap/lib/$(basename "$f")" 644; done
 }
 
 # The daemon's own clone: made from your checkout (quick), then pointed at GitHub.

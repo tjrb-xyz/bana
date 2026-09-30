@@ -1,5 +1,6 @@
 #!/bin/sh
-# Stand-in Claude Code: it never runs a prompt. It logs its arguments and where it ran, and
+# Stand-in Claude Code: it never runs a prompt (--help lists -n unless FAKE_CLAUDE_NO_NAME).
+# It logs its arguments and where it ran, and
 # keeps them for the tests in $FAKE_STATE: claude.cwd, and claude.args (each argument ends
 # with a NUL). --version answers as Claude Code does. `mcp add|remove|get NAME` keep the
 # names registered in claude.mcp, one a line (get fails for one that is not there, and
@@ -13,6 +14,13 @@
 # hook's exit goes on a line of claude.stops, and what it said on stderr into the stream.
 printf 'claude %s (in %s)\n' "$*" "$(pwd -P)" >>"$FAKE_LOG"
 [ "${1:-}" != --version ] || { echo "2.1.284 (Claude Code)"; exit 0; }
+# --help: its options, with -n, --name unless FAKE_CLAUDE_NO_NAME (an older Claude Code).
+if [ "${1:-}" = --help ]; then
+  echo "Usage: claude [options] [command] [prompt]"
+  [ -n "${FAKE_CLAUDE_NO_NAME:-}" ] || echo "  -n, --name <name>                     Set a display name for this session"
+  echo "  -p, --print                           Print response and exit"
+  exit 0
+fi
 if [ "${1:-}" = mcp ]; then
   reg=$FAKE_STATE/claude.mcp
   case ${2:-} in

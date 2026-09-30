@@ -10,6 +10,8 @@
 #     --x64            Linux containers as x86_64 (on Apple silicon, through OrbStack's Rosetta)
 #     --list           the jobs, without running them
 #     -n, --dry-run    what would run
+#     -v, --verbose    act's own output as it comes (by default: a line as each job starts and
+#                      ends, a failed step's last lines, and why a job did not run)
 #     --event FILE     run with this event (a push's payload), whose inputs carry the tier
 #   Linux jobs (<prefix>-linux, ubuntu-*) run in containers from bana.conf's act.image; on a
 #   Mac, macOS jobs (<prefix>-macos) run on the Mac itself, with its CoreAudio and USB devices,
@@ -145,7 +147,7 @@ act_lock() { # LABEL
 }
 
 act_main() {
-  local tier='' x64='' list='' dry='' event='' secrets='' locked jobs=() pass=() args=() extra=()
+  local tier='' x64='' list='' dry='' event='' secrets='' locked jobs=() pass=() args=() extra=() verbose=''
   local wf root here tiers image arch net i o dc all=() mlabels=''
   while (($#)); do
     case $1 in
@@ -153,6 +155,7 @@ act_main() {
     --x64) x64=1 ;;
     --list | -l) list=1 ;;
     -n | --dry-run) dry=1 ;;
+    -v | --verbose) verbose=1 ;;
     --event) event=${2:?--event FILE}; shift ;;
     --) shift; pass=("$@"); break ;;
     -h | --help | help) act_usage ;;
@@ -342,7 +345,7 @@ act_machine_jobs() { # FILE...
 # disk. Under --json only the jobs' own lines (and errors) come out: the jobs they need ran in
 # the first act already. Uses act_main's locals.
 act_machine() { # IDS ACT-ARGUMENT...
-  local ids=$1 a=() vc=() j json='' v pf tf st=0 i
+  local ids=$1 a=() vc=() j json='' v pf tf st=0 i names
   shift
   for ((i = 1; i <= $#; i++)); do
     case ${!i} in
@@ -354,6 +357,11 @@ act_machine() { # IDS ACT-ARGUMENT...
   for j in $ids; do a+=(-j "$j"); done
   v=$(act --version 2>/dev/null | awk 'NR == 1 { print $NF }')
   [[ -n $v ]] || { warn "act has no version to install in the Linux machine"; return 1; }
+  # The jobs' names, as act's text shows them.
+  names=$(act -l -C "$root" -W "$wf" 2>/dev/null | awk -v ids=" $(printf '%s' "$ids" | tr '\n' ' ') " '
+    NR == 1 { b = index($0, "Job name"); c = index($0, "Workflow name"); a = index($0, "Job ID"); next }
+    { id = substr($0, a, b - a); nm = substr($0, b, c - b); gsub(/^ +| +$/, "", id); gsub(/^ +| +$/, "", nm)
+      if (index(ids, " " id " ")) print nm }') || true
   say "act: $(printf '%s' "$ids" | tr '\n' ' ')in the Linux machine $vm (host mode, with systemd)"
   { vm_up "$vm" native && vm_bana "$vm" linux-prepare "$v"; } >&2 ||
     { warn "The Linux machine $vm is not ready: its jobs did not run"; return 1; }
@@ -371,7 +379,7 @@ act_machine() { # IDS ACT-ARGUMENT...
     GITHUB_TOKEN=$(cat "$tf"); export GITHUB_TOKEN
     echo $$ >"$pf"
     exec "$HOME/.local/bin/act-$v" "$@" --action-cache-path "$HOME/.cache/bana/$c"' \
-    bana-act "$here" "$pf" "$v" "$tf" "act-$prefix" "${a[@]}") > >(act_only "$json" "$ids") &
+    bana-act "$here" "$pf" "$v" "$tf" "act-$prefix" "${a[@]}") > >(act_only "$json" "$ids" "$names") &
   act_child=$!
   act_wait "$act_child" || st=$?
   act_child='' act_vm_pid=''
@@ -379,13 +387,39 @@ act_machine() { # IDS ACT-ARGUMENT...
   return "$st"
 }
 
-# act's output with JSON: only IDS' lines, lines that are not JSON, and errors; else all of it.
-act_only() { # JSON(1|'') IDS
-  [[ -n $1 ]] || { cat; return; }
+# The second act's output, of only its own jobs, IDS (by NAMES in act's text): the jobs they need
+# ran in the first act. Lines of no job (act's own, and errors) stay.
+act_only() { # JSON(1|'') IDS NAMES
+  if [[ -z $1 ]]; then
+    awk -v names="$3" 'BEGIN { n = split(names, a, "\n"); for (i = 1; i <= n; i++) keep[a[i]] = 1 }
+      !/^\[[^]]*\]/ { print; fflush(); next }
+      { j = substr($0, 2, index($0, "]") - 2); sub(/^[^\/]*\//, "", j); sub(/ +$/, "", j); if (j in keep) { print; fflush() } }'
+    return
+  fi
   awk -v ids=" $(printf '%s' "$2" | tr '\n' ' ') " '
     !/^\{/ { print; fflush(); next }
     match($0, /"jobID":"[^"]*"/) { id = substr($0, RSTART + 9, RLENGTH - 10); if (index(ids, " " id " ")) { print; fflush() } next }
     /"level":"(error|fatal|panic)"/ { print; fflush() }'
+}
+
+# What bana ci shows by hand, from act's text (all of which goes to last.log): a line as each
+# job starts and ends, a failed step's last 20 lines, the plan's choice, why a job did not run
+# (its labels' place here, or its if:), bana's own lines and act's errors; then a count.
+# -v shows act's output itself. It ignores Ctrl-C, so tee and act still end the log.
+# Uses act_main's locals.
+act_view() {
+  local lf tf
+  [[ -z $verbose ]] || { cat; return; }
+  lf=$(mktemp "${TMPDIR:-/tmp}/bana-view.XXXXXX")
+  tf=$lf.table
+  act -l -C "$root" -W "$wf" >"$lf" 2>/dev/null || true
+  act_platform_table >"$tf"
+  (
+    trap '' INT
+    exec awk -v list="$lf" -v table="$tf" -v machine="$mlabels" -v vm="$vm" -v os="$os" -v only="${jobs[1]:-}" \
+      -v logfile="$home/ci/last.log" -v tty="$([[ -t 1 ]] && echo 1)" -f "$bana_root/lib/view.awk"
+  )
+  rm -f "$lf" "$tf"
 }
 
 # A run by hand keeps act's output, and what ran, for bana fix: in ~/.bana/<prefix>/ci,
@@ -413,7 +447,7 @@ act_logged() { # ACT-ARGUMENT...
   # Ctrl-C reaches act, which stops its jobs and ends; tee -i and bash (trapping it) wait
   # for that, so the log ends as act's output does.
   trap 'stopped=1' INT
-  if act_both "$@" 2>&1 | tee -i "$dir/last.log.part"; then status=0; else status=${PIPESTATUS[0]}; fi
+  if act_both "$@" 2>&1 | tee -i "$dir/last.log.part" | act_view; then status=0; else status=${PIPESTATUS[0]}; fi
   trap - INT
   printf '%s\n' "sha=$sha" "ref=$ref" "dirty=$dirty" "tier=$tier" "job=${jobs[1]:-}" "event=$event" \
     "network=$net" "act=$v" "bana=$b" "started=$started" "ended=$(date +%s)" "exit=$status" \

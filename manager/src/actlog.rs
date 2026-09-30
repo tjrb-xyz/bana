@@ -897,6 +897,9 @@ pub struct BuildView {
     pub tier: String,
     /// `push`, `manual`, `rerun` or `retry`.
     pub trigger: String,
+    /// A manual build of one job (and the jobs it needs): that job's id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
     pub attempt: u32,
     pub state: BuildState,
     pub reason: Option<String>,
@@ -928,6 +931,9 @@ pub struct QueuedView {
     pub sha: String,
     pub tier: String,
     pub trigger: String,
+    /// A one-job build's job (a round's is on its fix).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
     pub queued_at: i64,
     /// Why it waits, when not just for the running build: `paused`,
     /// `waiting for Docker`, `waiting for your bana ci`.
@@ -1982,6 +1988,7 @@ mod tests {
             git_ref: "main".into(),
             sha: "1a2b3c4d5e6f".into(),
             tier: "quick".into(),
+            job: None,
             trigger: "push".into(),
             attempt: 1,
             state,
