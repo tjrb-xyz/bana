@@ -1,0 +1,280 @@
+# ---- the rest is bana's installer (lib/install.sh.in); the lines above are this build's ----
+# Installs the build for this machine: its files in PREFIX/TAG, PREFIX/current pointing
+# at them, its commands linked in BIN. Run it again to upgrade.
+#
+#   sh install.sh [--yes] [--force] [--no-hook] [--prefix DIR] [--bin-dir DIR] [--from FILE|DIR]
+#   sh install.sh --uninstall [--purge] [--yes] [--prefix DIR]
+#
+#   --prefix DIR     where it goes (INSTALL_PREFIX; default bana.conf's install.prefix,
+#                    else ~/.local/share/NAME)
+#   --bin-dir DIR    where its commands are linked (INSTALL_BIN; default where the installed
+#                    version has them, else bana.conf's install.bin, else ~/.local/bin)
+#   --from FILE|DIR  install this archive, or this machine's from a directory of them (a
+#                    build's files on bana's daemon), not a download; its sha256 must still match
+#   --yes            yes to the hook's questions (INSTALL_YES=1; for CI and scripts)
+#   --force          install the installed version again
+#   --no-hook        do not run the project's hook
+#   --uninstall      the hook's pre-uninstall, then remove the links and files, then
+#                    post-uninstall (INSTALL_UNINSTALL=1)
+#   --purge          with --uninstall: remove the project's settings too
+set -eu
+
+die() { printf '%s installer: %s\n' "$NAME" "$*" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+
+yes=0 force=0 hook=1 uninstall=0 purge=0 from='' prefix=${INSTALL_PREFIX:-} bin=${INSTALL_BIN:-}
+[ "${INSTALL_YES:-}" != 1 ] || yes=1
+[ "${INSTALL_UNINSTALL:-}" != 1 ] || uninstall=1
+while [ $# -gt 0 ]; do
+  case $1 in
+  -y | --yes) yes=1 ;;
+  -f | --force) force=1 ;;
+  --no-hook) hook=0 ;;
+  --uninstall) uninstall=1 ;;
+  --purge) purge=1 ;;
+  --from | --prefix | --bin-dir)
+    [ $# -ge 2 ] || die "$1 needs a value"
+    [ -n "$2" ] || die "$1 needs a value"
+    case $1 in --from) from=$2 ;; --prefix) prefix=$2 ;; --bin-dir) bin=$2 ;; esac
+    shift ;;
+  -h | --help) sed -n '/^# Installs/,/^# *--purge/p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) die "unknown option $1 (--help)" ;;
+  esac
+  shift
+done
+
+[ -n "${HOME:-}" ] || die "HOME is not set"
+# shellcheck disable=SC2088 # a literal ~/ from bana.conf or a flag, made $HOME/
+home_path() { case $1 in "~") printf '%s\n' "$HOME" ;; "~/"*) printf '%s/%s\n' "$HOME" "${1#"~/"}" ;; *) printf '%s\n' "$1" ;; esac; }
+prefix=$(home_path "${prefix:-${PREFIX_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/$NAME}}")
+config=$(home_path "${CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/$NAME}")
+case $prefix in /*) ;; *) prefix=$(pwd)/$prefix ;; esac
+case $from in '' | /*) ;; *) from=$(pwd)/$from ;; esac
+
+# os-arch of this machine, as the archives name it: macos-arm64, linux-x64, ...
+platform() {
+  os=$(uname -s) arch=$(uname -m)
+  case $os in
+  Darwin) os=macos ;;
+  Linux) os=linux ;;
+  MINGW* | MSYS* | CYGWIN*) die "on Windows, run install.ps1 in PowerShell" ;;
+  *) die "no build for $os" ;;
+  esac
+  case $arch in
+  arm64 | aarch64) arch=arm64 ;;
+  x86_64 | amd64) arch=x64 ;;
+  *) die "no build for $arch" ;;
+  esac
+  # Under Rosetta, uname says x86_64 on an Apple silicon Mac; the kernel's
+  # hw.optional.arm64 exists (and is 1) only on Apple silicon.
+  if [ "$os" = macos ] && [ "$arch" = x64 ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ]; then
+    arch=arm64
+  fi
+  # A 32-bit userland on a 64-bit ARM kernel (older Raspberry Pi OS) cannot run arm64 builds.
+  if [ "$os" = linux ] && [ "$arch" = arm64 ] && [ "$(getconf LONG_BIT 2>/dev/null)" = 32 ]; then
+    die "this is a 32-bit system on a 64-bit CPU: no build for it"
+  fi
+}
+
+# No tool to check the download with stops the install: it never skips the check.
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1"                           # Linux; macOS 14+ (/sbin/sha256sum)
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1"                       # every macOS
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$1" | awk '{ print $NF }'
+  else
+    echo "none"
+  fi | awk '{ print $1; exit }'
+}
+
+# The archive for this machine, and its sha256, from ASSETS.
+pick() {
+  asset=$(printf '%s\n' "$ASSETS" | awk -v p="$os-$arch" '$1 == p { print $2; exit }')
+  want=$(printf '%s\n' "$ASSETS" | awk -v p="$os-$arch" '$1 == p { print $3; exit }')
+  [ -n "$asset" ] || die "$TAG has no build for $os-$arch (it has: $(printf '%s\n' "$ASSETS" | awk '{ printf "%s ", $1 }'))"
+}
+
+download() { # ASSET DIR
+  url=${INSTALL_URL:-https://github.com/$REPO/releases/download/$TAG} # INSTALL_URL: a mirror
+  if [ -z "${INSTALL_URL:-}" ] && command -v gh >/dev/null 2>&1 && gh auth token >/dev/null 2>&1; then
+    # Private repositories too, with gh's own sign-in.
+    gh release download "$TAG" -R "$REPO" -p "$1" -D "$2" --clobber
+  elif command -v curl >/dev/null 2>&1; then
+    curl -fL --proto '=https' --tlsv1.2 --progress-bar -o "$2/$1" "$url/$1" ||
+      die "could not download $url/$1 ($REPO may be private: install the GitHub CLI and run 'gh auth login')"
+  else
+    die "need the GitHub CLI (gh) or curl to download"
+  fi
+}
+
+# The receipt: what is installed, and where (KEY=VALUE lines; link= once per command,
+# version= once per version directory this installer made).
+receipt() { [ -f "$prefix/receipt" ] && awk -v k="$1" 'index($0, k "=") == 1 { print substr($0, length(k) + 2) }' "$prefix/receipt"; }
+# The version directories in PREFIX that are ours: only those are ever removed (PREFIX
+# may be a directory with other things in it).
+versions() { { receipt version || true; } | awk '$0 != "" && $0 != "." && $0 != ".." && $0 != "current" && $0 != "receipt" && !index($0, "/")'; }
+
+# Questions go to the terminal even under curl | sh (stdin is the script then); with no
+# terminal (CI), the hook gets no stdin and INSTALL_YES says what to do.
+tty_in() { (: </dev/tty) 2>/dev/null && echo /dev/tty || echo /dev/null; }
+
+# The project's hook: sh HOOK STAGE, in the version's directory, with INSTALL_* and
+# bana.conf's install.env.* in its environment.
+run_hook() { # STAGE HOOK_FILE DIR TAG
+  [ "$hook" = 1 ] && [ -n "$HOOK" ] && [ -f "$2" ] || return 0
+  (cd "$3" 2>/dev/null || cd /
+    while IFS= read -r l; do
+      [ -z "$l" ] || export "${l%%=*}=$(home_path "${l#*=}")"
+    done <<EOF
+$ENVS
+EOF
+    INSTALL_STAGE=$1 INSTALL_DIR=$3 INSTALL_TAG=$4 INSTALL_PREVIOUS=$previous \
+      INSTALL_PREVIOUS_DIR=${previous:+$prefix/$previous} INSTALL_PREFIX=$prefix INSTALL_BIN=$bin \
+      INSTALL_CONFIG=$config INSTALL_NAME=$NAME INSTALL_YES=$yes INSTALL_OS=$os INSTALL_ARCH=$arch \
+      sh "$2" "$1" <"$(tty_in)")
+}
+
+# The links this installer made (and only those: a file of yours by that name stays).
+ours() { [ -L "$1" ] && case $(readlink "$1") in "$prefix"/*) true ;; *) false ;; esac; }
+
+# ARCHIVE into DIR, once its list is checked: one top directory, nothing outside it.
+unpack() {
+  tar -tzf "$1" >"$tmp/list" 2>/dev/null || die "$asset is not a tar.gz"
+  bad=$(awk '{ p = "/" $0 "/" } substr($0, 1, 1) == "/" || index(p, "/../") { print; exit }' "$tmp/list")
+  [ -z "$bad" ] || die "$asset has an entry outside its directory: $bad"
+  top=$(awk '{ while (substr($0, 1, 2) == "./") $0 = substr($0, 3); i = index($0, "/"); if (i) $0 = substr($0, 1, i - 1) } $0 != "" && $0 != "." { print }' "$tmp/list" | sort -u)
+  [ -n "$top" ] || die "$asset is empty"
+  [ "$(printf '%s\n' "$top" | wc -l | tr -d ' ')" = 1 ] ||
+    die "$asset should hold one directory, and has: $(printf '%s\n' "$top" | tr '\n' ' ')"
+  mkdir "$2"
+  tar -xzf "$1" -C "$2"
+  src=$2/$top
+  [ -d "$src" ] || die "$asset should hold one directory, and $top is not one"
+  [ ! -L "$src" ] || die "$asset should hold one directory, and $top is a link"
+}
+
+platform
+previous=$(receipt tag || true)
+
+if [ "$uninstall" = 1 ]; then
+  [ -n "$previous" ] || die "not installed in $prefix (no receipt)"
+  HOOK=$(receipt hook || true) bin=$(receipt bin || true) was_config=$(receipt config || true)
+  config=${was_config:-$config}
+  dir=$prefix/$previous
+  keep=$(mktemp -d)
+  trap 'rm -rf "$keep"' EXIT
+  [ -z "$HOOK" ] || [ ! -f "$dir/$HOOK" ] || cp "$dir/$HOOK" "$keep/hook"
+  run_hook pre-uninstall "$dir/$HOOK" "$dir" "$previous" || die "the pre-uninstall hook failed; nothing removed"
+  receipt link | while IFS= read -r l; do ! ours "$l" || rm -f "$l"; done
+  versions | while IFS= read -r v; do rm -rf "${prefix:?}/$v"; done
+  rm -f "$prefix/current" "$prefix/receipt"
+  rmdir "$prefix" 2>/dev/null || true # not when something else is in it
+  if [ "$purge" = 1 ]; then
+    case ${config%/} in '' | "$HOME" | "${HOME%/}") say "warning: not removing $config (your home)" ;; *) rm -rf "$config" ;; esac
+  fi
+  say "$NAME $previous is uninstalled"
+  run_hook post-uninstall "$keep/hook" "$dir" "$previous" || die "the post-uninstall hook failed (the files are gone)"
+  exit 0
+fi
+
+# A build on bana's daemon is no release: nothing to download it from.
+[ "$LOCAL" = 0 ] || [ -n "$from" ] ||
+  die "$TAG is a build on bana's daemon, not a release: bana install there, or sh install.sh --from DIR (its files)"
+bin=$(home_path "${bin:-$(receipt bin || true)}")
+bin=$(home_path "${bin:-${BIN_DIR:-${XDG_BIN_HOME:-$HOME/.local/bin}}}")
+case $bin in /*) ;; *) bin=$(pwd)/$bin ;; esac
+pick
+if [ -d "$from" ]; then
+  [ -f "$from/$asset" ] || die "$from has no $asset ($TAG for $os-$arch)"
+  from=$from/$asset
+fi
+# The same tag with the same archive (a build on bana's daemon keeps its label when built
+# again, with other bytes): nothing to do.
+if [ "$previous" = "$TAG" ] && [ "$force" = 0 ] && [ "$(receipt sha256 || true)" = "$want" ]; then
+  say "$NAME $TAG is installed already ($prefix/$TAG); --force installs it again"
+  exit 0
+fi
+
+# PREFIX may hold other things; this installer only touches TAG, current and receipt.
+if [ -z "$previous" ] && { [ -e "$prefix/current" ] || [ -L "$prefix/current" ] || [ -e "$prefix/receipt" ]; }; then
+  die "$prefix has a current or receipt that is not $NAME's installer's: another --prefix"
+fi
+if [ -e "$prefix/$TAG" ] && ! versions | grep -Fqx "$TAG"; then
+  die "$prefix/$TAG is not $NAME's installer's: another --prefix"
+fi
+old=$(versions)
+mkdir -p "$prefix" "$bin" || die "cannot write $prefix or $bin (another --prefix, or sudo)"
+# Download and unpack next to where it goes: the move into place is then a rename, and
+# a running command keeps its old file (overwriting it in place fails: text file busy).
+tmp=$(mktemp -d "$prefix/.install.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+trap 'exit 130' INT TERM
+if [ -n "$from" ]; then
+  [ -f "$from" ] || die "no file $from"
+  cp "$from" "$tmp/$asset"
+else
+  say "Downloading $NAME $TAG for $os-$arch"
+  download "$asset" "$tmp" || die "could not download $asset from $REPO's release $TAG"
+fi
+got=$(sha256 "$tmp/$asset")
+[ "$got" != none ] || die "need sha256sum, shasum or openssl to check $asset"
+[ "$got" = "$want" ] || die "$asset: sha256 $got, but the release says $want"
+
+unpack "$tmp/$asset" "$tmp/x"
+# macOS: a browser's download is quarantined, and tar passes that on to what it unpacks
+# (Gatekeeper then refuses a binary that is not notarized). curl and gh never set it.
+if [ "$os" = macos ] && command -v xattr >/dev/null 2>&1; then
+  xattr -dr com.apple.quarantine "$src" 2>/dev/null || true
+fi
+
+run_hook pre-install "$src/$HOOK" "$src" "$TAG" || die "the pre-install hook failed; nothing changed"
+
+[ ! -e "$prefix/$TAG" ] || mv "$prefix/$TAG" "$tmp/replaced"
+mv "$src" "$prefix/$TAG"
+ln -sfn "$TAG" "$prefix/current"
+
+# The commands: bin/'s files, or those of BINS it has.
+cmds=$BINS
+if [ -z "$cmds" ] && [ -d "$prefix/$TAG/bin" ]; then
+  cmds=$(cd "$prefix/$TAG/bin" && for f in *; do if [ -f "$f" ] && [ -x "$f" ]; then printf '%s ' "$f"; fi; done)
+fi
+: >"$tmp/links"
+linked=''
+for c in $cmds; do
+  [ -f "$prefix/$TAG/bin/$c" ] || continue # BINS names every platform's; this one may lack some
+  if [ -e "$bin/$c" ] || [ -L "$bin/$c" ]; then
+    ours "$bin/$c" || { say "warning: $bin/$c is not $NAME's: left alone"; continue; }
+  fi
+  ln -sfn "$prefix/current/bin/$c" "$bin/$c"
+  printf '%s\n' "$bin/$c" >>"$tmp/links"
+  linked="$linked $c"
+done
+# Links the previous version had and this one has not.
+receipt link | while IFS= read -r l; do grep -Fqx "$l" "$tmp/links" || ! ours "$l" || rm -f "$l"; done
+{
+  printf 'name=%s\nrepo=%s\ntag=%s\nplatform=%s\nasset=%s\nsha256=%s\n' "$NAME" "$REPO" "$TAG" "$os-$arch" "$asset" "$want"
+  printf 'bin=%s\nconfig=%s\nhook=%s\n' "$bin" "$config" "$HOOK"
+  sed 's/^/link=/' "$tmp/links"
+  # The versions kept: this one and the previous (to go back: ln -sfn OLD PREFIX/current);
+  # the same tag again keeps them all.
+  printf 'version=%s\n' "$TAG"
+  if [ "$previous" = "$TAG" ]; then printf '%s\n' "$old"; else printf '%s\n' "$previous"; fi |
+    awk -v t="$TAG" '$0 != "" && $0 != t { print "version=" $0 }'
+} >"$tmp/receipt"
+mv "$tmp/receipt" "$prefix/receipt"
+# Older versions of ours go.
+[ "$previous" = "$TAG" ] || printf '%s\n' "$old" | while IFS= read -r v; do
+  [ -z "$v" ] || [ "$v" = "$TAG" ] || [ "$v" = "$previous" ] || rm -rf "${prefix:?}/$v"
+done
+say "$NAME $TAG is in $prefix/$TAG${linked:+; commands in $bin:$linked}"
+
+[ -z "${GITHUB_PATH:-}" ] || printf '%s\n' "$bin" >>"$GITHUB_PATH"
+case ":$PATH:" in
+*":$bin:"*) ;;
+*) say "Add $bin to your PATH, e.g. in ~/.zprofile or ~/.profile: export PATH=\"$bin:\$PATH\"" ;;
+esac
+
+run_hook post-install "$prefix/$TAG/$HOOK" "$prefix/$TAG" "$TAG" ||
+  die "the post-install hook failed; $TAG is installed. Again: this installer with --force${from:+ --from $from}"

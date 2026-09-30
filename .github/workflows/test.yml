@@ -22,13 +22,21 @@ jobs:
       - uses: actions/checkout@v4
       - name: shellcheck
         if: runner.os == 'Linux'
-        run: shellcheck -x bin/bana lib/*.sh install.sh tests/run.sh tests/e2e-daemon.sh tests/stand-ins/* tests/fixtures/runner/*.sh examples/example/*.sh
+        run: shellcheck -x bin/bana lib/*.sh install.sh tests/*.sh tests/stand-ins/* tests/fixtures/runner/*.sh examples/example/*.sh
       - name: tests (macOS's /bin/bash 3.2 and awk)
         if: runner.os == 'macOS'
         run: BASH_UNDER_TEST=/bin/bash tests/run.sh
       - name: "tests (as root, so a Proxmox container's path too)"
         if: runner.os == 'Linux'
         run: sudo -E env PATH="$PATH" tests/run.sh
+      - name: the compiled installer (dash and bash; install.ps1 on pwsh)
+        if: runner.os == 'Linux'
+        run: SH=dash tests/install.sh && SH=bash tests/install.sh && SH=dash tests/install-real.sh && tests/install-ps1.sh
+      # The Mac's own: BSD tar, /sbin/sha256sum, sysctl (and Rosetta, when the runner has
+      # it), and a quarantined download installed with --from, which leaves no mark behind.
+      - name: the compiled installer on the Mac's own tools (/bin/sh)
+        if: runner.os == 'macOS'
+        run: SH=/bin/sh tests/install.sh && SH=/bin/sh tests/install-real.sh
   manager:
     runs-on: ubuntu-latest
     defaults:

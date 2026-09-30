@@ -23,8 +23,10 @@
 # The fix loop, with the test as Claude Code: Fix with Claude on the failed build makes its
 # worktree in the checkout and runs round 0; the test then starts bana's MCP server as Claude
 # Code does and calls its tools (fix_brief, run_jobs red, run_jobs green, commit_fix), and
-# pushes the branch with bana fix push, which the daemon builds as any push. Last, a hand
-# bana ci that fails, bana fix last (the claude stand-in), and run_jobs until green.
+# pushes the branch with bana fix push, which the daemon builds as any push. Then a hand
+# bana ci that fails, bana fix last (the claude stand-in), and run_jobs until green. Last,
+# a matrix that uploads an archive per CPU: the green build keeps them as its files with the
+# project's installer, which installs demo under a scratch home, as bana install does.
 set -euo pipefail
 
 if [[ ${BANA_E2E:-} != 1 ]]; then
@@ -129,6 +131,8 @@ repo = acme/wid
 prefix = wid
 tiers = quick nightly
 daemon.poll = 10
+# The gh stand-in's token is no token: act fetches upload-artifact from GitHub without one.
+daemon.token = none
 act.args = $host_args
 act.image = ${image:-none}
 report.work = linux/work host
@@ -720,7 +724,9 @@ git -C "$w" commit -q -am "fails, by hand"
 h=$(git -C "$w" rev-parse HEAD)
 h7=${h:0:7}
 s=$(date +%s)
-out=$(cd "$w" && bash "$bana" ci quick -j broken 2>&1) && code=0 || code=$?
+# --pull=false as the daemon's builds: act would pull the image again, and Docker Hub
+# answers repeated pulls with 429 (the run then fails in a second or two).
+out=$(cd "$w" && bash "$bana" ci quick -j broken -- --pull=false 2>&1) && code=0 || code=$?
 echo "   bana ci: exit $code in $(($(date +%s) - s)) s"
 check "hand: bana ci failed" test "$code" -ne 0
 check "hand: and points to bana fix" has <(printf '%s\n' "$out") "bana fix: hand this failure"
@@ -755,6 +761,84 @@ done
 check "hand: nor for the commit" same "$(posts "$h")" ""
 until_ok 60 "the daemon idle" idle
 clean "hand fix"
+
+# ---- 7. a green build's files, and an install from them -------------------------------------
+say "7. a package job's uploads: the build's files, and its installer"
+# A two-leg matrix packs demo for each CPU (the same script: act builds both on this one) and
+# uploads the archive with its .sha256 through upload-artifact@v4. Host jobs on a Mac pack
+# demo-macos-*, which the Mac's installer takes.
+cat >>"$w/.github/workflows/ci.yml" <<'EOF'
+  package:
+    runs-on: [self-hosted, wid-linux]
+    strategy:
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: pack
+        run: sh ci/pack.sh ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: demo-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-${{ matrix.arch }}
+          path: out/
+EOF
+cat >"$w/ci/pack.sh" <<'EOF'
+# out/demo-OS-ARCH.tar.gz, one directory with bin/demo and the hook; and its .sha256.
+case $(uname -s) in Darwin) d=demo-macos-$1 ;; *) d=demo-linux-$1 ;; esac
+mkdir -p "out/$d/bin"
+printf '#!/bin/sh\necho "demo works (%s)"\n' "$1" >"out/$d/bin/demo"
+chmod +x "out/$d/bin/demo"
+printf 'mkdir -p "$WID_LOG_DIR" && echo "$1 $INSTALL_TAG" >>"$WID_LOG_DIR/hook.log"\n' >"out/$d/hook.sh"
+tar -C out -czf "out/$d.tar.gz" "$d"
+rm -rf "out/$d"
+(cd out && { sha256sum "$d.tar.gz" 2>/dev/null || shasum -a 256 "$d.tar.gz"; } >"$d.tar.gz.sha256")
+EOF
+cat >>"$w/.github/bana.conf" <<'EOF'
+install.bins = demo
+install.hook = hook.sh
+install.env.WID_LOG_DIR = ~/wid-logs
+EOF
+g=$(push pass "packages")
+until_ok 900 "build of $g" finished "$g"
+until_ok 60 "the daemon idle" idle
+id=$(builds_of "$g" | tail -n 1 | cut -d'|' -f1)
+dist=$d/builds/$id/dist
+label=quick-${g:0:10}
+# What the jobs packed, and the build this machine's installer takes.
+pos=linux && [[ $os == Darwin ]] && pos=macos
+cpu=x64 && [[ $(uname -m) == arm64 || $(uname -m) == aarch64 ]] && cpu=arm64
+names() { find "$1" -mindepth 1 -maxdepth 1 2>/dev/null | sed 's|.*/||' | LC_ALL=C sort | tr '\n' ' '; }
+echo "   build #$id: $(state_of "$g"), files: $(names "$dist")"
+check "files: the build passed" same "$(state_of "$g")" success
+check "files: its dist: both archives, the installer and SHA256SUMS" same "$(names "$dist")" \
+  "SHA256SUMS demo-$pos-arm64.tar.gz demo-$pos-x64.tar.gz install.sh "
+check "files: SHA256SUMS holds for them" bash -c "cd '$dist' && sha256sum -c --quiet SHA256SUMS"
+check "files: the installer is this build's (a label: --from only)" has "$dist/install.sh" "TAG='$label'"
+check "files: the zips act kept are gone" test ! -e "$d/builds/$id/artifacts/$id"
+check "files: the build lists them" same \
+  "$(api "/builds/$id" | jq_ '" ".join("%s:%s" % (f["name"], f.get("platform") or "") for f in j["dist"]["files"])')" \
+  "SHA256SUMS: demo-$pos-arm64.tar.gz:$pos-arm64 demo-$pos-x64.tar.gz:$pos-x64 install.sh:"
+check "files: without a problem" same "$(api "/builds/$id" | jq_ 'j["dist"].get("problem")')" ""
+check "files: the history counts them" same "$(api /builds | jq_ '[b.get("files") for b in j["builds"] if b["id"] == '"$id"'][0]')" 4
+check "files: a download is the file" cmp -s <(api "/builds/$id/files/demo-$pos-x64.tar.gz") "$dist/demo-$pos-x64.tar.gz"
+check "files: nothing else is served" not api "/builds/$id/files/..%2Fbuild.json" -o /dev/null
+check "files: the report lists the artifacts" has "$d/builds/$id/report.md" "- \`demo-$pos-x64\` (package (x64), "
+check "files: the page has its Files section" bash -c "curl -fsS --noproxy '*' 'http://127.0.0.1:$port/' | grep -q 'id=\"files-table\"'"
+# Installed from the build's own files, under a home of its own.
+out=$(env HOME="$T/inst" XDG_DATA_HOME= XDG_BIN_HOME= XDG_CONFIG_HOME= sh "$dist/install.sh" --from "$dist" --yes 2>&1) && code=0 || code=$?
+[[ $code == 0 ]] || echo "$out" >&2
+check "install: sh dist/install.sh --from dist --yes" same "$code" 0
+check "install: demo in the bin it links, and it works" same "$("$T/inst/.local/bin/demo" 2>&1)" "demo works ($cpu)"
+check "install: the hook ran, with install.env" same "$(tr '\n' ' ' <"$T/inst/wid-logs/hook.log" 2>/dev/null)" \
+  "pre-install $label post-install $label "
+check "install: a receipt" has "$T/inst/.local/share/wid/receipt" "tag=$label"
+out=$(cd "$w" && bash "$bana" install "$id" --yes 2>&1) && code=0 || code=$?
+[[ $code == 0 ]] || echo "$out" >&2
+check "install: bana install $id, in this home" same "$code|$("$HOME/.local/bin/demo" 2>&1)" "0|demo works ($cpu)"
+out=$(cd "$w" && bash "$bana" install "$id" --uninstall --yes 2>&1) && code=0 || code=$?
+[[ $code == 0 ]] || echo "$out" >&2
+check "install: and --uninstall takes it away" same "$code|$(ls "$HOME/.local/bin" 2>/dev/null)" "0|"
+clean files
 
 stop_daemon
 check "stop: the daemon leaves no lock" test ! -e "$HOME/.bana/act.lock"

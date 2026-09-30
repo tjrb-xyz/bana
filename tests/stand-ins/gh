@@ -1,6 +1,7 @@
 #!/bin/sh
 # Stand-in GitHub CLI: signed in when FAKE_GH=1 (FAKE_GH_SCOPES: its token's); tokens,
-# labels, the runner list and the user.
+# labels, the runner list and the user; release download TAG -R REPO -p NAME -D DIR from
+# FAKE_RELEASES/TAG (install.sh's tests).
 echo "gh $*" >>"$FAKE_LOG"
 [ "${FAKE_GH:-1}" = 1 ] || exit 1
 case "$*" in
@@ -12,5 +13,10 @@ case "$*" in
 *remove-token*) echo REMOVE-TOKEN ;;
 *"-X PUT"*labels*) echo '{}' ;;
 *"-X DELETE"*) ;;
+"release download "*)
+  tag=$3; shift 3; p='' d=.
+  while [ $# -gt 0 ]; do case $1 in -R) shift ;; -p) p=$2; shift ;; -D) d=$2; shift ;; esac; shift; done
+  [ -f "$FAKE_RELEASES/$tag/$p" ] || { echo "no assets match the file pattern" >&2; exit 1; }
+  cp "$FAKE_RELEASES/$tag/$p" "$d/$p" ;;
 *actions/runners*) printf '%s\n' "${FAKE_POOL:-}" ;;
 esac

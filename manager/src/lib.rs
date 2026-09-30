@@ -12,6 +12,7 @@
 //! This module is the pure part: the programs' outputs in, the views out.
 
 pub mod actlog;
+pub mod artifacts;
 pub mod daemon;
 pub mod fix;
 pub mod guard;

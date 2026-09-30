@@ -906,6 +906,16 @@ pub struct BuildView {
     /// The history's chip from its CI report (`tests 95%`), once it ended.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tests: Option<String>,
+    /// The files its dist/ has to download ([`crate::daemon::Dist`]).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub files: usize,
+    /// Its files were refused, or have no installer.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub files_problem: bool,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

@@ -525,6 +525,7 @@ fn local_routes(d: Daemon) -> Router {
         .route("/builds/{id}", get(build))
         .route("/builds/{id}/log", get(build_log))
         .route("/builds/{id}/report", get(build_report))
+        .route("/builds/{id}/files/{name}", get(build_file))
         .route("/builds/{id}/cancel", post(cancel_build))
         .route("/builds/{id}/rerun", post(rerun))
         .route("/builds/{id}/fix", post(fix_build))
@@ -629,6 +630,32 @@ async fn build_report(State(d): D, Path(id): Path<u64>) -> Response {
             Json(json!({"build": id, "markdown": r.markdown, "standards": r.standards}))
                 .into_response()
         }
+    }
+}
+
+/// One of a build's collected files, to download: only a name its dist
+/// lists (no path, no `..`).
+async fn build_file(State(d): D, Path((id, name)): Path<(u64, String)>) -> Response {
+    let Some(path) = d.file(id, &name) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("build {id} has no file {name}"),
+        );
+    };
+    match tokio::task::spawn_blocking(move || std::fs::read(path)).await {
+        Ok(Ok(bytes)) => (
+            [
+                (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{name}\""),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{name}: {e}")),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
@@ -1327,6 +1354,74 @@ esac"#,
             .collect()
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_builds_files_are_served_by_their_names_only() {
+        let (p, d, app) = daemon_app("srv-files").await;
+        p.commit("files", "packages");
+        p.push("main");
+        assert_eq!(
+            call(&app, "POST", "/ci/v1/daemon/poll", None, true).await.0,
+            200
+        );
+        let rec = built(&d, 1).await;
+        assert_eq!(rec.dist.map(|d| d.files.len()), Some(4));
+        let get = |path: String, token: bool| {
+            let app = app.clone();
+            async move {
+                let mut b = axum::http::Request::builder()
+                    .uri(path)
+                    .header(header::HOST, "127.0.0.1:8470");
+                if token {
+                    b = b.header(header::AUTHORIZATION, format!("Bearer {TOKEN}"));
+                }
+                let r = app.oneshot(b.body(Body::empty()).unwrap()).await.unwrap();
+                let code = r.status().as_u16();
+                let h = r.headers().clone();
+                let bytes = r.into_body().collect().await.unwrap().to_bytes();
+                (code, h, bytes.to_vec())
+            }
+        };
+        let (code, h, body) = get("/ci/v1/builds/1/files/install.sh".into(), true).await;
+        assert_eq!((code, body), (200, b"#!/bin/sh\n".to_vec()));
+        assert_eq!(h[header::CONTENT_TYPE], "application/octet-stream");
+        assert_eq!(
+            h[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"install.sh\""
+        );
+        let (code, v) = call(&app, "GET", "/ci/v1/builds/1", None, true).await;
+        assert_eq!(code, 200);
+        assert_eq!(v["dist"]["files"][1]["platform"], "linux-x64", "{v}");
+        assert_eq!(
+            get("/ci/v1/builds/1/files/install.sh".into(), false)
+                .await
+                .0,
+            401
+        );
+        for name in [
+            "..%2Fbuild.json",
+            "..",
+            "%2E%2E%2Fact.jsonl",
+            "act.jsonl",
+            "install.sh%00",
+            "INSTALL.SH",
+        ] {
+            let (code, ..) = get(format!("/ci/v1/builds/1/files/{name}"), true).await;
+            assert_eq!(code, 404, "{name}");
+        }
+        assert_eq!(
+            get("/ci/v1/builds/1/files/../build.json".into(), true)
+                .await
+                .0,
+            404
+        );
+        assert_eq!(
+            get("/ci/v1/builds/9/files/install.sh".into(), true).await.0,
+            404
+        );
+        d.shutdown().await;
+        p.remove();
+    }
+
     #[tokio::test]
     async fn daemon_routes_need_the_token_a_known_host_and_no_foreign_origin() {
         let (p, d, app) = daemon_app("srv-guard").await;
@@ -1342,6 +1437,7 @@ esac"#,
             ("GET", "/ci/v1/builds/1"),
             ("GET", "/ci/v1/builds/1/log?from=0"),
             ("GET", "/ci/v1/builds/1/report"),
+            ("GET", "/ci/v1/builds/1/files/install.sh"),
             ("POST", "/ci/v1/builds"),
             ("POST", "/ci/v1/builds/1/cancel"),
             ("POST", "/ci/v1/builds/1/rerun"),

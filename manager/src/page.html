@@ -73,6 +73,8 @@ tr.sel td { background: var(--bg); }
 #fix p { margin: 4px 0; }
 #report-table td:nth-child(2), #report-table td:nth-child(3) { white-space: nowrap; }
 #report-text { max-height: 480px; }
+#files { margin-top: 10px; } #files p { margin: 4px 0; }
+#files-table td:nth-child(2) { white-space: nowrap; text-align: right; }
 code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px; background: var(--bg); border-radius: 4px; padding: 1px 4px; }
 </style>
 </head>
@@ -130,6 +132,14 @@ code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px
           <button id="fix-drop" class="danger" type="button" title="Remove the worktree; the branch stays while it has commits">Discard…</button>
         </div>
         <p class="error" id="fix-error" hidden></p>
+      </div>
+      <div id="files" hidden>
+        <p><strong>Files</strong> <span class="muted" id="files-note"></span></p>
+        <p class="error" id="files-problem" hidden></p>
+        <div class="wrap"><table id="files-table"></table></div>
+        <p id="files-install" hidden>Install on this machine, in a terminal (the project's hook may ask, and use sudo):
+          <code id="files-cmd"></code> <button id="files-copy" type="button">Copy</button>
+          <span class="muted">or <code id="files-sh"></code></span></p>
       </div>
       <div class="chips" id="jobs" style="margin-top:10px"></div>
       <pre class="mono" id="log"></pre>
@@ -401,9 +411,17 @@ function historyRows(l) {
     return `<tr class="${id === sel ? "sel" : ""}"><td><span class="dot ${esc(b.state)}"></span><a href="#build=${id}">#${id}</a> <span class="muted">${esc(when)}</span></td>
       <td>${esc(b.ref)}</td><td class="mono">${esc(shortSha(b.sha))}</td><td>${esc(b.tier)}</td><td>${esc(why)}</td>
       <td>${b.started_at ? esc(dur(b.elapsed)) : ""}</td><td>${esc(st)}</td>
-      <td title="${esc(b.description)}">${esc(b.state)}${b.reason ? ": " + esc(b.reason) : ""}${b.tests ? ` <a class="chip" href="#build=${id}&report=1">${esc(b.tests)}</a>` : ""}</td></tr>`;
+      <td title="${esc(b.description)}">${esc(b.state)}${b.reason ? ": " + esc(b.reason) : ""}${b.tests ? ` <a class="chip" href="#build=${id}&report=1">${esc(b.tests)}</a>` : ""}${filesChip(b)}</td></tr>`;
   }).join("");
 }
+
+// A build's files: how many to download, and whether something is wrong with them.
+function filesChip(b) {
+  if (!b.files && !b.files_problem) return "";
+  const label = b.files ? `${Number(b.files)} file${b.files > 1 ? "s" : ""}` : "no files";
+  return ` <a class="chip${b.files_problem ? " failure" : ""}" href="#build=${Number(b.id)}"${b.files_problem ? ' title="See the build"' : ""}>${label}</a>`;
+}
+const filesSig = (v) => v ? `${v.files || 0}:${!!v.files_problem}` : "";
 
 function fillSelect(sel, values, label) {
   const want = values.join("\n");
@@ -434,10 +452,10 @@ async function renderBuild() {
   if (!v) {
     try { v = (await api("GET", `/builds?before=${id + 1}&limit=1`)).builds.find((b) => b.id === id) || null; } catch (e) {}
   }
-  if (!shown || shown.id !== id || (v && shown.state !== v.state)) {
+  if (!shown || shown.id !== id || (v && (shown.state !== v.state || shown.files !== filesSig(v)))) {
     let detail;
     try { detail = await api("GET", `/builds/${id}`); } catch (e) { detail = { error: e.message }; }
-    shown = { id, detail, state: v && v.state, fix: await loadFix(v), sig: lastSig, made: false, error: null };
+    shown = { id, detail, state: v && v.state, files: filesSig(v), fix: await loadFix(v), sig: lastSig, made: false, error: null };
   } else if (shown.fix && shown.sig !== lastSig) {
     // A build started or ended: maybe one of the fix's rounds.
     shown.sig = lastSig;
@@ -452,7 +470,7 @@ async function renderBuild() {
     $("build-meta").replaceChildren();
     $("jobs").replaceChildren();
     $("log").replaceChildren();
-    $("report").hidden = true;
+    $("report").hidden = $("files").hidden = true;
     $("build-cancel").hidden = $("build-rerun").hidden = $("build-fix").hidden = $("fix").hidden = true;
     logState = null;
     return;
@@ -473,6 +491,7 @@ async function renderBuild() {
   // Only a failure: a cancelled, timed-out or never-started build says nothing to fix.
   $("build-fix").hidden = v.state !== "failure";
   renderFix(id, v);
+  renderFiles(id, d.dist);
 
   // The job asked for; else a finished build's failed job opens.
   const failed = !running && (v.jobs || []).find((j) => j.state === "failure");
@@ -496,6 +515,52 @@ async function renderBuild() {
   $("report").hidden = !report;
   if (report) { logState = null; renderReport(id); }
   else startLog(id, job, running || v.state === "queued");
+}
+
+// What a green build's jobs uploaded (dist/), each to download, and the command that
+// installs them here: bana install <id> runs the project's installer in a terminal,
+// where its hook can ask and use sudo. The page installs nothing itself.
+function renderFiles(id, dist) {
+  const files = dist && !dist.removed ? dist.files || [] : [];
+  $("files").hidden = !dist;
+  if (!dist) return;
+  $("files-note").textContent = dist.removed ? "removed a week after the build" : "kept a week, and the newest of each branch and tier while the branch is there";
+  show("files-problem", dist.problem ? "Not collected: " + dist.problem : "");
+  const size = (n) => n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`;
+  $("files-table").replaceChildren(...files.map((f) => {
+    const tr = document.createElement("tr");
+    const b = text("button", "Download");
+    b.type = "button";
+    b.addEventListener("click", () => download(id, f.name, b));
+    const td = document.createElement("td");
+    td.append(b);
+    tr.append(text("td", f.name, "mono"), text("td", size(Number(f.bytes) || 0)),
+      text("td", f.platform || (f.release ? "" : "not in a release"), "muted"), td);
+    return tr;
+  }));
+  const installer = files.some((f) => f.name === "install.sh");
+  $("files-install").hidden = !installer;
+  if (installer) {
+    $("files-cmd").textContent = `bana install ${id}`;
+    $("files-sh").textContent = dist.dir ? `sh '${dist.dir}/install.sh' --from '${dist.dir}'` : "";
+    $("files-sh").parentElement.hidden = !dist.dir;
+  }
+}
+
+// A download needs the token, so the file comes through fetch, then a blob.
+async function download(id, name, button) {
+  button.disabled = true;
+  try {
+    const r = await fetch(`/ci/v1/builds/${id}/files/${encodeURIComponent(name)}`, { headers: { authorization: "Bearer " + token } });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(await r.blob());
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    show("fatal", "");
+  } catch (e) { show("fatal", `${name}: ${e.message}`); }
+  button.disabled = false;
 }
 
 // The CI report (report.md, written when the build ended): its table as a
@@ -777,6 +842,12 @@ $("build-rerun").addEventListener("click", async () => {
   if (!shown) return;
   const r = await actLocal("POST", `/builds/${shown.id}/rerun`);
   if (r && r.build) location.hash = "build=" + Number(r.build);
+});
+$("files-copy").addEventListener("click", () => {
+  const cmd = $("files-cmd").textContent;
+  (navigator.clipboard ? navigator.clipboard.writeText(cmd) : Promise.reject()).then(
+    () => { $("files-copy").textContent = "Copied"; setTimeout(() => { $("files-copy").textContent = "Copy"; }, 2000); },
+    () => { getSelection().selectAllChildren($("files-cmd")); });
 });
 $("report-copy").addEventListener("click", () => {
   const md = shown && shown.report && shown.report.markdown;

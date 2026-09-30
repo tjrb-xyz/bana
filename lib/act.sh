@@ -164,7 +164,12 @@ act_main() {
     die "This workflow takes no tier (bana.conf: tiers)"
   fi
   [[ -z $event || -f $event ]] || die "--event: no file $event"
-  [[ $locked == 1 ]] || act_lock "bana ci${tier:+ $tier} ($prefix)"
+  if [[ $locked != 1 ]]; then
+    act_lock "bana ci${tier:+ $tier} ($prefix)"
+    # Every run by hand is act's run 1, and download-artifact hands a run every artifact of
+    # its run id: the last run's go, so a run gets only its own. (A dry run uploads nothing.)
+    [[ -n $dry ]] || rm -rf "$base_home/act/artifacts"
+  fi
   act_docker
 
   image=$(act_conf act.image catthehacker/ubuntu:act-24.04)

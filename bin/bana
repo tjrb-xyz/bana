@@ -14,6 +14,10 @@
 #   bana report [BUILD | last | --log FILE|-] [--json]   the CI report (Markdown): a daemon build's,
 #                            the last bana ci's (the newer by default), or act's output from
 #                            elsewhere; checks and tests per standard (bana.conf's report.* keys)
+#   bana installer DIST (--tag T | --label L)   the project's installer for a build's files: install.sh,
+#                            install.ps1 and SHA256SUMS, from bana.conf's install.* keys (bana installer help)
+#   bana install [BUILD | --from FILE|DIR]   a daemon build's files on this machine, through that
+#                            installer (the project's hook may ask, and use sudo)
 #   bana mcp                 bana's tools for Claude Code in a fix (an MCP server on stdin and
 #                            stdout); bana daemon install registers it with Claude Code here
 # CI on push, on this machine (a daemon runs each push through act and posts commit statuses):
@@ -195,7 +199,9 @@ settings() {
   for k in repo prefix labels vm vm_x64 linux_user packages.linux path hook.mac hook.linux \
     runner_version workflow tiers tier_input act.image act.network act.args act.docker_config ci.log keep keep_max_gb \
     daemon.branches daemon.tags daemon.tier daemon.tag_tier daemon.poll daemon.timeout \
-    daemon.supersede daemon.token fix.rounds fix.token fix.allow fix.turns fix.budget_usd tart_name; do
+    daemon.supersede daemon.token fix.rounds fix.token fix.allow fix.turns fix.budget_usd \
+    install.name install.bins install.hook install.hook_ps1 install.prefix install.bin install.config \
+    release.files tart_name; do
     case $k in
     repo) v=$repo ;; prefix) v=$prefix ;; vm) v=$vm ;; vm_x64) v=$vm_x64 ;; linux_user) v=$linux_user ;;
     hook.*) v=$(conf_path "$k") ;;
@@ -214,6 +220,8 @@ settings() {
     fix.token) v=$(conf "$k" none) ;;
     fix.turns) v=$(conf "$k" 60) ;;
     fix.budget_usd) v=$(conf "$k" 5) ;;
+    install.name) v=$(conf "$k" "$prefix") ;;
+    release.files) v=$(conf "$k" '*') ;;
     tart_name) v=$(conf "$k" bana-tart) ;;
     *) v=$(conf "$k") ;;
     esac
@@ -893,6 +901,15 @@ init)
   init_main "$@"
   ;;
 report) report "$@" ;;
+installer | install)
+  # shellcheck source=SCRIPTDIR/../lib/installer.sh
+  source "$bana_root/lib/installer.sh"
+  case $cmd:${1:-} in
+  *:help | *:-h | *:--help) installer_usage ;;
+  installer:*) installer_main "$@" ;;
+  install:*) install_main "$@" ;;
+  esac
+  ;;
 mcp)
   # Claude Code starts it; stdout is the protocol's alone.
   need_repo

@@ -154,6 +154,12 @@ d_doctor() { # ROOT
   command -v docker >/dev/null || die "Docker is needed: install OrbStack (https://orbstack.dev)"
   if docker info >/dev/null 2>&1; then echo "  Docker: running"
   else warn "  Docker is not running: builds wait for it (start OrbStack)"; fi
+  # A green build's uploads: unzip, then a sha256 of each file (act's digest, the installer's).
+  if command -v unzip >/dev/null && { command -v sha256sum || command -v shasum; } >/dev/null; then
+    echo "  unzip and sha256: a green build's uploads are kept as its files"
+  else
+    warn "  No unzip, or no sha256sum or shasum: a green build's uploads are not collected (bana install needs them)"
+  fi
   gh=$(command -v gh) || die "The GitHub CLI is needed: brew install gh, then gh auth login"
   v=$(gh auth status 2>&1) || die "The GitHub CLI is not signed in: gh auth login"
   # A classic token lists its scopes; statuses need repo (a fine-grained one lists none).
@@ -250,7 +256,7 @@ d_snapshot() { # BIN
   local f
   d_put "$1" "$d_snap/bana-manager" 755
   d_put "$bana_root/bin/bana" "$d_snap/bin/bana" 755
-  for f in "$bana_root"/lib/*.sh; do d_put "$f" "$d_snap/lib/$(basename "$f")" 644; done
+  for f in "$bana_root"/lib/*.sh "$bana_root"/lib/install.*.in; do d_put "$f" "$d_snap/lib/$(basename "$f")" 644; done
 }
 
 # The daemon's own clone: made from your checkout (quick), then pointed at GitHub.

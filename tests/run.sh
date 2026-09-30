@@ -167,6 +167,13 @@ check "ci: refuses an unknown tier" bash -c "! bash '$bana' ci weekly 2>/dev/nul
 FAKE_DOCKER=0 bash "$bana" ci >"$T/out" 2>&1 || true
 check "ci: says to start OrbStack when Docker is not running" has "$T/out" "start OrbStack"
 check "ci: and, act never started, leaves no lock" test ! -e "$HOME/.bana/act.lock"
+mkdir -p "$HOME/.bana/act/artifacts/1/x"
+bash "$bana" ci -n >/dev/null
+check "ci: a dry run keeps the last run's artifacts" test -d "$HOME/.bana/act/artifacts/1/x"
+BANA_ACT_LOCKED=1 bash "$bana" ci >/dev/null
+check "ci: the daemon's (BANA_ACT_LOCKED=1) keeps them too" test -d "$HOME/.bana/act/artifacts/1/x"
+bash "$bana" ci >/dev/null
+check "ci: a run by hand removes the last run's artifacts (all are act's run 1)" test ! -e "$HOME/.bana/act/artifacts"
 : >"$FAKE_LOG"
 (cd .github && bash "$bana" ci >/dev/null)
 check "ci: from a subdirectory, act still runs the whole checkout" has "$FAKE_LOG" "act workflow_dispatch -C $(pwd -P) -W"
@@ -838,6 +845,135 @@ print(list(s), s["bana"]["args"])' "$(claude_arg 17)")" "['bana'] ['mcp', '--dir
   check "fix: your checkout's own files stay as they were" same "$(git status --porcelain)" ""
 fi
 
+# ---- bana installer: the project's install.sh and install.ps1 -------------------------------
+fresh
+# A build's files: archives with one top directory each, and some that are not archives.
+dist=$T/w/dist
+pack() { # NAME: NAME.tar.gz (or NAME.zip) holding NAME/bin/wid
+  mkdir -p "$T/w/stage/$1/bin" && printf '#!/bin/sh\necho wid\n' >"$T/w/stage/$1/bin/wid" && chmod +x "$T/w/stage/$1/bin/wid"
+  case $1 in
+  *-windows-*) (cd "$T/w/stage" && zip -qr "$dist/$1.zip" "$1") ;;
+  *) tar -C "$T/w/stage" -czf "$dist/$1.tar.gz" "$1" ;;
+  esac
+  rm -rf "$T/w/stage"
+}
+mkdir -p "$dist"
+pack wid-nightly-abc-linux-x64
+pack wid-nightly-abc-macos-arm64
+echo deb >"$dist/wid_1.0~abc+1_amd64.deb"
+echo notes >"$dist/notes.txt"
+cat >>.github/bana.conf <<'CONF'
+install.bins = wid
+install.hook = hooks/install.sh
+install.config = ~/it's "odd" $HOME `x` \ path
+install.env.WID_LOG_DIR = ~/Library/Logs/wid
+install.env.ODD = it's "quoted"
+CONF
+bash "$bana" installer "$dist" --tag v1.0.0 >"$T/out" 2>&1
+check "installer: install.sh and SHA256SUMS" test -x "$dist/install.sh" -a -f "$dist/SHA256SUMS"
+check "installer: no Windows zip, no install.ps1" test ! -e "$dist/install.ps1"
+check "installer: SHA256SUMS passes sha256sum -c" bash -c "cd '$dist' && sha256sum -c --quiet SHA256SUMS"
+check "installer: SHA256SUMS has every file (release.files: *) and install.sh" same \
+  "$(awk '{ print $2 }' "$dist/SHA256SUMS" | tr '\n' ' ')" \
+  "install.sh notes.txt wid-nightly-abc-linux-x64.tar.gz wid-nightly-abc-macos-arm64.tar.gz wid_1.0~abc+1_amd64.deb "
+# The values, as sh reads them back.
+awk '/^# ---- the rest/ { exit } { print }' "$dist/install.sh" >"$T/header.sh"
+# shellcheck disable=SC2016,SC2088 # sh expands them; the ~ is the value
+check "installer: odd values survive sh's quotes" same "$(sh -c '. "$1"; printf "%s|%s|%s" "$CONFIG" "$NAME" "$ENVS"' sh "$T/header.sh")" \
+  "~/it's \"odd\" \$HOME \`x\` \\ path|wid|WID_LOG_DIR=~/Library/Logs/wid
+ODD=it's \"quoted\""
+check "installer: --tag, so downloads" has "$dist/install.sh" "LOCAL=0"
+check "installer: this platform's archive and its sha256" has "$dist/install.sh" \
+  "linux-x64 wid-nightly-abc-linux-x64.tar.gz $(sha256sum "$dist/wid-nightly-abc-linux-x64.tar.gz" | cut -d' ' -f1)"
+check "installer: the gh one-liner in its header" has "$dist/install.sh" "gh release download v1.0.0 -R acme/widget -p install.sh -O - | sh"
+if command -v shellcheck >/dev/null; then
+  check "installer: shellcheck -s sh passes on install.sh" shellcheck -s sh "$dist/install.sh"
+fi
+BANA_RELEASE_FILES='*.tar.gz *.zip' bash "$bana" installer "$dist" --label nightly-abc >"$T/out" 2>&1
+check "installer --label: LOCAL=1 (the installer needs --from)" has "$dist/install.sh" "LOCAL=1"
+check "installer: release.files leaves the .deb and notes out" same "$(awk '{ print $2 }' "$dist/SHA256SUMS" | tr '\n' ' ')" \
+  "install.sh wid-nightly-abc-linux-x64.tar.gz wid-nightly-abc-macos-arm64.tar.gz "
+pack wid-nightly-abc-windows-x64
+BANA_INSTALL_HOOK_PS1=hooks/install.ps1 bash "$bana" installer "$dist" --label nightly-abc >"$T/out" 2>&1
+check "installer: a Windows zip, so install.ps1" test -f "$dist/install.ps1"
+check "installer: install.ps1 is in SHA256SUMS" bash -c "cd '$dist' && sha256sum -c --quiet SHA256SUMS && grep -q ' install.ps1\$' SHA256SUMS"
+check "installer: install.ps1's values in PowerShell's quotes" has "$dist/install.ps1" "  'ODD' = 'it''s \"quoted\"'"
+check "installer: install.ps1's zip" has "$dist/install.ps1" "  'x64' = @('wid-nightly-abc-windows-x64.zip', '$(sha256sum "$dist/wid-nightly-abc-windows-x64.zip" | cut -d' ' -f1)')"
+check "installer: install.ps1 knows it is a daemon build" has "$dist/install.ps1" "\$Local = \$true"
+rm "$dist/wid-nightly-abc-windows-x64.zip"
+bash "$bana" installer "$dist" --label nightly-abc >"$T/out" 2>&1
+check "installer: no zip any more, no stale install.ps1" test ! -e "$dist/install.ps1"
+dist=$T/w/wonly && mkdir -p "$dist" && pack wid-nightly-abc-windows-x64
+echo '#!/bin/sh' >"$dist/install.sh"
+bash "$bana" installer "$dist" --label nightly-abc >"$T/out" 2>&1
+check "installer: only a Windows zip, only install.ps1 (no stale install.sh)" test -f "$dist/install.ps1" -a ! -e "$dist/install.sh"
+check "... and SHA256SUMS has no install.sh" same "$(awk '{ print $2 }' "$dist/SHA256SUMS" | tr '\n' ' ')" "install.ps1 wid-nightly-abc-windows-x64.zip "
+wonly=$dist dist=$T/w/dist
+# What it refuses.
+BANA_INSTALL_ENV_ODD=$(printf 'a\033[31mb') bash "$bana" installer "$dist" --tag v1 >"$T/out" 2>&1 && ok=1 || ok=0
+check "installer: an escape byte in a value is refused" same "$ok" 0
+check "... saying where" has "$T/out" "install.env.ODD has a character that is not printable ASCII"
+BANA_INSTALL_HOOK=../x.sh bash "$bana" installer "$dist" --tag v1 >"$T/out" 2>&1 && ok=1 || ok=0
+check "installer: a hook outside the archive is refused" same "$ok" 0
+BANA_INSTALL_NAME=a/b bash "$bana" installer "$dist" --tag v1 >"$T/out" 2>&1 && ok=1 || ok=0
+check "installer: a name that is no directory name is refused" same "$ok" 0
+BANA_INSTALL_PREFIX=relative/dir bash "$bana" installer "$dist" --tag v1 >"$T/out" 2>&1 && ok=1 || ok=0
+check "installer: install.prefix neither ~ nor absolute is refused" same "$ok" 0
+# shellcheck disable=SC2088 # as bana.conf says it
+BANA_INSTALL_PREFIX='~/' bash "$bana" installer "$dist" --tag v1 >"$T/out" 2>&1 && ok=1 || ok=0
+check "installer: install.prefix of ~ itself is refused (uninstalling empties it)" has "$T/out" "install.prefix: a directory of its own, not '~/'"
+BANA_INSTALL_CONFIG=/ bash "$bana" installer "$dist" --tag v1 >"$T/out" 2>&1 && ok=1 || ok=0
+check "installer: install.config of / is refused (--purge removes it)" has "$T/out" "install.config: a directory of its own, not '/'"
+echo 'install.env.INSTALL_DIR = x' >>.github/bana.conf
+bash "$bana" installer "$dist" --tag v1 >"$T/out" 2>&1 && ok=1 || ok=0
+check "installer: install.env of the installer's own variables is refused" has "$T/out" "install.env.INSTALL_DIR: the installer's own"
+sed -i.bak '$d' .github/bana.conf && rm .github/bana.conf.bak
+bash "$bana" installer "$dist" --tag current >"$T/out" 2>&1 && ok=1 || ok=0
+check "installer: a tag named current is refused" same "$ok" 0
+pack wid-release-abc-linux-x64
+bash "$bana" installer "$dist" --tag v1 >"$T/out" 2>&1 && ok=1 || ok=0
+check "installer: two archives for one platform are refused" has "$T/out" "two archives for linux-x64"
+rm "$dist/wid-release-abc-linux-x64.tar.gz"
+mkdir -p "$T/w/stage/a" "$T/w/stage/b" && echo x >"$T/w/stage/a/x" && echo y >"$T/w/stage/b/y"
+tar -C "$T/w/stage" -czf "$dist/wid-nightly-abc-macos-arm64.tar.gz" a b && rm -rf "$T/w/stage"
+bash "$bana" installer "$dist" --tag v1 >"$T/out" 2>&1 && ok=1 || ok=0
+check "installer: an archive with two top directories is refused" has "$T/out" "should hold one directory, and has: a b"
+rm "$dist/wid-nightly-abc-macos-arm64.tar.gz"
+bash "$bana" installer "$dist" --tag v1 >"$T/out" 2>&1 && ok=1 || ok=0
+check "installer: no --tag nor --label" bash -c "! bash '$bana' installer '$dist' 2>/dev/null"
+bash "$bana" installer "$T/w/nothing" --tag v1 >"$T/out" 2>&1 && ok=1 || ok=0
+check "installer: no such directory" has "$T/out" "no directory $T/w/nothing"
+
+# bana install: a daemon build's files, through their install.sh.
+b=$HOME/.bana/wid/builds
+mkdir -p "$b/7" "$b/12"
+cp -R "$dist" "$b/7/dist" && bash "$bana" installer "$b/7/dist" --label nightly-7 >/dev/null
+cp -R "$dist" "$b/12/dist" && BANA_INSTALL_BINS='' bash "$bana" installer "$b/12/dist" --label nightly-12 >/dev/null
+bash "$bana" install 7 --no-hook >"$T/out" 2>&1
+check "install BUILD: installs its files" same "$(readlink "$HOME/.local/share/wid/current")" nightly-7
+check "install BUILD: its commands linked" same "$("$HOME/.local/bin/wid")" wid
+bash "$bana" install --no-hook >"$T/out" 2>&1
+check "install: the newest build with files by default" has "$T/out" "Build 12"
+check "... installed" same "$(readlink "$HOME/.local/share/wid/current")" nightly-12
+bash "$bana" install --from "$b/7/dist/wid-nightly-abc-linux-x64.tar.gz" --no-hook >"$T/out" 2>&1
+check "install --from FILE: the install.sh beside it" same "$(readlink "$HOME/.local/share/wid/current")" nightly-7
+bash "$bana" install 99 >"$T/out" 2>&1 && ok=1 || ok=0
+check "install: a build without files" has "$T/out" "Build 99 has no files to install"
+mkdir -p "$b/13" && cp -R "$wonly" "$b/13/dist"
+bash "$bana" install 13 >"$T/out" 2>&1 && ok=1 || ok=0
+check "install: a build with only a Windows zip says so" has "$T/out" "only a Windows build: install.ps1"
+# No install.bins: every program in bin/, though its last file is none (a README).
+mkdir -p "$b/14/dist" "$T/w/stage/wid-nightly-abc-linux-x64/bin"
+printf '#!/bin/sh\necho wid\n' >"$T/w/stage/wid-nightly-abc-linux-x64/bin/wid" && chmod +x "$T/w/stage/wid-nightly-abc-linux-x64/bin/wid"
+echo readme >"$T/w/stage/wid-nightly-abc-linux-x64/bin/zz-readme.txt"
+tar -C "$T/w/stage" -czf "$b/14/dist/wid-nightly-abc-linux-x64.tar.gz" wid-nightly-abc-linux-x64 && rm -rf "$T/w/stage"
+BANA_INSTALL_BINS='' bash "$bana" installer "$b/14/dist" --label nightly-14 >/dev/null
+bash "$bana" install 14 --no-hook >"$T/out" 2>&1
+check "install: no install.bins, and bin/ ends in a file that is no program" bash -c \
+  "grep -q 'commands in $HOME/.local/bin: wid\$' '$T/out' && grep -qx tag=nightly-14 '$HOME/.local/share/wid/receipt' && ! test -e '$HOME/.local/bin/zz-readme.txt'"
+bash "$bana" install 7 --uninstall >"$T/out" 2>&1
+check "install BUILD --uninstall" test ! -e "$HOME/.local/share/wid" -a ! -e "$HOME/.local/bin/wid"
+
 # ---- USB audio --------------------------------------------------------------------
 fresh
 BANA_SYS_ROOT=$here/fixtures/linux-sys bash "$bana" usb >"$T/out"
@@ -1023,6 +1159,7 @@ d=$HOME/.bana/wid
 export FAKE_OS=Darwin FAKE_ARCH=arm64 FAKE_HOST=MBP
 bash "$bana" daemon install --port 8471 --no-open >"$T/out" 2>&1 || { cat "$T/out"; false; }
 check "daemon: the doctor reads act's version" has "$T/out" "act: act version 0.2.89"
+check "daemon: the doctor finds unzip and a sha256 tool, for a build's files" has "$T/out" "unzip and sha256: a green build's uploads are kept"
 hook=$(git rev-parse --git-path hooks)/reference-transaction
 check "daemon: a push hook in this checkout" test -x "$hook"
 check "daemon: it pokes this daemon's port" has "$hook" "http://127.0.0.1:8471/ci/v1/daemon/poll"
@@ -1036,6 +1173,7 @@ check "daemon: git reads the repository through gh" has "$T/out" "git: reads acm
 check "daemon: the snapshot's binary" cmp -s "$T/w/bana-manager" "$d/daemon/bana-manager"
 check "daemon: the snapshot's bana" cmp -s "$bana" "$d/daemon/bin/bana"
 check "daemon: the snapshot's lib" cmp -s "$here/../lib/daemon.sh" "$d/daemon/lib/daemon.sh"
+check "daemon: the snapshot's installer templates" cmp -s "$here/../lib/install.sh.in" "$d/daemon/lib/install.sh.in"
 check "daemon: its clone's origin is GitHub" same "$(git -C "$d/src" config remote.origin.url)" "https://github.com/acme/widget.git"
 check "daemon: its clone knows GitHub's default branch" same "$(git -C "$d/src" symbolic-ref --short refs/remotes/origin/HEAD)" \
   "origin/$(git symbolic-ref --short HEAD)"

@@ -94,7 +94,10 @@ your next login or `bana daemon install`.
   ([FIX.md](FIX.md)), then the fix's card: its rounds, *Keep*, *Push*, *Compare on GitHub*, *More rounds* and
   *Discard*;
 - the build's *Report* (once it ended): the CI report's table, the rest as text, with *Copy* and *Download*;
-- the history (the last 100 builds, each with its tests' share, `tests 95%`), and the pushes not built.
+- the build's *Files* ([below](#a-builds-files)): each with its size, platform and *Download*, and the command
+  that installs them here;
+- the history (the last 100 builds, each with its tests' share, `tests 95%`, and its files, `4 files`), and the
+  pushes not built.
 
 The runner pool's sections follow, under *Runner pool (optional)*. `bana manager` opens this page too while the
 project's daemon runs.
@@ -184,12 +187,39 @@ it has none. An ended build without a report (one from before bana wrote them) g
 | `notice` | `key`, `step`, `text`, `left_out` (true: the step did not check here; bana sets it when report.left_out matches, and a builder may set it itself), `title`, `file`, `line`, `col` |
 | `summary` | `key`, `step`, `markdown` (the step's GITHUB_STEP_SUMMARY) |
 | `tail` | `key`, `step`, `lines`: a failed step's last lines |
+| `artifact` | `name`, `key` and `step` (the upload), `bytes`, `sha256` (the zip's), `files` (their names in `dist/`), `problem`: what a green build's jobs uploaded ([below](#a-builds-files)) |
 | `error` | `owner`, `text`, and `key` and `step` when it names one: act's or bana's errors |
 
 Lines come in that order, a job's steps after it, a step's lines after it; unknown kinds and fields are skipped.
 act's `--json` lines that the daemon reads: `jobID`, `matrix`, `step`, `stepID` (`stepid` for Set up job),
 `stage`, `msg` with `raw_output` (a step's output), `stepResult` with `executionTime` (ns), `jobResult`, and
 optionally `command` (`summary`, `error`, `warning`, `notice`); `actlog.rs` has the details.
+
+## A build's files
+
+After a green build (not a fix round), the daemon collects what its jobs uploaded with
+`actions/upload-artifact@v4` into `builds/<id>/dist/`. act keeps each upload as one zip,
+`artifacts/<id>/<name>/<name>.zip`, from anyone who reaches its artifact server, and keeps only the last of two
+uploads of one name. So a zip is taken only when exactly one upload step says it uploaded it: its `artifact-id`
+output is act's id for the name (FNV-1a) and its `artifact-digest` is the zip's sha256. A 0-byte zip (a failed
+upload), entries that are absolute, `..` or symlinks, a `NAME.sha256` that does not match NAME, or two files of
+one name with different content (a matrix whose legs each built "their" CPU under act) refuse the whole
+collection, with the reasons on the build. Names become `[A-Za-z0-9._-]`. An upload-artifact@v3 layout is left
+as it is, with a note.
+
+When the files include archives, `bana installer dist --label <tier>-<sha10>` (`--tag <tag>` for a tag) compiles
+the project's installer beside them, from the built commit's bana.conf, in at most 120 seconds. Then the zips
+go, so each file is kept once. The build's `dist` lists each file with its size, platform, and whether it is a
+release's (in `SHA256SUMS`: `release.files` and the installer), or its problem. The CI report's *Artifacts*
+section lists what each upload gave. A problem never changes the build's result or its statuses.
+
+`GET /ci/v1/builds/<id>/files/<name>` serves a listed file, and nothing else. Install one on this machine with
+`bana install <id>` (or `sh <dist>/install.sh --from <dist>`), in a terminal: the project's hook may ask, and
+use sudo. The page does not install anything itself.
+
+Kept: the newest build with files of each branch and tier while the branch exists, which the 100 builds do not
+count. The rest go a week after the build: its `artifacts/` and `dist/`. A failed build's uploads stay where act
+put them, for that week; a fix round's go when it ends.
 
 ## Sleep, wake and restarts
 
@@ -279,7 +309,9 @@ get no Docker socket, and act gets only a short list of the daemon's environment
 same trust as the workflow; a fix round reads it from the failing commit, not from Claude's snapshot.
 
 While a build runs, act's artifact and cache servers listen without a password on the Mac's network address, so
-on a shared network (café Wi-Fi) a neighbour could reach them. The macOS firewall may ask once about act.
+on a shared network (café Wi-Fi) a neighbour could reach them. A file planted or replaced there is refused (its
+digest is not the one the upload step printed), but a neighbour could read unreleased packages while the build
+runs. The macOS firewall may ask once about act.
 
 A fix round runs the code Claude wrote the same way, with the same reach as a push, but with no token by
 default: nobody reviews it before it runs. Claude works in its worktree with your own Claude Code permission
@@ -293,7 +325,7 @@ Logs stay on the machine.
 |---|---|
 | `~/.bana/<prefix>/daemon/` | the snapshot: `bana-manager`, bana, and `settings` |
 | `~/.bana/<prefix>/src/` | the daemon's clone |
-| `~/.bana/<prefix>/builds/<id>/` | each build: `build.json`, `act.jsonl` (act's log), `event.json`, `results.jsonl` and `report.md` (the CI report), `artifacts/` |
+| `~/.bana/<prefix>/builds/<id>/` | each build: `build.json`, `act.jsonl` (act's log), `event.json`, `results.jsonl` and `report.md` (the CI report), `artifacts/` (act's), `dist/` (a green build's files and installer) |
 | `~/.bana/<prefix>/act-cache/` | act's actions, and the macOS jobs' copies while they run |
 | `~/.bana/<prefix>/fix/` | *Fix with Claude* and `bana fix`: each fix's worktree, and beside it `<sha7>.d/` with its brief and `rounds.json` ([FIX.md](FIX.md)) |
 | `~/.bana/<prefix>/state.json` | paused, the queue, the heads seen, each branch's last green commit |
@@ -301,8 +333,9 @@ Logs stay on the machine.
 | `~/.bana/act.lock` | the lock shared with `bana ci` |
 | `~/Library/Logs/bana/<prefix>.log` | the daemon's log on a Mac (`journalctl --user -u bana-<prefix>` on Linux) |
 
-The last 100 builds are kept, and their artifacts for 7 days. A fix's rounds are kept apart, until the fix is
-discarded or 14 days after its last round.
+The last 100 builds are kept, and their artifacts and files for 7 days, but for the newest files of each branch
+and tier ([above](#a-builds-files)). A fix's rounds are kept apart, until the fix is discarded or 14 days after
+its last round.
 
 ## Commands
 

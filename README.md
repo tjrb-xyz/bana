@@ -64,6 +64,15 @@ matching `daemon.tags` (none by default), and not a head commit with `[skip ci]`
 markers. The rules come from the install, not from the pushed commit. A commit already built at that tier does
 not run again. A branch keeps one queued build, and a newer push replaces it; a running build finishes.
 
+**A green build's files.** What a green build's jobs upload with `actions/upload-artifact@v4` becomes its files,
+in `~/.bana/<prefix>/builds/<id>/dist/`: each zip is checked against the digest its upload step printed, then
+unpacked, and a `NAME.sha256` beside a file must match it. When they include archives
+(`NAME-...-linux-x64.tar.gz`, [below](#the-projects-installer)), bana compiles the project's installer beside
+them. The page lists them with *Download* and the command that installs the build here, `bana install <id>`,
+in a terminal, where the project's hook can ask. They are kept a week, and the newest of each branch and tier
+while the branch is there, so the latest nightly of main can always be installed. A failed build's uploads stay
+as act left them, for a week; a problem with the files never changes a build's result.
+
 **One build at a time.** The daemon and `bana ci` share a lock: while the daemon builds, `bana ci` stops with
 *act is busy here*, and while your `bana ci` runs, the daemon's builds wait.
 
@@ -131,8 +140,10 @@ bana.conf is `linux` (a container from `act.image`), `mac` (the Mac itself; else
 be keys. After a run, bana names the jobs that had no place: *not run here: JOB (runs-on: ...): see bana init*.
 
 The run uses your working tree, uncommitted changes included, and the workflow's tier input (`tiers`,
-`tier_input` in bana.conf). Artifacts land in `~/.bana/act/artifacts`. With the GitHub CLI signed in, jobs get
-its token as `GITHUB_TOKEN`.
+`tier_input` in bana.conf). Artifacts land in `~/.bana/act/artifacts/1/<name>/<name>.zip` (upload-artifact@v4:
+one zip each), the last run's only: a run first removes the previous run's, which act would otherwise hand
+to its download-artifact steps (every run is act's run 1). With the GitHub CLI signed in,
+jobs get its token as `GITHUB_TOKEN`.
 
 act's output also goes to `~/.bana/<prefix>/ci/last.log`, and what ran to `last.env` (commit, changed files,
 tier, job, network, versions, exit status, and whether Ctrl-C stopped it), for `bana fix`, which a failed run
@@ -221,6 +232,58 @@ Each daemon build writes one when it ends, with its commit's standards (a fix ro
 `bana ci` ends with the table and keeps the report in `~/.bana/<prefix>/ci/last.report.md`. Nothing goes to GitHub.
 [docs/DAEMON.md](docs/DAEMON.md#the-ci-report) has results.jsonl, what the report is made from, for a builder other
 than act.
+
+## The project's installer
+
+bana compiles an installer for the project's builds from its templates and bana.conf's `install.*` keys:
+`install.sh` (POSIX sh: macOS and Linux, under dash, bash 3.2 and busybox) and `install.ps1` (Windows PowerShell
+5.1 and PowerShell 7), with each archive's sha256 baked in, and `SHA256SUMS`, written last.
+
+```sh
+bana installer DIST --tag v1.2.0         # a release: the installers download from it (gh, else curl)
+bana installer DIST --label nightly-abc  # a daemon build: its installer takes --from
+bana install [BUILD]                     # a daemon build's files, here: sh DIST/install.sh --from DIST
+sh install.sh [--yes] [--prefix DIR] [--bin-dir DIR] [--from FILE|DIR] [--force] [--no-hook]
+sh install.sh --uninstall [--purge]
+```
+
+The archives are the build's files named `NAME-...-(linux|macos)-(x64|arm64).tar.gz` and
+`NAME-...-windows-(x64|arm64).zip`, one per platform, each holding one directory (only a Windows zip: no
+install.sh). A Linux archive is used on any libc, so build it static (a musl target, say) if it should run on
+Alpine or other busybox systems. The installer picks this
+machine's (arm64 under Rosetta too), checks its sha256 (no sha256sum, shasum or openssl: it stops), refuses an
+archive with entries outside its directory, and unpacks it into `PREFIX/TAG` beside the installed version; then
+`PREFIX/current` switches to it and the commands are linked into the bin directory. The previous version stays
+(older ones go), a receipt in `PREFIX/receipt` says what is installed, and `--uninstall` removes only what it made:
+the versions the receipt lists, `current` and the links, so PREFIX may be a directory with other things in it.
+It never uses sudo and never edits your shell's rc files.
+
+```
+install.name = example                 # its directories and messages (default: prefix)
+install.bins = exampled example-new    # the commands linked (default: every program in the archive's bin/)
+install.hook = install-hook.sh         # the lifecycle hook, a path inside the archive
+install.hook_ps1 = install-hook.ps1    # the same for Windows
+install.prefix = ~/.local/share/example   # where versions go (--prefix, INSTALL_PREFIX)
+install.bin = ~/.local/bin             # where commands are linked (--bin-dir, INSTALL_BIN)
+install.config = ~/.config/example     # the settings: given to the hook, removed only by --purge
+install.env.EXAMPLE_LOG_DIR = ~/Library/Logs/example   # given to the hook (~ is the home)
+release.files = example-*.tar.gz example-*.deb         # the files that are the release (default *)
+```
+
+The hook runs as `sh HOOK STAGE` from the archive: `pre-install` from the unpacked files before they are current
+(failing: nothing changes), `post-install` once they are (failing: installed, and `--force` runs it again),
+`pre-uninstall` (failing: nothing is removed) and `post-uninstall` (from a copy). An upgrade is pre-install and
+post-install with `INSTALL_PREVIOUS` set. It gets `INSTALL_STAGE`, `DIR`, `TAG`, `PREVIOUS`, `PREVIOUS_DIR`,
+`PREFIX`, `BIN`, `CONFIG`, `NAME`, `YES`, `OS` and `ARCH`, and the `install.env.*` keys; its stdin is the terminal,
+even under `curl | sh`, so it can ask before it uses sudo (`--yes` answers for it). The example's
+[install-hook.sh](examples/example/install-hook.sh) puts its audio devices in /Library/Audio/Plug-Ins/HAL that way.
+The daemon runs `bana installer dist --label <tier>-<sha10>` (`--tag` for a tag) after each green build with
+archives, from the built commit's bana.conf, and `bana install [BUILD]` runs that installer here.
+`install.prefix`, `install.bin`, `install.config` and `install.bins` are install.sh's (install.prefix and
+install.config are never `~` or `/` themselves); install.ps1 uses `%LOCALAPPDATA%\Programs\NAME`, puts all of
+`current\bin` on your user PATH, and keeps settings in `%APPDATA%\NAME`. It also works as `irm URL | iex`: a
+failure then returns to your prompt with `$LASTEXITCODE` 1.
+Every value must be printable ASCII.
 
 ## bana up: a runner pool (optional)
 
@@ -394,7 +457,9 @@ and `ci.yml`, its workflow trimmed to where the jobs run (`bana init`'s tests ru
 Homebrew's SCons, ragel and CMake and the project's audio driver, and checks for rustup. The linux hook installs
 rustup and checks that sudo does not ask. Its `plan.*` keys are its path rules. Its `daemon.*` keys build every
 branch but the bots', at `quick`, and no tags. Its `report.*` keys are its CI report's standards: toolchain,
-rust, engine (the `real_*` tests), web, macos, streaming, sdk, linux_service and packaging.
+rust, engine (the `real_*` tests), web, macos, streaming, sdk, linux_service and packaging. Its `install.*` keys
+make its installer per-user, with `install-hook.sh` (shipped in each archive) asking before it installs the Mac's
+audio devices with sudo.
 
 On a Mac, `bana init --check` finds a place for every job of it, and still exits 1: `package`'s matrix splits
 over machines (the Linux targets in containers, `osx-arm64` on the Mac itself), and act runs every Linux
@@ -465,6 +530,8 @@ send the jobs elsewhere without a change to the workflow.
 bana ci [TIER] [-j JOB] [--x64] [--list] [--event FILE] [-- ACT-OPTIONS]
 bana fix [BUILD | last | --log FILE|-] [--open | --headless]   # and brief, list, push, drop: docs/FIX.md
 bana report [BUILD | last | --log FILE|-] [--json]   # the CI report, per standard
+bana installer DIST (--tag T | --label L)   # the project's install.sh, install.ps1 and SHA256SUMS
+bana install [BUILD | --from FILE|DIR]     # a daemon build's files, on this machine
 bana mcp             # bana's tools for Claude Code, by hand (an MCP server on stdio)
 bana daemon install [--port N] [--no-tray] [--no-open] [--now] [--no-claude]
 bana daemon status|log|open|poke|run|uninstall   # docs/DAEMON.md
@@ -538,8 +605,14 @@ own devices reach only its macOS runner.
 
 `tests/run.sh` runs every command against stand-ins for the programs bana drives (`uname`, `orb`, `tart`,
 `gh`, `ioreg`, `sudo`, `apt-get`, and the runner's own scripts), so the macOS paths run on Linux too.
-`BASH_UNDER_TEST=/bin/bash` picks the shell under test. `.github/workflows/test.yml` runs it on Ubuntu and on
+`BASH_UNDER_TEST=/bin/bash` picks the shell under test. `tests/install.sh` runs the compiled installer (`SH=dash`,
+bash, bash 3.2) through every stage of example's hook, `tests/install-ps1.sh` runs install.ps1 on pwsh, and
+`tests/install-real.sh` runs install.sh on the machine's own tools (on a Mac: sysctl, BSD tar, /sbin/sha256sum and a
+quarantined download). `.github/workflows/test.yml` runs them on Ubuntu and on
 macOS (stock bash 3.2), plus shellcheck and the manager's tests. On a private repository the macOS job's
-minutes count ten times.
+minutes count ten times. `.github/workflows/installer.yml` runs install.ps1 on Windows (PowerShell 5.1 and 7:
+the junction, the user PATH, Unblock-File, the hook under a Restricted policy), only when the installer changes.
+`BANA_E2E=1 tests/e2e-daemon.sh` runs the daemon with real act: its last push uploads an archive per CPU, and the
+green build's installer installs one under a scratch home.
 
 License: GPL-3.0-only.

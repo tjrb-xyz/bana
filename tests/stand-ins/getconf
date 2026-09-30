@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stand-in: getconf LONG_BIT is FAKE_LONG_BIT (default 64).
+[ "${1:-}" = LONG_BIT ] || { echo "getconf stand-in: $*" >&2; exit 2; }
+echo "${FAKE_LONG_BIT:-64}"

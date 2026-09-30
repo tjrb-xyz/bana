@@ -1,0 +1,2 @@
+{"dryrun":false,"job":"ci/wait","jobID":"wait","level":"info","matrix":{},"msg":"  ✅  Success - Main sleep 25 [25.113855007s]","stage":"Main","step":"sleep 25","stepID":["0"],"stepResult":"success","time":"2026-09-29T07:33:08Z"}
+{"dryrun":false,"job":"ci/wait","jobID":"wait","jobResult":"success","level":"info","matrix":{},"msg":"🏁  Job succeeded","time":"2026-09-29T07:33:08Z"}

@@ -35,7 +35,8 @@
 //!   pushes not built;
 //! - `builds/<id>/`: `build.json` ([`Record`]), `jobs.txt` (`act -l`),
 //!   `event.json`, `act.jsonl` (act's lines, and bana's), `artifacts/`, and
-//!   `secrets` (0600) while act runs;
+//!   `secrets` (0600) while act runs; after a green build, `dist/`: what its
+//!   jobs uploaded ([`crate::artifacts`]) with the project's installer;
 //! - `act-cache/`: act's action cache;
 //! - `daemon.lock`: locked (flock) while a daemon runs here;
 //! - `vars`: optional, the owner's `KEY=value` lines for `vars.*`;
@@ -87,7 +88,7 @@ use crate::watch::{
 use crate::{valid_repo, valid_tier, valid_workflow};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -106,8 +107,11 @@ const KEEP_BUILDS: usize = 100;
 const KEEP_ROUNDS: i64 = 14 * 86_400;
 /// A round's long poll waits at most this long (seconds).
 pub const ROUND_WAIT: u64 = 55;
-/// A build's artifacts are kept this long (seconds).
+/// A build's artifacts and files are kept this long (seconds), but for the
+/// newest files of each branch and tier.
 const KEEP_ARTIFACTS: i64 = 7 * 86_400;
+/// How long `bana installer` may take.
+const INSTALLER_TIMEOUT: u64 = 120;
 /// The longest wait between tries to post statuses.
 const RETRY_MAX: Duration = Duration::from_secs(300);
 /// Pushes not built that state.json remembers.
@@ -586,6 +590,46 @@ pub struct Record {
     /// The CI report's rows (report.md's table), once the build ended.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub standards: Vec<crate::report::Row>,
+    /// What a green build's jobs uploaded, in `dist/`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dist: Option<Dist>,
+}
+
+/// A build's `dist/`: the files its jobs uploaded, and the project's
+/// installer for them. A problem never changes the build's result.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Dist {
+    pub files: Vec<DistEntry>,
+    /// Why nothing was collected, or why the installer is missing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
+    /// Pruned: the build is more than a week old.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub removed: bool,
+}
+
+impl Dist {
+    /// Files there to download: none once removed.
+    pub fn available(&self) -> &[DistEntry] {
+        if self.removed {
+            &[]
+        } else {
+            &self.files
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DistEntry {
+    pub name: String,
+    pub bytes: u64,
+    /// `linux-x64`…: an archive the installer installs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    /// In SHA256SUMS: a release's file (release.files, and the installer).
+    pub release: bool,
 }
 
 /// Lines of one build's log, from a byte offset in act.jsonl.
@@ -789,7 +833,21 @@ impl Daemon {
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or(Value::Null);
         v["compare"] = event["compare"].clone();
+        if v["dist"].is_object() {
+            v["dist"]["dir"] = json!(dir.join("dist"));
+        }
         Some(v)
+    }
+
+    /// A file of build `id`'s dist/, when its record lists it and it is
+    /// still there; none for anything else.
+    pub fn file(&self, id: u64, name: &str) -> Option<PathBuf> {
+        let inner = self.0.lock();
+        let dist = inner.records.get(&id)?.dist.as_ref()?;
+        dist.available().iter().find(|f| f.name == name)?;
+        let path = self.0.build_dir(id).join("dist").join(name);
+        let meta = std::fs::symlink_metadata(&path).ok()?;
+        meta.file_type().is_file().then_some(path)
     }
 
     /// A build's CI report, as its end wrote it: report.md and its rows.
@@ -1512,6 +1570,8 @@ impl Shared {
                 .unwrap_or_default(),
             jobs: b.chips(),
             tests: crate::report::chip(&r.standards),
+            files: r.dist.as_ref().map_or(0, |d| d.available().len()),
+            files_problem: r.dist.as_ref().is_some_and(|d| d.problem.is_some()),
         }
     }
 
@@ -1742,7 +1802,7 @@ impl Shared {
         }
         self.clear_stale_lock().await;
         let inner = self.lock();
-        let fixes: std::collections::BTreeSet<String> = inner
+        let fixes: BTreeSet<String> = inner
             .records
             .values()
             .filter_map(|r| r.request.fix.clone())
@@ -2809,7 +2869,7 @@ impl Shared {
         // Containers are left behind only when act did not end on its own.
         self.sweep(id, ladder.is_some() || code.is_none()).await;
 
-        let pin = {
+        let (pin, green) = {
             let mut inner = self.lock();
             let inner = &mut *inner;
             let Some(rec) = inner.records.get_mut(&id) else {
@@ -2835,13 +2895,26 @@ impl Shared {
                 &rules.tier
             };
             let green = state == BuildState::Success && !rec.request.is_fix();
-            (green && rec.request.tier == *push_tier).then(|| {
+            let pin = (green && rec.request.tier == *push_tier).then(|| {
                 inner.state.green.insert(git_ref.clone(), sha.clone());
                 self.save_state(&inner.state);
                 (git_ref, sha)
-            })
+            });
+            (pin, green)
         };
-        // src is still at the built commit: the next build checks out its own.
+        // src is still at the built commit: the next build checks out its own,
+        // and the installer is made from this one's bana.conf.
+        if green {
+            self.collect(id).await;
+        } else if self
+            .lock()
+            .records
+            .get(&id)
+            .is_some_and(|r| r.request.is_fix())
+        {
+            // A fix's round keeps nothing it uploaded.
+            let _ = std::fs::remove_dir_all(dir.join("artifacts"));
+        }
         self.write_report(id).await;
         if let Some((git_ref, sha)) = pin {
             if let Err(e) = self
@@ -2850,6 +2923,104 @@ impl Shared {
             {
                 eprintln!("bana daemon: pin {git_ref}: {e}");
             }
+        }
+    }
+
+    /// A green build's uploads into its `dist/` ([`crate::artifacts`]), then
+    /// the project's installer for them (`bana installer dist --label
+    /// <tier>-<sha10>`, or `--tag` for a tag), from the built commit's
+    /// bana.conf. Once that is made, the zips go: each file is kept once.
+    /// A problem is the build's `dist.problem`, never its result.
+    async fn collect(&self, id: u64) {
+        let dir = self.build_dir(id);
+        if !dir.join("artifacts").join(id.to_string()).is_dir() {
+            return;
+        }
+        let Some(req) = self.lock().records.get(&id).map(|r| r.request.clone()) else {
+            return;
+        };
+        let at = dir.clone();
+        let c = match tokio::task::spawn_blocking(move || crate::artifacts::collect(&at, id)).await
+        {
+            Ok(c) => c,
+            Err(e) => crate::artifacts::Collection {
+                problem: Some(e.to_string()),
+                ..Default::default()
+            },
+        };
+        if c.artifacts.is_empty() && c.problem.is_none() {
+            return;
+        }
+        let mut dist = Dist {
+            problem: c.problem.clone(),
+            ..Dist::default()
+        };
+        if c.problem.is_none() && !c.files.is_empty() {
+            // Archives an installer can install: else the files are just files.
+            if c.files.iter().any(|f| f.platform.is_some()) {
+                if let Err(e) = self.installer(id, &req).await {
+                    eprintln!("bana daemon: build {id}: {e}");
+                    dist.problem = Some(e);
+                }
+            }
+            dist.files = dist_entries(&dir.join("dist"));
+            if dist.problem.is_none() {
+                let zips = dir.join("artifacts").join(id.to_string());
+                for a in c.artifacts.iter().filter(|a| a.problem.is_none()) {
+                    let _ = std::fs::remove_dir_all(zips.join(&a.name));
+                }
+                let _ = std::fs::remove_dir(&zips);
+                let _ = std::fs::remove_dir(dir.join("artifacts"));
+            }
+        }
+        if let Some(p) = &c.problem {
+            eprintln!("bana daemon: build {id}: files not collected: {p}");
+        }
+        if let Err(e) = crate::artifacts::record(&dir, &c.artifacts) {
+            eprintln!("bana daemon: build {id}: {e}");
+        }
+        if dist.files.is_empty() && dist.problem.is_none() {
+            return;
+        }
+        let mut inner = self.lock();
+        if let Some(rec) = inner.records.get_mut(&id) {
+            rec.dist = Some(dist);
+            self.save(rec);
+        }
+        self.publish(&inner);
+    }
+
+    /// `bana installer dist …` in the build's directory, as `bana ci` runs.
+    async fn installer(&self, id: u64, req: &Request) -> Result<(), String> {
+        let s = &self.settings;
+        let how = match req.git_ref.strip_prefix("refs/tags/") {
+            Some(tag) => ["--tag".to_string(), tag.to_string()],
+            None => {
+                let sha: String = req.sha.chars().take(10).collect();
+                let label = match req.tier.as_str() {
+                    "" => sha,
+                    t => format!("{t}-{sha}"),
+                };
+                ["--label".to_string(), label]
+            }
+        };
+        let run = Command::new(&s.bash)
+            .arg(&s.script)
+            .args(["installer", "dist"])
+            .args(&how)
+            .env_clear()
+            .envs(s.child_env(id))
+            .current_dir(self.build_dir(id))
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        match tokio::time::timeout(Duration::from_secs(INSTALLER_TIMEOUT), run).await {
+            Err(_) => Err(format!(
+                "bana installer took longer than {INSTALLER_TIMEOUT} s"
+            )),
+            Ok(Err(e)) => Err(format!("{}: {e}", s.bash)),
+            Ok(Ok(o)) if o.status.success() => Ok(()),
+            Ok(Ok(o)) => Err(failure(&o)),
         }
     }
 
@@ -3216,16 +3387,18 @@ impl Shared {
 
     // ---- pruning ------------------------------------------------------------------
 
-    /// Keeps the newest builds, a fix's rounds while it lasts, and a week of
-    /// artifacts. Says which fixes lost their last round build: their
-    /// snapshots' refs in src go too ([`Self::forget_refs`]).
+    /// Keeps the newest builds, a fix's rounds while it lasts, a week of
+    /// artifacts and files, and the newest files of each branch and tier.
+    /// Says which fixes lost their last round build: their snapshots' refs in
+    /// src go too ([`Self::forget_refs`]).
     fn prune(&self, inner: &mut Inner) -> Vec<String> {
         let busy = |id: u64| {
             inner.state.queue.contains(&id) || inner.running.as_ref().is_some_and(|r| r.id == id)
         };
         let fixes = self.settings.dir.join("fix");
         let gone = |fix: &str| !fixes.join(format!("{fix}.d/fix.json")).exists();
-        let old = to_prune(&inner.records, busy, gone, now());
+        let keep = kept_files(&inner.records, &inner.state.heads);
+        let old = to_prune(&inner.records, &keep, busy, gone, now());
         let mut forgotten: Vec<String> = Vec::new();
         for id in old {
             if let Some(fix) = inner.records.remove(&id).and_then(|r| r.request.fix) {
@@ -3241,21 +3414,62 @@ impl Shared {
                 .values()
                 .any(|r| r.request.fix.as_deref() == Some(fix.as_str()))
         });
-        let week_ago = now() - KEEP_ARTIFACTS;
-        for r in inner.records.values() {
-            if r.build.ended_at.is_some_and(|t| t < week_ago) {
-                let _ = std::fs::remove_dir_all(self.build_dir(r.request.id).join("artifacts"));
+        for id in stale_files(&inner.records, &keep, now()) {
+            let dir = self.build_dir(id);
+            let _ = std::fs::remove_dir_all(dir.join("artifacts"));
+            let _ = std::fs::remove_dir_all(dir.join("dist"));
+            if let Some(d) = inner.records.get_mut(&id).and_then(|r| r.dist.as_mut()) {
+                if !d.removed && !d.files.is_empty() {
+                    d.removed = true;
+                    let rec = &inner.records[&id];
+                    self.save(rec);
+                }
             }
         }
         forgotten
     }
 }
 
+/// The builds whose files are kept past the week: the newest that can be
+/// installed (its installer made, no problem) of each branch (or tag) and
+/// tier, while the branch is there, so the latest nightly of main can always
+/// be installed.
+fn kept_files(records: &BTreeMap<u64, Record>, heads: &Heads) -> BTreeSet<u64> {
+    let mut seen = BTreeSet::new();
+    let mut keep = BTreeSet::new();
+    for r in records.values().rev() {
+        let has = r.dist.as_ref().is_some_and(|d| {
+            d.problem.is_none()
+                && d.available()
+                    .iter()
+                    .any(|f| f.name == "install.sh" || f.name == "install.ps1")
+        });
+        let key = (r.request.git_ref.as_str(), r.request.tier.as_str());
+        if has && heads.contains_key(&r.request.git_ref) && seen.insert(key) {
+            keep.insert(r.request.id);
+        }
+    }
+    keep
+}
+
+/// The ended builds whose artifacts and files go: those that ended
+/// [`KEEP_ARTIFACTS`] ago, but for `keep`.
+fn stale_files(records: &BTreeMap<u64, Record>, keep: &BTreeSet<u64>, now: i64) -> Vec<u64> {
+    records
+        .values()
+        .filter(|r| r.build.ended_at.is_some_and(|t| t < now - KEEP_ARTIFACTS))
+        .filter(|r| !keep.contains(&r.request.id))
+        .map(|r| r.request.id)
+        .collect()
+}
+
 /// The builds pruning removes: those past the newest [`KEEP_BUILDS`], not
-/// counting fix rounds, and a fix's rounds once the fix is `gone` or its last
-/// round ended [`KEEP_ROUNDS`] ago. A `busy` build (queued, running) stays.
+/// counting fix rounds or those whose files are kept (`keep`), and a fix's
+/// rounds once the fix is `gone` or its last round ended [`KEEP_ROUNDS`] ago.
+/// A `busy` build (queued, running) stays.
 fn to_prune(
     records: &BTreeMap<u64, Record>,
+    keep: &BTreeSet<u64>,
     busy: impl Fn(u64) -> bool,
     gone: impl Fn(&str) -> bool,
     now: i64,
@@ -3263,7 +3477,7 @@ fn to_prune(
     let mut out: Vec<u64> = records
         .values()
         .rev()
-        .filter(|r| !r.request.is_fix() && !busy(r.request.id))
+        .filter(|r| !r.request.is_fix() && !busy(r.request.id) && !keep.contains(&r.request.id))
         .skip(KEEP_BUILDS)
         .map(|r| r.request.id)
         .collect();
@@ -3283,6 +3497,35 @@ fn to_prune(
             out.push(r.request.id);
         }
     }
+    out
+}
+
+/// What `dir` (a build's dist/) holds, by name: a file named in its
+/// SHA256SUMS is the release's.
+fn dist_entries(dir: &Path) -> Vec<DistEntry> {
+    let sums = std::fs::read_to_string(dir.join("SHA256SUMS")).unwrap_or_default();
+    let listed: Vec<&str> = sums
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .map(|n| n.trim_start_matches('*'))
+        .collect();
+    let mut out: Vec<DistEntry> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| {
+            let name = e.file_name().to_str()?.to_string();
+            Some(DistEntry {
+                bytes: e.metadata().map(|m| m.len()).unwrap_or(0),
+                platform: crate::artifacts::platform(&name),
+                release: name == "SHA256SUMS" || listed.contains(&name.as_str()),
+                name,
+            })
+        })
+        .filter(|f| !f.name.starts_with('.') && !f.name.ends_with(".part"))
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 
@@ -3645,8 +3888,20 @@ pub(crate) mod tests {
     /// file says `stubborn` (the first SIGINT is ignored) or `deaf` (all are).
     /// With `orphans`, it first leaves two sleeps that are not its children
     /// (setsid, nohup), carrying the marker, and records their pids. While
-    /// `stall` exists, it stops after a job's first line.
+    /// `stall` exists, it stops after a job's first line. The `files` fixture
+    /// (build 10 of the artifacts fixtures) leaves that build's uploads in
+    /// `artifacts/<id>/`, as does any fixture while `artifacts` exists.
+    /// `installer` records its arguments, then writes an install.sh and a
+    /// SHA256SUMS of it and the tar.gz, or fails while `installer-fails` exists.
     const BANA: &str = r#"ctl='CTL'; fx='FX'
+if [[ $1 == installer ]]; then
+  b=${BANA_BUILD##*-}
+  printf '%s\n' "$@" "$BANA_PROJECT_ROOT" "$PWD" >"$ctl/installer.$b"
+  [[ ! -e $ctl/installer-fails ]] || { echo "bana installer: install.name: not 'a b'" >&2; exit 1; }
+  echo '#!/bin/sh' >"$2/install.sh"
+  (cd "$2" && for f in install.sh *.tar.gz; do echo "0  $f"; done) >"$2/SHA256SUMS"
+  exit 0
+fi
 [[ $1 == ci ]] || exit 2
 shift
 f=$(cat "$BANA_PROJECT_ROOT/fixture")
@@ -3681,6 +3936,10 @@ while IFS= read -r line; do
   case $line in *'"jobID"'*) while [[ -e $ctl/stall ]]; do sleep 0.05; done ;; esac
   sleep 0.01
 done <"$fx/$f.jsonl"
+if [[ $f == files || -e $ctl/artifacts ]]; then
+  mkdir -p "artifacts/$b"
+  cp -R "$fx/../artifacts/b10/artifacts/10/." "artifacts/$b/"
+fi
 case $f in fail | syntax) exit 1 ;; esac
 exit 0
 "#;
@@ -4404,6 +4663,126 @@ exec git \"$@\"
             "{md}"
         );
         assert_eq!(read(2, "report.md"), md);
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_green_builds_files_are_kept_with_their_installer() {
+        let p = Project::new("files");
+        let d = start(&p, "").await;
+        let a = p.commit("files", "packages");
+        p.push("main");
+        poll(&d).await;
+        let rec = finished(&d, 1).await;
+        assert_eq!(rec.build.state, BuildState::Success);
+        let dir = p.dir.join("builds/1");
+        let dist = rec.dist.clone().expect("collected");
+        assert_eq!(dist.problem, None);
+        let names: Vec<(&str, Option<&str>, bool)> = dist
+            .files
+            .iter()
+            .map(|f| (f.name.as_str(), f.platform.as_deref(), f.release))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("SHA256SUMS", None, true),
+                (
+                    "demo-nightly-abc123-linux-x64.tar.gz",
+                    Some("linux-x64"),
+                    true
+                ),
+                (
+                    "demo_0.0.0.nightly202609290728.gabc123_amd64.deb",
+                    None,
+                    false
+                ),
+                ("install.sh", None, true),
+            ],
+            "{dist:?}"
+        );
+        // The installer of the built commit's bana.conf, labelled for the build.
+        let src = p.dir.join("src");
+        assert_eq!(
+            p.read("installer.1"),
+            format!(
+                "installer\ndist\n--label\nquick-{}\n{}\n{}\n",
+                &a[..10],
+                src.display(),
+                dir.display()
+            )
+        );
+        // The zips it took are gone; the upload-artifact@v3 one is not a zip.
+        assert!(!dir.join("artifacts/1/demo-nightly-linux-x64").exists());
+        assert!(dir.join("artifacts/1/old-style/a.txt").exists());
+        let md = std::fs::read_to_string(dir.join("report.md")).unwrap();
+        assert!(
+            md.contains(
+                "\n## Artifacts\n\n- `demo-nightly-linux-x64` (package (linux-x64), 1.1 KB): "
+            ),
+            "{md}"
+        );
+        let view = d.builds(None, 1).remove(0);
+        assert_eq!((view.files, view.files_problem), (4, false));
+        let tar = "demo-nightly-abc123-linux-x64.tar.gz";
+        assert_eq!(d.file(1, tar), Some(dir.join("dist").join(tar)));
+        for name in ["../build.json", "dist", "", "a.txt", "SHA256SUMS.part"] {
+            assert_eq!(d.file(1, name), None, "{name}");
+        }
+        let detail = d.build(1).unwrap();
+        assert_eq!(detail["dist"]["dir"], json!(dir.join("dist")));
+        let said = |id: u64| {
+            d.0.lock().records[&id]
+                .statuses
+                .iter()
+                .map(|(c, s)| (c.clone(), s.state, s.description.clone()))
+                .collect::<Vec<_>>()
+        };
+        let green = said(1);
+
+        // A failed build's uploads stay where act put them.
+        p.set("artifacts", true);
+        p.commit("fail", "fails");
+        p.push("main");
+        poll(&d).await;
+        let rec = finished(&d, 2).await;
+        assert_eq!((rec.build.state, rec.dist), (BuildState::Failure, None));
+        let two = p.dir.join("builds/2");
+        assert!(two.join("artifacts/2/demo-nightly-linux-x64").is_dir());
+        assert!(!two.join("dist").exists() && !p.flag("installer.2").exists());
+
+        // An installer that fails: the files stay, with the problem; the build
+        // stays green, and says the same as build 1.
+        p.set("artifacts", false);
+        p.set("installer-fails", true);
+        p.commit("files", "packages again");
+        p.push("main");
+        poll(&d).await;
+        let rec = finished(&d, 3).await;
+        assert_eq!(rec.build.state, BuildState::Success);
+        let dist = rec.dist.clone().unwrap();
+        assert_eq!(
+            dist.problem.as_deref(),
+            Some("bana installer: install.name: not 'a b'")
+        );
+        assert_eq!(dist.files.len(), 2, "{dist:?}");
+        let three = p.dir.join("builds/3");
+        assert!(three.join("artifacts/3/demo-nightly-linux-x64").is_dir());
+        let view = d.builds(None, 1).remove(0);
+        assert_eq!((view.files, view.files_problem), (2, true));
+        posted(&d).await;
+        let strip = |v: Vec<(String, StatusState, String)>| {
+            v.into_iter().map(|(c, s, _)| (c, s)).collect::<Vec<_>>()
+        };
+        assert_eq!(strip(said(3)), strip(green));
+        assert!(said(3).iter().all(|(_, _, d)| !d.contains("install")));
+        // Past the week, build 1's files are the ones kept: 3 has no installer.
+        let keep = {
+            let inner = d.0.lock();
+            kept_files(&inner.records, &inner.state.heads)
+        };
+        assert!(keep.contains(&1) && !keep.contains(&3), "{keep:?}");
         d.shutdown().await;
         p.remove();
     }
@@ -5433,11 +5812,26 @@ exec git \"$@\"
         let p = Project::new("rounds");
         let extra = format!("checkout = {}\nfix.rounds = 2\n", p.checkout().display());
         let d = start(&p, &extra).await;
+        // Every build uploads: a fix's round keeps nothing, a failed build all.
+        p.set("artifacts", true);
         let (c, made) = failed_and_fixed(&p, &d).await;
         let sha7 = &c[..7];
         let wt = PathBuf::from(&made.worktree);
         let r0 = finished(&d, 3).await;
         assert_eq!(r0.request.round, Some(0));
+        assert!(!p.dir.join("builds/3/artifacts").exists());
+        assert!(p.dir.join("builds/2/artifacts/2").is_dir());
+        // Build 1's log has no upload step for them: refused, and still green.
+        let one = d.0.lock().records[&1].clone();
+        assert_eq!(one.build.state, BuildState::Success);
+        assert!(
+            one.dist
+                .and_then(|d| d.problem)
+                .is_some_and(|p| p.contains("no upload-artifact step")),
+            "{:?}",
+            d.0.lock().records[&1].dist
+        );
+        p.set("artifacts", false);
         posted(&d).await;
         let posts = p.posts().len();
 
@@ -5795,14 +6189,76 @@ exec git \"$@\"
             records.insert(id, rec(id, None, now));
         }
         let idle = |_: u64| false;
-        let mut out = to_prune(&records, idle, |f| f == "ccccccc", now);
+        let none = BTreeSet::new();
+        let mut out = to_prune(&records, &none, idle, |f| f == "ccccccc", now);
         out.sort();
         // a's last round is recent; b's is old; c's fix is gone; two pushes are past the cap.
         assert_eq!(out, [3, 4, 10, 11]);
-        let out = to_prune(&records, |id| id == 4 || id == 10, |f| f == "ccccccc", now);
+        let busy = |id: u64| id == 4 || id == 10;
+        let out = to_prune(&records, &none, busy, |f| f == "ccccccc", now);
         assert!(
             !out.contains(&4) && !out.contains(&10),
             "busy builds stay: {out:?}"
         );
+    }
+
+    #[test]
+    fn the_newest_files_of_each_branch_and_tier_are_kept() {
+        let rec = |id: u64, git_ref: &str, tier: &str, ended: i64, files: bool| Record {
+            request: Request {
+                id,
+                git_ref: git_ref.into(),
+                tier: tier.into(),
+                ..Request::default()
+            },
+            build: Build {
+                ended_at: Some(ended),
+                ..Build::default()
+            },
+            dist: files.then(|| Dist {
+                files: ["demo-linux-x64.tar.gz", "install.sh"]
+                    .map(|name| DistEntry {
+                        name: name.into(),
+                        ..DistEntry::default()
+                    })
+                    .to_vec(),
+                ..Dist::default()
+            }),
+            ..Record::default()
+        };
+        let now = 1_790_000_000;
+        let old = now - KEEP_ARTIFACTS - 10;
+        let mut records = BTreeMap::new();
+        // Two nightlies of main with files, a month ago; one of a branch since
+        // deleted; then 105 quick builds of main, the first with files.
+        records.insert(1, rec(1, "refs/heads/main", "nightly", old, true));
+        records.insert(2, rec(2, "refs/heads/main", "nightly", old, true));
+        records.insert(3, rec(3, "refs/heads/gone", "nightly", old, true));
+        for id in 10..115 {
+            records.insert(id, rec(id, "refs/heads/main", "quick", old, id == 10));
+        }
+        let heads: Heads = [("refs/heads/main".to_string(), "a".repeat(40))].into();
+        let keep = kept_files(&records, &heads);
+        assert_eq!(keep, [2, 10].into(), "the newest per (branch, tier)");
+        let mut out = to_prune(&records, &keep, |_| false, |_| false, now);
+        out.sort();
+        // The kept two are not counted: 100 of the other 106 stay.
+        assert_eq!(out, [1, 3, 11, 12, 13, 14]);
+        let stale = stale_files(&records, &keep, now);
+        assert!(!stale.contains(&2) && !stale.contains(&10), "{stale:?}");
+        assert!(stale.contains(&1) && stale.contains(&3) && stale.contains(&50));
+        // A removed dist has nothing to keep: the next newest is kept.
+        records.get_mut(&2).unwrap().dist.as_mut().unwrap().removed = true;
+        assert_eq!(kept_files(&records, &heads), [1, 10].into());
+        assert!(stale_files(&records, &keep, old + 10).is_empty(), "a week");
+        // Files the installer could not use (it failed, or no archive): not
+        // the kept ones; the newest that installs is.
+        let mut failed = rec(4, "refs/heads/main", "nightly", old, true);
+        failed.dist.as_mut().unwrap().problem = Some("no".into());
+        let mut no_installer = rec(5, "refs/heads/main", "nightly", old, true);
+        no_installer.dist.as_mut().unwrap().files.pop();
+        records.insert(4, failed);
+        records.insert(5, no_installer);
+        assert_eq!(kept_files(&records, &heads), [1, 10].into());
     }
 }

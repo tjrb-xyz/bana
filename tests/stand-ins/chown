@@ -1,0 +1,3 @@
+#!/bin/sh
+# Stand-in: logs itself only.
+echo "chown $*" >>"${FAKE_LOG:-/dev/null}"
