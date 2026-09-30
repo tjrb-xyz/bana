@@ -122,7 +122,8 @@ The run uses your working tree, uncommitted changes included, and the workflow's
 its token as `GITHUB_TOKEN`.
 
 act's output also goes to `~/.bana/<prefix>/ci/last.log`, and what ran to `last.env` (commit, changed files,
-tier, job, network, versions, exit status), for `bana fix`, which a failed run points to. `ci.log = no` skips it.
+tier, job, network, versions, exit status, and whether Ctrl-C stopped it), for `bana fix`, which a failed run
+points to. `ci.log = no` skips it.
 
 Limits worth knowing:
 - act uses your working tree only for a checkout step without `ref:` (or with `ref:` equal to the current ref).
@@ -152,7 +153,7 @@ It makes `bana/fix-<sha7>` at the failing commit, as a git worktree of your chec
 and line, cargo's rerun command, each failed step's last lines, and what was bana's or act's rather than the
 project's), and starts Claude Code there with a prompt that says so. Your working tree and branches stay as they
 are, and a commit on the fix branch shows up in your checkout at once. Claude works with your own Claude Code
-settings plus one rule: no `git push`. Pushing is yours:
+settings plus rules against `git push` (a guard for Claude, not a lock). Pushing is yours:
 
 ```sh
 bana fix list                              # the fixes: branch, commits, worktree
@@ -161,7 +162,7 @@ bana fix push [FIX] [--pr]                 # push the branch (the daemon builds 
 bana fix drop [FIX] [--force] [--delete-branch]   # remove the worktree; the branch stays while it has commits
 ```
 
-It needs bana-manager: the daemon's (`bana daemon install`), or a `cargo build --release` in bana's `manager/`.
+It needs bana-manager: the daemon's (`bana daemon install`), else one bana builds with cargo the first time.
 [docs/FIX.md](docs/FIX.md) has the rest.
 
 ## bana up: a runner pool (optional)

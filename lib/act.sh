@@ -177,9 +177,10 @@ act_main() {
 
 # A run by hand keeps act's output, and what ran, for bana fix: in ~/.bana/<prefix>/ci,
 # last.log and last.env. last.env's lines are KEY=VALUE (the rest of the line): sha, ref,
-# dirty (the changed files, as git status names them, space-separated), tier, job, event (its
-# file), network, act and bana (their versions), started and ended (Unix seconds), and exit
-# (act's). Both take their names when act ends (.part until then). act's output goes through
+# dirty (the changed files, as git status names them: space-separated, C-quoted when a name
+# has a space), tier, job, event (its file), network, act and bana (their versions), started
+# and ended (Unix seconds), exit (act's), and stopped (1: Ctrl-C stopped it, so it did not
+# fail). Both take their names when act ends (.part until then). act's output goes through
 # tee, so bash stays, holding the lock, until act ends; its EXIT trap then frees the lock.
 # Uses act_main's locals.
 act_logged() { # ACT-ARGUMENT...
@@ -187,7 +188,7 @@ act_logged() { # ACT-ARGUMENT...
   mkdir -p "$dir"
   sha=$(git -C "$root" rev-parse -q --verify HEAD 2>/dev/null) || true
   ref=$(git -C "$root" symbolic-ref -q HEAD 2>/dev/null) || true
-  dirty=$(git -C "$root" status --porcelain 2>/dev/null |
+  dirty=$(git -C "$root" -c core.quotePath=false status --porcelain 2>/dev/null |
     awk '{ p = substr($0, 4); i = index(p, " -> "); if (i) p = substr(p, i + 4); printf "%s%s", s, p; s = " " }') || true
   v=$(act --version 2>/dev/null | awk 'NR == 1 { print $NF }') || true
   # bana's own commit, unless it is a copy inside another repository.
@@ -201,7 +202,8 @@ act_logged() { # ACT-ARGUMENT...
   if act "$@" 2>&1 | tee -i "$dir/last.log.part"; then status=0; else status=${PIPESTATUS[0]}; fi
   trap - INT
   printf '%s\n' "sha=$sha" "ref=$ref" "dirty=$dirty" "tier=$tier" "job=${jobs[1]:-}" "event=$event" \
-    "network=$net" "act=$v" "bana=$b" "started=$started" "ended=$(date +%s)" "exit=$status" >"$dir/last.env.part"
+    "network=$net" "act=$v" "bana=$b" "started=$started" "ended=$(date +%s)" "exit=$status" \
+    "stopped=${stopped:-0}" >"$dir/last.env.part"
   mv -f "$dir/last.log.part" "$dir/last.log"
   mv -f "$dir/last.env.part" "$dir/last.env"
   if ((status)) && [[ -z $stopped ]]; then

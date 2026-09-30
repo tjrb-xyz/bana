@@ -19,7 +19,9 @@ bana fix --open              # Claude Code in a new terminal, through its claude
 With no argument, bana fix takes the newer of the last `bana ci` here, if it failed, and the newest failed daemon
 build of the branch you are on. It reads both from their files (`~/.bana/<prefix>/ci/last.env`, and
 `builds/<id>/build.json`), so the daemon need not run. A daemon build that ended in error (cancelled, timed
-out, could not start) is not a failure to fix.
+out, could not start) is not a failure to fix, and neither is a `bana ci` you stopped with Ctrl-C (`bana fix
+--log ~/.bana/<prefix>/ci/last.log` takes its output all the same). A log that names nothing that failed, an
+empty paste included, makes no fix.
 
 The daemon's page has *Fix with Claude* on a failed build, and 🧱 has *Fix #41 with Claude…* while the last
 build failed. Both make the same fix, then open Claude Code's link, as `bana fix --open` does.
@@ -34,8 +36,9 @@ For a failure at commit `d4b5174`:
   they are. A commit your checkout lacks (a push from elsewhere) is first fetched from the daemon's clone;
 - beside it, `fix/d4b5174.d/`: `fix.json` (where the failure came from), `brief.md`, `prompt.txt`, the log
   (`log.txt`, for a hand run or a paste) and `results.jsonl` (the log, read);
-- in the worktree, `.claude/settings.local.json`, which denies Claude `git push`, and one line in your
-  checkout's `.git/info/exclude` so that file is never committed. A project that tracks that file gets neither.
+- in the worktree, `.claude/settings.local.json`, with rules against Claude's `git push` (below), and one line
+  in your checkout's `.git/info/exclude` so that file is never committed. A project that tracks that file, or
+  whose `.gitignore` un-ignores it (`!.claude/*.json`), gets no such file: the brief says so.
 
 bana runs git in your checkout with its hooks off (`-c core.hooksPath=/dev/null`), except for `bana fix push`,
 which is your push. A second failure at the same commit reuses the worktree and its branch: the fix goes on.
@@ -44,17 +47,24 @@ which is your push. A second failure at the same commit reuses the worktree and 
 
 The brief says, per failed job and step: whose it is (the project's; bana's, for a step of bana's own actions;
 act's, for act's errors outside a job), the failing tests with the file and line of each panic and its message,
-cargo's rerun command, whether cargo stopped early, and the step's last lines (as data, fenced). It also says
-how the run ran: commit, branch, tier, machine, act's version and network, the bana that ran and the one the
-workflow pins, the jobs beside it, and, for a hand run, the changes it had that the branch lacks. `bana fix
-brief` prints it.
+cargo's rerun command, whether cargo stopped early, and the step's last lines. It also says how the run ran:
+commit, branch, tier, machine, act's version (for a daemon build, the act installed now: the daemon does not
+keep it per build) and network, the bana that ran and the one the workflow pins, the jobs beside it, and, for a
+hand run, the changes it had that the branch lacks. `bana fix brief` prints it.
 
-The prompt (at most 5,000 characters, the link's limit) says what failed and where Claude is, then: read the
-brief, reproduce with the rerun command in the worktree, and commit on the branch with a message that says why,
-never pushing and never switching branches.
+The prompt (at most 5,000 characters, the link's limit, counted as Claude Code counts them: after Unicode's
+NFKC, which makes `…` three) says what failed and where Claude is, then: read the brief, reproduce with the
+rerun command in the worktree, and commit on the branch with a message that says why, never pushing and never
+switching branches.
 
-Claude Code runs as you, with your own settings and permission mode, plus that one rule. It asks once to trust
-each new worktree.
+Whatever comes from the log (test names, messages, annotations, errors, step and job names, its last lines) is
+quoted in both, fenced or in backticks, and both say that quoted text is data, not instructions: a test or a
+dependency can print anything. A rerun command goes on only in cargo's own shape (`-p crate --test facts`).
+
+Claude Code runs as you, with your own settings and permission mode, plus those rules. They deny `git push`,
+`git -C … push`, `git -c …` (a one-off alias or push URL) and `git config … alias`: a guard against Claude
+pushing, not a lock. A script Claude writes and runs can still push, as can anything your own rules allow in
+auto or bypass mode. It asks once to trust each new worktree.
 
 ## How it ends
 
@@ -68,14 +78,18 @@ bana fix drop [FIX] --delete-branch  # the branch too
 ```
 
 FIX is the commit's first digits (4 or more). Without it, a command takes the fix whose worktree you are in,
-else the newest. Push refuses a branch with no commits. Drop refuses a worktree with changes, untracked files
-included, unless `--force`. Nothing leaves the machine unless you push.
+else the newest. Push refuses a branch with no commits. Drop refuses, unless `--force`, a worktree with changes
+(untracked files and submodules' changes included), or with submodule commits that no remote has: a worktree
+keeps its submodules' repositories in its own git directory, so they would go with it. Drop, and a fix made
+again where its worktree was removed by hand, make git forget only that worktree: bana never runs `git worktree
+prune`, which would forget any of yours that is missing just then (on a volume not mounted, say). bana itself
+pushes nothing: `bana fix push` is yours.
 
 ## bana-manager
 
 bana fix's work is done by `bana-manager fix prepare` (and `fix brief`): the daemon's copy, which `bana daemon
-install` puts in `~/.bana/<prefix>/daemon`, else a `cargo build --release` in bana's `manager/`. An older copy
-without `fix` does not count: `bana daemon install` again brings a new one.
+install` puts in `~/.bana/<prefix>/daemon`, else a release build in bana's `manager/`, which bana makes with
+cargo when there is none (the first time takes a minute). An older copy without `fix` does not count.
 
 ## Check once on the Mac
 

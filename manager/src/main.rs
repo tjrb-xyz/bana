@@ -307,7 +307,12 @@ fn fix(mut args: impl Iterator<Item = String>) {
             _ => usage(),
         }
     }
-    let Some(dir) = dir else { usage() };
+    // Absolute: git runs in the checkout, where a relative path means another place.
+    let absolute = |p: PathBuf| std::path::absolute(&p).unwrap_or(p);
+    let Some(dir) = dir.map(absolute) else {
+        usage()
+    };
+    let checkout = checkout.map(absolute);
     let done = |r: Result<String, fix::Error>| match r {
         Ok(text) => {
             use std::io::Write;

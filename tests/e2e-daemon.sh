@@ -408,8 +408,8 @@ check "fix: a worktree of the checkout" has <(git -C "$w" worktree list --porcel
 check "fix: its Claude Code settings deny git push" has "$wt/.claude/settings.local.json" 'Bash(git push:*)'
 check "fix: which git leaves out" same "$(git -C "$wt" status --porcelain)" ""
 check "fix: the checkout stays as it was" same "$(git -C "$w" symbolic-ref HEAD)|$(git -C "$w" status --porcelain)" "refs/heads/main|"
-check "fix: the prompt names the failing test" has "$d/fix/$sha7.d/prompt.txt" "tests::the_answer panicked at src/lib.rs:9:5"
-check "fix: and cargo's rerun" has "$d/fix/$sha7.d/prompt.txt" "Rerun: cargo test --lib"
+check "fix: the prompt names the failing test" has "$d/fix/$sha7.d/prompt.txt" "\`tests::the_answer\` panicked at \`src/lib.rs:9:5\`"
+check "fix: and cargo's rerun" has "$d/fix/$sha7.d/prompt.txt" "Rerun: \`cargo test --lib\`"
 check "fix: the link opens Claude Code in the worktree, the prompt typed" same "$(fx 'j["link"].startswith("claude-cli://open?") and (
   lambda q: q["cwd"] == [j["worktree"]] and q["q"] == [open(j["dir"] + "/prompt.txt").read()])(
   __import__("urllib.parse").parse.parse_qs(j["link"].split("?", 1)[1]))')" True

@@ -20,9 +20,10 @@
 #   bana fix drop [FIX] [--force] [--delete-branch]   remove the worktree (--force: with its
 #                          changes); the branch stays while it has commits
 #   FIX: the commit's first digits (4 or more); by default the fix you are in, else the newest.
-#   Claude Code works in the worktree with your own settings, and one rule more: no git push.
+#   Claude Code works in the worktree with your own settings, plus rules against git push:
+#   a guard for Claude, not a lock (docs/FIX.md). bana pushes nothing: bana fix push is yours.
 
-fix_usage() { awk '/^#   bana fix \[/, /^#   Claude Code works/ { sub(/^# ?/, ""); print }' "$bana_root/lib/fix.sh" >&2; exit 2; }
+fix_usage() { awk '/^#   bana fix \[/, /^#   a guard for Claude/ { sub(/^# ?/, ""); print }' "$bana_root/lib/fix.sh" >&2; exit 2; }
 
 # git in the owner's checkout without their hooks, as bana-manager runs it there.
 fix_git() { # DIR GIT-ARGS...
@@ -91,10 +92,13 @@ fix_failed_build() { # REF
 # With no source named: the newer of the last bana ci here, if it failed, and the newest
 # failed daemon build of this branch. Sets fix_start's src.
 fix_default() { # BRANCH (refs/heads/…, or empty)
-  local e ended b='' at=0
+  local e ended stopped b='' at=0 why='no failed bana ci'
   e=$(fix_env exit)
   ended=$(fix_env ended)
+  stopped=$(fix_env stopped)
   [[ $ended =~ ^[0-9]+$ ]] || ended=0
+  # A run Ctrl-C stopped did not fail (as a cancelled daemon build).
+  [[ $stopped != 1 ]] || { e=0 why='the last bana ci was stopped (Ctrl-C)'; }
   [[ -z $1 ]] || read -r b at < <(fix_failed_build "$1") || true
   if [[ -n $e && $e != 0 ]] && { [[ -z $b ]] || ((ended >= at)); }; then
     say "The newest failure here is the last bana ci (bana fix last)"
@@ -103,7 +107,7 @@ fix_default() { # BRANCH (refs/heads/…, or empty)
     say "The newest failure here is daemon build $b of ${1#refs/heads/} (bana fix $b)"
     src=(--build "$b")
   else
-    die "Nothing here failed: no failed bana ci${1:+, and no failed daemon build of ${1#refs/heads/}}. bana fix --log FILE takes act's output from elsewhere"
+    die "Nothing here failed: $why${1:+, and no failed daemon build of ${1#refs/heads/}}. bana fix --log FILE takes act's output from elsewhere"
   fi
 }
 
@@ -200,6 +204,36 @@ fix_find() { # [FIX]
 fix_ahead() { git -C "$1" rev-list --count "$2..refs/heads/$3" 2>/dev/null; } # CHECKOUT SHA BRANCH
 plural() { if (($1 == 1)); then echo "1 $2"; else echo "$1 $2s"; fi; } # N WORD
 
+# A path as it is on disk; a missing one through its directory's.
+fix_real() { # PATH
+  local d
+  if d=$(cd "$1" 2>/dev/null && pwd -P); then echo "$d"
+  elif d=$(cd "$(dirname "$1")" 2>/dev/null && pwd -P); then echo "$d/$(basename "$1")"
+  else echo "$1"; fi
+}
+
+# WORKTREE as CHECKOUT's git lists it, its directory there or not (fails when git has none).
+fix_listed() { # CHECKOUT WORKTREE
+  local w want
+  want=$(fix_real "$2")
+  while IFS= read -r w; do
+    [[ $w == "worktree "* && $(fix_real "${w#worktree }") == "$want" ]] || continue
+    echo "${w#worktree }"
+    return 0
+  done < <(git -C "$1" worktree list --porcelain 2>/dev/null)
+  return 1
+}
+
+# The worktree's submodules with commits that no remote branch or tag has, a path a line: a
+# linked worktree keeps its submodules' repositories in its own git directory, so they go
+# with it.
+fix_lost() { # WORKTREE
+  # shellcheck disable=SC2016 # git's submodule foreach expands them
+  git -C "$1" submodule foreach --quiet --recursive \
+    'n=$(git rev-list --count HEAD --branches --not --remotes --tags 2>/dev/null) || n=1; [ "$n" = 0 ] || echo "$displaypath"' \
+    2>/dev/null || true
+}
+
 fix_brief() { # [FIX]
   local m out
   (($# <= 1)) || fix_usage
@@ -262,7 +296,7 @@ fix_push() { # [FIX] [--pr]
 }
 
 fix_drop() { # [FIX] [--force] [--delete-branch]
-  local name='' force='' delete='' x checkout wt branch sha n changes
+  local name='' force='' delete='' x checkout wt branch sha n changes lost listed
   while (($#)); do
     case $1 in
     --force) force=1 ;;
@@ -274,17 +308,28 @@ fix_drop() { # [FIX] [--force] [--delete-branch]
   done
   x=$(fix_find "$name")
   checkout=$(fx "$x" checkout) wt=$(fx "$x" worktree) branch=$(fx "$x" branch) sha=$(fx "$x" sha)
-  if [[ -d $wt ]]; then
-    changes=$(git -C "$wt" status --porcelain 2>/dev/null) || true
-    if [[ -n $changes && -z $force ]]; then
+  if [[ -d $wt && -z $force ]]; then
+    # Submodules' changes too, whatever .gitmodules says to ignore.
+    changes=$(git -C "$wt" status --porcelain --ignore-submodules=none 2>/dev/null) || true
+    if [[ -n $changes ]]; then
       printf '%s\n' "$changes" | sed 's/^/  /' >&2
       die "$wt has changes not committed: commit them, or bana fix drop $x --force (they go)"
     fi
-    # --force for a clean one too: git keeps a worktree with submodules otherwise.
-    fix_git "$checkout" worktree remove --force "$wt" || die "git could not remove $wt"
-    say "Removed the worktree $wt"
+    lost=$(fix_lost "$wt")
+    if [[ -n $lost ]]; then
+      printf '%s\n' "$lost" | sed 's/^/  /' >&2
+      die "$wt has submodule commits that no remote has, and they go with it: push them, or bana fix drop $x --force"
+    fi
   fi
-  fix_git "$checkout" worktree prune
+  # git forgets this worktree only, its directory there or not. (A prune would forget any
+  # missing worktree of yours too, on a volume not mounted now, with its index and HEAD.)
+  if listed=$(fix_listed "$checkout" "$wt"); then
+    # --force for a clean one too: git keeps a worktree with submodules otherwise.
+    fix_git "$checkout" worktree remove --force "$listed" || die "git could not remove $wt"
+    say "Removed the worktree $wt"
+  elif [[ -d $wt ]]; then
+    die "$wt is not a worktree of $checkout: remove it yourself, if nothing in it is yours"
+  fi
   if n=$(fix_ahead "$checkout" "$sha" "$branch") && ((n > 0)) && [[ -z $delete ]]; then
     say "$branch stays, with its $(plural "$n" commit): bana fix push $x, or bana fix drop $x --delete-branch"
     return 0

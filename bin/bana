@@ -740,16 +740,23 @@ relabel() {
   say "Labels are up to date."
 }
 
-# bana-manager for its SUBCOMMAND: the daemon's snapshot, else this bana's own release build.
-# One older than the subcommand (its usage lacks it) does not count.
+# bana-manager for its SUBCOMMAND: the daemon's snapshot, else this bana's own release build,
+# which cargo builds (or brings up to date) when neither has it, as for bana manager. One
+# older than the subcommand (its usage lacks it) does not count.
 bm() { # SUBCOMMAND
-  local b
-  for b in "$home/daemon/bana-manager" "${CARGO_TARGET_DIR:-$bana_root/manager/target}/release/bana-manager"; do
-    [[ -x $b ]] || continue
-    if grep -q "bana-manager $1 " <<<"$("$b" "$1" --usage </dev/null 2>&1)"; then echo "$b"; return; fi
+  local b built=${CARGO_TARGET_DIR:-$bana_root/manager/target}/release/bana-manager
+  for b in "$home/daemon/bana-manager" "$built"; do
+    if bm_has "$b" "$1"; then echo "$b"; return; fi
   done
-  die "bana $1 needs bana-manager: bana daemon install"
+  command -v cargo >/dev/null ||
+    die "bana $1 needs bana-manager: bana daemon install, or Rust (https://rustup.rs) for bana to build it"
+  say "Building bana-manager (the first time takes a minute)" >&2
+  cargo build -q --release --locked --manifest-path "$bana_root/manager/Cargo.toml" >&2 ||
+    die "cargo could not build bana-manager, which bana $1 needs (bana daemon install brings one too)"
+  bm_has "$built" "$1" || die "bana $1 needs bana-manager, and cargo built none in $built"
+  echo "$built"
 }
+bm_has() { [[ -x $1 ]] && grep -q "bana-manager $2 " <<<"$("$1" "$2" --usage </dev/null 2>&1)"; } # BINARY SUBCOMMAND
 
 manager() {
   need_repo

