@@ -41,7 +41,8 @@ jobs:
       - run: cargo test --locked
 
   # The daemon end to end: real act and Docker, pushes to a local origin, statuses
-  # through the gh stand-in, a cancel from the API, kill -9 and a restart.
+  # through the gh stand-in, a cancel from the API, kill -9 and a restart, and the fix
+  # loop with the test as Claude Code (bana's MCP server over stdio).
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 20

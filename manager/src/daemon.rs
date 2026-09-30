@@ -195,7 +195,7 @@ impl From<fix::Error> for RoundError {
     fn from(e: fix::Error) -> Self {
         match e {
             fix::Error::Missing(m) => Self::Missing(m),
-            fix::Error::NotFailed(m) => Self::refused(m),
+            fix::Error::NotFailed(m) | fix::Error::Refused(m) => Self::refused(m),
             fix::Error::Failed(m) => Self::Failed(m),
         }
     }

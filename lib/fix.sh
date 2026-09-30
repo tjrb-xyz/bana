@@ -3,7 +3,7 @@
 # bana fix: a failed CI run handed to Claude Code, on a branch of its own. bana-manager does
 # the work (the worktree, the brief, the prompt); docs/FIX.md has the rest. Sourced by bin/bana.
 #
-#   bana fix [BUILD | last | --log FILE|-] [--open]
+#   bana fix [BUILD | last | --log FILE|-] [--open | --headless]
 #     makes bana/fix-<sha7> at the failing commit, a worktree of this checkout in
 #     ~/.bana/<prefix>/fix/<sha7>, with the brief (what failed, and how it ran) and the
 #     prompt, and starts Claude Code there
@@ -13,6 +13,9 @@
 #     (none)           the newer of the last bana ci here, if it failed, and the newest
 #                      failed daemon build of this branch
 #     --open           Claude Code in a new terminal instead, through its claude-cli:// link
+#     --headless       Claude Code unattended, here: it may read, edit the worktree, and use
+#                      bana's tools (fix.allow adds rules), within fix.turns and
+#                      fix.budget_usd; it needs the daemon, whose rounds test its changes
 #   bana fix brief [FIX]   what failed, where, and how it ran
 #   bana fix list          the fixes: their branches, commits and worktrees
 #   bana fix push [FIX] [--pr]   push the branch to origin (the daemon then builds it); --pr
@@ -21,16 +24,11 @@
 #                          changes); the branch stays while it has commits
 #   FIX: the commit's first digits (4 or more); by default the fix you are in, else the newest.
 #   Claude Code works in the worktree with your own settings, plus rules against git push:
-#   a guard for Claude, not a lock (docs/FIX.md). bana pushes nothing: bana fix push is yours.
+#   a guard for Claude, not a lock (docs/FIX.md), and bana's tools (bana mcp): run_jobs runs
+#   the failed jobs through the daemon, commit_fix commits a green round. bana pushes
+#   nothing: bana fix push is yours.
 
-fix_usage() { awk '/^#   bana fix \[/, /^#   a guard for Claude/ { sub(/^# ?/, ""); print }' "$bana_root/lib/fix.sh" >&2; exit 2; }
-
-# git in the owner's checkout without their hooks, as bana-manager runs it there.
-fix_git() { # DIR GIT-ARGS...
-  local dir=$1
-  shift
-  git -C "$dir" -c core.hooksPath=/dev/null "$@"
-}
+fix_usage() { awk '/^#   bana fix \[/, /^#   nothing: bana fix push/ { sub(/^# ?/, ""); print }' "$bana_root/lib/fix.sh" >&2; exit 2; }
 
 # A value in bana-manager's JSON: the first "KEY": string or number (its files put their
 # top-level keys first), a string's escapes undone; null is empty.
@@ -111,11 +109,83 @@ fix_default() { # BRANCH (refs/heads/…, or empty)
   fi
 }
 
+# bana's tools for Claude Code in worktree WT: none when Claude Code has them there already
+# (bana daemon install registers them in your checkout, and its worktrees see them), else
+# --mcp-config with bana's MCP server. `claude mcp get` is a config command: no prompt runs.
+fix_mcp() { # BANA-MANAGER WT
+  (cd "$2" && claude mcp get bana) >/dev/null 2>&1 && return 0
+  if ! bm_has "$1" mcp; then
+    warn "Claude Code gets no bana tools (run_jobs, commit_fix): this bana-manager predates them (bana daemon install)"
+    return 0
+  fi
+  printf '%s\n' --mcp-config "$("$1" mcp --dir "$home" --config)"
+}
+
+# bana fix --headless: the settings it runs with (checked first), and the daemon it needs.
+fix_headless_check() {
+  local r bare='(^|[ ,])Bash([ ,]|$)' any='Bash\((:?\*)?\)' git='Bash\(git[ :*)]'
+  r=$(conf fix.turns 60)
+  [[ $r =~ ^[1-9][0-9]{0,3}$ ]] || die "fix.turns: a number from 1 to 9999, not '$r'"
+  r=$(conf fix.budget_usd 5)
+  [[ $r =~ ^[0-9]{1,4}(\.[0-9]{1,2})?$ && ! $r =~ ^0+(\.0*)?$ ]] || die "fix.budget_usd: dollars, like 5 or 2.50, not '$r'"
+  r=$(conf fix.allow)
+  if [[ $r =~ $bare || $r =~ $any || $r =~ $git ]]; then
+    die "fix.allow: narrow rules only, like 'Bash(cargo test:*)': not all of Bash, nor git (its --output writes files; commit_fix commits)"
+  fi
+  command -v claude >/dev/null || die "Claude Code (claude) is not on PATH: https://claude.com/claude-code"
+  # shellcheck source=SCRIPTDIR/daemon.sh
+  source "$bana_root/lib/daemon.sh"
+  fix_port=$(d_port)
+  if ! r=$(d_health "$fix_port") || ! d_is_ours "$r"; then
+    die "bana fix --headless needs the daemon, whose rounds test Claude's changes: bana daemon install (or status)"
+  fi
+}
+
+# Claude Code on fix FIX, unattended: -p in its worktree, with only the tools listed (dontAsk
+# denies the rest without asking), bana's MCP server alone, and its stream in claude.jsonl.
+fix_headless() { # BANA-MANAGER FIX WT DIR
+  local m=$1 fix=$2 wt=$3 dir=$4 log=$4/claude.jsonl sha out mc allow extra turns budget r rc=0 n
+  local sub cost sid
+  sha=$(fx "$fix" sha)
+  bm_has "$m" mcp || die "bana fix --headless needs bana's tools, which this bana-manager predates: bana daemon install"
+  mc=$("$m" mcp --dir "$home" --config) || die "bana-manager gave no MCP config"
+  # Registered, the daemon runs the failed jobs again at the failing commit (round 0), which
+  # its clone may not have yet (a hand run's, a paste's): bana pushes it there, hooks off.
+  if out=$(git -C "$wt" -c core.hooksPath=/dev/null push -q "$home/src" "$sha:refs/bana/fix/$fix/base" 2>&1) &&
+    out=$(d_curl "$fix_port" /ci/v1/fixes -X POST -H 'Content-Type: application/json' --data "{\"fix\":\"$fix\"}" 2>&1); then
+    [[ $(fix_json recheck <<<"$out") != 0 ]] || echo "  round 0: the daemon runs the failed jobs again at $fix"
+  else
+    warn "The daemon did not take fix $fix, so no round 0: ${out:-no answer}"
+  fi
+  allow="Read Grep Glob Edit(/$wt/**) Write(/$wt/**) mcp__bana__fix_brief mcp__bana__ci_log mcp__bana__run_jobs"
+  allow+=" mcp__bana__fix_status mcp__bana__commit_fix"
+  extra=$(conf fix.allow) turns=$(conf fix.turns 60) budget=$(conf fix.budget_usd 5)
+  [[ -z $extra ]] || allow+=" $extra"
+  say "Claude Code works on fix $fix unattended (at most $turns turns and \$$budget): tail -f $log"
+  (cd "$wt" && exec claude -p "$(cat "$dir/prompt.txt")" -n "bana fix $fix" --permission-mode dontAsk \
+    --allowedTools "$allow" --max-turns "$turns" --max-budget-usd "$budget" \
+    --strict-mcp-config --mcp-config "$mc" --output-format stream-json --verbose) </dev/null >"$log" || rc=$?
+  r=$(grep -E '^\{"type": *"result"' "$log" | tail -1) || true
+  [[ -n $r ]] || die "Claude Code ended (exit $rc) without a result: $log"
+  sub=$(fix_json subtype <<<"$r") n=$(fix_json num_turns <<<"$r")
+  cost=$(fix_json total_cost_usd <<<"$r") sid=$(fix_json session_id <<<"$r")
+  if [[ $sub == success ]]; then say "Claude Code is done with fix $fix"; else warn "Claude Code stopped: $sub"; fi
+  echo "  $sub, $(plural "${n:-0}" turn), \$${cost:-?}"
+  if n=$(fix_ahead "$(fx "$fix" checkout)" "$sha" "$(fx "$fix" branch)") && ((n > 0)); then
+    echo "  $(fx "$fix" branch): $(plural "$n" commit), not pushed (bana fix push $fix)"
+  else
+    echo "  $(fx "$fix" branch): no commit"
+  fi
+  [[ -z $sid ]] || printf '  take over: cd %q && claude --resume %s\n' "$wt" "$sid"
+  [[ $sub == success ]]
+}
+
 fix_start() {
-  local src=() open='' m checkout out fix wt dir branch link cmd v
+  local src=() open='' headless='' fix_port='' m checkout out fix wt dir branch link cmd v mcp=() a
   while (($#)); do
     case $1 in
     --open) open=1 ;;
+    --headless) headless=1 ;;
     --log) ((${#src[@]} == 0)) || fix_usage; src=(--log "${2:?--log FILE|-}"); shift ;;
     last) ((${#src[@]} == 0)) || fix_usage; src=(--run) ;;
     -h | --help | help) fix_usage ;;
@@ -123,12 +193,15 @@ fix_start() {
     esac
     shift
   done
+  [[ -z $open || -z $headless ]] || fix_usage
+  [[ -z $headless ]] || fix_headless_check
   m=$(bm fix)
   checkout=$(fix_checkout)
   ((${#src[@]})) || fix_default "$(git -C "${BANA_PROJECT_ROOT:-.}" symbolic-ref -q HEAD 2>/dev/null || true)"
   [[ ${src[*]} != "--log -" || ! -t 0 ]] || echo "Paste act's output, then Ctrl-D:" >&2
   local args=(fix prepare --dir "$home" --checkout "$checkout" "${src[@]}" --workflow "$(conf workflow ci.yml)" --bana "$self")
   [[ ! $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || args+=(--repo "$repo")
+  [[ -z $headless ]] || args+=(--headless)
   out=$("$m" "${args[@]}" 2>&1) || die "${out#bana-manager: }"
   fix=$(fix_json fix <<<"$out") wt=$(fix_json worktree <<<"$out") dir=$(fix_json dir <<<"$out")
   branch=$(fix_json branch <<<"$out") link=$(fix_json link <<<"$out") cmd=$(fix_json command <<<"$out")
@@ -148,7 +221,10 @@ fix_start() {
   # The brief says which Claude Code ran: its flags and settings change.
   v=$(claude --version 2>/dev/null | awk 'NR == 1') || true
   [[ -z $v ]] || printf -- '- Claude Code: %s\n' "$v" >>"$dir/brief.md"
+  if [[ -n $headless ]]; then fix_headless "$m" "$fix" "$wt" "$dir"; return; fi
+  while IFS= read -r a; do mcp+=("$a"); done < <(fix_mcp "$m" "$wt")
   if [[ -n $open ]]; then
+    ((${#mcp[@]} == 0)) || warn "Claude Code has no bana tools in $wt (bana daemon install registers them): without them, bana fix $fix in a terminal"
     # Claude Code's own handler opens a terminal in the worktree, with the prompt typed.
     if [[ $os == Darwin ]]; then open "$link"
     elif command -v xdg-open >/dev/null; then xdg-open "$link"
@@ -160,7 +236,8 @@ fix_start() {
   # A log pasted on stdin used it up: Claude Code gets the terminal back.
   if [[ ! -t 0 ]] && (: </dev/tty) 2>/dev/null; then exec </dev/tty; fi
   cd "$wt" || die "No worktree $wt"
-  exec claude -n "bana fix $fix" "$(cat "$dir/prompt.txt")"
+  # --mcp-config takes several values: -n ends them, before the prompt.
+  exec claude ${mcp[@]+"${mcp[@]}"} -n "bana fix $fix" "$(cat "$dir/prompt.txt")"
 }
 
 # ---- the fixes ---------------------------------------------------------------------------
@@ -204,36 +281,6 @@ fix_find() { # [FIX]
 fix_ahead() { git -C "$1" rev-list --count "$2..refs/heads/$3" 2>/dev/null; } # CHECKOUT SHA BRANCH
 plural() { if (($1 == 1)); then echo "1 $2"; else echo "$1 $2s"; fi; } # N WORD
 
-# A path as it is on disk; a missing one through its directory's.
-fix_real() { # PATH
-  local d
-  if d=$(cd "$1" 2>/dev/null && pwd -P); then echo "$d"
-  elif d=$(cd "$(dirname "$1")" 2>/dev/null && pwd -P); then echo "$d/$(basename "$1")"
-  else echo "$1"; fi
-}
-
-# WORKTREE as CHECKOUT's git lists it, its directory there or not (fails when git has none).
-fix_listed() { # CHECKOUT WORKTREE
-  local w want
-  want=$(fix_real "$2")
-  while IFS= read -r w; do
-    [[ $w == "worktree "* && $(fix_real "${w#worktree }") == "$want" ]] || continue
-    echo "${w#worktree }"
-    return 0
-  done < <(git -C "$1" worktree list --porcelain 2>/dev/null)
-  return 1
-}
-
-# The worktree's submodules with commits that no remote branch or tag has, a path a line: a
-# linked worktree keeps its submodules' repositories in its own git directory, so they go
-# with it.
-fix_lost() { # WORKTREE
-  # shellcheck disable=SC2016 # git's submodule foreach expands them
-  git -C "$1" submodule foreach --quiet --recursive \
-    'n=$(git rev-list --count HEAD --branches --not --remotes --tags 2>/dev/null) || n=1; [ "$n" = 0 ] || echo "$displaypath"' \
-    2>/dev/null || true
-}
-
 fix_brief() { # [FIX]
   local m out
   (($# <= 1)) || fix_usage
@@ -266,7 +313,7 @@ fix_list() {
 }
 
 fix_push() { # [FIX] [--pr]
-  local name='' pr='' x checkout wt branch sha ref r n args=()
+  local name='' pr='' x m out branch sha ref r n args=()
   while (($#)); do
     case $1 in
     --pr) pr=1 ;;
@@ -276,12 +323,13 @@ fix_push() { # [FIX] [--pr]
     shift
   done
   x=$(fix_find "$name")
-  checkout=$(fx "$x" checkout) wt=$(fx "$x" worktree) branch=$(fx "$x" branch) sha=$(fx "$x" sha) ref=$(fx "$x" ref)
-  n=$(fix_ahead "$checkout" "$sha" "$branch") || die "$branch is gone from $checkout"
-  ((n > 0)) || die "$branch has no commits on ${sha:0:7} yet: nothing to push"
-  [[ ! -d $wt || -z $(git -C "$wt" status --porcelain 2>/dev/null) ]] || warn "$wt has changes not committed: they stay out"
+  sha=$(fx "$x" sha) ref=$(fx "$x" ref)
+  m=$(bm "fix push")
   # Your push, as any other: your hooks run, and bana's tells the daemon, which builds it.
-  git -C "$checkout" push -u origin "$branch" || die "git could not push $branch to origin"
+  # bana-manager does it (as the fix card's Push); git talks here as it pushes.
+  out=$("$m" fix push --dir "$home" "$x") || exit 1
+  branch=$(fix_json branch <<<"$out") n=$(fix_json commits <<<"$out")
+  [[ $(fix_json dirty <<<"$out") != true ]] || warn "$(fx "$x" worktree) has changes not committed: they stayed out"
   say "Pushed $branch ($(plural "$n" commit) on ${sha:0:7})"
   [[ -n $pr ]] || return 0
   command -v gh >/dev/null || die "--pr needs the GitHub CLI: brew install gh, then gh auth login"
@@ -292,53 +340,31 @@ fix_push() { # [FIX] [--pr]
   r=$(fx "$x" repo)
   [[ -n $r ]] || r=$repo
   [[ ! $r =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || args+=(--repo "$r")
-  (cd "$checkout" && gh "${args[@]}")
+  (cd "$(fx "$x" checkout)" && gh "${args[@]}")
 }
 
 fix_drop() { # [FIX] [--force] [--delete-branch]
-  local name='' force='' delete='' x checkout wt branch sha n changes lost listed
+  local name='' x m out n flags=()
   while (($#)); do
     case $1 in
-    --force) force=1 ;;
-    --delete-branch) delete=1 ;;
+    --force | --delete-branch) flags+=("$1") ;;
     -*) fix_usage ;;
     *) [[ -z $name ]] || fix_usage; name=$1 ;;
     esac
     shift
   done
   x=$(fix_find "$name")
-  checkout=$(fx "$x" checkout) wt=$(fx "$x" worktree) branch=$(fx "$x" branch) sha=$(fx "$x" sha)
-  if [[ -d $wt && -z $force ]]; then
-    # Submodules' changes too, whatever .gitmodules says to ignore.
-    changes=$(git -C "$wt" status --porcelain --ignore-submodules=none 2>/dev/null) || true
-    if [[ -n $changes ]]; then
-      printf '%s\n' "$changes" | sed 's/^/  /' >&2
-      die "$wt has changes not committed: commit them, or bana fix drop $x --force (they go)"
-    fi
-    lost=$(fix_lost "$wt")
-    if [[ -n $lost ]]; then
-      printf '%s\n' "$lost" | sed 's/^/  /' >&2
-      die "$wt has submodule commits that no remote has, and they go with it: push them, or bana fix drop $x --force"
-    fi
+  m=$(bm "fix drop")
+  # bana-manager does it, as the fix card's Discard: never with changes not committed or
+  # submodule commits no remote has (they would go), unless --force.
+  out=$("$m" fix drop --dir "$home" "$x" ${flags[@]+"${flags[@]}"} 2>&1) || die "${out#bana-manager: }"
+  [[ $(fix_json removed <<<"$out") != true ]] || say "Removed the worktree $(fix_json worktree <<<"$out")"
+  n=$(fix_json kept <<<"$out")
+  if [[ -n $n ]]; then
+    say "$(fix_json branch <<<"$out") stays, with its $(plural "$n" commit): bana fix push $x, or bana fix drop $x --delete-branch"
+  elif [[ $(fix_json deleted <<<"$out") == true ]]; then
+    say "Deleted $(fix_json branch <<<"$out")"
   fi
-  # git forgets this worktree only, its directory there or not. (A prune would forget any
-  # missing worktree of yours too, on a volume not mounted now, with its index and HEAD.)
-  if listed=$(fix_listed "$checkout" "$wt"); then
-    # --force for a clean one too: git keeps a worktree with submodules otherwise.
-    fix_git "$checkout" worktree remove --force "$listed" || die "git could not remove $wt"
-    say "Removed the worktree $wt"
-  elif [[ -d $wt ]]; then
-    die "$wt is not a worktree of $checkout: remove it yourself, if nothing in it is yours"
-  fi
-  if n=$(fix_ahead "$checkout" "$sha" "$branch") && ((n > 0)) && [[ -z $delete ]]; then
-    say "$branch stays, with its $(plural "$n" commit): bana fix push $x, or bana fix drop $x --delete-branch"
-    return 0
-  fi
-  if git -C "$checkout" rev-parse -q --verify "refs/heads/$branch" >/dev/null; then
-    fix_git "$checkout" branch -q -D "$branch"
-    say "Deleted $branch"
-  fi
-  rm -rf "${home:?}/fix/$x.d"
 }
 
 fix_main() {

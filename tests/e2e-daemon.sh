@@ -15,11 +15,16 @@
 #   BANA_E2E_PORT=N          the daemon's port (default 18470)
 #   BANA_E2E_KEEP=1          keep the scratch directory
 #
-# Pushes: one that passes, one whose test fails (then Fix with Claude makes its worktree
-# in the checkout), a [skip ci] one, one whose `sleep 600` is cancelled through the
-# daemon's API, and one whose daemon is killed (-9) mid-build and started again (the build
-# runs again, once). After each: no job containers, act workspaces, marker processes,
-# secrets or lock left.
+# Pushes: one that passes, one whose test fails, a [skip ci] one, one whose `sleep 600` is
+# cancelled through the daemon's API, and one whose daemon is killed (-9) mid-build and
+# started again (the build runs again, once). After each: no job containers, act
+# workspaces, marker processes, secrets or lock left.
+#
+# The fix loop, with the test as Claude Code: Fix with Claude on the failed build makes its
+# worktree in the checkout and runs round 0; the test then starts bana's MCP server as Claude
+# Code does and calls its tools (fix_brief, run_jobs red, run_jobs green, commit_fix), and
+# pushes the branch with bana fix push, which the daemon builds as any push. Last, a hand
+# bana ci that fails, bana fix last (the claude stand-in), and run_jobs until green.
 set -euo pipefail
 
 if [[ ${BANA_E2E:-} != 1 ]]; then
@@ -289,6 +294,8 @@ cleanup() {
     tail -n 60 "$T/daemon.log" 2>/dev/null || true
     echo "---- gh log"
     grep -v '^gh auth' "$FAKE_LOG" 2>/dev/null | tail -n 60 || true
+    echo "---- bana mcp's stderr (last 20 lines)"
+    tail -n 20 "$T/mcp.log" 2>/dev/null || true
   fi
   if [[ ${BANA_E2E_KEEP:-} == 1 ]]; then echo "kept: $T"; else rm -rf "$T"; fi
 }
@@ -341,6 +348,76 @@ running_job() { # SHA KEY: the build of SHA runs, and so does its job KEY
 }
 build_log() { cat "$d/builds/$1/act.jsonl"; }
 state_of() { builds_of "$1" | tail -n 1 | cut -d'|' -f2; }
+
+# ---- Claude Code's side of a fix ----------------------------------------------------------
+
+# The MCP server Claude Code starts, as {command, args}: what bana daemon install registers.
+mcp_server='{"command": "'"$d/daemon/bana-manager"'", "args": ["mcp", "--dir", "'"$d"'"]}'
+# Starts the server in DIR over stdio, says what Claude Code 2.1.284 says (initialize,
+# notifications/initialized, tools/list), then calls TOOL with ARGS (JSON). Prints the result's
+# structuredContent (else its text as {"text": ...}) with isError; fails when a line on stdout
+# is not one JSON-RPC message, an answer is missing, or the server does not exit 0 at EOF.
+# Its stderr goes to mcp.log.
+tool() { # DIR TOOL ARGS
+  (cd "$1" && python3 -c '
+import json, subprocess, sys
+tool, args, server = sys.argv[1], json.loads(sys.argv[2]), json.loads(sys.argv[3])
+p = subprocess.Popen([server["command"]] + server["args"], stdin=subprocess.PIPE,
+                     stdout=subprocess.PIPE, stderr=open(sys.argv[4], "a"), text=True)
+client = {"name": "claude-code", "title": "Claude Code", "version": "2.1.284"}
+def send(m):
+    p.stdin.write(json.dumps(dict(m, jsonrpc="2.0")) + "\n")
+    p.stdin.flush()
+def answer(i):
+    for line in p.stdout:
+        m = json.loads(line)
+        assert isinstance(m, dict) and m.get("jsonrpc") == "2.0", line
+        if m.get("id") == i:
+            return m
+    sys.exit("bana mcp: no answer to %d" % i)
+send({"id": 0, "method": "initialize", "params": {"protocolVersion": "2025-11-25",
+      "capabilities": {"roots": {"listChanged": True}, "elicitation": {}}, "clientInfo": client}})
+init = answer(0)["result"]
+assert init["serverInfo"]["name"] == "bana" and init["protocolVersion"] == "2025-11-25", init
+send({"method": "notifications/initialized"})
+send({"id": 1, "method": "tools/list"})
+assert tool in [t["name"] for t in answer(1)["result"]["tools"]], tool
+send({"id": 2, "method": "tools/call", "params": {"name": tool, "arguments": args,
+      "_meta": {"claudecode/toolUseId": "toolu_e2e"}}})
+r = answer(2)
+p.stdin.close()
+assert p.wait() == 0, "bana mcp exited %s" % p.returncode
+assert "result" in r, r
+out = r["result"].get("structuredContent") or {"text": r["result"]["content"][0]["text"]}
+out["isError"] = r["result"].get("isError", False)
+print(json.dumps(out))' "$2" "$3" "$mcp_server" "$T/mcp.log")
+}
+# A fix's round N ended (the daemon's answer, without waiting).
+round_ended() { # FIX N
+  api "/fixes/$1/rounds/$2" | jq_ 'j["state"] in ("success", "failure", "error") or ""' | grep -q True
+}
+# A fix's round builds, as the history lists them: ROUND:JOB:STATE, oldest first.
+round_builds() { # FIX
+  api /builds | python3 -c '
+import json, sys
+for b in reversed(json.load(sys.stdin)["builds"]):
+    if b.get("fix") == sys.argv[1]:
+        print("%s:%s:%s:%s" % (b["round"], b["job"], b["trigger"], b["state"]))' "$1" | tr '\n' ' '
+}
+# The snapshots a fix's rounds ran (round 0 is the failing commit itself).
+round_shas() { # FIX
+  python3 -c 'import json, sys; print(" ".join(r["sha"] for r in json.load(open(sys.argv[1]))["rounds"] if r["n"] > 0))' \
+    "$d/fix/$1.d/rounds.json"
+}
+# Runs the Stop hook bana wrote into WT's Claude Code settings, as Claude Code runs it (sh,
+# the hook's JSON on stdin); prints its exit status.
+stop_hook() { # WT
+  local cmd
+  cmd=$(jq_ '[h["command"] for m in j["hooks"]["Stop"] for h in m["hooks"] if " fix gate " in h["command"]][0]' \
+    <"$1/.claude/settings.local.json")
+  printf '{"session_id":"e2e","hook_event_name":"Stop","stop_hook_active":false,"cwd":"%s"}' "$1" |
+    (cd "$1" && sh -c "$cmd" >/dev/null 2>&1) && echo 0 || echo $?
+}
 
 mkdir -p "$d/daemon"
 echo "port = $port" >"$d/daemon/settings"
@@ -424,6 +501,106 @@ posted_status() { # PATH
 check "fix: none for a build that passed (409)" same "$(posted_status "/builds/$(builds_of "$a" | tail -n 1 | cut -d'|' -f1)/fix")" 409
 check "fix: none for a build that is not there (404)" same "$(posted_status /builds/9999/fix)" 404
 check "fix: nothing asked of GitHub" same "$(wc -l <"$FAKE_LOG")" "$asked"
+check "fix: its settings let Claude run the jobs through bana" has "$wt/.claude/settings.local.json" 'mcp__bana__run_jobs'
+check "fix: and not commit without asking" not has "$wt/.claude/settings.local.json" 'mcp__bana__commit_fix' 2>/dev/null
+check "fix: and hold Claude's stop with bana's gate" has "$wt/.claude/settings.local.json" " fix gate --dir "
+
+# ---- 2c. the fix loop, the test as Claude Code ---------------------------------------------
+say "2c. round 0, then run_jobs until green, commit_fix and bana fix push"
+posted_b=$(posts "$b" | wc -l)
+s=$(date +%s)
+until_ok 600 "round 0 of fix $sha7" round_ended "$sha7" 0
+echo "   round 0: $(api "/fixes/$sha7/rounds/0" | jq_ 'j["state"]') $(($(date +%s) - s)) s after the fix"
+r0=$(api "/fixes/$sha7/rounds/0")
+check "loop: round 0 ran the failed job at the failing commit, and failed again" same \
+  "$(jq_ '"%s %s %s" % (j["sha"], j["jobs"], j["state"])' <<<"$r0")" "$b ['broken'] failure"
+check "loop: round 0's failure, in the brief's shape" same \
+  "$(jq_ '"%s %s" % (j["failures"][0]["job"], j["failures"][0]["step"])' <<<"$r0")" "broken test"
+
+r=$(tool "$wt" fix_brief '{}') || r='{}'
+check "loop: fix_brief names the fix, its branch and worktree" same \
+  "$(jq_ '"%s %s %s %s" % (j["fix"], j["base_sha"], j["branch"], j["worktree"])' <<<"$r")" "$sha7 $b bana/fix-$sha7 $wt"
+check "loop: fix_brief has the failing test" same "$(jq_ '[t["name"] for t in j["failures"][0]["tests"]]' <<<"$r")" "['tests::the_answer']"
+check "loop: fix_brief has round 0's result and the rounds" same \
+  "$(jq_ '"%s %s %s %s" % (j["recheck"]["state"], j["rounds"]["used"], j["rounds"]["max"], j["rounds"]["left"])' <<<"$r")" "failure 0 5 5"
+
+# Claude's first try changes the test's output but not its outcome, and adds a file.
+sed -i.bak 's/left: 41/left: 40/' "$wt/ci/cargo-test.txt" && rm -f "$wt/ci/cargo-test.txt.bak"
+echo "why it failed" >"$wt/notes.txt"
+check "loop: the gate holds Claude's first stop on an untested change (exit 2)" same "$(stop_hook "$wt")" 2
+check "loop: but only once for that tree" same "$(stop_hook "$wt")" 0
+s=$(date +%s)
+r=$(tool "$wt" run_jobs '{}') || r='{}'
+echo "   round 1: $(jq_ 'j.get("state")' <<<"$r") in $(($(date +%s) - s)) s"
+check "loop: run_jobs runs round 1, red" same \
+  "$(jq_ '"%s %s %s %s" % (j["round"], j["state"], j["green"], j["isError"])' <<<"$r")" "1 failure False False"
+check "loop: it says what failed" same "$(jq_ '[f["job"] for f in j["failures"]]' <<<"$r")" "['broken']"
+check "loop: and which new file it took in" same "$(jq_ 'j["new_files"]' <<<"$r")" "['notes.txt']"
+check "loop: 4 rounds left" same "$(jq_ 'j["rounds_left"]' <<<"$r")" 4
+snap1=$(jq_ 'j["snapshot"]' <<<"$r")
+round1=$(jq_ 'j["builds"][0]["build"]' <<<"$r")
+check "loop: the snapshot is the worktree on the failing commit, which git leaves alone" same \
+  "$(git -C "$wt" rev-parse "$snap1^")|$(git -C "$wt" status --porcelain | tr '\n' ' ')" "$b| M ci/cargo-test.txt ?? notes.txt "
+r=$(tool "$wt" ci_log "{\"build\": $round1, \"job\": \"broken\", \"grep\": \"left:\"}") || r='{}'
+check "loop: ci_log shows round 1 ran the edited worktree" same \
+  "$(jq_ 'any("left: 40" in l for l in j["lines"]) and not any("left: 41" in l for l in j["lines"])' <<<"$r")" True
+r=$(tool "$wt" fix_status '{}') || r='{}'
+check "loop: fix_status: red, and the worktree is what round 1 ran" same \
+  "$(jq_ '"%s %s" % (j["state"], j["changed_since_last_round"])' <<<"$r")" "red False"
+
+# The second try fixes it.
+echo pass >"$wt/ci/mode"
+r=$(tool "$wt" fix_status '{}') || r='{}'
+check "loop: fix_status sees the untested change" same "$(jq_ 'j["changed_since_last_round"]' <<<"$r")" True
+s=$(date +%s)
+r=$(tool "$wt" run_jobs '{}') || r='{}'
+echo "   round 2: $(jq_ 'j.get("state")' <<<"$r") in $(($(date +%s) - s)) s"
+check "loop: run_jobs runs round 2, green" same "$(jq_ '"%s %s %s" % (j["round"], j["state"], j["green"])' <<<"$r")" "2 success True"
+check "loop: and says to commit" has <(jq_ 'j["next"]' <<<"$r") "commit_fix"
+green_tree=$(jq_ 'j["tree"]' <<<"$r")
+r=$(tool "$wt" run_jobs '{}') || r='{}'
+check "loop: the same tree again gets round 2 back, without a build" same \
+  "$(jq_ '"%s %s %s" % (j["round"], j["reused"], j["green"])' <<<"$r")" "2 True True"
+check "loop: the gate lets Claude stop once the tree is tested" same "$(stop_hook "$wt")" 0
+check "loop: the history shows the fix's rounds, per job" same "$(round_builds "$sha7")" \
+  "0:broken:fix:failure 1:broken:fix:failure 2:broken:fix:success "
+
+r=$(tool "$wt" commit_fix '{"message": "Make the answer 42\n\nci/mode said fail."}') || r='{}'
+check "loop: commit_fix refuses the new file it was not told to take" same \
+  "$(jq_ 'j["isError"] and "notes.txt" in j["text"]' <<<"$r")" True
+r=$(tool "$wt" commit_fix '{"message": "Make the answer 42\n\nci/mode said fail.", "include_new_files": true}') || r='{}'
+check "loop: commit_fix commits on the fix's branch" same \
+  "$(jq_ '"%s %s %s" % (j["isError"], j["branch"], j["round"])' <<<"$r")" "False bana/fix-$sha7 2"
+kept=$(jq_ 'j["commit"]' <<<"$r")
+check "loop: the branch's tip is that commit, on the failing one" same \
+  "$(git -C "$w" rev-parse "bana/fix-$sha7") $(git -C "$w" rev-parse "bana/fix-$sha7^")" "$kept $b"
+check "loop: the tip's tree is the green round's" same "$(git -C "$w" rev-parse "bana/fix-$sha7^{tree}")" "$green_tree"
+check "loop: the worktree is clean on it" same "$(git -C "$wt" status --porcelain)" ""
+check "loop: the checkout stays as it was" same "$(git -C "$w" symbolic-ref HEAD)|$(git -C "$w" status --porcelain)" "refs/heads/main|"
+r=$(tool "$wt" fix_status '{}') || r='{}'
+check "loop: fix_status: kept" same "$(jq_ '"%s %s" % (j["state"], j["commits"])' <<<"$r")" "kept 1"
+for x in $(round_shas "$sha7"); do
+  check "loop: nothing posted for round snapshot ${x:0:7}" same "$(posts "$x")" ""
+done
+check "loop: nor for the failing commit since the fix" same "$(posts "$b" | wc -l)" "$posted_b"
+check "loop: the rounds never reached the origin" same "$(git -C "$T/origin.git" for-each-ref refs/bana)" ""
+check "loop: they are in the daemon's clone only, with the base round 0 ran" same \
+  "$(git -C "$d/src" rev-parse "refs/bana/fix/$sha7/base" "refs/bana/fix/$sha7/${snap1:0:7}" | tr '\n' ' ')" "$b $snap1 "
+clean "fix rounds"
+
+# The owner's push: a push like any other, which the daemon builds and posts.
+out=$(cd "$w" && bash "$bana" fix push "$sha7" 2>&1) || echo "$out" >&2
+check "push: bana fix push reaches the origin" same "$(git -C "$T/origin.git" rev-parse "refs/heads/bana/fix-$sha7" 2>/dev/null)" "$kept"
+(cd "$w" && bash "$bana" daemon poke >/dev/null)
+until_ok 600 "build of $kept" finished "$kept"
+until_ok 60 "the daemon idle" idle
+check "push: the daemon built bana/fix-$sha7 as a push, and it passed" same "$(builds_of "$kept" | cut -d'|' -f2,3)" "success|push"
+check "push: with statuses: bana pending, then success" same \
+  "$(posts "$kept" | head -n 1 | cut -d'|' -f1-2) $(last "$kept" bana | cut -d'|' -f1)" "bana|pending success"
+check "push: bana/broken passes" same "$(last "$kept" bana/broken | cut -d'|' -f1)" success
+r=$(tool "$wt" fix_status '{}') || r='{}'
+check "push: fix_status: pushed" same "$(jq_ 'j["state"]' <<<"$r")" pushed
+clean "fix push"
 
 # ---- 3. a [skip ci] push ----------------------------------------------------------------------
 say "3. a [skip ci] push"
@@ -500,6 +677,49 @@ sleep 3
 until_ok 60 "the daemon idle" idle
 check "kill -9: retried exactly once" same "$(builds_of "$f" | wc -l | tr -d ' ')" 2
 clean "kill -9"
+
+# ---- 6. a hand bana ci that fails, then bana fix last -----------------------------------------
+say "6. a hand bana ci that fails, bana fix last, run_jobs"
+# The stand-in Claude Code: bana fix ends by starting it, which runs no prompt here.
+ln -s "$here/stand-ins/claude" "$T/bin/claude"
+echo fail >"$w/ci/mode"
+git -C "$w" commit -q -am "fails, by hand"
+h=$(git -C "$w" rev-parse HEAD)
+h7=${h:0:7}
+s=$(date +%s)
+out=$(cd "$w" && bash "$bana" ci quick -j broken 2>&1) && code=0 || code=$?
+echo "   bana ci: exit $code in $(($(date +%s) - s)) s"
+check "hand: bana ci failed" test "$code" -ne 0
+check "hand: and points to bana fix" has <(printf '%s\n' "$out") "bana fix: hand this failure"
+check "hand: it kept its log" has "$d/ci/last.log" "tests::the_answer"
+check "hand: and what ran" has "$d/ci/last.env" "sha=$h"
+out=$(cd "$w" && bash "$bana" fix last 2>&1) && code=0 || code=$?
+[[ $code == 0 ]] || echo "$out" >&2
+wt=$d/fix/$h7
+check "hand: bana fix last makes the fix at the commit that failed" same "$(git -C "$wt" rev-parse HEAD 2>/dev/null)" "$h"
+check "hand: and starts Claude Code in its worktree" same "$(cat "$FAKE_STATE/claude.cwd" 2>/dev/null)" "$wt"
+# Claude Code has no bana server registered here (bana daemon run registers none), so bana fix
+# passes it one: the test starts that one, as Claude Code would.
+mcp_server=$(tr '\0' '\n' <"$FAKE_STATE/claude.args" | sed -n '/^--mcp-config$/{n;p;}' | jq_ 'json.dumps(j["mcpServers"]["bana"])')
+check "hand: with bana's MCP server" same "$(jq_ '" ".join([j["command"]] + j["args"])' <<<"$mcp_server")" "$d/daemon/bana-manager mcp --dir $d"
+check "hand: and the prompt, which says to test with run_jobs" has <(tr '\0' '\n' <"$FAKE_STATE/claude.args") "run_jobs"
+r=$(tool "$wt" fix_brief '{}') || r='{}'
+check "hand: fix_brief: a hand run of broken, with its failing test" same \
+  "$(jq_ '"%s %s %s" % (j["fix"], [f["job"] for f in j["failures"]], [t["name"] for t in j["failures"][0]["tests"]])' <<<"$r")" \
+  "$h7 ['broken'] ['tests::the_answer']"
+echo pass >"$wt/ci/mode"
+s=$(date +%s)
+r=$(tool "$wt" run_jobs '{}') || r='{}'
+echo "   round $(jq_ 'j.get("round")' <<<"$r"): $(jq_ 'j.get("state")' <<<"$r") in $(($(date +%s) - s)) s"
+check "hand: run_jobs is green, in the daemon, for a commit it never saw pushed" same \
+  "$(jq_ '"%s %s %s" % (j["isError"], j["state"], j["green"])' <<<"$r")" "False success True"
+check "hand: its snapshot is on the failing commit" same "$(git -C "$wt" rev-parse "$(jq_ 'j["snapshot"]' <<<"$r")^")" "$h"
+for x in $(round_shas "$h7"); do
+  check "hand: nothing posted for round snapshot ${x:0:7}" same "$(posts "$x")" ""
+done
+check "hand: nor for the commit" same "$(posts "$h")" ""
+until_ok 60 "the daemon idle" idle
+clean "hand fix"
 
 stop_daemon
 check "stop: the daemon leaves no lock" test ! -e "$HOME/.bana/act.lock"

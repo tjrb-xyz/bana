@@ -117,6 +117,16 @@ code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px
         <p id="fix-line"></p>
         <p id="fix-how" class="muted" hidden><span id="fix-said"></span> <a id="fix-link" href="#">Open Claude Code there</a><span id="fix-or">,
           or run <code id="fix-cmd"></code> <button id="fix-copy" type="button">Copy</button> in your checkout</span>.</p>
+        <p id="fix-recheck" class="muted" hidden></p>
+        <ul class="plain" id="fix-rounds"></ul>
+        <div class="row" id="fix-actions" hidden>
+          <button id="fix-keep" class="primary" type="button" hidden
+            title="Commit the green round's tree on the fix's branch, as Claude's commit_fix does">Keep</button>
+          <button id="fix-push" type="button" hidden title="git push -u origin, from your checkout">Push…</button>
+          <a id="fix-compare" href="#" target="_blank" rel="noopener" hidden>Compare on GitHub</a>
+          <button id="fix-more" type="button" hidden>More rounds</button>
+          <button id="fix-drop" class="danger" type="button" title="Remove the worktree; the branch stays while it has commits">Discard…</button>
+        </div>
         <p class="error" id="fix-error" hidden></p>
       </div>
       <div class="chips" id="jobs" style="margin-top:10px"></div>
@@ -375,7 +385,8 @@ function historyRows(l) {
     const id = Number(b.id);
     const st = b.unposted ? `${Number(b.posted)} posted, ${Number(b.unposted)} waiting` : b.posted ? `${Number(b.posted)} posted` : "";
     const when = b.ended_at ? ago(l.now, b.ended_at) : b.state;
-    const why = b.trigger + (b.attempt > 1 ? ` (attempt ${Number(b.attempt)})` : "");
+    const why = (b.fix ? `fix ${b.fix} · round ${Number(b.round)}` + (b.job ? ` · ${b.job}` : "") : b.trigger)
+      + (b.attempt > 1 ? ` (attempt ${Number(b.attempt)})` : "");
     return `<tr class="${id === sel ? "sel" : ""}"><td><span class="dot ${esc(b.state)}"></span><a href="#build=${id}">#${id}</a> <span class="muted">${esc(when)}</span></td>
       <td>${esc(b.ref)}</td><td class="mono">${esc(shortSha(b.sha))}</td><td>${esc(b.tier)}</td><td>${esc(why)}</td>
       <td>${b.started_at ? esc(dur(b.elapsed)) : ""}</td><td>${esc(st)}</td>
@@ -415,7 +426,11 @@ async function renderBuild() {
   if (!shown || shown.id !== id || (v && shown.state !== v.state)) {
     let detail;
     try { detail = await api("GET", `/builds/${id}`); } catch (e) { detail = { error: e.message }; }
-    shown = { id, detail, state: v && v.state, fix: await loadFix(v), made: false, error: null };
+    shown = { id, detail, state: v && v.state, fix: await loadFix(v), sig: lastSig, made: false, error: null };
+  } else if (shown.fix && shown.sig !== lastSig) {
+    // A build started or ended: maybe one of the fix's rounds.
+    shown.sig = lastSig;
+    shown.fix = (await loadFix(v)) || shown.fix;
   }
   shown.view = v;
   const d = shown.detail;
@@ -466,9 +481,10 @@ async function renderBuild() {
 // terminal there with the prompt typed. A browser may refuse a link followed
 // after an await, so the link, and `bana fix N` for a terminal, stay on the page.
 async function loadFix(v) {
-  if (!v || !["success", "failure", "error"].includes(v.state)) return null;
+  if (!v || !(v.fix || ["success", "failure", "error"].includes(v.state))) return null;
   try {
-    const f = (await api("GET", "/fixes")).fixes.find((x) => x.sha === v.sha);
+    // The fix of the failing commit, or the one whose round this build is.
+    const f = (await api("GET", "/fixes")).fixes.find((x) => x.sha === v.sha || x.fix === v.fix);
     return f ? await api("GET", `/fixes/${encodeURIComponent(f.fix)}`) : null;
   } catch (e) { return null; }
 }
@@ -479,14 +495,16 @@ function renderFix(id, v) {
   $("fix").hidden = !(f || shown.error);
   show("fix-error", shown.error);
   $("fix-line").textContent = "";
-  $("fix-how").hidden = true;
+  $("fix-how").hidden = $("fix-actions").hidden = $("fix-recheck").hidden = true;
+  $("fix-rounds").replaceChildren();
   if (!f) return;
+  renderRounds(f);
   const n = f.ahead;
   const commits = n === undefined ? "" : n === null ? ", its branch is gone"
     : n ? `, ${n} commit${n === 1 ? "" : "s"} on it` : ", no commits on it yet";
-  $("fix-line").textContent = `Fix ${f.fix}: ${f.branch}${commits}, in ${f.worktree}`;
+  $("fix-line").textContent = `Fix ${f.fix}: ${f.branch}${commits}` + (f.worktree_there === false ? ", its worktree removed" : `, in ${f.worktree}`);
   const link = typeof f.link === "string" && /^claude-cli:\/\//.test(f.link) ? f.link : null;
-  if (!link) return;
+  if (!link || f.worktree_there === false) return;
   $("fix-how").hidden = false;
   $("fix-said").textContent = shown.made ? "Claude Code opens in a terminal there, with the prompt typed: press Enter. If nothing opened:" : "";
   $("fix-link").textContent = shown.made ? "open it" : "Open Claude Code there";
@@ -495,6 +513,86 @@ function renderFix(id, v) {
   $("fix-cmd").textContent = `bana fix ${Number(id)}`;
   $("fix-copy").textContent = "Copy";
 }
+
+// The fix's rounds (round 0 is the recheck at the failing commit; run_jobs
+// runs the others on the worktree), and the owner's buttons: Keep the green
+// round's tree, Push the branch (after a yes), More rounds, Discard.
+const roundWords = { queued: "waits", running: "runs", success: "passed", failure: "failed", error: "ended in error" };
+function renderRounds(f) {
+  const rs = (f.rounds && f.rounds.rounds) || [], r0 = f.recheck;
+  if (r0) {
+    $("fix-recheck").hidden = false;
+    $("fix-recheck").textContent = {
+      success: "Round 0 passed at the unchanged commit with the current bana: the failure did not reproduce here, so it depends on its environment, or is flaky.",
+      failure: "Round 0 failed again at the unchanged commit: the failure reproduces here.",
+      error: "Round 0 (the recheck at the unchanged commit) ended in error.",
+    }[r0.state] || "Round 0 runs the failed jobs again at the unchanged commit, with the current bana.";
+  }
+  $("fix-rounds").replaceChildren(...rs.filter((r) => r.n > 0).map((r) => {
+    const li = text("li", "");
+    li.append(text("span", "", "dot " + r.state), `Round ${Number(r.n)} ${roundWords[r.state] || r.state}` + (r.repeat ? " (again)" : ""), " ");
+    li.append(text("span", shortSha(r.sha), "mono muted"), " ");
+    for (const b of r.builds || []) {
+      const a = text("a", `${b.job} #${Number(b.id)}`, "chip " + b.state);
+      a.href = "#build=" + Number(b.id);
+      li.append(a, " ");
+    }
+    return li;
+  }));
+  const left = f.rounds ? Number(f.rounds.left) : null, last = rs[rs.length - 1];
+  if (rs.length && left !== null) {
+    const li = text("li", `${left} of ${Number(f.rounds.limit)} rounds left`, "muted");
+    $("fix-rounds").append(li);
+  }
+  const there = f.worktree_there !== false;
+  $("fix-actions").hidden = false;
+  $("fix-keep").hidden = !(there && last && last.n > 0 && last.state === "success");
+  $("fix-push").hidden = !(f.ahead > 0 && !f.pushed);
+  const compare = githubUrl(f.compare);
+  $("fix-compare").hidden = !(compare && f.pushed);
+  if (compare) $("fix-compare").href = compare;
+  $("fix-more").hidden = !rs.length;
+  $("fix-drop").hidden = !there;
+}
+
+// A fix card button: its request, then the fix as it is now.
+async function fixAct(path, body) {
+  const s = shown;
+  if (!s || !s.fix) return null;
+  let r = null;
+  s.error = null;
+  try { r = await api("POST", `/fixes/${encodeURIComponent(s.fix.fix)}${path}`, body); } catch (e) { s.error = e.message; }
+  s.fix = (await loadFix(s.view)) || (r && r.removed ? null : s.fix);
+  if (shown === s) renderFix(s.id, s.view);
+  lastSig = "";
+  return r;
+}
+
+$("fix-keep").addEventListener("click", () => {
+  const f = shown && shown.fix;
+  if (!f) return;
+  const rs = f.rounds.rounds, n = rs[rs.length - 1].n;
+  const message = prompt(`Commit round ${n}'s tree on ${f.branch}. The message says why:`, `Fix ${(f.jobs || []).join(", ")} (bana fix ${f.fix}, round ${n})`);
+  if (!message || !message.trim()) return;
+  const files = f.new_files || [];
+  const include = files.length > 0 && confirm(`Round ${n}'s tree has new files:\n${files.slice(0, 20).join("\n")}\n\nCommit them too? (Cancel commits nothing.)`);
+  if (files.length && !include) return;
+  fixAct("/keep", { message, include_new_files: include });
+});
+$("fix-push").addEventListener("click", () => {
+  const f = shown && shown.fix;
+  if (!f) return;
+  const n = Number(f.ahead);
+  if (confirm(`Push ${f.branch} (${n} commit${n === 1 ? "" : "s"}) to origin, from your checkout? The daemon then builds it as a push, with statuses on GitHub.`)) fixAct("/push");
+});
+$("fix-more").addEventListener("click", () => fixAct("/more"));
+$("fix-drop").addEventListener("click", async () => {
+  const f = shown && shown.fix;
+  if (!f || !confirm(`Remove the worktree ${f.worktree}? ${f.branch} stays while it has commits.`)) return;
+  const r = await fixAct("/drop", {});
+  const e = shown && shown.error;
+  if (!r && e && /changes not committed|no remote has/.test(e) && confirm(e + "\n\nDiscard them with the worktree?")) fixAct("/drop", { force: true });
+});
 
 $("build-fix").addEventListener("click", async () => {
   if (!shown || !shown.view) return;

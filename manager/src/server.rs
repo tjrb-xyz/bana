@@ -532,6 +532,9 @@ fn local_routes(d: Daemon) -> Router {
         .route("/fixes/{fix}/rounds", post(ask_round))
         .route("/fixes/{fix}/rounds/{n}", get(round))
         .route("/fixes/{fix}/more", post(more_rounds))
+        .route("/fixes/{fix}/keep", post(keep_fix))
+        .route("/fixes/{fix}/push", post(push_fix))
+        .route("/fixes/{fix}/drop", post(drop_fix))
         .route("/daemon", post(set_daemon))
         .route("/daemon/poll", post(poll))
         .route("/queue/clear", post(clear_queue))
@@ -683,10 +686,23 @@ async fn fix_state(State(d): D, Path(name): Path<String>) -> Response {
     if !fix_name(&name) {
         return err(StatusCode::BAD_REQUEST, "fix: its commit's hex digits");
     }
-    match d.fix_state(&name).await {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => fix_error(e),
+    let mut v = match d.fix_state(&name).await {
+        Ok(v) => v,
+        Err(e) => return fix_error(e),
+    };
+    // For the card: its new files, and whether origin has the branch.
+    let s = d.settings();
+    let (git, path) = (s.git.clone(), s.path.clone());
+    let f: Option<fix::Fix> = serde_json::from_value(v.clone()).ok();
+    if let Some(f) = f {
+        let card = tokio::task::spawn_blocking(move || fix::card(&f, &git, Some(&path)))
+            .await
+            .unwrap_or_default();
+        if let (Some(v), Some(card)) = (v.as_object_mut(), card.as_object()) {
+            v.extend(card.clone());
+        }
     }
+    Json(v).into_response()
 }
 
 #[derive(Deserialize)]
@@ -769,6 +785,98 @@ async fn more_rounds(State(d): D, Path(name): Path<String>) -> Response {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Keep {
+    message: String,
+    #[serde(default)]
+    include_new_files: bool,
+}
+
+/// Keep, on the fix card: the green round's tree committed on the fix's
+/// branch, as commit_fix does it. 409 with the reason when the last round is
+/// not green, the worktree changed since, the tree is the failing commit's,
+/// or the round took in new files and `include_new_files` is not set.
+async fn keep_fix(State(d): D, Path(name): Path<String>, Json(b): Json<Keep>) -> Response {
+    if !fix_name(&name) {
+        return err(StatusCode::BAD_REQUEST, "fix: its commit's hex digits");
+    }
+    let s = d.settings();
+    let (dir, git, path) = (s.dir.clone(), s.git.clone(), s.path.clone());
+    let done = tokio::task::spawn_blocking(move || {
+        fix::commit_green(
+            &dir,
+            &name,
+            &git,
+            Some(&path),
+            &b.message,
+            b.include_new_files,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| Err(fix::Error::Failed(format!("the commit: {e}"))));
+    match done {
+        Ok(c) => Json(c).into_response(),
+        Err(e) => fix_error(e),
+    }
+}
+
+/// Push, on the fix card (after the owner's yes): the fix's branch to origin,
+/// from the checkout, as bana fix push does it; then a poll, so the daemon
+/// builds it as a push. {fix, branch, commits, compare, dirty}.
+async fn push_fix(State(d): D, Path(name): Path<String>) -> Response {
+    if !fix_name(&name) {
+        return err(StatusCode::BAD_REQUEST, "fix: its commit's hex digits");
+    }
+    let s = d.settings();
+    let (dir, git, path) = (s.dir.clone(), s.git.clone(), s.path.clone());
+    let done =
+        tokio::task::spawn_blocking(move || fix::push_fix(&dir, &name, &git, Some(&path), false))
+            .await
+            .unwrap_or_else(|e| Err(fix::Error::Failed(format!("the push: {e}"))));
+    match done {
+        Ok(p) => {
+            d.poll_now();
+            Json(p).into_response()
+        }
+        Err(e) => fix_error(e),
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct DropFix {
+    #[serde(default)]
+    force: bool,
+    #[serde(default)]
+    delete_branch: bool,
+}
+
+/// Discard, on the fix card: the worktree goes (with its changes only when
+/// `force`, which the page asks the owner about first), as bana fix drop
+/// does it, and the fix's round builds with it.
+async fn drop_fix(State(d): D, Path(name): Path<String>, Json(b): Json<DropFix>) -> Response {
+    if !fix_name(&name) {
+        return err(StatusCode::BAD_REQUEST, "fix: its commit's hex digits");
+    }
+    let s = d.settings();
+    let (dir, git, path) = (s.dir.clone(), s.git.clone(), s.path.clone());
+    let done = tokio::task::spawn_blocking(move || {
+        fix::drop_fix(&dir, &name, &git, Some(&path), b.force, b.delete_branch)
+    })
+    .await
+    .unwrap_or_else(|e| Err(fix::Error::Failed(format!("the drop: {e}"))));
+    match done {
+        Ok(dropped) => {
+            let builds = d.forget_fix(&dropped.fix).await;
+            let mut v = json!(dropped);
+            v["builds"] = json!(builds);
+            Json(v).into_response()
+        }
+        Err(e) => fix_error(e),
+    }
+}
+
 fn round_error(e: RoundError) -> Response {
     match e {
         RoundError::Missing(m) => err(StatusCode::NOT_FOUND, m),
@@ -785,7 +893,7 @@ fn round_error(e: RoundError) -> Response {
 fn fix_error(e: fix::Error) -> Response {
     let code = match &e {
         fix::Error::Missing(_) => StatusCode::NOT_FOUND,
-        fix::Error::NotFailed(_) => StatusCode::CONFLICT,
+        fix::Error::NotFailed(_) | fix::Error::Refused(_) => StatusCode::CONFLICT,
         fix::Error::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     err(code, e.to_string())
@@ -1187,6 +1295,9 @@ esac"#,
             ("POST", "/ci/v1/fixes/abcd123/rounds"),
             ("GET", "/ci/v1/fixes/abcd123/rounds/0?wait=55"),
             ("POST", "/ci/v1/fixes/abcd123/more"),
+            ("POST", "/ci/v1/fixes/abcd123/keep"),
+            ("POST", "/ci/v1/fixes/abcd123/push"),
+            ("POST", "/ci/v1/fixes/abcd123/drop"),
             ("POST", "/ci/v1/daemon"),
             ("POST", "/ci/v1/daemon/poll"),
             ("POST", "/ci/v1/queue/clear"),
@@ -1600,6 +1711,129 @@ esac"#,
             (200, &json!(10), &json!(10)),
             "{m}"
         );
+
+        // The fix card: a green round, Keep, Push, Discard.
+        let wt = PathBuf::from(wt);
+        let work = p.checkout();
+        for (k, v) in [("user.name", "Ada"), ("user.email", "ada@example.com")] {
+            let ok = std::process::Command::new("git")
+                .args(["-C", &work.to_string_lossy(), "config", k, v])
+                .status()
+                .unwrap();
+            assert!(ok.success());
+        }
+        let keep = format!("/ci/v1/fixes/{sha7}/keep");
+        let (code, e) = call(&app, "POST", &keep, Some(json!({"message": "why"})), true).await;
+        assert_eq!(code, 409, "round 0 failed: {e}");
+        std::fs::write(wt.join("fixture"), "pass").unwrap();
+        std::fs::write(wt.join("notes.txt"), "new\n").unwrap();
+        let snap = fix::snapshot("git", None, &wt).unwrap();
+        let src = d.settings().dir.join("src");
+        let to = format!("{}:refs/bana/fix/{sha7}/{}", snap.commit, &snap.commit[..7]);
+        let ok = std::process::Command::new("git")
+            .args(["-C", &wt.to_string_lossy(), "push", "-q", "--no-verify"])
+            .arg(&src)
+            .arg(&to)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let body = Some(json!({"sha": snap.commit}));
+        let rounds = format!("/ci/v1/fixes/{sha7}/rounds");
+        let (code, r1) = call(&app, "POST", &rounds, body, true).await;
+        assert_eq!((code, &r1["round"]), (200, &json!(1)), "{r1}");
+        let path = format!("/ci/v1/fixes/{sha7}/rounds/1?wait=30");
+        let (_, r1) = call(&app, "GET", &path, None, true).await;
+        assert_eq!(r1["state"], "success", "{r1}");
+        let (_, one) = call(&app, "GET", &format!("/ci/v1/fixes/{sha7}"), None, true).await;
+        assert_eq!(
+            (&one["new_files"], &one["pushed"], &one["worktree_there"]),
+            (&json!(["notes.txt"]), &json!(false), &json!(true)),
+            "{one}"
+        );
+        let (code, e) = call(&app, "POST", &keep, Some(json!({"message": "why"})), true).await;
+        assert_eq!(code, 409, "{e}");
+        assert!(e["error"].as_str().unwrap().contains("notes.txt"), "{e}");
+        let body = json!({"message": "The fixture passes", "include_new_files": true});
+        let (code, c) = call(&app, "POST", &keep, Some(body), true).await;
+        assert_eq!(code, 200, "{c}");
+        assert_eq!(
+            (&c["round"], &c["files"]),
+            (&json!(1), &json!(["fixture", "notes.txt"]))
+        );
+        let branch = format!("refs/heads/bana/fix-{sha7}");
+        let tree = std::process::Command::new("git")
+            .args(["-C", &work.to_string_lossy(), "rev-parse"])
+            .arg(format!("{branch}^{{tree}}"))
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&tree.stdout).trim(), snap.tree);
+
+        let push = format!("/ci/v1/fixes/{sha7}/push");
+        let (code, pushed) = call(&app, "POST", &push, None, true).await;
+        assert_eq!(code, 200, "{pushed}");
+        assert_eq!(
+            (&pushed["commits"], &pushed["compare"]),
+            (
+                &json!(1),
+                &json!(format!(
+                    "https://github.com/o/r/compare/main...bana/fix-{sha7}"
+                ))
+            )
+        );
+        let (_, one) = call(&app, "GET", &format!("/ci/v1/fixes/{sha7}"), None, true).await;
+        assert_eq!((&one["pushed"], &one["ahead"]), (&json!(true), &json!(1)));
+
+        let drop = format!("/ci/v1/fixes/{sha7}/drop");
+        std::fs::write(wt.join("scratch.txt"), "x").unwrap();
+        let (code, e) = call(&app, "POST", &drop, Some(json!({})), true).await;
+        assert_eq!(code, 409, "{e}");
+        assert!(
+            e["error"]
+                .as_str()
+                .unwrap()
+                .contains("has changes not committed"),
+            "{e}"
+        );
+        let (code, gone) = call(&app, "POST", &drop, Some(json!({"force": true})), true).await;
+        assert_eq!(code, 200, "{gone}");
+        assert_eq!(
+            (&gone["removed"], &gone["kept"], &gone["builds"]),
+            (&json!(true), &json!(1), &json!(2)),
+            "the round builds go"
+        );
+        assert!(!wt.exists());
+        let (_, b) = call(&app, "GET", "/ci/v1/builds", None, true).await;
+        assert!(
+            b["builds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|x| x["fix"].is_null()),
+            "{b}"
+        );
+        let refs = std::process::Command::new("git")
+            .args([
+                "-C",
+                &src.to_string_lossy(),
+                "for-each-ref",
+                "refs/bana/fix",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            refs.stdout.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&refs.stdout)
+        );
+        let (code, _) = call(
+            &app,
+            "POST",
+            "/ci/v1/fixes/xyz1/drop",
+            Some(json!({})),
+            true,
+        )
+        .await;
+        assert_eq!(code, 400);
         d.shutdown().await;
         p.remove();
     }

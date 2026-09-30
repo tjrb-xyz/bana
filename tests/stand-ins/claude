@@ -1,9 +1,75 @@
 #!/bin/sh
 # Stand-in Claude Code: it never runs a prompt. It logs its arguments and where it ran, and
 # keeps them for the tests in $FAKE_STATE: claude.cwd, and claude.args (each argument ends
-# with a NUL). --version answers as Claude Code does.
+# with a NUL). --version answers as Claude Code does. `mcp add|remove|get NAME` keep the
+# names registered in claude.mcp, one a line (get fails for one that is not there).
+# -p (headless) prints stream-json as Claude Code does, ending in a result line
+# (FAKE_CLAUDE_SUBTYPE: its subtype, success by default; any other exits 1). With
+# FAKE_CLAUDE_FIX set it edits that file (if one is named) and neither tests nor commits
+# it, then stops as Claude Code does: it runs the worktree's Stop hooks with
+# {hook_event_name, cwd} on stdin, and goes on while one exits 2, at most 8 times. Each
+# hook's exit goes on a line of claude.stops, and what it said on stderr into the stream.
 printf 'claude %s (in %s)\n' "$*" "$(pwd -P)" >>"$FAKE_LOG"
 [ "${1:-}" != --version ] || { echo "2.1.284 (Claude Code)"; exit 0; }
+if [ "${1:-}" = mcp ]; then
+  reg=$FAKE_STATE/claude.mcp
+  case ${2:-} in
+  add)
+    shift 2
+    n=
+    while [ $# -gt 0 ] && [ "$1" != -- ]; do
+      case $1 in -s | --scope) shift ;; *) n=$1 ;; esac
+      shift
+    done
+    echo "$n" >>"$reg"
+    echo "Added stdio MCP server $n"
+    ;;
+  remove | get)
+    for n; do :; done
+    grep -qx "$n" "$reg" 2>/dev/null || { echo "No MCP server named \"$n\"" >&2; exit 1; }
+    if [ "$2" = get ]; then echo "$n: Connected"; exit 0; fi
+    grep -vx "$n" "$reg" >"$reg.new" || true
+    mv "$reg.new" "$reg"
+    echo "Removed MCP server $n"
+    ;;
+  esac
+  exit 0
+fi
 pwd -P >"$FAKE_STATE/claude.cwd"
 : >"$FAKE_STATE/claude.args"
 for a in "$@"; do printf '%s\0' "$a" >>"$FAKE_STATE/claude.args"; done
+for a; do [ "$a" != -p ] || exec python3 -c '
+import json, os, subprocess, sys
+state, cwd = sys.argv[1], os.getcwd()
+sid = "5f0c1a2e-0000-4000-8000-000000000001"
+out = lambda **o: print(json.dumps(o), flush=True)
+out(type="system", subtype="init", cwd=cwd, session_id=sid, permissionMode="dontAsk")
+turns, fix = 1, os.environ.get("FAKE_CLAUDE_FIX")
+if fix is not None:
+    if fix:
+        with open(fix, "a") as f:
+            f.write("fixed, untested\n")
+        turns += 1
+    try:
+        groups = json.load(open(".claude/settings.local.json"))["hooks"]["Stop"]
+    except (OSError, ValueError, KeyError):
+        groups = []
+    cmds = [h["command"] for g in groups for h in g.get("hooks", []) if h.get("type") == "command"]
+    for n in range(8):
+        blocked = False
+        for c in cmds:
+            hook = {"session_id": sid, "hook_event_name": "Stop", "stop_hook_active": n > 0, "cwd": cwd}
+            p = subprocess.run(["sh", "-c", c], input=json.dumps(hook), capture_output=True, text=True)
+            with open(os.path.join(state, "claude.stops"), "a") as f:
+                f.write("%d\n" % p.returncode)
+            if p.returncode == 2:
+                blocked = True
+                out(type="user", session_id=sid, message={"role": "user", "content": "Stop hook feedback:\n" + p.stderr.strip()})
+        if not blocked:
+            break
+        turns += 1
+sub = os.environ.get("FAKE_CLAUDE_SUBTYPE", "success")
+out(type="result", subtype=sub, is_error=sub != "success", duration_ms=1234, num_turns=turns,
+    result="Done." if sub == "success" else "", session_id=sid, total_cost_usd=0.4213)
+sys.exit(0 if sub == "success" else 1)
+' "$FAKE_STATE"; done

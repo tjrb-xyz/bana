@@ -19,6 +19,7 @@ bana daemon install --port 8471 # another port (the default is 8470, or the one 
 bana daemon install --no-tray   # on a Mac: no menu bar item (a Mac mini nobody looks at)
 bana daemon install --no-open   # don't open the page afterwards
 bana daemon install --now       # restart at once, even while a build runs
+bana daemon install --no-claude # don't register bana's tools with Claude Code (below)
 ```
 
 Install first checks the machine and the workflow (the doctor): act, Docker, gh and its token's scope, that git
@@ -27,6 +28,11 @@ wrong in the workflow ([What the workflow needs](#what-the-workflow-needs)), and
 machine, since with both every push would run twice. Then it builds `bana-manager`, puts a snapshot of bana in
 `~/.bana/<prefix>/daemon`, clones the repository into `~/.bana/<prefix>/src` and writes the daemon's settings
 from bana.conf.
+
+When Claude Code (`claude`) is on the PATH, install also registers bana's MCP server with it, in this checkout
+at local scope (private to you; the fix worktrees see it too): `claude mcp remove -s local bana`, then `claude
+mcp add -s local bana -- ~/.bana/<prefix>/daemon/bana-manager mcp --dir ~/.bana/<prefix>`. Those are the tools
+Claude uses in a fix ([FIX.md](FIX.md)). Install prints how to undo it; uninstall removes it.
 
 The settings are read at install, so run install again after changing bana.conf's `daemon.*` keys, or to take a
 newer bana. If a build is running, install waits for it to end; with `--now` it restarts at once and the build
@@ -85,7 +91,8 @@ your next login or `bana daemon install`.
 - the queue, each build with *Remove*;
 - the build: its jobs, the live log of the one you pick (a failed step opens by itself), *Cancel* and *Re-run*
   (the same commit and tier again, even if it was built), and on a failed build *Fix with Claude*
-  ([FIX.md](FIX.md));
+  ([FIX.md](FIX.md)), then the fix's card: its rounds, *Keep*, *Push*, *Compare on GitHub*, *More rounds* and
+  *Discard*;
 - the history (the last 100 builds), and the pushes not built.
 
 The runner pool's sections follow, under *Runner pool (optional)*. `bana manager` opens this page too while the
@@ -131,6 +138,23 @@ A build that takes longer than `daemon.timeout` (120 minutes of awake time) is c
 SIGINT, so its cleanup and `always()` steps run; a second one after 60 s, and after 30 s more act and everything
 it started are killed. After every build the daemon ends any process the build left behind and removes act's
 workspaces; after one that did not end on its own, its job containers too.
+
+## Fix rounds
+
+A fix's rounds ([FIX.md](FIX.md#the-loop)) are builds too, one per failed job: `bana ci <tier> -j <job>` on a
+snapshot of Claude's worktree, which the MCP server pushes into the daemon's clone under `refs/bana/fix/`
+(the daemon's fetch never touches those, and they never reach GitHub). They run with the failing build's ref,
+tier and before, at the front of the queue, behind the running build: they never cancel one.
+
+They differ from pushes: they post no statuses, move no branch's last green commit, never count as built and are
+never replaced. Their `GITHUB_TOKEN` is empty and act gets `--action-offline-mode`, so they use the actions the
+daemon already has; `fix.token = gh` gives them gh's token (a fix that moves an action pin to a commit the daemon
+never ran needs it). The history shows them as `fix d4b5174 · round 2 · job`. A round cut short by a restart
+runs again once, like any build.
+
+A fix gets `fix.rounds` rounds, one at a time, and none while the daemon is paused. Round 0, the failed jobs at
+the failing commit, runs when the page or 🧱 makes a fix. The daemon touches your checkout only when you click:
+*Fix with Claude* (the worktree), *Keep*, *Push* and *Discard*.
 
 ## Sleep, wake and restarts
 
@@ -215,6 +239,10 @@ same trust as the workflow.
 While a build runs, act's artifact and cache servers listen without a password on the Mac's network address, so
 on a shared network (café Wi-Fi) a neighbour could reach them. The macOS firewall may ask once about act.
 
+A fix round runs the code Claude wrote the same way, with the same reach as a push, but with no token by
+default: nobody reviews it before it runs. Claude works in its worktree with your own Claude Code permission
+settings.
+
 Logs stay on the machine.
 
 ## Files and logs
@@ -225,18 +253,19 @@ Logs stay on the machine.
 | `~/.bana/<prefix>/src/` | the daemon's clone |
 | `~/.bana/<prefix>/builds/<id>/` | each build: `build.json`, `act.jsonl` (act's log), `event.json`, `artifacts/` |
 | `~/.bana/<prefix>/act-cache/` | act's actions, and the macOS jobs' copies while they run |
-| `~/.bana/<prefix>/fix/` | *Fix with Claude* and `bana fix`: each fix's worktree, and its brief beside it ([FIX.md](FIX.md)) |
+| `~/.bana/<prefix>/fix/` | *Fix with Claude* and `bana fix`: each fix's worktree, and beside it `<sha7>.d/` with its brief and `rounds.json` ([FIX.md](FIX.md)) |
 | `~/.bana/<prefix>/state.json` | paused, the queue, the heads seen, each branch's last green commit |
 | `~/.bana/<prefix>/vars` | optional, yours: `KEY=value` lines for `vars.*` |
 | `~/.bana/act.lock` | the lock shared with `bana ci` |
 | `~/Library/Logs/bana/<prefix>.log` | the daemon's log on a Mac (`journalctl --user -u bana-<prefix>` on Linux) |
 
-The last 100 builds are kept, and their artifacts for 7 days.
+The last 100 builds are kept, and their artifacts for 7 days. A fix's rounds are kept apart, until the fix is
+discarded or 14 days after its last round.
 
 ## Commands
 
 ```sh
-bana daemon install [--port N] [--no-tray] [--no-open] [--now]
+bana daemon install [--port N] [--no-tray] [--no-open] [--now] [--no-claude]
 bana daemon status             # whether it runs, what it builds, what waits
 bana daemon log                # its log, followed
 bana daemon open               # the page

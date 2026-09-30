@@ -142,18 +142,27 @@ Limits worth knowing:
 
 ```sh
 bana fix                     # the newest failure here: the last bana ci, or the daemon's last failed build of this branch
-bana fix 41                  # daemon build 41
+bana fix 41                  # daemon build 41 (or Fix with Claude on the daemon's page, or in 🧱)
 bana fix last                # the last bana ci here
 pbpaste | bana fix --log -   # act's output from elsewhere (or --log FILE); the fix starts at HEAD
 bana fix --open              # in a new terminal, through Claude Code's claude-cli:// link
+bana fix --headless          # unattended, within fix.turns and fix.budget_usd
 ```
 
 It makes `bana/fix-<sha7>` at the failing commit, as a git worktree of your checkout in
 `~/.bana/<prefix>/fix/<sha7>`, writes a brief of what failed and how it ran (the failing tests with their file
 and line, cargo's rerun command, each failed step's last lines, and what was bana's or act's rather than the
 project's), and starts Claude Code there with a prompt that says so. Your working tree and branches stay as they
-are, and a commit on the fix branch shows up in your checkout at once. Claude works with your own Claude Code
-settings plus rules against `git push` (a guard for Claude, not a lock). Pushing is yours:
+are, and a commit on the fix branch shows up in your checkout at once.
+
+With the daemon, Claude tests through bana's tools (an MCP server that `bana daemon install` registers with
+Claude Code in your checkout; `--no-claude` leaves it out). `run_jobs` snapshots the worktree and has the daemon
+run the failed jobs on it under act, the way CI ran them, at the front of its queue and without posting
+statuses. A fix gets `fix.rounds` (5) such rounds, one at a time, plus round 0: the failed jobs again at the
+unchanged commit, to tell a real failure from an environmental one. When a round is green, `commit_fix` (which
+asks you) or *Keep* on the fix card commits exactly the tree that passed. A Stop hook holds Claude once when it
+stops with changes no round tested. Claude works with your own Claude Code settings plus rules against
+`git push` (a guard for Claude, not a lock). Pushing is yours:
 
 ```sh
 bana fix list                              # the fixes: branch, commits, worktree
@@ -162,8 +171,9 @@ bana fix push [FIX] [--pr]                 # push the branch (the daemon builds 
 bana fix drop [FIX] [--force] [--delete-branch]   # remove the worktree; the branch stays while it has commits
 ```
 
-It needs bana-manager: the daemon's (`bana daemon install`), else one bana builds with cargo the first time.
-[docs/FIX.md](docs/FIX.md) has the rest.
+The page's fix card has the same: the rounds, *Keep*, *Push*, *More rounds* and *Discard*. It needs
+bana-manager: the daemon's (`bana daemon install`), else one bana builds with cargo the first time.
+[docs/FIX.md](docs/FIX.md) has the rest, and a checklist to run once on a Mac.
 
 ## bana up: a runner pool (optional)
 
@@ -224,6 +234,7 @@ Every key can be overridden by `BANA_<KEY>` in the environment (`plan.path.rust`
 | `act.docker_config` | `~/.bana/docker` | the Docker config act pulls with: bana's own, without your logins, so macOS never asks for your Keychain password; `~/.docker` for private images |
 | `ci.log` | `yes` | `bana ci` keeps act's output in `~/.bana/<prefix>/ci/last.log` for `bana fix`, through a pipe, so Linux jobs print without colours; `no` gives act your terminal, and keeps nothing |
 | `daemon.*` | | which pushes the daemon builds, and how ([docs/DAEMON.md](docs/DAEMON.md#settings)) |
+| `fix.*` | | a fix's rounds and their token ([docs/DAEMON.md](docs/DAEMON.md#settings)), and `bana fix --headless`'s limits ([docs/FIX.md](docs/FIX.md#headless)) |
 | `keep`, `keep_max_gb` | , `0` | what `keep-builds` keeps (git clean `-e` patterns), and the size that starts one over |
 | `plan.*` | | how `plan` picks jobs ([Tiers and plan](#tiers-and-plan)) |
 
@@ -365,8 +376,9 @@ Moving a machine over: `scripts/ci-runner.sh down` with the old script (it remov
 
 ```sh
 bana ci [TIER] [-j JOB] [--x64] [--list] [--event FILE] [-- ACT-OPTIONS]
-bana fix [BUILD | last | --log FILE|-] [--open]   # and brief, list, push, drop: docs/FIX.md
-bana daemon install [--port N] [--no-tray] [--no-open] [--now]
+bana fix [BUILD | last | --log FILE|-] [--open | --headless]   # and brief, list, push, drop: docs/FIX.md
+bana mcp             # bana's tools for Claude Code, by hand (an MCP server on stdio)
+bana daemon install [--port N] [--no-tray] [--no-open] [--now] [--no-claude]
 bana daemon status|log|open|poke|run|uninstall   # docs/DAEMON.md
 bana up [--linux N] [--x64 N] [--no-mac] [--dedicated] [--label L] [--no-usb] [--token T]
 bana status          # this machine's runners and USB audio devices, and the pool

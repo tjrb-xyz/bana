@@ -11,6 +11,7 @@
 #     --no-open        on a Mac: don't open the page afterwards
 #     --now            restart at once, even while a build runs (it runs again once)
 #     --no-hook        don't add the git hook that tells the daemon about your pushes at once
+#     --no-claude      don't register bana's tools (its MCP server) with Claude Code here
 #   bana daemon uninstall [--purge]  stop and remove it; --purge also its clone, builds and state
 #   bana daemon run [--build]   in the foreground, for debugging (--build: from this checkout first)
 #   bana daemon status          whether it runs, and what it builds
@@ -28,6 +29,10 @@
 # clone, ~/.bana/<prefix>/src: your checkout stays yours. Only Fix with Claude on a failed
 # build (the page, 🧱) writes there: a bana/fix-<sha7> branch and its worktree under
 # ~/.bana/<prefix>/fix, in the checkout install ran in.
+#
+# When Claude Code (claude) is on PATH, install also registers bana's MCP server with it, in
+# this checkout's local scope (private to you; its fix worktrees see it too): the tools
+# Claude uses in a fix (fix_brief, run_jobs, commit_fix...). uninstall removes it.
 
 daemon_usage() { awk '/^#   bana daemon/, /^#   bana daemon poke/ { sub(/^# ?/, ""); print }' "$bana_root/lib/daemon.sh" >&2; exit 2; }
 
@@ -483,6 +488,26 @@ d_hook_remove() { # ROOT
   if [[ -f $f ]] && grep -qF "$d_hook_mark" "$f"; then rm -f "$f"; fi
 }
 
+# bana's MCP server for Claude Code, in ROOT's local scope (~/.claude.json; nothing to commit
+# or approve): what an earlier install registered goes first. Claude Code's config
+# commands run no prompt.
+d_claude_add() { # ROOT
+  if ! command -v claude >/dev/null; then
+    echo "  Claude Code: not on PATH; bana fix passes bana's tools to it itself"
+    return 0
+  fi
+  (cd "$1" && claude mcp remove -s local bana) >/dev/null 2>&1 || true
+  if (cd "$1" && claude mcp add -s local bana -- "$d_snap/bana-manager" mcp --dir "$home") >/dev/null 2>&1; then
+    echo "  Claude Code: bana's tools, as the MCP server bana in $1 (undo: claude mcp remove -s local bana)"
+  else
+    warn "  Claude Code did not register bana's tools (claude mcp add): bana fix passes them to it itself"
+  fi
+}
+d_claude_remove() { # ROOT
+  command -v claude >/dev/null || return 0
+  (cd "$1" && claude mcp remove -s local bana) >/dev/null 2>&1 || true
+}
+
 d_prepare() { # PORT TRAY
   local root bin gh path
   root=$(d_root)
@@ -497,7 +522,7 @@ d_prepare() { # PORT TRAY
 }
 
 daemon_install() {
-  local port='' tray=yes open=1 now='' hook=1 h k path
+  local port='' tray=yes open=1 now='' hook=1 claude=1 h k path
   [[ $os == Darwin ]] || tray=no
   while (($#)); do
     case $1 in
@@ -506,6 +531,7 @@ daemon_install() {
     --no-open) open='' ;;
     --now) now=1 ;;
     --no-hook) hook='' ;;
+    --no-claude) claude='' ;;
     *) daemon_usage ;;
     esac
     shift
@@ -520,6 +546,7 @@ daemon_install() {
   fi
   d_prepare "$port" "$tray"
   if [[ -n $hook ]]; then d_hook_install "$(d_root)" "$port"; else d_hook_remove "$(d_root)"; fi
+  [[ -z $claude ]] || d_claude_add "$(d_root)"
   path=$(d_setting path)
   [[ -n $now ]] || ! d_installed || d_wait_build "$port"
   d_service "$path" "$tray"
@@ -550,6 +577,7 @@ daemon_uninstall() {
   fi
   rm -rf "$d_snap"
   d_hook_remove "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  d_claude_remove "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   if [[ -n $purge ]]; then
     for d in src builds act-cache state.json daemon.lock; do rm -rf "${home:?}/$d"; done
     rm -f "$d_logfile"

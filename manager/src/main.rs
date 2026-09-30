@@ -30,13 +30,27 @@
 //!
 //!   bana-manager fix prepare --dir ~/.bana/<prefix> --checkout DIR
 //!                (--build N | --run | --log FILE|- [--sha S] [--ref R] [--tier T])
-//!                [--repo OWNER/REPO] [--workflow FILE] [--bana CMD]
+//!                [--repo OWNER/REPO] [--workflow FILE] [--bana CMD] [--headless]
 //!   bana-manager fix brief --dir ~/.bana/<prefix> [FIX]
+//!   bana-manager fix gate --dir ~/.bana/<prefix>
+//!   bana-manager fix push --dir ~/.bana/<prefix> FIX
+//!   bana-manager fix drop --dir ~/.bana/<prefix> FIX [--force] [--delete-branch]
 //!
 //! bana fix's Rust side (bana_manager::fix): `prepare` makes (or reuses) the
 //! fix branch's worktree for a daemon build, the last hand run or a pasted log,
 //! writes its brief and prompt, and prints {fix, worktree, branch, link,
-//! command, dir, reused} as JSON; `brief` prints a fix's brief.
+//! command, dir, reused} as JSON (`--headless`: fix.json says Claude runs
+//! unattended, and the prompt that round 0 runs); `brief` prints a fix's brief. `gate` is the
+//! fix worktree's Stop hook: it reads the hook's JSON on stdin and exits 2,
+//! with what Claude should do on stderr, when Claude stops with changes bana
+//! has not run. `push` and `drop` are bana fix push and drop (and the fix
+//! card's Push and Discard); they print what they did as JSON.
+//!
+//!   bana-manager mcp --dir ~/.bana/<prefix> [--config]
+//!
+//! bana's MCP server for Claude Code, on stdin and stdout (bana_manager::mcp):
+//! the fix loop's tools, in the fix worktree it runs in. `--config` prints the
+//! --mcp-config JSON that starts it instead.
 
 use bana_manager::actlog::{Status, StatusState};
 use bana_manager::daemon::{post_status, Daemon, Settings};
@@ -52,7 +66,7 @@ use tokio::sync::Notify;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: bana-manager --script PATH --repo OWNER/REPO [--port N] [--workflow FILE] [--tiers A,B] [--tier-input NAME] [--gh PATH] [--token T]\n       bana-manager daemon --dir DIR [--no-tray]\n       bana-manager results (--json FILE | --text FILE|-)\n       bana-manager fix prepare --dir DIR --checkout DIR (--build N | --run | --log FILE|- [--sha S] [--ref R] [--tier T]) [--repo OWNER/REPO] [--workflow FILE] [--bana CMD]\n       bana-manager fix brief --dir DIR [FIX]"
+        "usage: bana-manager --script PATH --repo OWNER/REPO [--port N] [--workflow FILE] [--tiers A,B] [--tier-input NAME] [--gh PATH] [--token T]\n       bana-manager daemon --dir DIR [--no-tray]\n       bana-manager results (--json FILE | --text FILE|-)\n       bana-manager fix prepare --dir DIR --checkout DIR (--build N | --run | --log FILE|- [--sha S] [--ref R] [--tier T]) [--repo OWNER/REPO] [--workflow FILE] [--bana CMD] [--headless]\n       bana-manager fix brief --dir DIR [FIX]\n       bana-manager fix gate --dir DIR\n       bana-manager fix push --dir DIR FIX\n       bana-manager fix drop --dir DIR FIX [--force] [--delete-branch]\n       bana-manager mcp --dir DIR [--config]"
     );
     std::process::exit(2)
 }
@@ -118,6 +132,12 @@ fn main() {
     if args.peek().is_some_and(|a| a == "fix") {
         args.next();
         fix(args);
+        return;
+    }
+    // Synchronous, with no runtime: Claude Code starts one for each session.
+    if args.peek().is_some_and(|a| a == "mcp") {
+        args.next();
+        mcp(args);
         return;
     }
     let daemon_mode = args.peek().is_some_and(|a| a == "daemon");
@@ -287,6 +307,8 @@ fn fix(mut args: impl Iterator<Item = String>) {
     let (mut build, mut run, mut log) = (None, false, None);
     let (mut sha, mut git_ref, mut tier) = (None, None, None);
     let (mut repo, mut workflow, mut bana) = (None, None, None);
+    let (mut force, mut delete_branch, mut headless) = (false, false, false);
+    let named = ["brief", "push", "drop"].contains(&sub.as_str());
     while let Some(a) = args.next() {
         let mut value = || args.next().unwrap_or_else(|| usage());
         match a.as_str() {
@@ -301,9 +323,10 @@ fn fix(mut args: impl Iterator<Item = String>) {
             "--repo" => repo = Some(value()),
             "--workflow" => workflow = Some(value()),
             "--bana" => bana = Some(value()),
-            n if sub == "brief" && name.is_none() && !n.starts_with('-') => {
-                name = Some(n.to_string())
-            }
+            "--force" if sub == "drop" => force = true,
+            "--delete-branch" if sub == "drop" => delete_branch = true,
+            "--headless" if sub == "prepare" => headless = true,
+            n if named && name.is_none() && !n.starts_with('-') => name = Some(n.to_string()),
             _ => usage(),
         }
     }
@@ -323,9 +346,22 @@ fn fix(mut args: impl Iterator<Item = String>) {
             std::process::exit(1)
         }
     };
-    if sub == "brief" {
-        let cwd = std::env::current_dir().ok();
-        return done(fix::brief(&dir, name.as_deref(), cwd.as_deref()));
+    match sub.as_str() {
+        "brief" => {
+            let cwd = std::env::current_dir().ok();
+            return done(fix::brief(&dir, name.as_deref(), cwd.as_deref()));
+        }
+        "gate" => gate(&dir),
+        "push" | "drop" => {
+            let Some(name) = name else { usage() };
+            return done(if sub == "push" {
+                // git talks to the terminal as it pushes.
+                fix::push_fix(&dir, &name, "git", None, true).map(|p| pretty(&p))
+            } else {
+                fix::drop_fix(&dir, &name, "git", None, force, delete_branch).map(|d| pretty(&d))
+            });
+        }
+        _ => {}
     }
     if sub != "prepare" {
         usage()
@@ -382,9 +418,68 @@ fn fix(mut args: impl Iterator<Item = String>) {
     if let Some(b) = bana {
         p.bana = b;
     }
-    done(
-        fix::prepare(&p).map(|made| serde_json::to_string_pretty(&made).unwrap_or_default() + "\n"),
-    );
+    if headless {
+        // bana fix registers it with the daemon next, which queues round 0
+        // unless the fix has rounds already.
+        p.headless = true;
+        p.recheck = p.rounds.is_some();
+    }
+    done(fix::prepare(&p).map(|made| pretty(&made)));
+}
+
+fn pretty<T: serde::Serialize>(v: &T) -> String {
+    serde_json::to_string_pretty(v).unwrap_or_default() + "\n"
+}
+
+/// `mcp`: bana's MCP server on stdin and stdout, for the fix whose worktree
+/// this runs in, until stdin ends; `--config` prints how to start it.
+fn mcp(mut args: impl Iterator<Item = String>) {
+    let (mut dir, mut config) = (None, false);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--dir" => dir = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
+            "--config" => config = true,
+            _ => usage(),
+        }
+    }
+    let Some(dir) = dir else { usage() };
+    let dir = std::path::absolute(&dir).unwrap_or(dir);
+    if config {
+        let exe = std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .unwrap_or_else(|e| fail(&format!("this program's path: {e}")));
+        println!("{}", bana_manager::mcp::config(&exe, &dir));
+        return;
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|e| fail(&format!("the directory: {e}")));
+    let mut server = bana_manager::mcp::Server::new(&dir, &cwd);
+    let (stdin, stdout) = (std::io::stdin(), std::io::stdout());
+    if let Err(e) = server.serve(stdin.lock(), stdout.lock()) {
+        eprintln!("bana mcp: {e}");
+    }
+}
+
+/// `fix gate`: Claude Code's Stop hook in a fix's worktree. The hook's JSON
+/// on stdin says where Claude is (cwd); exit 2 sends stderr to Claude, and
+/// keeps it going. Anything unexpected lets Claude stop (exit 0).
+fn gate(dir: &Path) -> ! {
+    let mut input = Vec::new();
+    let _ = std::io::stdin().take(1 << 20).read_to_end(&mut input);
+    let hook: serde_json::Value = serde_json::from_slice(&input).unwrap_or_default();
+    let cwd = hook["cwd"]
+        .as_str()
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok());
+    let Some(cwd) = cwd else {
+        std::process::exit(0)
+    };
+    match bana_manager::fix::gate(dir, &cwd, "git", None) {
+        bana_manager::fix::Gate::Block(why) => {
+            eprintln!("{why}");
+            std::process::exit(2)
+        }
+        bana_manager::fix::Gate::Pass(_) => std::process::exit(0),
+    }
 }
 
 /// `post-status`: one status, through the poster's own code.

@@ -6,10 +6,13 @@
 # On this machine, when you want it (act, in OrbStack's Docker; nothing stays running):
 #   bana ci [TIER] [-j JOB] [--x64] [--list] [--event FILE]   the workflow's jobs here (bana ci --help);
 #                            act's output stays in ~/.bana/<prefix>/ci/last.log, for bana fix
-#   bana fix [BUILD | last | --log FILE|-] [--open]   a failed run to Claude Code, on a branch
+#   bana fix [BUILD | last | --log FILE|-] [--open | --headless]   a failed run to Claude Code, on a branch
 #                            of its own in a worktree (bana fix help: brief, list, push, drop)
+#   bana mcp                 bana's tools for Claude Code in a fix (an MCP server on stdin and
+#                            stdout); bana daemon install registers it with Claude Code here
 # CI on push, on this machine (a daemon runs each push through act and posts commit statuses):
-#   bana daemon install [--port N] [--no-tray] [--no-open] [--now]   start it (bana daemon help)
+#   bana daemon install [--port N] [--no-tray] [--no-open] [--now] [--no-claude]   start it
+#                            (bana daemon help)
 #   bana daemon uninstall [--purge] | run [--build] | status | log | open | poke
 # A runner pool, if you want GitHub to run the jobs on your machines (they must stay awake):
 #   bana up [options]        join the pool
@@ -186,7 +189,7 @@ settings() {
   for k in repo prefix labels vm vm_x64 linux_user packages.linux path hook.mac hook.linux \
     runner_version workflow tiers tier_input act.image act.network act.args act.docker_config ci.log keep keep_max_gb \
     daemon.branches daemon.tags daemon.tier daemon.tag_tier daemon.poll daemon.timeout \
-    daemon.supersede daemon.token; do
+    daemon.supersede daemon.token fix.rounds fix.token fix.allow fix.turns fix.budget_usd; do
     case $k in
     repo) v=$repo ;; prefix) v=$prefix ;; vm) v=$vm ;; vm_x64) v=$vm_x64 ;; linux_user) v=$linux_user ;;
     hook.*) v=$(conf_path "$k") ;;
@@ -201,6 +204,10 @@ settings() {
     ci.log) v=$(conf ci.log yes) ;;
     keep_max_gb) v=$(conf keep_max_gb 0) ;;
     daemon.*) v=$(daemon_conf "$k") ;;
+    fix.rounds) v=$(conf "$k" 5) ;;
+    fix.token) v=$(conf "$k" none) ;;
+    fix.turns) v=$(conf "$k" 60) ;;
+    fix.budget_usd) v=$(conf "$k" 5) ;;
     *) v=$(conf "$k") ;;
     esac
     printf '%s = %s\n' "$k" "$v"
@@ -825,6 +832,11 @@ ci)
   # shellcheck source=SCRIPTDIR/../lib/act.sh
   source "$bana_root/lib/act.sh"
   act_main "$@"
+  ;;
+mcp)
+  # Claude Code starts it; stdout is the protocol's alone.
+  need_repo
+  exec "$(bm mcp)" mcp --dir "$home" "$@"
   ;;
 fix)
   # shellcheck source=SCRIPTDIR/../lib/fix.sh
