@@ -33,6 +33,15 @@ act_docker() {
 }
 
 # When PID started, as the lock's owner file has it (empty: no such process).
+# act's own settings (act.*). A fix round runs Claude's snapshot, so they come from the
+# failing commit's bana.conf, which the daemon saves and names in BANA_ROUND_CONF: the
+# snapshot cannot loosen how act isolates its own jobs.
+act_conf() { # KEY [DEFAULT]
+  [[ -n ${round_conf:-} ]] || { conf "$@"; return; }
+  # shellcheck disable=SC2034 # conf_lookup reads it
+  local conf_file=$round_conf v
+  if v=$(conf_lookup "$1"); then printf '%s\n' "$v"; else printf '%s\n' "${2:-}"; fi
+}
 act_started() { LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | awk '{ $1 = $1; print }'; }
 
 # One act at a time on this machine, for bana ci and the daemon's builds: act names its
@@ -91,7 +100,8 @@ act_main() {
   fi
   # Neither reaches act's jobs: a job's own bana works on the job's checkout.
   locked=${BANA_ACT_LOCKED:-}
-  unset BANA_PROJECT_ROOT BANA_ACT_LOCKED
+  round_conf=${BANA_ROUND_CONF:-}
+  unset BANA_PROJECT_ROOT BANA_ACT_LOCKED BANA_ROUND_CONF
   wf=$root/.github/workflows/$(conf workflow ci.yml)
   [[ -f $wf ]] || die "No workflow $wf (bana.conf: workflow)"
   if [[ -n $list ]]; then
@@ -108,7 +118,7 @@ act_main() {
   [[ $locked == 1 ]] || act_lock "bana ci${tier:+ $tier} ($prefix)"
   act_docker
 
-  image=$(conf act.image catthehacker/ubuntu:act-24.04)
+  image=$(act_conf act.image catthehacker/ubuntu:act-24.04)
   args=(-C "$root" -W "$wf" --artifact-server-path "$base_home/act/artifacts")
   for l in "$prefix-linux" ubuntu-latest ubuntu-24.04 ubuntu-22.04; do args+=(-P "$l=$image"); done
   # A macOS job runs here on a Mac (act's host mode); elsewhere act skips it.
@@ -120,7 +130,7 @@ act_main() {
   # Each job gets a localhost of its own, as on GitHub, where each job has its own machine:
   # act's default (host) gives all of a run's Linux jobs the Docker host's, so the servers
   # of jobs running side by side answer each other (act.network = host for that).
-  net=$(conf act.network bridge)
+  net=$(act_conf act.network bridge)
   args+=(--network "$net")
 
   # act reads its files relative to -C: relative paths stay relative to where bana ci runs.
@@ -155,14 +165,14 @@ act_main() {
   # act pulls with Docker's logins, which on a Mac sit in the Keychain: macOS then asks for
   # your password whenever act reads them. The images CI needs are public, so act gets a
   # Docker config of its own, without logins (act.docker_config = ~/.docker for yours).
-  dc=$(conf act.docker_config)
+  dc=$(act_conf act.docker_config)
   case $dc in
   '') dc=$base_home/docker; mkdir -p "$dc"; [[ -s $dc/config.json ]] || echo '{}' >"$dc/config.json" ;;
   "~"/*) dc=$HOME/${dc#\~/} ;;
   esac
   export DOCKER_CONFIG=$dc
   # The commit's own act options; those after -- come later, so they win.
-  read -r -a extra <<<"$(conf act.args)" || true
+  read -r -a extra <<<"$(act_conf act.args)" || true
   # They may name another network: act takes the last.
   all=(${extra[@]+"${extra[@]}"} ${pass[@]+"${pass[@]}"})
   for ((i = 0; i < ${#all[@]}; i++)); do

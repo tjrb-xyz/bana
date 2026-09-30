@@ -165,10 +165,10 @@ stops with changes no round tested. Claude works with your own Claude Code setti
 `git push` (a guard for Claude, not a lock). Pushing is yours:
 
 ```sh
-bana fix list                              # the fixes: branch, commits, worktree
+bana fix list                              # the fixes: where each stands, rounds, branch, worktree
 bana fix brief [FIX]                       # what failed, where and how it ran
 bana fix push [FIX] [--pr]                 # push the branch (the daemon builds it); --pr opens a pull request
-bana fix drop [FIX] [--force] [--delete-branch]   # remove the worktree; the branch stays while it has commits
+bana fix drop [FIX] [--force] [--delete-branch]   # remove the worktree and round builds; the branch stays while it has commits
 ```
 
 The page's fix card has the same: the rounds, *Keep*, *Push*, *More rounds* and *Discard*. It needs

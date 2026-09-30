@@ -258,7 +258,9 @@ pub struct Fix {
     pub tier: Option<String>,
     /// What the build's plan job diffed against, when known.
     pub before: Option<String>,
-    /// The failed jobs' ids (what `bana ci -j` takes), in the log's order.
+    /// The ids (what `bana ci -j` takes) of the jobs where the project
+    /// failed, in the log's order: what rounds run, and what commit_fix wants
+    /// green. A job that failed only in bana's steps is not among them.
     pub jobs: Vec<String>,
     pub failures: Vec<Failure>,
     pub checkout: String,
@@ -344,8 +346,11 @@ pub fn prepare(p: &Prepare) -> Result<Prepared, Error> {
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok());
     let (items, _) = items(&results);
+    // The jobs rounds run: those where the project failed. A job that failed
+    // only in bana's steps stays red whatever Claude does (it is told not to
+    // work around bana), so it would keep every round from going green.
     let mut jobs: Vec<String> = Vec::new();
-    for it in &items {
+    for it in items.iter().filter(|it| it.owner == Owner::Project) {
         if !it.job.key.is_empty() && !jobs.contains(&it.job.id) {
             jobs.push(it.job.id.clone());
         }
@@ -582,6 +587,119 @@ pub fn here(dir: &Path, cwd: &Path) -> Option<Fix> {
         .find(|f| std::fs::canonicalize(&f.worktree).is_ok_and(|w| cwd.starts_with(w)))
 }
 
+/// Whether a fix's worktree is still the checkout's own: its `.git` file names
+/// a git directory in the checkout's `worktrees/`, whose `commondir` is the
+/// checkout's. Claude edits the worktree's files, and bana's git runs there
+/// unattended (the gate, run_jobs, commit_fix) with the config of whatever git
+/// directory that file names: one Claude wrote could run commands.
+pub fn check_worktree(f: &Fix) -> Result<(), String> {
+    let wt = Path::new(&f.worktree);
+    let not = |why: &str| format!("{}: {why}, so bana runs no git there", f.worktree);
+    let gitdir =
+        gitdir_of(wt).ok_or_else(|| not("its .git is not the one git worktree add wrote"))?;
+    let common = common_dir(Path::new(&f.checkout))
+        .ok_or_else(|| not("the checkout's git directory is not there"))?;
+    let back = std::fs::read_to_string(gitdir.join("commondir"))
+        .ok()
+        .and_then(|c| std::fs::canonicalize(gitdir.join(c.trim())).ok());
+    if gitdir.parent() != Some(common.join("worktrees").as_path()) || back.as_ref() != Some(&common)
+    {
+        return Err(not(&format!(
+            "its .git names {}, not a worktree of {}",
+            gitdir.display(),
+            f.checkout
+        )));
+    }
+    Ok(())
+}
+
+/// The git directory a `.git` file in `dir` names (`gitdir: …`), if it is one.
+fn gitdir_of(dir: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(dir.join(".git")).ok()?;
+    let to = text.lines().next()?.strip_prefix("gitdir: ")?;
+    std::fs::canonicalize(dir.join(to)).ok()
+}
+
+/// A checkout's common git directory: its `.git`, or for a checkout that is
+/// itself a linked worktree (or a submodule), the one its `.git` file names.
+fn common_dir(checkout: &Path) -> Option<PathBuf> {
+    let dotgit = checkout.join(".git");
+    if dotgit.is_dir() {
+        return std::fs::canonicalize(dotgit).ok();
+    }
+    let gitdir = gitdir_of(checkout)?;
+    match std::fs::read_to_string(gitdir.join("commondir")) {
+        Ok(c) => std::fs::canonicalize(gitdir.join(c.trim())).ok(),
+        Err(_) => Some(gitdir),
+    }
+}
+
+/// What run_jobs cannot test in `wt`'s submodules, one line each: changes to
+/// tracked files not committed in one (a snapshot takes a submodule's commit,
+/// not its files), and commits no remote has (the daemon's clone cannot fetch
+/// them).
+pub fn submodule_trouble(git: &str, path: Option<&str>, wt: &Path) -> Result<Vec<String>, String> {
+    if !wt.join(".gitmodules").exists() {
+        return Ok(Vec::new());
+    }
+    let out = run_git(
+        git,
+        path,
+        wt,
+        &[
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--ignore-submodules=none",
+            "--untracked-files=no",
+        ],
+        120,
+    )?;
+    let mut trouble = Vec::new();
+    let mut fields = out.split('\0');
+    while let Some(entry) = fields.next() {
+        let parts: Vec<&str> = entry.splitn(9, ' ').collect();
+        let (kind, sub) = (parts.first().copied(), parts.get(2).copied().unwrap_or(""));
+        // A rename has its old path in the next field.
+        let name = match kind {
+            Some("1") => parts.get(8).copied(),
+            Some("2") => {
+                let rest = entry.splitn(10, ' ').nth(9);
+                fields.next();
+                rest
+            }
+            _ => None,
+        };
+        let (Some(name), Some(flags)) = (name, sub.strip_prefix('S')) else {
+            continue;
+        };
+        let flags: Vec<char> = flags.chars().collect();
+        if flags.get(1) == Some(&'M') {
+            trouble.push(format!("{name}: changed files in it"));
+        } else if flags.first() == Some(&'C') {
+            let unpushed = run_git(
+                git,
+                path,
+                &wt.join(name),
+                &[
+                    "rev-list",
+                    "--count",
+                    "HEAD",
+                    "--not",
+                    "--remotes",
+                    "--tags",
+                ],
+                60,
+            )
+            .map_or(true, |n| n.trim() != "0");
+            if unpushed {
+                trouble.push(format!("{name}: a commit no remote has"));
+            }
+        }
+    }
+    Ok(trouble)
+}
+
 /// Snapshots worktree `wt` ([`Snapshot`]); every git runs without the
 /// owner's hooks.
 pub fn snapshot(git: &str, path: Option<&str>, wt: &Path) -> Result<Snapshot, Error> {
@@ -687,7 +805,7 @@ impl Drop for TempIndex {
 }
 
 /// The files in `wt` that are neither in its index nor ignored.
-fn new_files(git: &str, path: Option<&str>, wt: &Path) -> Result<Vec<String>, String> {
+pub fn new_files(git: &str, path: Option<&str>, wt: &Path) -> Result<Vec<String>, String> {
     let out = run_git(
         git,
         path,
@@ -750,6 +868,7 @@ pub fn commit_green(
             f.worktree
         )));
     }
+    check_worktree(&f).map_err(Error::Refused)?;
     let g = |args: &[&str]| run_git(git, path, wt, args, 60).map_err(Error::Failed);
     let head = format!("refs/heads/{}", f.branch);
     // Detached, symbolic-ref says nothing (and fails).
@@ -775,6 +894,21 @@ pub fn commit_green(
         return Err(Error::Refused(format!(
             "{}: only a green round's tree is committed",
             ended(last)
+        )));
+    }
+    // Green with the jobs that failed, not with others alone.
+    let untested: Vec<String> = f
+        .jobs
+        .iter()
+        .filter(|j| !last.jobs.contains(j))
+        .cloned()
+        .collect();
+    if !untested.is_empty() {
+        return Err(Error::Refused(format!(
+            "round {} ran {}, not {}, which failed: call run_jobs without jobs (it runs those), then commit",
+            last.n,
+            names(&last.jobs),
+            names(&untested)
         )));
     }
     let tree = worktree_tree(git, path, wt).map_err(Error::Failed)?;
@@ -879,17 +1013,25 @@ pub enum Gate {
 struct Blocked {
     trees: Vec<String>,
     rounds: Vec<u32>,
+    /// A tree with the submodule changes it blocked for.
+    submodules: Vec<String>,
 }
 
 /// The Stop gate (`fix gate`), from files and one snapshot of the tree, never
-/// running a job. In a fix's worktree with rounds left, it blocks once for a
-/// tree that differs from the failing commit's and from the last round's
-/// (Claude may still stop to ask the owner something, the second time), and
-/// for a headless fix once for each red round.
+/// running a job. In a fix's worktree with rounds left (and a daemon to run
+/// them), it blocks once for a tree that differs from the failing commit's and
+/// from the last round's (Claude may still stop to ask the owner something,
+/// the second time), for a headless fix once for each red round, and once for
+/// changes inside submodules, which no round can test.
 pub fn gate(dir: &Path, cwd: &Path, git: &str, path: Option<&str>) -> Gate {
     let Some(f) = here(dir, cwd) else {
         return Gate::Pass("no fix here");
     };
+    // Without the daemon, nothing runs rounds: the prompt says to test and
+    // commit by hand.
+    if !dir.join("daemon/settings").is_file() {
+        return Gate::Pass("no daemon");
+    }
     let limit = daemon_settings(dir)
         .get("fix.rounds")
         .and_then(|n| n.parse().ok())
@@ -900,6 +1042,9 @@ pub fn gate(dir: &Path, cwd: &Path, git: &str, path: Option<&str>) -> Gate {
         .unwrap_or_else(|| Rounds::new(limit));
     if rs.left() == 0 {
         return Gate::Pass("no rounds left");
+    }
+    if check_worktree(&f).is_err() {
+        return Gate::Pass("not the checkout's worktree");
     }
     let wt = Path::new(&f.worktree);
     let Ok(tree) = worktree_tree(git, path, wt) else {
@@ -924,16 +1069,14 @@ pub fn gate(dir: &Path, cwd: &Path, git: &str, path: Option<&str>) -> Gate {
             Err(_) => Gate::Pass("the gate file cannot be written"),
         }
     };
-    if tree != base.trim() && last.is_none_or(|r| r.tree != tree) {
-        if blocked.trees.contains(&tree) {
-            return Gate::Pass("blocked once for this tree");
-        }
+    let untested = tree != base.trim() && last.is_none_or(|r| r.tree != tree);
+    if untested && !blocked.trees.contains(&tree) {
         blocked.trees.push(tree);
         let keep = blocked.trees.len().saturating_sub(100);
         blocked.trees.drain(..keep);
         return block(&mut blocked, UNTESTED.into());
     }
-    if let Some(r) = last.filter(|r| f.headless && r.state.finished()) {
+    if let Some(r) = last.filter(|r| !untested && f.headless && r.state.finished()) {
         if r.state != BuildState::Success && !blocked.rounds.contains(&r.n) {
             blocked.rounds.push(r.n);
             let left = rs.left();
@@ -946,7 +1089,24 @@ pub fn gate(dir: &Path, cwd: &Path, git: &str, path: Option<&str>) -> Gate {
             return block(&mut blocked, why);
         }
     }
-    Gate::Pass(if tree == base.trim() {
+    // Changes inside a submodule are in no tree bana takes: say so, once.
+    let trouble = submodule_trouble(git, path, wt).unwrap_or_default();
+    if !trouble.is_empty() {
+        let key = format!("{tree} {}", trouble.join("; "));
+        if !blocked.submodules.contains(&key) {
+            blocked.submodules.push(key);
+            let keep = blocked.submodules.len().saturating_sub(100);
+            blocked.submodules.drain(..keep);
+            let why = format!(
+                "You changed files inside submodules ({}), which run_jobs cannot test: a round takes each submodule at a commit its remote has. Say so before you stop.",
+                trouble.join("; ")
+            );
+            return block(&mut blocked, why);
+        }
+    }
+    Gate::Pass(if untested {
+        "blocked once for this tree"
+    } else if tree == base.trim() {
         "no change"
     } else {
         "tested"
@@ -1011,6 +1171,7 @@ pub fn push_fix(
     };
     let wt = Path::new(&f.worktree);
     let dirty = wt.is_dir()
+        && check_worktree(&f).is_ok()
         && run_git(git, path, wt, &["status", "--porcelain"], 60)
             .is_ok_and(|s| !s.trim().is_empty());
     let mut cmd = git_command(git, path, checkout, true);
@@ -1084,6 +1245,12 @@ pub fn drop_fix(
             .collect::<String>()
     };
     if wt.is_dir() && !force {
+        check_worktree(&f).map_err(|e| {
+            Error::Refused(format!(
+                "{e}: bana fix drop {} --force removes it without looking",
+                f.fix
+            ))
+        })?;
         // Submodules' changes too, whatever .gitmodules says to ignore.
         let changes = g(
             wt,
@@ -1185,11 +1352,21 @@ pub fn drop_fix(
 /// asks before it commits them), and whether origin has the branch as it is.
 pub fn card(f: &Fix, git: &str, path: Option<&str>) -> Value {
     let wt = Path::new(&f.worktree);
-    let new = if wt.is_dir() {
+    let new = if wt.is_dir() && check_worktree(f).is_ok() {
         new_files(git, path, wt).unwrap_or_default()
     } else {
         Vec::new()
     };
+    json!({
+        "new_files": new,
+        "worktree_there": wt.is_dir(),
+        "pushed": pushed(f, git, path),
+        "compare": compare(f),
+    })
+}
+
+/// Whether origin has the fix's branch as it is (as the checkout last saw it).
+fn pushed(f: &Fix, git: &str, path: Option<&str>) -> bool {
     let checkout = Path::new(&f.checkout);
     let at = |r: &str| {
         run_git(git, path, checkout, &["rev-parse", "-q", "--verify", r], 30)
@@ -1197,13 +1374,105 @@ pub fn card(f: &Fix, git: &str, path: Option<&str>) -> Value {
             .map(|s| s.trim().to_string())
     };
     let tip = at(&format!("refs/heads/{}", f.branch));
-    let pushed = tip.is_some() && tip == at(&format!("refs/remotes/origin/{}", f.branch));
-    json!({
-        "new_files": new,
-        "worktree_there": wt.is_dir(),
-        "pushed": pushed,
-        "compare": compare(f),
-    })
+    tip.is_some() && tip == at(&format!("refs/remotes/origin/{}", f.branch))
+}
+
+/// Where a fix stands ([`status`]).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Status {
+    pub fix: String,
+    /// open, working, green, red, out_of_rounds, kept or pushed.
+    pub state: &'static str,
+    /// Rounds after round 0: run or running, allowed, left.
+    pub rounds_used: u32,
+    pub rounds_limit: u32,
+    pub rounds_left: u32,
+    /// Round 0's state, if it has one.
+    pub recheck: Option<BuildState>,
+    /// The worktree's tree now (none when it is gone), and the failing
+    /// commit's.
+    pub tree: Option<String>,
+    pub base_tree: Option<String>,
+    /// The worktree is not what the last round ran (or, before any, the
+    /// failing commit).
+    pub changed_since_last_round: Option<bool>,
+    /// Its branch's commits on the failing one (none: the branch is gone).
+    pub commits: Option<u64>,
+    pub pushed: bool,
+    pub worktree_there: bool,
+    /// Its rounds.json, none before its first round.
+    #[serde(skip)]
+    pub rounds: Option<Rounds>,
+}
+
+/// Where a fix stands (fix_status, the fix card, bana fix list): kept or
+/// pushed once its branch has the worktree's tree or origin has the branch;
+/// working while a round runs; green once the last round ran the worktree as
+/// it is and passed with the jobs that failed; red when it failed; else open,
+/// or out of rounds.
+pub fn status(dir: &Path, f: &Fix, git: &str, path: Option<&str>) -> Status {
+    let had = crate::rounds::load(&crate::rounds::path(dir, &f.fix))
+        .ok()
+        .flatten();
+    let limit = daemon_settings(dir)
+        .get("fix.rounds")
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(ROUNDS);
+    let rs = had.clone().unwrap_or_else(|| Rounds::new(limit));
+    let wt = Path::new(&f.worktree);
+    let there = wt.is_dir() && check_worktree(f).is_ok();
+    let tree = there.then(|| worktree_tree(git, path, wt).ok()).flatten();
+    let checkout = Path::new(&f.checkout);
+    let rev = |spec: String| {
+        run_git(
+            git,
+            path,
+            checkout,
+            &["rev-parse", "-q", "--verify", &spec],
+            30,
+        )
+        .ok()
+        .map(|t| t.trim().to_string())
+    };
+    let base = rev(format!("{}^{{tree}}", f.sha));
+    let tip = rev(format!("refs/heads/{}^{{tree}}", f.branch));
+    let last = rs.rounds.iter().rev().find(|r| r.state.finished());
+    let changed = tree
+        .as_ref()
+        .map(|t| Some(t.as_str()) != last.map(|r| r.tree.as_str()).or(base.as_deref()));
+    let commits = ahead(f, git, path);
+    let pushed = pushed(f, git, path);
+    let kept = commits.is_some_and(|n| n > 0);
+    let state = if kept && pushed {
+        "pushed"
+    } else if rs.running().is_some() {
+        "working"
+    } else if kept && (tree.is_none() || tip == tree) {
+        "kept"
+    } else {
+        // What the last round said of the worktree as it is, if it ran it.
+        match last.filter(|_| changed == Some(false)) {
+            Some(r) if r.state == BuildState::Success && r.covers(&f.jobs) => "green",
+            _ if rs.left() == 0 => "out_of_rounds",
+            Some(r) if r.n > 0 && r.state != BuildState::Success => "red",
+            _ => "open",
+        }
+    };
+    Status {
+        fix: f.fix.clone(),
+        state,
+        rounds_used: rs.used(),
+        rounds_limit: rs.limit,
+        rounds_left: rs.left(),
+        recheck: rs.get(0).map(|r| r.state),
+        tree,
+        base_tree: base,
+        changed_since_last_round: changed,
+        commits,
+        pushed,
+        worktree_there: wt.is_dir(),
+        rounds: had,
+    }
 }
 
 // ---- the failure -------------------------------------------------------------
@@ -1617,37 +1886,48 @@ fn claude_settings(p: &Prepare, checkout: &Path, wt: &Path) -> Result<(), String
         },
         Err(_) => None,
     };
-    let gate = format!(
-        "{} {GATE} {}",
-        sh_quote(&p.manager),
-        sh_quote(&p.dir.to_string_lossy())
-    );
-    let mut text =
-        serde_json::to_vec_pretty(&settings_json(old, &gate)).map_err(|e| e.to_string())?;
+    // The gate only where the daemon runs rounds: without it, the prompt says
+    // to test by hand, and run_jobs would say no.
+    let gate = p.rounds.map(|_| {
+        format!(
+            "{} {GATE} {}",
+            sh_quote(&p.manager),
+            sh_quote(&p.dir.to_string_lossy())
+        )
+    });
+    let mut text = serde_json::to_vec_pretty(&settings_json(old, gate.as_deref(), wt))
+        .map_err(|e| e.to_string())?;
     text.push(b'\n');
     std::fs::create_dir_all(wt.join(".claude"))
         .and_then(|_| std::fs::write(&path, text))
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Claude Code's settings for a fix worktree: what was there, plus bana's
-/// rules (git push denied; bana's read-only tools and run_jobs allowed) and
-/// its Stop gate, `gate`, which replaces an earlier one of bana's. It loosens
+/// Claude Code's settings for worktree `wt`: what was there, plus bana's
+/// rules (git push denied, and edits to the worktree's `.git` and `.claude`;
+/// bana's read-only tools and run_jobs allowed) and its Stop gate, `gate`,
+/// which replaces an earlier one of bana's (none: bana's goes). It loosens
 /// nothing else.
-fn settings_json(old: Option<Value>, gate: &str) -> Value {
+fn settings_json(old: Option<Value>, gate: Option<&str>, wt: &Path) -> Value {
     let mut v = old.filter(Value::is_object).unwrap_or_else(|| json!({}));
     let Some(o) = v.as_object_mut() else {
         return v;
     };
     let perms = object(o, "permissions");
-    for (key, rules) in [("allow", ALLOW), ("deny", DENY)] {
+    let deny: Vec<String> = DENY
+        .iter()
+        .map(|r| r.to_string())
+        .chain(own_files(wt))
+        .collect();
+    let allow: Vec<String> = ALLOW.iter().map(|r| r.to_string()).collect();
+    for (key, rules) in [("allow", allow), ("deny", deny)] {
         let list = perms.entry(key).or_insert_with(|| json!([]));
         if !list.is_array() {
             *list = json!([]);
         }
         if let Some(list) = list.as_array_mut() {
             for rule in rules {
-                if !list.iter().any(|r| r == rule) {
+                if !list.iter().any(|r| *r == rule) {
                     list.push(json!(rule));
                 }
             }
@@ -1667,9 +1947,23 @@ fn settings_json(old: Option<Value>, gate: &str) -> Value {
             })
         };
         groups.retain(|g| !bana(g));
-        groups.push(json!({"hooks": [{"type": "command", "command": gate, "timeout": 30}]}));
+        if let Some(gate) = gate {
+            groups.push(json!({"hooks": [{"type": "command", "command": gate, "timeout": 30}]}));
+        }
     }
     v
+}
+
+/// Claude Code rules for the files in worktree `wt` that are bana's and git's
+/// (its `.git`, which names the git directory bana's git trusts, and its
+/// `.claude` settings): `Edit` covers every tool that writes files.
+pub fn own_files(wt: &Path) -> Vec<String> {
+    let wt = wt.to_string_lossy();
+    let wt = wt.trim_end_matches('/');
+    [".git", ".git/**", ".claude/**"]
+        .iter()
+        .map(|p| format!("Edit(/{wt}/{p})"))
+        .collect()
 }
 
 /// `o[key]` as an object: made (or replaced) if it is none.
@@ -1802,12 +2096,18 @@ fn run_git_env(
 }
 
 /// git in `cwd`, never asking in a terminal, with none of git's variables
-/// from this process; the owner's hooks off unless `hooks`.
+/// from this process; unless `hooks` (the owner's push), neither the owner's
+/// hooks nor a file system monitor, which git would start as a command.
 fn git_command(git: &str, path: Option<&str>, cwd: &Path, hooks: bool) -> Command {
     let mut cmd = Command::new(git);
     cmd.arg("-C").arg(cwd);
     if !hooks {
-        cmd.args(["-c", "core.hooksPath=/dev/null"]);
+        cmd.args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+        ]);
     }
     cmd.env("GIT_TERMINAL_PROMPT", "0").stdin(Stdio::null());
     for k in [
@@ -3075,16 +3375,17 @@ mod tests {
         let settings: Value =
             serde_json::from_str(&std::fs::read_to_string(wt.join(SETTINGS_LOCAL)).unwrap())
                 .unwrap();
-        let gate = format!(
-            "{} fix gate --dir {}",
-            sh_quote(&this_manager()),
-            sh_quote(&r.dir.to_string_lossy())
-        );
+        // No daemon, no rounds: no Stop gate.
+        let deny: Vec<String> = DENY
+            .iter()
+            .map(|r| r.to_string())
+            .chain(own_files(&wt))
+            .collect();
         assert_eq!(
             settings,
             json!({
-                "permissions": {"allow": ALLOW, "deny": DENY},
-                "hooks": {"Stop": [{"hooks": [{"type": "command", "command": gate, "timeout": 30}]}]},
+                "permissions": {"allow": ALLOW, "deny": deny},
+                "hooks": {"Stop": []},
             })
         );
         assert!(
@@ -3229,7 +3530,11 @@ mod tests {
             assert!(brief.contains(want), "{want}\n---\n{brief}");
         }
         let f: Fix = serde_json::from_str(&r.state(&made.fix, "fix.json")).unwrap();
-        assert_eq!(f.jobs, ["rust", "macos"]);
+        assert_eq!(
+            f.jobs,
+            ["rust"],
+            "macos failed in bana's step alone: rounds would stay red on it"
+        );
         assert_eq!(f.failures[1].owner, Owner::Bana);
         assert_eq!(f.failures[1].step, format!("Post {kb}"));
     }
@@ -3312,6 +3617,7 @@ mod tests {
     #[test]
     fn a_second_failure_at_the_commit_goes_on_with_its_fix() {
         let r = Repo::new("reuse");
+        put(&r.dir.join("daemon/settings"), "fix.rounds = 5\n");
         let first = r.prepare(paste()).unwrap();
         let wt = PathBuf::from(&first.worktree);
         put(&wt.join("src/lib.rs"), "pub fn f() { /* fixed */ }\n");
@@ -3335,9 +3641,14 @@ mod tests {
         let settings: Value =
             serde_json::from_str(&std::fs::read_to_string(wt.join(SETTINGS_LOCAL)).unwrap())
                 .unwrap();
+        let deny: Vec<String> = ["Bash(git push:*)", "Bash(mine)", DENY[1], DENY[2], DENY[3]]
+            .iter()
+            .map(|r| r.to_string())
+            .chain(own_files(&wt))
+            .collect();
         assert_eq!(
             settings["permissions"],
-            json!({"allow": ["Bash(cargo test:*)", ALLOW[0], ALLOW[1], ALLOW[2], ALLOW[3], ALLOW[4]], "deny": ["Bash(git push:*)", "Bash(mine)", DENY[1], DENY[2], DENY[3]]})
+            json!({"allow": ["Bash(cargo test:*)", ALLOW[0], ALLOW[1], ALLOW[2], ALLOW[3], ALLOW[4]], "deny": deny})
         );
         assert_eq!(
             settings["hooks"]["Stop"].as_array().unwrap().len(),
@@ -3671,13 +3982,14 @@ mod tests {
         assert_eq!(q["q"], prompt);
         assert_eq!(q["cwd"], "/Users/lilly/.bana/dsper/fix/d4b5174");
 
-        // With the daemon's rounds, the loop's words: bana's tools, and round 0.
-        let jobs: Vec<String> = ["rust", "macos"].map(String::from).into();
+        // With the daemon's rounds, the loop's words: bana's tools, and round 0
+        // (of the project's failed jobs: macos failed in bana's step alone).
+        let jobs: Vec<String> = ["rust"].map(String::from).into();
         let mut v = view(&r, &pins);
         (v.rounds, v.recheck, v.jobs) = (Some(5), true, &jobs);
         let prompt = render_prompt(&v);
         assert!(units(&prompt) <= PROMPT_MAX, "{}", units(&prompt));
-        let tail = "\nbana is re-running rust and macos at the unchanged commit with the current bana (round 0).
+        let tail = "\nbana is re-running rust at the unchanged commit with the current bana (round 0).
 1. fix_brief has details and log tails; ci_log has more.
 2. Test only with the bana tool run_jobs: it runs the failed jobs under act on this machine the way CI ran them, on this worktree as it is. Don't run bana ci or act yourself. You have 5 rounds.
 3. If round 0 passes, the failure depends on its environment (ports, parallel jobs, timing): find the cause rather than retrying.
@@ -3826,23 +4138,29 @@ mod tests {
         assert_eq!(unquote_names("\"open"), ["open"], "no closing quote");
         let gate = "'/b/bana-manager' fix gate --dir '/h/.bana/p'";
         let ours = json!({"hooks": [{"type": "command", "command": gate, "timeout": 30}]});
+        let wt = Path::new("/h/.bana/p/fix/d4b5174");
+        let mut deny: Vec<Value> = DENY.iter().map(|r| json!(r)).collect();
+        for p in [".git", ".git/**", ".claude/**"] {
+            deny.push(json!(format!("Edit(//h/.bana/p/fix/d4b5174/{p})")));
+        }
         assert_eq!(
             settings_json(
                 Some(json!({"permissions": {"deny": "x"}, "hooks": [], "model": "opus"})),
-                gate
+                Some(gate),
+                wt
             ),
-            json!({"permissions": {"allow": ALLOW, "deny": DENY}, "hooks": {"Stop": [ours]}, "model": "opus"})
+            json!({"permissions": {"allow": ALLOW, "deny": deny}, "hooks": {"Stop": [ours]}, "model": "opus"})
         );
         // The owner's own Stop hooks stay; bana's older gate (another
-        // bana-manager) goes.
+        // bana-manager) goes, and without the daemon, bana's is not there.
         let mine = json!({"hooks": [{"type": "command", "command": "say done"}]});
         let old = json!({"hooks": [{"type": "command", "command": "'/old/bana-manager' fix gate --dir '/h/.bana/p'"}]});
-        let v = settings_json(
-            Some(json!({"hooks": {"Stop": [mine, old], "PreToolUse": []}})),
-            gate,
-        );
+        let had = json!({"hooks": {"Stop": [mine, old], "PreToolUse": []}});
+        let v = settings_json(Some(had.clone()), Some(gate), wt);
         assert_eq!(v["hooks"]["Stop"], json!([mine, ours]));
         assert_eq!(v["hooks"]["PreToolUse"], json!([]));
+        let v = settings_json(Some(had), None, wt);
+        assert_eq!(v["hooks"]["Stop"], json!([mine]));
     }
 
     /// `jobs` failed jobs, each with `tests` failing tests with long messages.
@@ -4182,6 +4500,8 @@ Error: {say} /Users/l/.cache/act/x-bana-actions-plan@1/y
         put(&r.work.join(".gitignore"), "target/\n");
         git(&r.work, &["add", "-A"]);
         git(&r.work, &["commit", "-qm", "ignore target"]);
+        // The daemon's settings: rounds, so the loop's words and its gate.
+        put(&r.dir.join("daemon/settings"), "fix.rounds = 5\n");
         let made = r.prepare(paste()).unwrap();
         let f = fixes(&r.dir).remove(0);
         let wt = PathBuf::from(&made.worktree);
@@ -4340,6 +4660,20 @@ Error: {say} /Users/l/.cache/act/x-bana-actions-plan@1/y
             refused(commit("why", false)),
             "round 1 took in new files, which stay out unless include_new_files is true: src/new.rs"
         );
+        // Green, but a round of other jobs than those that failed.
+        assert_eq!(f.jobs, ["rust"]);
+        let mut rs = crate::rounds::load(&crate::rounds::path(&r.dir, fix))
+            .unwrap()
+            .unwrap();
+        rs.rounds[1].jobs = vec!["docs".into()];
+        crate::rounds::save(&crate::rounds::path(&r.dir, fix), &rs).unwrap();
+        assert_eq!(
+            refused(commit("why", true)),
+            "round 1 ran docs, not rust, which failed: call run_jobs without jobs (it runs those), then commit"
+        );
+        assert_eq!(status(&r.dir, &f, "git", None).state, "open");
+        set_rounds(&r, fix, 5, &green);
+        assert_eq!(status(&r.dir, &f, "git", None).state, "green");
         let tip = git(&wt, &["rev-parse", "HEAD"]);
         assert_eq!(
             git(&wt, &["rev-parse", "HEAD"]),
@@ -4410,6 +4744,13 @@ Error: {say} /Users/l/.cache/act/x-bana-actions-plan@1/y
         assert_eq!(gate(&r.work), Gate::Pass("no fix here"), "the checkout");
         assert_eq!(gate(&r.root), Gate::Pass("no fix here"));
         assert_eq!(gate(&wt), Gate::Pass("no change"), "nothing changed yet");
+        // Without the daemon nothing runs rounds: the prompt says to test by hand.
+        let settings = r.dir.join("daemon/settings");
+        std::fs::rename(&settings, r.dir.join("settings.away")).unwrap();
+        put(&wt.join("src/lib.rs"), "pub fn f() { /* away */ }\n");
+        assert_eq!(gate(&wt), Gate::Pass("no daemon"));
+        std::fs::rename(r.dir.join("settings.away"), &settings).unwrap();
+        git(&wt, &["checkout", "-q", "--", "src/lib.rs"]);
 
         put(&wt.join("src/lib.rs"), "pub fn f() { /* one */ }\n");
         assert_eq!(
@@ -4502,6 +4843,110 @@ Error: {say} /Users/l/.cache/act/x-bana-actions-plan@1/y
     }
 
     #[test]
+    fn changes_inside_a_submodule_are_said_not_tested() {
+        let (r, f, wt) = loop_fix("gate-sub");
+        let lib = r.root.join("lib.git");
+        git(
+            &r.root,
+            &["init", "-q", "--bare", "-b", "main", &lib.to_string_lossy()],
+        );
+        let seed = r.root.join("lib-seed");
+        git(
+            &r.root,
+            &[
+                "clone",
+                "-q",
+                &lib.to_string_lossy(),
+                &seed.to_string_lossy(),
+            ],
+        );
+        for (k, v) in [("user.name", "Ada"), ("user.email", "ada@example.com")] {
+            git(&seed, &["config", k, v]);
+        }
+        put(&seed.join("a.txt"), "a\n");
+        git(&seed, &["add", "-A"]);
+        git(&seed, &["commit", "-qm", "a"]);
+        git(&seed, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+        let url = format!("file://{}", lib.display());
+        git(
+            &wt,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &url,
+                "lib",
+            ],
+        );
+        git(&wt, &["commit", "-qm", "a submodule"]);
+        let gate = || gate(&r.dir, &wt, "git", None);
+        assert!(submodule_trouble("git", None, &wt).unwrap().is_empty());
+        assert_eq!(gate(), Gate::Block(UNTESTED.into()), "a commit of its own");
+        assert_eq!(gate(), Gate::Pass("blocked once for this tree"));
+
+        // An edit inside it: the snapshot's tree cannot see it.
+        let before = worktree_tree("git", None, &wt).unwrap();
+        put(&wt.join("lib/a.txt"), "b\n");
+        assert_eq!(worktree_tree("git", None, &wt).unwrap(), before);
+        assert_eq!(
+            submodule_trouble("git", None, &wt).unwrap(),
+            ["lib: changed files in it"]
+        );
+        let Gate::Block(why) = gate() else {
+            panic!("an edit inside a submodule")
+        };
+        assert!(
+            why.starts_with("You changed files inside submodules (lib: changed files in it), which run_jobs cannot test"),
+            "{why}"
+        );
+        assert_eq!(gate(), Gate::Pass("blocked once for this tree"), "once");
+        // Committed inside it, not pushed: src could not fetch it.
+        let sub = wt.join("lib");
+        for (k, v) in [("user.name", "Ada"), ("user.email", "ada@example.com")] {
+            git(&sub, &["config", k, v]);
+        }
+        git(&sub, &["commit", "-qam", "b"]);
+        assert_eq!(
+            submodule_trouble("git", None, &wt).unwrap(),
+            ["lib: a commit no remote has"]
+        );
+        git(&sub, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+        git(&sub, &["fetch", "-q", "origin"]);
+        assert!(submodule_trouble("git", None, &wt).unwrap().is_empty());
+        let _ = f;
+    }
+
+    #[test]
+    fn a_worktree_whose_git_file_moved_gets_no_git_of_banas() {
+        let (r, f, wt) = loop_fix("gitfile");
+        assert_eq!(check_worktree(&f), Ok(()));
+        // Its .git names another repository's git directory.
+        let other = r.root.join("other");
+        git(&r.root, &["init", "-q", &other.to_string_lossy()]);
+        let was = std::fs::read_to_string(wt.join(".git")).unwrap();
+        put(
+            &wt.join(".git"),
+            &format!("gitdir: {}\n", other.join(".git").display()),
+        );
+        let why = check_worktree(&f).unwrap_err();
+        assert!(why.contains("not a worktree of"), "{why}");
+        put(&wt.join("src/lib.rs"), "pub fn f() { /* x */ }\n");
+        assert_eq!(
+            gate(&r.dir, &wt, "git", None),
+            Gate::Pass("not the checkout's worktree")
+        );
+        let Err(Error::Refused(why)) = commit_green(&r.dir, &f.fix, "git", None, "why", false)
+        else {
+            panic!("commit_green in a worktree that is not the checkout's")
+        };
+        assert!(why.contains("so bana runs no git there"), "{why}");
+        put(&wt.join(".git"), &was);
+        assert_eq!(check_worktree(&f), Ok(()));
+    }
+
+    #[test]
     fn the_gate_answers_in_under_a_second_on_ten_thousand_files() {
         let r = Repo::new("gate10k");
         for d in 0..100 {
@@ -4514,6 +4959,7 @@ Error: {say} /Users/l/.cache/act/x-bana-actions-plan@1/y
         }
         git(&r.work, &["add", "-A"]);
         git(&r.work, &["commit", "-qm", "ten thousand files"]);
+        put(&r.dir.join("daemon/settings"), "fix.rounds = 5\n");
         let made = r.prepare(paste()).unwrap();
         let wt = PathBuf::from(&made.worktree);
         put(&wt.join("big/d7/f7.txt"), "changed\n");

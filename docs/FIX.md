@@ -62,7 +62,7 @@ bana's tools come from its MCP server, `bana-manager mcp` (`bana mcp` runs it by
 registers it with Claude Code in your checkout, at local scope (private to you, and seen in its worktrees):
 `claude mcp add -s local bana -- ~/.bana/<prefix>/daemon/bana-manager mcp --dir ~/.bana/<prefix>`.
 `--no-claude` skips that, and `bana daemon uninstall` removes it. `bana fix` asks `claude mcp get bana` in each
-new worktree and, if the server is missing there, passes it with `--mcp-config`.
+new worktree and, if the server is missing there or does not connect, passes it with `--mcp-config`.
 
 | Tool | Asks you | What |
 |---|---|---|
@@ -70,40 +70,55 @@ new worktree and, if the server is missing there, passes it with `--mcp-config`.
 | `ci_log` | no | more of a build's (or a round's) log: a job, a step, a search, the last lines |
 | `run_jobs` | no | one round (below): the failed jobs on the worktree as it is, until they end |
 | `fix_status` | no | open, working, green, red, out of rounds, kept or pushed, and whether the worktree changed since the last round |
+
+A tool called with arguments that do not fit says why as its result, so Claude can call it again.
 | `commit_fix` | yes | commits the green round's tree on the fix's branch |
 
 Claude Code runs as you, with your own settings and permission mode, plus what the settings file adds: those
-four tools allowed, rules that deny `git push` (`git -C … push`, `git -c …` and `git config … alias` too), and
-the Stop gate. The rules are a guard against Claude pushing, not a lock: a script Claude writes and runs can
+four tools allowed, rules that deny `git push` (`git -C … push`, `git -c …` and `git config … alias` too) and
+edits to the worktree's `.git` file and `.claude` folder, and, with the daemon, the Stop gate. bana's own git in
+the worktree (the gate, run_jobs, commit_fix) first checks that its `.git` still names a worktree of your
+checkout, and runs with hooks and `core.fsmonitor` off. The rules are a guard against Claude pushing, not a lock: a script Claude writes and runs can
 still push, as can anything your own rules allow in auto or bypass mode.
 
 ## The loop
 
 Each run_jobs call is one round:
 
-1. The MCP server (a child of Claude Code, in your terminal) snapshots the worktree without touching its index:
-   tracked changes and new files, not ignored ones such as `target/`, nor the settings file.
-2. It pushes the snapshot into the daemon's clone as `refs/bana/fix/<sha7>/<snapshot>`, with hooks off. Nothing
-   goes to GitHub.
+1. The MCP server (a child of Claude Code, in your terminal) takes the worktree's tree without touching its
+   index: tracked changes and new files, not ignored ones such as `target/`, nor the settings file. It asks the
+   daemon first: a tree that already ran, or a round the limits refuse, pushes nothing.
+2. Otherwise it commits that tree as a snapshot and pushes it into the daemon's clone as
+   `refs/bana/fix/<sha7>/<snapshot>`, with hooks off. Nothing goes to GitHub.
 3. The daemon runs `bana ci <tier> -j <job>` for each failed job, at the front of the queue (behind a build that
    runs), with the failing build's ref, tier and before, in its own clone.
-4. run_jobs waits for the round, and gives green, or what failed in the brief's shape, and the new files it took
-   in.
+4. run_jobs waits for the round, telling Claude Code how it goes every few seconds (Claude Code gives up on a
+   tool that stays silent for 30 minutes), and gives green, or what failed in the brief's shape, and the new
+   files it took in. Meanwhile the other tools answer; stopping run_jobs (Esc) leaves the round to run, and
+   fix_status shows it.
+
+The failed jobs are those where the project failed: a job that failed only in a step of bana's own actions stays
+out of the rounds, since Claude is not to work around bana. A round cannot test changes inside a submodule (a
+snapshot takes each submodule at a commit): run_jobs refuses them, and the gate says so once.
 
 Rounds post no statuses, move no green commit, and never count as built. Their `GITHUB_TOKEN` is empty and act
 runs with `--action-offline-mode` (the actions the daemon has already), because Claude's code runs in those jobs
-without a prompt; `fix.token = gh` gives them gh's token instead. The history shows them as `fix d4b5174 ·
-round 2 · job`.
+without a prompt; `fix.token = gh` gives them gh's token instead. act's own settings (`act.args`, `act.network`,
+`act.image`, `act.docker_config`) come from the failing commit's bana.conf, not the snapshot's, so Claude's code
+cannot loosen how act isolates its jobs. On a Mac, a round's macOS jobs run on the Mac itself, as you: an empty
+token keeps yours out of the job's environment, but host code can still use your gh sign-in (see
+[the daemon's trust](DAEMON.md#trust)). The history shows rounds as `fix d4b5174 · round 2 · job`.
 
-**Round 0.** A fix made from the page or 🧱 (and a headless one) first runs the failed jobs at the unchanged
-commit with the current bana, while Claude reads. If it passes, the failure did not reproduce here: it depends on
-its environment (ports, parallel jobs, timing), and the brief says so. `bana fix` in a terminal runs no round 0
-yet.
+**Round 0.** Every fix made while the daemon runs (from the page, 🧱, or `bana fix` in a terminal, which
+registers it) first runs the failed jobs at the unchanged commit with the current bana, while Claude reads. If it
+passes, the failure did not reproduce here: it depends on its environment (ports, parallel jobs, timing), and
+the brief says so.
 
 **The Stop gate.** When Claude stops, `bana-manager fix gate` checks the worktree against the last round, from
 files, in well under a second, without running act. If the worktree changed since then, it holds Claude once
 for that tree: "call run_jobs before you stop, or say why you stop without testing". Claude can still stop to ask
-you something. Claude Code loads the gate after you trust the worktree.
+you something. Claude Code loads the gate after you trust the worktree. A fix made without the daemon gets no
+gate: nothing would run its rounds.
 
 ## The limits
 
@@ -111,8 +126,10 @@ The daemon enforces them all:
 
 - `fix.rounds` (5) rounds per fix, not counting round 0. *More rounds* on the fix card adds as many again;
 - one round at a time;
-- a tree that already ran gets that round's result back, unless run_jobs asks for `repeat` (a flaky check);
-- no rounds while the daemon is paused;
+- a tree that already ran with the same jobs gets that round's result back if it passed or failed, unless
+  run_jobs asks for `repeat` (a flaky check); one that ended in error runs again;
+- no rounds while the daemon is paused: run_jobs says so at once, and after ten minutes when Docker or your own
+  `bana ci` holds a round back (the round stays queued);
 - each job keeps `daemon.timeout`.
 
 A refused round comes back to Claude with the reason, and out of rounds the prompt says to stop and sum up.
@@ -123,7 +140,7 @@ A refused round comes back to Claude with the reason, and out of rounds the prom
 commits exactly the green round's tree on `bana/fix-d4b5174` (with a compare-and-swap, so a branch that moved
 meanwhile is left alone) and resets the worktree's index to it. It refuses:
 
-- when the last round was not green, or the worktree changed since it ran;
+- when the last round was not green, did not run the jobs that failed, or the worktree changed since it ran;
 - when the round passed with the failing commit's own tree: environmental or flaky, not fixed;
 - new files the round took in, unless `include_new_files` (the card asks), and it lists them either way.
 
@@ -132,11 +149,12 @@ bana/fix-d4b5174` from your checkout, with your hooks; the daemon then builds th
 statuses. The card links GitHub's compare page, and `bana fix push --pr` opens a pull request against the
 branch that failed.
 
-**Drop.** `bana fix drop`, or *Discard* on the card, removes the worktree and the rounds' refs in the daemon's
-clone; the card also removes the round builds. The branch stays while it has commits.
+**Drop.** `bana fix drop`, or *Discard* on the card, removes the worktree, the round builds (cancelling one
+that runs) and the rounds' refs in the daemon's clone. The branch stays while it has commits. A fix whose
+builds age out of the history loses its refs there too.
 
 ```sh
-bana fix list                        # the fixes: branch, commits, changes, where each came from
+bana fix list                        # the fixes: where each stands, rounds, branch, commits, changes
 bana fix brief [FIX]                 # what failed, where and how it ran
 bana fix push [FIX] [--pr]           # git push -u origin bana/fix-d4b5174; the daemon builds it
 bana fix drop [FIX]                  # remove the worktree; the branch stays while it has commits
@@ -152,13 +170,15 @@ would forget any of your worktrees that is missing just then.
 ## Headless
 
 Only when you type it: `bana fix --headless [BUILD | last | --log FILE|-]` runs Claude Code unattended in the
-worktree (`claude -p`), and needs the daemon. It registers the fix, so round 0 runs. Then Claude may read and search files,
-edit and write them only inside the worktree, and use bana's five tools, commit_fix included; `--permission-mode
-dontAsk` denies anything else without asking, and bana's MCP server is the only one it gets. There is no shell unless `fix.allow` in bana.conf names narrow rules:
+worktree (`claude -p`), and needs the daemon. It registers the fix, so round 0 runs. Then Claude may read and
+search files inside the worktree (and the fix's own files beside it), edit and write them there but for its
+`.git` and `.claude`, and use bana's five tools, commit_fix included; `--permission-mode dontAsk` denies anything
+else without asking, and bana's MCP server is the only one it gets. There is no shell unless `fix.allow` in
+bana.conf names narrow rules:
 
 | Key | Default | What |
 |---|---|---|
-| `fix.allow` | | more Claude Code rules, such as `Bash(cargo test:*) Bash(cargo clippy:*)`. Not all of Bash, and no git rules: `git log --output=…` writes files |
+| `fix.allow` | | more Claude Code rules, such as `Bash(cargo test:*) Bash(cargo clippy:*)`. Not all of Bash, no rule that names git anywhere (`git log --output=…` writes files), and none whose command is a pattern or runs others (`env`, `sh`, `xargs`, …) |
 | `fix.turns` | `60` | at most this many turns |
 | `fix.budget_usd` | `5` | at most this many dollars |
 

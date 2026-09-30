@@ -30,21 +30,28 @@
 //!
 //!   bana-manager fix prepare --dir ~/.bana/<prefix> --checkout DIR
 //!                (--build N | --run | --log FILE|- [--sha S] [--ref R] [--tier T])
-//!                [--repo OWNER/REPO] [--workflow FILE] [--bana CMD] [--headless]
+//!                [--repo OWNER/REPO] [--workflow FILE] [--bana CMD] [--recheck] [--headless]
 //!   bana-manager fix brief --dir ~/.bana/<prefix> [FIX]
+//!   bana-manager fix status --dir ~/.bana/<prefix> [FIX]
 //!   bana-manager fix gate --dir ~/.bana/<prefix>
 //!   bana-manager fix push --dir ~/.bana/<prefix> FIX
 //!   bana-manager fix drop --dir ~/.bana/<prefix> FIX [--force] [--delete-branch]
+//!   bana-manager fix result FILE
 //!
 //! bana fix's Rust side (bana_manager::fix): `prepare` makes (or reuses) the
 //! fix branch's worktree for a daemon build, the last hand run or a pasted log,
 //! writes its brief and prompt, and prints {fix, worktree, branch, link,
-//! command, dir, reused} as JSON (`--headless`: fix.json says Claude runs
-//! unattended, and the prompt that round 0 runs); `brief` prints a fix's brief. `gate` is the
-//! fix worktree's Stop hook: it reads the hook's JSON on stdin and exits 2,
-//! with what Claude should do on stderr, when Claude stops with changes bana
-//! has not run. `push` and `drop` are bana fix push and drop (and the fix
-//! card's Push and Discard); they print what they did as JSON.
+//! command, dir, reused} as JSON (`--recheck`: bana fix registers it with the
+//! daemon next, so the prompt says round 0 runs; `--headless`: fix.json says
+//! Claude runs unattended, and implies `--recheck`); `brief` prints a fix's
+//! brief, and `status` where each fix stands (one JSON line each, the newest
+//! first). `gate` is the fix worktree's Stop hook: it reads the hook's JSON on
+//! stdin and exits 2, with what Claude should do on stderr, when Claude stops
+//! with changes bana has not run. `push` and `drop` are bana fix push and drop
+//! (and the fix card's Push and Discard); they print what they did as JSON.
+//! `result` prints how a headless run ended ({subtype, num_turns,
+//! total_cost_usd, session_id}), from the last result line of Claude Code's
+//! stream-json in FILE.
 //!
 //!   bana-manager mcp --dir ~/.bana/<prefix> [--config]
 //!
@@ -66,7 +73,7 @@ use tokio::sync::Notify;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: bana-manager --script PATH --repo OWNER/REPO [--port N] [--workflow FILE] [--tiers A,B] [--tier-input NAME] [--gh PATH] [--token T]\n       bana-manager daemon --dir DIR [--no-tray]\n       bana-manager results (--json FILE | --text FILE|-)\n       bana-manager fix prepare --dir DIR --checkout DIR (--build N | --run | --log FILE|- [--sha S] [--ref R] [--tier T]) [--repo OWNER/REPO] [--workflow FILE] [--bana CMD] [--headless]\n       bana-manager fix brief --dir DIR [FIX]\n       bana-manager fix gate --dir DIR\n       bana-manager fix push --dir DIR FIX\n       bana-manager fix drop --dir DIR FIX [--force] [--delete-branch]\n       bana-manager mcp --dir DIR [--config]"
+        "usage: bana-manager --script PATH --repo OWNER/REPO [--port N] [--workflow FILE] [--tiers A,B] [--tier-input NAME] [--gh PATH] [--token T]\n       bana-manager daemon --dir DIR [--no-tray]\n       bana-manager results (--json FILE | --text FILE|-)\n       bana-manager fix prepare --dir DIR --checkout DIR (--build N | --run | --log FILE|- [--sha S] [--ref R] [--tier T]) [--repo OWNER/REPO] [--workflow FILE] [--bana CMD] [--recheck] [--headless]\n       bana-manager fix brief --dir DIR [FIX]\n       bana-manager fix status --dir DIR [FIX]\n       bana-manager fix gate --dir DIR\n       bana-manager fix push --dir DIR FIX\n       bana-manager fix drop --dir DIR FIX [--force] [--delete-branch]\n       bana-manager fix result FILE\n       bana-manager mcp --dir DIR [--config]"
     );
     std::process::exit(2)
 }
@@ -303,12 +310,18 @@ fn fix(mut args: impl Iterator<Item = String>) {
     use bana_manager::fix::{self, Prepare, Source};
     use bana_manager::valid_ref;
     let sub = args.next().unwrap_or_else(|| usage());
+    if sub == "result" {
+        let (Some(file), None) = (args.next(), args.next()) else {
+            usage()
+        };
+        return headless_result(&file);
+    }
     let (mut dir, mut checkout, mut name) = (None, None, None);
     let (mut build, mut run, mut log) = (None, false, None);
     let (mut sha, mut git_ref, mut tier) = (None, None, None);
     let (mut repo, mut workflow, mut bana) = (None, None, None);
-    let (mut force, mut delete_branch, mut headless) = (false, false, false);
-    let named = ["brief", "push", "drop"].contains(&sub.as_str());
+    let (mut force, mut delete_branch, mut headless, mut recheck) = (false, false, false, false);
+    let named = ["brief", "status", "push", "drop"].contains(&sub.as_str());
     while let Some(a) = args.next() {
         let mut value = || args.next().unwrap_or_else(|| usage());
         match a.as_str() {
@@ -326,6 +339,7 @@ fn fix(mut args: impl Iterator<Item = String>) {
             "--force" if sub == "drop" => force = true,
             "--delete-branch" if sub == "drop" => delete_branch = true,
             "--headless" if sub == "prepare" => headless = true,
+            "--recheck" if sub == "prepare" => recheck = true,
             n if named && name.is_none() && !n.starts_with('-') => name = Some(n.to_string()),
             _ => usage(),
         }
@@ -352,6 +366,25 @@ fn fix(mut args: impl Iterator<Item = String>) {
             return done(fix::brief(&dir, name.as_deref(), cwd.as_deref()));
         }
         "gate" => gate(&dir),
+        "status" => {
+            let one = match &name {
+                Some(n) => match fix::find(&dir, Some(n), None) {
+                    Ok(sha7) => Some(sha7),
+                    Err(e) => return done(Err(e)),
+                },
+                None => None,
+            };
+            let mut out = String::new();
+            for f in fix::fixes(&dir) {
+                if one.as_ref().is_some_and(|x| *x != f.fix) {
+                    continue;
+                }
+                let st = fix::status(&dir, &f, "git", None);
+                out.push_str(&serde_json::to_string(&st).unwrap_or_default());
+                out.push('\n');
+            }
+            return done(Ok(out));
+        }
         "push" | "drop" => {
             let Some(name) = name else { usage() };
             return done(if sub == "push" {
@@ -418,13 +451,33 @@ fn fix(mut args: impl Iterator<Item = String>) {
     if let Some(b) = bana {
         p.bana = b;
     }
-    if headless {
-        // bana fix registers it with the daemon next, which queues round 0
-        // unless the fix has rounds already.
-        p.headless = true;
-        p.recheck = p.rounds.is_some();
-    }
+    // bana fix registers it with the daemon next, which queues round 0
+    // unless the fix has rounds already.
+    p.headless = headless;
+    p.recheck = (recheck || headless) && p.rounds.is_some();
     done(fix::prepare(&p).map(|made| pretty(&made)));
+}
+
+/// `fix result FILE`: how a headless Claude Code ended, from its stream-json:
+/// the last line whose `type` is `result`, whatever the order of its keys.
+fn headless_result(file: &str) {
+    let text = std::fs::read_to_string(file).unwrap_or_else(|e| fail(&format!("{file}: {e}")));
+    let last = text
+        .lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["type"] == "result");
+    let Some(r) = last else {
+        eprintln!("bana-manager: {file}: no result line");
+        std::process::exit(1)
+    };
+    let out = serde_json::json!({
+        "subtype": r["subtype"],
+        "num_turns": r["num_turns"],
+        "total_cost_usd": r["total_cost_usd"],
+        "session_id": r["session_id"],
+    });
+    println!("{out}");
 }
 
 fn pretty<T: serde::Serialize>(v: &T) -> String {
@@ -452,9 +505,8 @@ fn mcp(mut args: impl Iterator<Item = String>) {
         return;
     }
     let cwd = std::env::current_dir().unwrap_or_else(|e| fail(&format!("the directory: {e}")));
-    let mut server = bana_manager::mcp::Server::new(&dir, &cwd);
-    let (stdin, stdout) = (std::io::stdin(), std::io::stdout());
-    if let Err(e) = server.serve(stdin.lock(), stdout.lock()) {
+    let server = bana_manager::mcp::Server::new(&dir, &cwd);
+    if let Err(e) = server.serve(std::io::stdin().lock(), std::io::stdout()) {
         eprintln!("bana mcp: {e}");
     }
 }

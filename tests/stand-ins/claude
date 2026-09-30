@@ -2,8 +2,10 @@
 # Stand-in Claude Code: it never runs a prompt. It logs its arguments and where it ran, and
 # keeps them for the tests in $FAKE_STATE: claude.cwd, and claude.args (each argument ends
 # with a NUL). --version answers as Claude Code does. `mcp add|remove|get NAME` keep the
-# names registered in claude.mcp, one a line (get fails for one that is not there).
-# -p (headless) prints stream-json as Claude Code does, ending in a result line
+# names registered in claude.mcp, one a line (get fails for one that is not there, and
+# with FAKE_CLAUDE_MCP_DOWN set says it failed to connect, exiting 0 as Claude Code does).
+# -p (headless) prints stream-json as Claude Code does, ending in a result line, its keys
+# in Claude Code's order (type near the end)
 # (FAKE_CLAUDE_SUBTYPE: its subtype, success by default; any other exits 1). With
 # FAKE_CLAUDE_FIX set it edits that file (if one is named) and neither tests nor commits
 # it, then stops as Claude Code does: it runs the worktree's Stop hooks with
@@ -27,7 +29,11 @@ if [ "${1:-}" = mcp ]; then
   remove | get)
     for n; do :; done
     grep -qx "$n" "$reg" 2>/dev/null || { echo "No MCP server named \"$n\"" >&2; exit 1; }
-    if [ "$2" = get ]; then echo "$n: Connected"; exit 0; fi
+    if [ "$2" = get ] && [ -n "${FAKE_CLAUDE_MCP_DOWN:-}" ]; then
+      printf '%s:\n  Scope: Local config\n  Status: \342\234\230 Failed to connect\n' "$n"
+      exit 0
+    fi
+    if [ "$2" = get ]; then printf '%s:\n  Scope: Local config\n  Status: \342\234\223 Connected\n' "$n"; exit 0; fi
     grep -vx "$n" "$reg" >"$reg.new" || true
     mv "$reg.new" "$reg"
     echo "Removed MCP server $n"
@@ -69,7 +75,10 @@ if fix is not None:
             break
         turns += 1
 sub = os.environ.get("FAKE_CLAUDE_SUBTYPE", "success")
-out(type="result", subtype=sub, is_error=sub != "success", duration_ms=1234, num_turns=turns,
-    result="Done." if sub == "success" else "", session_id=sid, total_cost_usd=0.4213)
+# As Claude Code 2.1.284 builds it: the common keys, the variant keys, then type.
+out(duration_api_ms=1000, stop_reason="end_turn", session_id=sid, total_cost_usd=0.4213,
+    is_error=sub != "success", num_turns=turns, subtype=sub,
+    result="Done." if sub == "success" else "", type="result", duration_ms=1234,
+    uuid="5f0c1a2e-0000-4000-8000-000000000002")
 sys.exit(0 if sub == "success" else 1)
 ' "$FAKE_STATE"; done

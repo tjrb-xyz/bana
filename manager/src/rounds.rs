@@ -12,7 +12,7 @@
 //!   fix card raises it);
 //! - one round at a time;
 //! - a tree equal to the last finished round's gets that round back, unless
-//!   `repeat`;
+//!   `repeat`, if that round passed or failed with the jobs asked for;
 //! - none while the daemon is paused.
 
 use crate::actlog::BuildState;
@@ -113,10 +113,16 @@ impl Rounds {
         self.rounds.iter().find(|r| !r.state.finished())
     }
 
-    /// Whether a round of `tree` may run now, in the limits' order: one at a
-    /// time; the same tree again gets its result; not while `paused`; not
-    /// past the limit.
-    pub fn ask(&self, tree: &str, repeat: bool, paused: bool) -> Result<Ask, Refused> {
+    /// Whether a round of `jobs` on `tree` may run now, in the limits' order:
+    /// one at a time; the same tree again gets its result ([`Round::answers`]);
+    /// not while `paused`; not past the limit.
+    pub fn ask(
+        &self,
+        tree: &str,
+        jobs: &[String],
+        repeat: bool,
+        paused: bool,
+    ) -> Result<Ask, Refused> {
         if let Some(r) = self.running() {
             let what = if r.n == 0 {
                 "round 0 (the recheck at the failing commit)".to_string()
@@ -130,7 +136,7 @@ impl Rounds {
         }
         if !repeat {
             let last = self.rounds.iter().rev().find(|r| r.state.finished());
-            if let Some(r) = last.filter(|r| r.tree == tree) {
+            if let Some(r) = last.filter(|r| r.tree == tree && r.answers(jobs)) {
                 return Ok(Ask::Same(r.n));
             }
         }
@@ -150,6 +156,25 @@ impl Rounds {
             });
         }
         Ok(Ask::New(self.rounds.last().map_or(1, |r| r.n + 1).max(1)))
+    }
+}
+
+impl Round {
+    /// Whether it ran each of `jobs`: a round of other jobs says nothing of
+    /// them (commit_fix wants the failed ones green).
+    pub fn covers(&self, jobs: &[String]) -> bool {
+        jobs.iter().all(|j| self.jobs.contains(j))
+    }
+
+    /// Whether its result answers a round of `jobs` on its tree: it ran those
+    /// jobs (more of them only if all passed), and passed or failed. One that
+    /// ended in error (cancelled, timed out, could not start) says nothing.
+    pub fn answers(&self, jobs: &[String]) -> bool {
+        match self.state {
+            BuildState::Success => self.covers(jobs),
+            BuildState::Failure => self.covers(jobs) && self.jobs.len() == jobs.len(),
+            _ => false,
+        }
     }
 }
 
@@ -250,9 +275,14 @@ mod tests {
         Round {
             n,
             tree: tree.into(),
+            jobs: vec!["rust".into()],
             state,
             ..Round::default()
         }
+    }
+
+    fn jobs(names: &[&str]) -> Vec<String> {
+        names.iter().map(|j| j.to_string()).collect()
     }
 
     fn build(id: u64, job: &str, state: BuildState) -> RoundBuild {
@@ -266,37 +296,66 @@ mod tests {
     #[test]
     fn the_limits_in_their_order() {
         use BuildState::*;
+        let rust = jobs(&["rust"]);
         let mut rs = Rounds::new(2);
-        assert_eq!(rs.ask("t0", false, false), Ok(Ask::New(1)), "no round 0");
+        assert_eq!(
+            rs.ask("t0", &rust, false, false),
+            Ok(Ask::New(1)),
+            "no round 0"
+        );
         rs.rounds.push(round(0, "t0", Running));
-        let e = rs.ask("t1", false, false).unwrap_err();
+        let e = rs.ask("t1", &rust, false, false).unwrap_err();
         assert_eq!(e.running, Some(0));
         assert!(e.why.starts_with("round 0 (the recheck"), "{e:?}");
         rs.rounds[0].state = Failure;
         assert_eq!(
-            rs.ask("t0", false, false),
+            rs.ask("t0", &rust, false, false),
             Ok(Ask::Same(0)),
             "the base again"
         );
-        assert_eq!(rs.ask("t0", true, false), Ok(Ask::New(1)), "repeat");
-        assert_eq!(rs.ask("t0", false, true), Ok(Ask::Same(0)), "even paused");
-        let e = rs.ask("t1", false, true).unwrap_err();
+        assert_eq!(rs.ask("t0", &rust, true, false), Ok(Ask::New(1)), "repeat");
+        assert_eq!(
+            rs.ask("t0", &rust, false, true),
+            Ok(Ask::Same(0)),
+            "even paused"
+        );
+        assert_eq!(
+            rs.ask("t0", &jobs(&["web"]), false, false),
+            Ok(Ask::New(1)),
+            "other jobs: that round never ran them"
+        );
+        assert_eq!(
+            rs.ask("t0", &jobs(&["rust", "web"]), false, false),
+            Ok(Ask::New(1)),
+            "nor all of these"
+        );
+        let e = rs.ask("t1", &rust, false, true).unwrap_err();
         assert!(e.why.contains("paused") && e.running.is_none(), "{e:?}");
-        assert_eq!(rs.ask("t1", false, false), Ok(Ask::New(1)));
+        assert_eq!(rs.ask("t1", &rust, false, false), Ok(Ask::New(1)));
 
-        rs.rounds.push(round(1, "t1", Success));
+        rs.rounds.push(Round {
+            jobs: jobs(&["rust", "web"]),
+            ..round(1, "t1", Success)
+        });
+        assert_eq!(
+            rs.ask("t1", &rust, false, false),
+            Ok(Ask::Same(1)),
+            "a green round of more jobs answers for fewer"
+        );
         rs.rounds.push(round(2, "t2", Queued));
         assert_eq!((rs.used(), rs.left()), (2, 0));
-        assert_eq!(rs.ask("t3", false, false).unwrap_err().running, Some(2));
-        rs.rounds[2].state = Error;
-        assert_eq!(rs.ask("t2", false, false), Ok(Ask::Same(2)));
         assert_eq!(
-            rs.ask("t1", false, false).unwrap_err().why,
+            rs.ask("t3", &rust, false, false).unwrap_err().running,
+            Some(2)
+        );
+        rs.rounds[2].state = Error;
+        assert_eq!(
+            rs.ask("t2", &rust, false, false).unwrap_err().why,
             "all 2 rounds of this fix are used: stop, and sum up what you found and what you would try next (the owner can give it more rounds)",
-            "only the last finished round's tree is given back"
+            "a round that ended in error answers nothing; only the last finished round's tree is given back"
         );
         rs.limit += 2;
-        assert_eq!(rs.ask("t1", false, false), Ok(Ask::New(3)));
+        assert_eq!(rs.ask("t2", &rust, false, false), Ok(Ask::New(3)));
         assert_eq!(rs.left(), 2);
     }
 

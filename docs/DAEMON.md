@@ -149,11 +149,13 @@ tier and before, at the front of the queue, behind the running build: they never
 They differ from pushes: they post no statuses, move no branch's last green commit, never count as built and are
 never replaced. Their `GITHUB_TOKEN` is empty and act gets `--action-offline-mode`, so they use the actions the
 daemon already has; `fix.token = gh` gives them gh's token (a fix that moves an action pin to a commit the daemon
-never ran needs it). The history shows them as `fix d4b5174 · round 2 · job`. A round cut short by a restart
-runs again once, like any build.
+never ran needs it). act's own settings (`act.*`) come from the failing commit's bana.conf, which the daemon
+saves as the build's `round.conf`, not from the snapshot. The history shows them as `fix d4b5174 · round 2 · job`.
+A round cut short by a restart runs again once, like any build.
 
 A fix gets `fix.rounds` rounds, one at a time, and none while the daemon is paused. Round 0, the failed jobs at
-the failing commit, runs when the page or 🧱 makes a fix. The daemon touches your checkout only when you click:
+the failing commit, runs when a fix is made or registered: from the page or 🧱, or `bana fix` while the daemon
+runs. When a fix's builds leave the history (pruned, or its fix dropped), its refs in the daemon's clone go too. The daemon touches your checkout only when you click:
 *Fix with Claude* (the worktree), *Keep*, *Push* and *Discard*.
 
 ## Sleep, wake and restarts
@@ -234,7 +236,7 @@ What the pushed commit cannot change: act runs in the build's directory, so an `
 (yours in `~` still is), and the tree's `.env`, `.input`, `.vars` and `.secrets` are ignored. Job containers
 get no Docker socket, and act gets only a short list of the daemon's environment (`PATH`, `HOME`, `USER`,
 `LOGNAME`, `SHELL`, `LANG`, `LC_ALL`, `TMPDIR`, `DOCKER_HOST`). `act.args` is read from the commit, which is the
-same trust as the workflow.
+same trust as the workflow; a fix round reads it from the failing commit, not from Claude's snapshot.
 
 While a build runs, act's artifact and cache servers listen without a password on the Mac's network address, so
 on a shared network (café Wi-Fi) a neighbour could reach them. The macOS firewall may ask once about act.

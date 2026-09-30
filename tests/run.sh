@@ -194,6 +194,24 @@ check "daemon ci: no --input (act ignores it with an event)" lacks "$FAKE_LOG" "
 check "daemon ci: the secret file has the token, not gh" lacks "$FAKE_LOG" "-s GITHUB_TOKEN"
 check "daemon ci: gh is not asked" lacks "$FAKE_LOG" "gh auth"
 check "daemon ci: act.args, then the daemon's options" has "$FAKE_LOG" "--reuse --secret-file $build/secrets --json"
+# A fix round: act's settings from the failing commit's bana.conf, not the snapshot's.
+cp "$src/.github/bana.conf" "$T/w/bana.conf.was"
+echo 'act.args = --privileged -P ubuntu-latest=-self-hosted' >>"$src/.github/bana.conf"
+echo 'act.network = host' >>"$src/.github/bana.conf"
+echo 'act.args = --reuse' >"$T/w/round.conf"
+: >"$FAKE_LOG"
+BANA_ROUND_CONF=$T/w/round.conf BANA_PROJECT_ROOT=$src BANA_ACT_LOCKED=1 bash "$bana" ci quick --event event.json -- --secret-file secrets --json >/dev/null
+check "daemon round: act.args of the failing commit" has "$FAKE_LOG" "--reuse --secret-file $build/secrets --json"
+check "daemon round: not the snapshot's" lacks "$FAKE_LOG" "--privileged"
+check "daemon round: nor its act.network" has "$FAKE_LOG" "--network bridge"
+check "daemon round: BANA_ROUND_CONF does not reach act's jobs" lacks "$FAKE_STATE/act.env" "BANA_ROUND_CONF="
+: >"$T/w/round.conf"
+: >"$FAKE_LOG"
+BANA_ROUND_CONF=$T/w/round.conf BANA_PROJECT_ROOT=$src BANA_ACT_LOCKED=1 bash "$bana" ci quick --event event.json -- --json >/dev/null
+check "daemon round: a failing commit without bana.conf: act's defaults" lacks "$FAKE_LOG" "--reuse"
+mv "$T/w/bana.conf.was" "$src/.github/bana.conf"
+: >"$FAKE_LOG"
+BANA_PROJECT_ROOT=$src BANA_ACT_LOCKED=1 bash "$bana" ci quick --event event.json -- --secret-file secrets --json >/dev/null
 check "daemon ci: BANA_PROJECT_ROOT does not reach act's jobs" lacks "$FAKE_STATE/act.env" "BANA_PROJECT_ROOT="
 check "daemon ci: nor BANA_ACT_LOCKED" lacks "$FAKE_STATE/act.env" "BANA_ACT_LOCKED="
 check "daemon ci: BANA_ACT_LOCKED=1 leaves the lock to the daemon" test ! -e "$HOME/.bana/act.lock"
@@ -449,6 +467,8 @@ print(s["type"], s["command"], *s["args"])' "$(claude_arg 2)")" "stdio $dp/daemo
   bash "$bana" fix --log - <"$paste" >"$T/out" 2>&1 || true
   check "fix --log -: pasted on stdin, at the same commit: its fix goes on" has "$T/out" "Fix $x1 goes on: bana/fix-$x1"
   check "fix: Claude Code has bana's tools there: no --mcp-config" same "$(claude_argc) $(claude_arg 1)" "3 -n"
+  FAKE_CLAUDE_MCP_DOWN=1 bash "$bana" fix --log "$paste" >"$T/out" 2>&1 || true
+  check "fix: registered, but its server does not start: --mcp-config after all" same "$(claude_arg 1)" "--mcp-config"
   (cd "$wt" && bash "$bana" fix brief) >"$T/out" 2>&1 || true
   check "fix brief: in a fix's worktree, its brief" same "$(head -1 "$T/out")" "# bana fix $x1"
   printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}' \
@@ -547,9 +567,9 @@ print(q["cwd"][0], q["q"][0] == open(sys.argv[2], encoding="utf-8").read())' "$l
   check "fix: and its prompt" has "$T/out" "prompt:   $d/fix/$x3.d/prompt.txt"
 
   bash "$bana" fix list >"$T/out" 2>&1 || true
-  check "fix list: the paste's fix" has "$T/out" "$x1  bana/fix-$x1: no commits yet (a pasted log, on ${br#refs/heads/})"
-  check "fix list: the hand run's" has "$T/out" "$x2  bana/fix-$x2: no commits yet (bana ci here, on ${br#refs/heads/})"
-  check "fix list: the daemon build's" has "$T/out" "$x3  bana/fix-$x3: no commits yet (daemon build 42, on ${br#refs/heads/})"
+  check "fix list: the paste's fix, open (no daemon, no rounds)" has "$T/out" "$x1  open; bana/fix-$x1: no commits yet (a pasted log, on ${br#refs/heads/})"
+  check "fix list: the hand run's" has "$T/out" "$x2  open; bana/fix-$x2: no commits yet (bana ci here, on ${br#refs/heads/})"
+  check "fix list: the daemon build's" has "$T/out" "$x3  open; bana/fix-$x3: no commits yet (daemon build 42, on ${br#refs/heads/})"
 
   # push goes to origin (a local bare one here); --pr asks gh for a pull request.
   bash "$bana" fix push "$x1" >"$T/out" 2>&1 || true
@@ -575,7 +595,7 @@ print(q["cwd"][0], q["q"][0] == open(sys.argv[2], encoding="utf-8").read())' "$l
   check "fix drop: a branch with commits stays" same "$(git rev-parse -q --verify "refs/heads/bana/fix-$x1" || true)" \
     "$(git -C "$T/w/origin.git" rev-parse "refs/heads/bana/fix-$x1")"
   bash "$bana" fix list >"$T/out" 2>&1 || true
-  check "fix drop: and so does its fix" has "$T/out" "$x1  bana/fix-$x1: 1 commit, worktree removed"
+  check "fix drop: and so does its fix" has "$T/out" "$x1  pushed; bana/fix-$x1: 1 commit, worktree removed"
   bash "$bana" fix drop "$x1" --delete-branch >/dev/null 2>&1 || true
   check "fix drop --delete-branch: the branch goes too" same "$(git rev-parse -q --verify "refs/heads/bana/fix-$x1" || true)" ""
   check "fix drop --delete-branch: and the fix" test ! -e "$d/fix/$x1.d"
@@ -654,6 +674,10 @@ print(len(p.encode("utf-16-le")) // 2 <= 5000, "tests::case_3" in p)' "$d/fix/$x
   check "fix --headless: fix.allow gives no Bash at large" has "$T/out" "fix.allow: narrow rules only"
   BANA_FIX_ALLOW='Bash(git log:*)' bash "$bana" fix --log "$paste" --headless >"$T/out" 2>&1 || true
   check "fix --headless: nor git (--output writes files)" has "$T/out" "fix.allow: narrow rules only"
+  for r in 'Bash(/usr/bin/git log:*)' 'Bash(env git log:*)' 'Bash(cargo test:*) Bash(xargs:*)' 'Bash(* test)' 'Bash(make -C x git:*)'; do
+    BANA_FIX_ALLOW=$r bash "$bana" fix --log "$paste" --headless >"$T/out" 2>&1 || true
+    check "fix --headless: nor $r" has "$T/out" "fix.allow: narrow rules only"
+  done
   BANA_FIX_TURNS=0 bash "$bana" fix --log "$paste" --headless >"$T/out" 2>&1 || true
   check "fix --headless: fix.turns is checked" has "$T/out" "fix.turns: a number from 1 to 9999, not '0'"
   BANA_FIX_BUDGET_USD=lots bash "$bana" fix --log "$paste" --headless >"$T/out" 2>&1 || true
@@ -677,18 +701,22 @@ print(len(p.encode("utf-16-le")) // 2 <= 5000, "tests::case_3" in p)' "$d/fix/$x
   check "fix --headless: -p, with the prompt" same "$(claude_arg 1)$(claude_arg 2)" "-p$(cat "$d/fix/$x5.d/prompt.txt")"
   check "fix --headless: named, and dontAsk: what is not listed is denied, not asked" \
     same "$(claude_arg 3) $(claude_arg 4) $(claude_arg 5) $(claude_arg 6)" "-n bana fix $x5 --permission-mode dontAsk"
-  check "fix --headless: Read, Grep, Glob, Edit and Write in the worktree only, bana's tools, and fix.allow" \
-    same "$(claude_arg 7) $(claude_arg 8)" "--allowedTools Read Grep Glob Edit(/$wt5/**) Write(/$wt5/**) mcp__bana__fix_brief mcp__bana__ci_log mcp__bana__run_jobs mcp__bana__fix_status mcp__bana__commit_fix Bash(cargo test:*)"
+  sd5=$(cd "$d/fix/$x5.d" && pwd -P)
+  check "fix --headless: Read, Grep, Glob, Edit and Write in the worktree only (and the fix's files), bana's tools, and fix.allow" \
+    same "$(claude_arg 7) $(claude_arg 8)" "--allowedTools Read(/$wt5/**) Grep(/$wt5/**) Glob(/$wt5/**) Read(/$sd5/**) Edit(/$wt5/**) Write(/$wt5/**) mcp__bana__fix_brief mcp__bana__ci_log mcp__bana__run_jobs mcp__bana__fix_status mcp__bana__commit_fix Bash(cargo test:*)"
+  check "fix --headless: but not the worktree's .git, nor Claude Code's settings there" \
+    same "$(claude_arg 9) $(claude_arg 10)" "--disallowedTools Edit(/$wt5/.git) Edit(/$wt5/.git/**) Edit(/$wt5/.claude/**)"
+  check "fix --headless: which its settings deny too" has "$wt5/.claude/settings.local.json" "\"Edit(/$wt5/.claude/**)\""
   check "fix --headless: capped: fix.turns and fix.budget_usd" \
-    same "$(claude_arg 9) $(claude_arg 10) $(claude_arg 11) $(claude_arg 12)" "--max-turns 60 --max-budget-usd 5"
-  check "fix --headless: bana's MCP server alone" same "$(claude_arg 13) $(claude_arg 14)" "--strict-mcp-config --mcp-config"
+    same "$(claude_arg 11) $(claude_arg 12) $(claude_arg 13) $(claude_arg 14)" "--max-turns 60 --max-budget-usd 5"
+  check "fix --headless: bana's MCP server alone" same "$(claude_arg 15) $(claude_arg 16)" "--strict-mcp-config --mcp-config"
   check "fix --headless: this bana-manager's, for this project" same "$(python3 -c 'import json, sys
 s = json.loads(sys.argv[1])["mcpServers"]
-print(list(s), s["bana"]["args"])' "$(claude_arg 15)")" "['bana'] ['mcp', '--dir', '$dp']"
+print(list(s), s["bana"]["args"])' "$(claude_arg 17)")" "['bana'] ['mcp', '--dir', '$dp']"
   check "fix --headless: stream-json, and nothing else" \
-    same "$(claude_arg 16) $(claude_arg 17) $(claude_arg 18) $(claude_argc)" "--output-format stream-json --verbose 18"
-  check "fix --headless: the stream is kept in claude.jsonl" \
-    same "$(json_lines <"$d/fix/$x5.d/claude.jsonl" && tail -1 "$d/fix/$x5.d/claude.jsonl" | cut -c1-35)" '{"type": "result", "subtype": "succ'
+    same "$(claude_arg 18) $(claude_arg 19) $(claude_arg 20) $(claude_argc)" "--output-format stream-json --verbose 20"
+  check "fix --headless: the stream is kept in claude.jsonl, its result line in Claude Code's key order" \
+    same "$(json_lines <"$d/fix/$x5.d/claude.jsonl" && tail -1 "$d/fix/$x5.d/claude.jsonl" | cut -c1-40)" '{"duration_api_ms": 1000, "stop_reason":'
   check "fix --headless: the Stop gate blocked the untested change once, then let Claude stop" \
     same "$(tr '\n' ' ' <"$FAKE_STATE/claude.stops")" "2 0 "
   check "fix --headless: and told Claude why" has "$d/fix/$x5.d/claude.jsonl" "Call run_jobs before you stop"
@@ -706,11 +734,25 @@ print(list(s), s["bana"]["args"])' "$(claude_arg 15)")" "['bana'] ['mcp', '--dir
   FAKE_CLAUDE_FIX='' FAKE_CLAUDE_SUBTYPE=error_max_turns bash "$bana" fix --log "$paste" --headless >"$T/out" 2>&1 || rc=$?
   check "fix --headless: fails when Claude Code does" same "$rc" 1
   check "fix --headless: no Bash without fix.allow" same "$(claude_arg 8)" \
-    "Read Grep Glob Edit(/$wt5/**) Write(/$wt5/**) mcp__bana__fix_brief mcp__bana__ci_log mcp__bana__run_jobs mcp__bana__fix_status mcp__bana__commit_fix"
+    "Read(/$wt5/**) Grep(/$wt5/**) Glob(/$wt5/**) Read(/$sd5/**) Edit(/$wt5/**) Write(/$wt5/**) mcp__bana__fix_brief mcp__bana__ci_log mcp__bana__run_jobs mcp__bana__fix_status mcp__bana__commit_fix"
   check "fix --headless: a fix with rounds gets no round 0 again, nor says so" lacks "$d/fix/$x5.d/prompt.txt" "round 0"
   check "fix --headless: the gate blocked once for the red round" same "$(tr '\n' ' ' <"$FAKE_STATE/claude.stops")" "2 0 "
   check "fix --headless: with what failed" has "$d/fix/$x5.d/claude.jsonl" "Round 0 failed: rust (build 9). You have 5 rounds left"
   check "fix --headless: says how Claude Code stopped" has "$T/out" "Claude Code stopped: error_max_turns"
+
+  # With the daemon, a fix in a terminal is registered too (round 0), and bana fix list
+  # says where each stands; bana fix drop tells the daemon, which drops its round builds.
+  : >"$FAKE_LOG"
+  bash "$bana" fix --log "$paste" >"$T/out" 2>&1 || true
+  check "fix: in a terminal too, the fix is registered with the daemon" has "$FAKE_LOG" \
+    "-X POST -H Content-Type: application/json --data {\"fix\":\"$x5\"} http://127.0.0.1:8470/ci/v1/fixes"
+  check "fix: and Claude Code starts, interactive" same "$(claude_arg 1)" "-n"
+  bash "$bana" fix list >"$T/out" 2>&1 || true
+  check "fix list: where it stands, its rounds and round 0" has "$T/out" "$x5  open, 0 of 5 rounds, round 0 failed; bana/fix-$x5"
+  : >"$FAKE_LOG"
+  bash "$bana" fix drop "$x5" --force >"$T/out" 2>&1 || true
+  check "fix drop: tells the daemon" has "$FAKE_LOG" "-X POST http://127.0.0.1:8470/ci/v1/fixes/$x5/forget"
+  check "fix drop: which dropped its round builds" has "$T/out" "the daemon dropped its 2 round builds"
   unset FAKE_HEALTH
   rm -f "$d/daemon/settings"
   bash "$bana" fix drop "$x5" --force >/dev/null 2>&1 || true

@@ -153,7 +153,12 @@ fn the_legacy_handshake_echoes_the_versions_it_knows() {
     assert_eq!(replies.len(), asked.len());
     for (i, v) in asked.iter().enumerate() {
         let r = &by_id(&replies, i as u64)["result"];
-        let want = if i < 4 { v } else { "2025-11-25" };
+        // Not 2025-03-26, whose servers must take batches.
+        let want = if [0, 1, 3].contains(&i) {
+            v
+        } else {
+            "2025-11-25"
+        };
         assert_eq!(r["protocolVersion"], want, "{v}: {r}");
         assert_eq!(r["serverInfo"]["name"], "bana");
         assert_eq!(r["capabilities"], json!({"tools": {}}));
@@ -304,35 +309,63 @@ fn errors_are_json_rpcs() {
             "[1, 2]".into(),
             String::new(),
             call(8, "commit_fix", json!({"message": ""})).to_string(),
+            r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#.into(),
         ],
     );
     assert_eq!(by_id(&replies, 1)["error"]["code"], -32601);
-    for id in [2, 3, 4, 5, 6, 7, 8] {
+    // An unknown tool, or no name: the protocol's errors.
+    for id in [2, 7] {
         let r = by_id(&replies, id);
         assert_eq!(r["error"]["code"], -32602, "{id}: {r}");
         assert!(r.get("result").is_none());
     }
+    // Arguments that do not fit: the tool's, so Claude can try again.
+    for (id, why) in [
+        (3, "fix_brief: fix: a string"),
+        (4, "ci_log: job is required"),
+        (5, "fix_status: no argument \"verbose\""),
+        (6, "run_jobs: jobs: a list of strings"),
+        (
+            8,
+            "commit_fix: message: what was wrong, and why this fixes it",
+        ),
+    ] {
+        let got = tool_error(by_id(&replies, id));
+        assert_eq!(got, why, "{id}");
+    }
     let nulls: Vec<&Value> = replies.iter().filter(|r| r["id"].is_null()).collect();
-    assert_eq!(nulls.len(), 2, "{replies:?}");
+    assert_eq!(nulls.len(), 3, "{replies:?}");
     assert_eq!(nulls[0]["error"]["code"], -32700);
-    assert_eq!(nulls[1]["error"]["code"], -32600);
-    assert_eq!(replies.len(), 11, "the empty line has no reply");
+    assert_eq!(nulls[1]["error"]["code"], -32600, "a batch");
+    assert_eq!(nulls[2]["error"]["code"], -32600, "an id of null");
+    assert_eq!(replies.len(), 12, "the empty line has no reply");
     let _ = std::fs::remove_dir_all(&d);
 }
 
 #[test]
 fn a_fixs_tools_answer_from_its_files_without_the_daemon() {
     let root = scratch("files");
-    let (dir, wt) = (root.join("home/wid"), root.join("wt"));
+    let (dir, co, wt) = (root.join("home/wid"), root.join("co"), root.join("wt"));
     std::fs::create_dir_all(dir.join("daemon")).unwrap();
-    std::fs::create_dir_all(&wt).unwrap();
-    git(&wt, &["init", "-q", "-b", "main"]);
-    std::fs::write(wt.join("lib.rs"), "one\n").unwrap();
-    git(&wt, &["add", "-A"]);
-    git(&wt, &["commit", "-q", "-m", "one"]);
-    let sha = git(&wt, &["rev-parse", "HEAD"]);
+    std::fs::create_dir_all(&co).unwrap();
+    git(&co, &["init", "-q", "-b", "main"]);
+    std::fs::write(co.join("lib.rs"), "one\n").unwrap();
+    git(&co, &["add", "-A"]);
+    git(&co, &["commit", "-q", "-m", "one"]);
+    let sha = git(&co, &["rev-parse", "HEAD"]);
     let sha7 = &sha[..7];
-    git(&wt, &["switch", "-q", "-c", &format!("bana/fix-{sha7}")]);
+    let branch = format!("bana/fix-{sha7}");
+    git(
+        &co,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            &branch,
+            &wt.to_string_lossy(),
+        ],
+    );
     // Nothing listens on the settings' port.
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
@@ -346,7 +379,7 @@ fn a_fixs_tools_answer_from_its_files_without_the_daemon() {
     let state = dir.join(format!("fix/{sha7}.d"));
     std::fs::create_dir_all(&state).unwrap();
     let fix = json!({"version": 1, "fix": sha7, "origin": "log", "sha": sha, "ref": "refs/heads/main",
-        "jobs": ["rust"], "checkout": wt, "worktree": wt, "branch": format!("bana/fix-{sha7}")});
+        "jobs": ["rust"], "checkout": co, "worktree": wt, "branch": branch});
     std::fs::write(state.join("fix.json"), fix.to_string()).unwrap();
     // The owner's pasted log, folded as bana fix folds it.
     let folded = Command::new(BIN)

@@ -535,6 +535,7 @@ fn local_routes(d: Daemon) -> Router {
         .route("/fixes/{fix}/keep", post(keep_fix))
         .route("/fixes/{fix}/push", post(push_fix))
         .route("/fixes/{fix}/drop", post(drop_fix))
+        .route("/fixes/{fix}/forget", post(forget_fix))
         .route("/daemon", post(set_daemon))
         .route("/daemon/poll", post(poll))
         .route("/queue/clear", post(clear_queue))
@@ -672,8 +673,9 @@ async fn fix_build(State(d): D, Path(id): Path<u64>) -> Response {
     }
 }
 
+/// The fixes, each with where it stands: its state, rounds and round 0.
 async fn fixes(State(d): D) -> Json<Value> {
-    Json(json!({ "fixes": d.fixes() }))
+    Json(json!({ "fixes": d.fixes().await }))
 }
 
 /// A fix's name: 4 to 64 hex digits of its commit (its sha7).
@@ -727,7 +729,11 @@ async fn register_fix(State(d): D, Json(b): Json<Register>) -> Response {
 #[serde(deny_unknown_fields)]
 struct AskRound {
     /// The snapshot, pushed to refs/bana/fix/<sha7>/… in src.
-    sha: String,
+    #[serde(default)]
+    sha: Option<String>,
+    /// Without `sha`: its tree, to ask first whether a round would run.
+    #[serde(default)]
+    tree: Option<String>,
     #[serde(default)]
     jobs: Option<Vec<String>>,
     #[serde(default)]
@@ -736,18 +742,24 @@ struct AskRound {
 
 /// run_jobs: a round at a snapshot. {fix, round, reused, tree, builds,
 /// rounds_left}; 409 with the reason (and `running`, the round that runs)
-/// when the limits say no or the snapshot is not the fix's.
+/// when the limits say no or the snapshot is not the fix's. With a `tree`
+/// and no `sha`, it only says whether a round would run (run_jobs asks so
+/// before it pushes a snapshot): {fix, round, reused, tree, rounds_left}.
 async fn ask_round(State(d): D, Path(name): Path<String>, Json(b): Json<AskRound>) -> Response {
     if !fix_name(&name) {
         return err(StatusCode::BAD_REQUEST, "fix: its commit's hex digits");
     }
-    if !matches!(b.sha.len(), 40 | 64) || !b.sha.bytes().all(|c| c.is_ascii_hexdigit()) {
-        return err(StatusCode::BAD_REQUEST, "sha: a snapshot's full commit");
-    }
+    let full = |s: &str| matches!(s.len(), 40 | 64) && s.bytes().all(|c| c.is_ascii_hexdigit());
     if b.jobs.as_ref().is_some_and(|j| j.len() > 32) {
         return err(StatusCode::BAD_REQUEST, "jobs: at most 32");
     }
-    match d.ask_round(&name, &b.sha, b.jobs, b.repeat).await {
+    let done = match (&b.sha, &b.tree) {
+        (Some(sha), _) if full(sha) => d.ask_round(&name, sha, b.jobs, b.repeat).await,
+        (None, Some(tree)) if full(tree) => d.check_round(&name, tree, b.jobs, b.repeat),
+        (None, Some(_)) => return err(StatusCode::BAD_REQUEST, "tree: a snapshot's full tree"),
+        _ => return err(StatusCode::BAD_REQUEST, "sha: a snapshot's full commit"),
+    };
+    match done {
         Ok(v) => Json(v).into_response(),
         Err(e) => round_error(e),
     }
@@ -875,6 +887,34 @@ async fn drop_fix(State(d): D, Path(name): Path<String>, Json(b): Json<DropFix>)
         }
         Err(e) => fix_error(e),
     }
+}
+
+/// A fix `bana fix drop` removed in a terminal: its round builds go (a
+/// running one is cancelled), and its refs in src. {fix, builds}. 409 while
+/// the fix still has its worktree: Discard drops a fix whole.
+async fn forget_fix(State(d): D, Path(name): Path<String>) -> Response {
+    if name.len() != 7
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "fix: its commit's first 7 hex digits",
+        );
+    }
+    let dir = d.settings().dir.join("fix");
+    let kept: Option<fix::Fix> = std::fs::read(dir.join(format!("{name}.d/fix.json")))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok());
+    if kept.is_some_and(|f| std::path::Path::new(&f.worktree).exists()) {
+        return err(
+            StatusCode::CONFLICT,
+            format!("fix {name} still has its worktree: bana fix drop {name} first"),
+        );
+    }
+    let builds = d.forget_fix(&name).await;
+    Json(json!({"fix": name, "builds": builds})).into_response()
 }
 
 fn round_error(e: RoundError) -> Response {
@@ -1298,6 +1338,7 @@ esac"#,
             ("POST", "/ci/v1/fixes/abcd123/keep"),
             ("POST", "/ci/v1/fixes/abcd123/push"),
             ("POST", "/ci/v1/fixes/abcd123/drop"),
+            ("POST", "/ci/v1/fixes/abcd123/forget"),
             ("POST", "/ci/v1/daemon"),
             ("POST", "/ci/v1/daemon/poll"),
             ("POST", "/ci/v1/queue/clear"),

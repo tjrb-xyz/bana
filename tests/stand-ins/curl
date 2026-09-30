@@ -2,7 +2,8 @@
 # Stand-in curl: serves the fake runner tarball for any download (-o FILE), and plays a
 # daemon on 127.0.0.1: its health answers once launchd or systemd runs it (FAKE_HEALTH:
 # this answer instead), /ci/v1/local is $FAKE_STATE/local.json (then local.next, if
-# any), a fix registered (/ci/v1/fixes) has its round 0 queued, and what comes on stdin
+# any), a fix registered (/ci/v1/fixes) has its round 0 queued, a fix dropped (…/forget)
+# had two round builds, and what comes on stdin
 # (-H @-: the token) goes to $FAKE_STATE/curl.stdin.
 echo "curl $*" >>"$FAKE_LOG"
 url=${*: -1}
@@ -23,6 +24,7 @@ http://127.0.0.1:*/ci/v1/local)
   exit 0 ;;
 http://127.0.0.1:*/ci/v1/daemon/poll) echo '{"ok":true}'; exit 0 ;;
 http://127.0.0.1:*/ci/v1/fixes) echo '{"fix":"","recheck":0,"rounds":{}}'; exit 0 ;;
+http://127.0.0.1:*/ci/v1/fixes/*/forget) echo '{"fix":"","builds":2}'; exit 0 ;;
 http://127.0.0.1:*) exit 7 ;;
 esac
 while (($#)); do

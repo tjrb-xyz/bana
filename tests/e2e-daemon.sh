@@ -354,9 +354,10 @@ state_of() { builds_of "$1" | tail -n 1 | cut -d'|' -f2; }
 # The MCP server Claude Code starts, as {command, args}: what bana daemon install registers.
 mcp_server='{"command": "'"$d/daemon/bana-manager"'", "args": ["mcp", "--dir", "'"$d"'"]}'
 # Starts the server in DIR over stdio, says what Claude Code 2.1.284 says (initialize,
-# notifications/initialized, tools/list), then calls TOOL with ARGS (JSON). Prints the result's
-# structuredContent (else its text as {"text": ...}) with isError; fails when a line on stdout
-# is not one JSON-RPC message, an answer is missing, or the server does not exit 0 at EOF.
+# notifications/initialized, tools/list), then calls TOOL with ARGS (JSON) and a progress token.
+# Prints the result's structuredContent (else its text as {"text": ...}) with isError, and
+# progress: how many progress notes came meanwhile; fails when a line on stdout is not one
+# JSON-RPC message, an answer is missing, or the server does not exit 0 at EOF.
 # Its stderr goes to mcp.log.
 tool() { # DIR TOOL ARGS
   (cd "$1" && python3 -c '
@@ -368,10 +369,15 @@ client = {"name": "claude-code", "title": "Claude Code", "version": "2.1.284"}
 def send(m):
     p.stdin.write(json.dumps(dict(m, jsonrpc="2.0")) + "\n")
     p.stdin.flush()
+notes = []
 def answer(i):
     for line in p.stdout:
         m = json.loads(line)
         assert isinstance(m, dict) and m.get("jsonrpc") == "2.0", line
+        if m.get("method") == "notifications/progress":
+            assert m["params"]["progressToken"] == "e2e", m
+            notes.append(m["params"]["message"])
+            continue
         if m.get("id") == i:
             return m
     sys.exit("bana mcp: no answer to %d" % i)
@@ -383,13 +389,14 @@ send({"method": "notifications/initialized"})
 send({"id": 1, "method": "tools/list"})
 assert tool in [t["name"] for t in answer(1)["result"]["tools"]], tool
 send({"id": 2, "method": "tools/call", "params": {"name": tool, "arguments": args,
-      "_meta": {"claudecode/toolUseId": "toolu_e2e"}}})
+      "_meta": {"claudecode/toolUseId": "toolu_e2e", "progressToken": "e2e"}}})
 r = answer(2)
 p.stdin.close()
 assert p.wait() == 0, "bana mcp exited %s" % p.returncode
 assert "result" in r, r
 out = r["result"].get("structuredContent") or {"text": r["result"]["content"][0]["text"]}
 out["isError"] = r["result"].get("isError", False)
+out["progress"] = len(notes)
 print(json.dumps(out))' "$2" "$3" "$mcp_server" "$T/mcp.log")
 }
 # A fix's round N ended (the daemon's answer, without waiting).
@@ -531,7 +538,10 @@ check "loop: the gate holds Claude's first stop on an untested change (exit 2)" 
 check "loop: but only once for that tree" same "$(stop_hook "$wt")" 0
 s=$(date +%s)
 r=$(tool "$wt" run_jobs '{}') || r='{}'
-echo "   round 1: $(jq_ 'j.get("state")' <<<"$r") in $(($(date +%s) - s)) s"
+took=$(($(date +%s) - s))
+echo "   round 1: $(jq_ 'j.get("state")' <<<"$r") in $took s, $(jq_ 'j.get("progress")' <<<"$r") progress notes"
+# It says how the round goes after each ask of the daemon (every 15 s).
+((took < 20)) || check "loop: run_jobs says how it goes while it waits" test "$(jq_ 'j["progress"]' <<<"$r")" -ge 1
 check "loop: run_jobs runs round 1, red" same \
   "$(jq_ '"%s %s %s %s" % (j["round"], j["state"], j["green"], j["isError"])' <<<"$r")" "1 failure False False"
 check "loop: it says what failed" same "$(jq_ '[f["job"] for f in j["failures"]]' <<<"$r")" "['broken']"
