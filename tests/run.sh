@@ -453,7 +453,7 @@ if [[ -x ${fix_bm:-} ]]; then
   check "fix --log: they don't: bana's MCP server, first" same "$(claude_arg 1)" "--mcp-config"
   check "fix --log: this bana-manager's, for this project" same "$(python3 -c 'import json, sys
 s = json.loads(sys.argv[1])["mcpServers"]["bana"]
-print(s["type"], s["command"], *s["args"])' "$(claude_arg 2)")" "stdio $dp/daemon/bana-manager mcp --dir $d"
+print(s["type"], s["command"], *s["args"])' "$(claude_arg 2)")" "stdio $dp/daemon/bana-manager mcp --dir $dp"
   check "fix --log: named after the fix (-n), which ends --mcp-config's values" same "$(claude_arg 3) $(claude_arg 4)" "-n bana fix $x1"
   check "fix --log: the prompt is its first message" same "$(claude_arg 5)" "$(cat "$d/fix/$x1.d/prompt.txt")"
   check "fix --log: and nothing else" same "$(claude_argc)" 5
@@ -490,7 +490,7 @@ print(s["type"], s["command"], *s["args"])' "$(claude_arg 2)")" "stdio $dp/daemo
   check "fix: a stopped bana ci is no failure to fix" has "$T/out" "Nothing here failed: the last bana ci was stopped (Ctrl-C)"
   bash "$bana" fix last >"$T/out" 2>&1 || true
   check "fix last: nor when named, but its log can be" has "$T/out" \
-    "the last hand run (bana ci) was stopped (Ctrl-C), so it did not fail: bana fix --log $d/ci/last.log takes its output as it is"
+    "the last hand run (bana ci) was stopped (Ctrl-C), so it did not fail: bana fix --log $dp/ci/last.log takes its output as it is"
   check "fix: no fix for it" same "$(git rev-parse -q --verify "refs/heads/bana/fix-$x2" || true)" ""
   cp "$T/last.env" "$d/ci/last.env"
   bash "$bana" fix >"$T/out" 2>&1 || true
@@ -564,7 +564,7 @@ print(q["cwd"][0], q["q"][0] == open(sys.argv[2], encoding="utf-8").read())' "$l
   noclaude=$(IFS=:; for p in $PATH; do [[ -x $p/claude ]] || printf '%s:' "$p"; done)
   PATH=${noclaude%:} bash "$bana" fix 42 >"$T/out" 2>&1 || true
   check "fix: no Claude Code on PATH: where the fix is" has "$T/out" "worktree: $dp/fix/$x3"
-  check "fix: and its prompt" has "$T/out" "prompt:   $d/fix/$x3.d/prompt.txt"
+  check "fix: and its prompt" has "$T/out" "prompt:   $dp/fix/$x3.d/prompt.txt"
 
   bash "$bana" fix list >"$T/out" 2>&1 || true
   check "fix list: the paste's fix, open (no daemon, no rounds)" has "$T/out" "$x1  open; bana/fix-$x1: no commits yet (a pasted log, on ${br#refs/heads/})"
