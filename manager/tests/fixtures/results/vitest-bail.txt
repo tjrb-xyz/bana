@@ -1,0 +1,32 @@
+
+ RUN  v5.0.2 /tmp/v
+
+ ❯ b.test.js (2 tests | 1 failed) 10ms
+   × one 7ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  b.test.js > one
+AssertionError: expected 1 to be 2 // Object.is equality
+
+- Expected
++ Received
+
+- 2
++ 1
+
+ ❯ b.test.js:2:31
+      1| import { test, expect } from 'vitest'
+      2| test('one', () => { expect(1).toBe(2) })
+       |                               ^
+      3| test('two', () => { expect(1).toBe(1) })
+      4|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed | 1 passed (2)
+      Tests  1 failed | 2 passed (4)
+   Start at  13:55:22
+   Duration  363ms (transform 38%, import 30%, tests 19%, worker 13%, environment 1%)
+

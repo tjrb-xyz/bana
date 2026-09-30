@@ -6,7 +6,13 @@
 //! Jobs and steps are [`actlog::Build`]'s, as for the statuses: a line of plain
 //! text is read into an [`actlog::JobLine`] first. What each step printed is
 //! read here: cargo's and nextest's test lines, the panics of failing tests,
-//! cargo's rerun target, annotations (`::error file=…::…`), and its last lines.
+//! cargo's rerun target, other tools' summary lines (vitest, jest, node, pytest,
+//! unittest, go), annotations (`::error file=…::…`), step summaries
+//! (GITHUB_STEP_SUMMARY, which act logs as `⚙  Summary - …`), and its last lines.
+//! A job that never ran is `skipped`, `unsupported` (no platform here), or
+//! `not_planned`: the jobs `act -l` listed ([`fold_json_listed`]) that the
+//! plan job set false (`::set-output:: web=false` in a job `plan`, or bana
+//! plan's `json={"tier":"quick","web":false}`).
 //!
 //! act's plain text (0.2.89) has `[ci/rust   ] ⭐ Run Main cargo test`, the
 //! step's output as `[ci/rust   ]   | …` (or `| …` alone, the bar in the job's
@@ -24,7 +30,8 @@
 //! Who a failure belongs to: bana, for a `*/bana/actions/*` step (Main, Pre or
 //! Post), an error naming such an action's cache directory
 //! (`…-bana-actions-keep-builds@…`), or bana's own red words; act, for act's
-//! other errors outside a job; the project otherwise.
+//! other errors outside a job but `workflow is not valid`; the project
+//! otherwise.
 
 use crate::actlog::{self, BuildState, Event, JobLine, JobState};
 use serde::{Deserialize, Serialize};
@@ -114,7 +121,8 @@ pub struct Job {
     /// The workflow's job id (in plain text, act's name for the job).
     pub id: String,
     pub matrix: BTreeMap<String, String>,
-    /// `success`, `failure`, `skipped`, `unsupported`, `cancelled`, or `unknown`.
+    /// `success`, `failure`, `skipped` (by `if:`, or a job it needs failed),
+    /// `unsupported`, `not_planned`, `cancelled`, or `unknown`.
     pub result: String,
     pub ms: Option<u64>,
     pub steps: Vec<Step>,
@@ -132,13 +140,15 @@ pub struct Step {
     pub owner: Owner,
     /// It failed under `continue-on-error`, so its job went on.
     pub continued: bool,
-    /// Test counts, one per tool that printed them (`cargo`, `nextest`).
+    /// Test counts, one per tool that printed them.
     pub tests: Vec<Count>,
     /// Each test's own line, in order.
     pub cases: Vec<Case>,
     /// What cargo says to pass to rerun what failed (`-p example-engine --test facts`).
     pub reruns: Vec<String>,
     pub annotations: Vec<Annotation>,
+    /// What it wrote to GITHUB_STEP_SUMMARY, as Markdown.
+    pub summaries: Vec<String>,
     /// A failed step's last lines, ANSI-stripped.
     pub tail: Vec<String>,
 }
@@ -163,11 +173,16 @@ impl Step {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Count {
+    /// `cargo`, `nextest`, `vitest`, `jest`, `node`, `pytest`, `unittest`, or
+    /// `go`, whose counts are packages (`ok`, `FAIL`), not tests.
     pub tool: String,
     pub passed: u64,
+    /// Errors, cancelled tests and timeouts too.
     pub failed: u64,
+    /// Ignored, todo and expected failures too.
     pub skipped: u64,
-    /// Not every test ran: cargo stopped early, or nextest ran N/M.
+    /// Not every test ran: cargo stopped early, nextest ran N/M, a tool said
+    /// it stopped, or the step never finished.
     pub incomplete: bool,
 }
 
@@ -210,12 +225,22 @@ pub struct Case {
 #[serde(default)]
 pub struct Annotation {
     /// `error`, `warning` or `notice`.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub level: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub col: Option<u64>,
+    /// vitest's is the test: `demo.test.js > accepted`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// A notice results.jsonl says leaves its step out (`left_out`).
+    #[serde(skip)]
+    pub left_out: bool,
 }
 
 /// An error outside the jobs: act's `Error: …`, or bana's.
@@ -245,7 +270,16 @@ impl Results {
 /// act's `--json` lines, as the daemon keeps them in act.jsonl (with bana's
 /// and act's stderr as `{"msg": …, "bana": "stderr"}`).
 pub fn fold_json(text: &str) -> Results {
+    fold_json_listed(text, &[])
+}
+
+/// As [`fold_json`], with the jobs `act -l` listed (the daemon's jobs.txt): a
+/// listed job that printed nothing was skipped, or not planned.
+pub fn fold_json_listed(text: &str, list: &[(u32, String)]) -> Results {
     let mut f = Folder::default();
+    if !list.is_empty() {
+        f.build = actlog::Build::new(list, 0);
+    }
     for line in text.lines() {
         f.json(line);
     }
@@ -338,6 +372,10 @@ struct Folder {
     network: Option<String>,
     /// act's first and last times (Unix seconds).
     times: (Option<i64>, Option<i64>),
+    /// What the plan job said of each job: `web` false is not planned.
+    plan: BTreeMap<String, bool>,
+    /// bana plan's tier.
+    tier: Option<String>,
     // Plain text only.
     /// Each job's running step, then the inner steps of a composite action it
     /// runs (act's JSON puts those under their step, and so does this).
@@ -353,6 +391,10 @@ struct Folder {
     marked: bool,
     /// Each colour's job, by act's name for it, in colour.
     colours: BTreeMap<String, String>,
+    /// Each job's last step that ended, which a step summary after it is from.
+    ended: BTreeMap<String, Open>,
+    /// The step whose summary goes on in the bare lines after act's line.
+    summary: Option<StepKey>,
     ids: u32,
 }
 
@@ -382,6 +424,11 @@ impl Folder {
             self.times.1 = Some(t);
         }
         self.build.fold(ev, 0);
+        if !l.output {
+            if let Some((name, value)) = set_output(&l.msg) {
+                self.planned(&l.id, name, value);
+            }
+        }
         let (Some(id), Some(_)) = (&l.step_id, &l.step) else {
             return;
         };
@@ -395,9 +442,28 @@ impl Folder {
             for line in msg.split('\n') {
                 out.read(&clean(line));
             }
+        } else if let Some(md) = summary(&l.msg) {
+            out.summaries.push(md);
         } else if let Some(a) = annotation(&l.msg) {
             out.keep(clean(l.msg.trim()));
             out.annotations.push(a);
+        }
+    }
+
+    /// A plan job's output: `web=false` from a job `plan`, or bana plan's
+    /// `json={"tier":"quick","web":false,…}` from any job.
+    fn planned(&mut self, job: &str, name: &str, value: &str) {
+        if let Ok(Value::Object(o)) = serde_json::from_str::<Value>(value) {
+            if let Some(tier) = o.get("tier").and_then(Value::as_str) {
+                self.tier = Some(tier.to_string());
+                for (k, v) in &o {
+                    if let Some(b) = v.as_bool() {
+                        self.plan.insert(k.clone(), b);
+                    }
+                }
+            }
+        } else if job == "plan" && matches!(value, "true" | "false") {
+            self.plan.insert(name.to_string(), value == "true");
         }
     }
 
@@ -420,6 +486,9 @@ impl Folder {
         }
         let owner = if bana_action(text).is_some() || (red && !act_said) {
             Owner::Bana
+        } else if text.starts_with("workflow is not valid") {
+            // act could not read the project's workflow.
+            Owner::Project
         } else {
             Owner::Act
         };
@@ -434,6 +503,7 @@ impl Folder {
 
     fn text(&mut self, raw: &str) {
         if raw.starts_with('{') && act_json(raw) {
+            self.summary = None;
             return self.json(raw);
         }
         // To a terminal, act gives each job a colour, for its name and for the
@@ -454,6 +524,14 @@ impl Folder {
                 self.colours.insert(c.to_string(), name.to_string());
             }
             return self.text_job(name, rest);
+        }
+        // A step summary's lines after act's first one are bare.
+        if let (None, Some(k)) = (colour, &self.summary) {
+            if let Some(md) = self.out.get_mut(k).and_then(|o| o.summaries.last_mut()) {
+                md.push('\n');
+                md.push_str(last_cr(s));
+                return;
+            }
         }
         if let Some(o) = s.strip_prefix('|') {
             let o = last_cr(o.strip_prefix(' ').unwrap_or(o));
@@ -499,6 +577,7 @@ impl Folder {
             }
         };
         self.last = Some(key.clone());
+        self.summary = None;
         if let Some(o) = rest.trim_start().strip_prefix('|') {
             self.marked = true;
             return self.output(&key, last_cr(o.strip_prefix(' ').unwrap_or(o)));
@@ -561,6 +640,12 @@ impl Folder {
                     None => fresh,
                 };
                 stack.clear();
+                let o = Open {
+                    stage: stage.clone(),
+                    name: step.clone(),
+                    id: id.clone(),
+                };
+                self.ended.insert(key.clone(), o);
                 // A paste's first lines: the output of the step that ends here.
                 let out = self
                     .out
@@ -588,6 +673,23 @@ impl Folder {
             self.job(&Event::Job(Box::new(l)));
             self.rekey(name, &key, &map);
             return;
+        } else if summary_start(body).is_some() {
+            // After its step's result, or an inner step's.
+            match (
+                self.open.get(&key).filter(|s| !s.is_empty()),
+                self.ended.get(&key),
+            ) {
+                (Some(stack), _) => on_step(&mut l, stack, stack.len() > 1),
+                (None, Some(o)) => {
+                    (l.stage, l.step, l.step_id) =
+                        (o.stage.clone(), Some(o.name.clone()), Some(o.id.clone()));
+                }
+                (None, None) => {}
+            }
+            self.summary = l
+                .step_id
+                .clone()
+                .map(|id| (key.clone(), l.stage.clone(), id));
         } else if let Some(stack) = self.open.get(&key).filter(|s| !s.is_empty()) {
             // act's word on the running step: an annotation, "Failed but continue next step".
             on_step(&mut l, stack, stack.len() > 1);
@@ -631,6 +733,9 @@ impl Folder {
         }
         if let Some(s) = self.open.remove(old) {
             self.open.insert(new.clone(), s);
+        }
+        if let Some(o) = self.ended.remove(old) {
+            self.ended.insert(new.clone(), o);
         }
         self.keys.insert(name.to_string(), new.clone());
         self.last = Some(new);
@@ -683,6 +788,8 @@ impl Folder {
             mut errors,
             network,
             times,
+            plan,
+            tier,
             ..
         } = self;
         for o in out.values_mut() {
@@ -694,9 +801,19 @@ impl Folder {
             .any(|j| j.failed_step.is_some() || j.state == JobState::Failure);
         let exit = i32::from(failed || !errors.is_empty());
         build.finish(Some(exit), None, times.1.unwrap_or(0));
-        // In text, a job `x-2` that turned out no matrix entry keeps its name.
+        // In text, a job `x-2` that turned out no matrix entry keeps its name,
+        // unless its siblings did (`x (arm64)`): then it is an entry that failed
+        // before act printed its matrix, and its id stays `x`.
+        let named: Vec<String> = build
+            .jobs
+            .iter()
+            .filter(|j| !j.matrix.is_empty())
+            .map(|j| j.id.clone())
+            .collect();
         for j in build.jobs.iter_mut().filter(|j| j.matrix.is_empty()) {
-            j.id = j.key.clone();
+            if !named.contains(&j.id) {
+                j.id = j.key.clone();
+            }
         }
         let cancelled = build.cancel_requested.is_some();
         let mut jobs: Vec<Job> = build
@@ -706,7 +823,11 @@ impl Folder {
                 key: j.key.clone(),
                 id: j.id.clone(),
                 matrix: j.matrix.clone(),
-                result: job_result(j, cancelled).into(),
+                result: match job_result(j, cancelled) {
+                    "skipped" if plan.get(&j.id) == Some(&false) => "not_planned",
+                    r => r,
+                }
+                .into(),
                 ms: match (j.started, j.ended) {
                     (Some(a), Some(b)) if a > 0 && b >= a => Some((b - a) as u64 * 1000),
                     _ => None,
@@ -757,6 +878,7 @@ impl Folder {
         Results {
             build: BuildInfo {
                 network,
+                tier,
                 started: times.0,
                 ended: times.1,
                 result: result.into(),
@@ -1024,10 +1146,46 @@ fn annotation(msg: &str) -> Option<Annotation> {
         match kv.split_once('=') {
             Some(("file", v)) => a.file = Some(unescape(v)),
             Some(("line", v)) => a.line = v.trim().parse().ok(),
+            Some(("col" | "column", v)) => a.col = v.trim().parse().ok(),
+            Some(("title", v)) => a.title = Some(unescape(v)),
             _ => {}
         }
     }
     Some(a)
+}
+
+/// act's line for a step's summary, `⚙  Summary - ## node job\n| a | b |…`:
+/// the Markdown.
+fn summary(msg: &str) -> Option<String> {
+    let mut lines = msg.trim_end().split('\n').map(clean);
+    let first = lines.next()?;
+    let first = summary_start(&first)?.to_string();
+    Some(
+        std::iter::once(first)
+            .chain(lines)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// `⚙  Summary - ## node job`: its first line.
+fn summary_start(body: &str) -> Option<&str> {
+    let rest = body
+        .trim_start()
+        .strip_prefix('⚙')?
+        .trim_start_matches(|c: char| c.is_whitespace() || c == '\u{fe0f}')
+        .strip_prefix("Summary -")?;
+    Some(rest.strip_prefix(' ').unwrap_or(rest))
+}
+
+/// act's line for what a step wrote to GITHUB_OUTPUT: `⚙  ::set-output:: web=false`.
+fn set_output(msg: &str) -> Option<(&str, &str)> {
+    let (name, value) = msg
+        .trim()
+        .trim_start_matches(|c: char| !c.is_ascii() || c.is_whitespace())
+        .strip_prefix("::set-output::")?
+        .split_once('=')?;
+    Some((name.trim(), value.trim()))
 }
 
 /// Workflow commands escape `%`, CR and LF (and `:` and `,` in properties).
@@ -1061,6 +1219,11 @@ struct Output {
     tail: VecDeque<String>,
     /// Summed `test result:` lines.
     cargo: Option<Count>,
+    /// libtest said `running N tests` and no `test result:` yet: the first
+    /// of that binary's cases.
+    libtest_open: Option<usize>,
+    /// A binary never said its `test result:` (it crashed, or the step was cut).
+    cargo_cut: bool,
     /// cargo said `error: N target(s) failed`: it ran every binary.
     all_ran: bool,
     /// The test binary cargo runs now (`Running …`, `Doc-tests …`).
@@ -1068,6 +1231,26 @@ struct Output {
     nextest: Option<Count>,
     /// nextest runs: its PASS/FAIL lines count until its Summary.
     in_nextest: bool,
+    /// The first of this nextest run's cases.
+    nextest_from: usize,
+    /// The other tools' summed counts, in the order they first printed.
+    counts: Vec<Count>,
+    /// node's `# tests N` (TAP) or `ℹ tests N` (spec), until its last line,
+    /// and that N.
+    node: Option<(Count, u64)>,
+    /// unittest's `Ran N tests`, until its `OK` or `FAILED (…)`.
+    unittest: Option<u64>,
+    /// unittest's `FAIL: NAME (…)` and `ERROR: NAME (…)` headers before it.
+    unittest_heads: Vec<String>,
+    /// pytest said it stopped (`-x`, `--maxfail`, an interrupt): its next
+    /// count is incomplete; `true` when it stopped while collecting.
+    pytest_stop: Option<bool>,
+    /// jest ran some of its suites (`Test Suites: 1 failed, 1 of 4 total`).
+    jest_stop: bool,
+    /// jest's `Tests:` line in the summary block read now: `--bail` can
+    /// print the block twice.
+    jest_last: Option<String>,
+    summaries: Vec<String>,
     cases: Vec<Case>,
     reruns: Vec<String>,
     annotations: Vec<Annotation>,
@@ -1109,11 +1292,22 @@ impl Output {
             }
             self.panicked(p);
         }
+        if self.tool_line(line) {
+            return;
+        }
         // libtest's lines at column 0 only: nextest indents them in a failing
-        // test's output, and counts that test itself.
+        // test's output, and counts that test itself. With `--no-capture` it
+        // passes them through as they are, one test per process: its own
+        // lines count then, not libtest's.
         let t = line.trim_start();
-        if let Some(rest) = line.strip_prefix("test result: ") {
-            (self.running, self.section) = (None, None);
+        let libtest = !self.in_nextest;
+        if !libtest && (line.starts_with("test ") || libtest_running(line)) {
+            // nextest's PASS or FAIL for it follows.
+        } else if libtest_running(line) {
+            self.libtest_cut();
+            self.libtest_open = Some(self.cases.len());
+        } else if let Some(rest) = line.strip_prefix("test result: ") {
+            (self.running, self.section, self.libtest_open) = (None, None, None);
             if let Some(c) = libtest_counts(rest) {
                 self.cargo
                     .get_or_insert_with(|| Count::new("cargo"))
@@ -1138,8 +1332,10 @@ impl Output {
         {
             self.all_ran = true;
         } else if let Some(binary) = running_binary(t) {
+            self.libtest_cut();
             (self.binary, self.running, self.section) = (Some(binary.to_string()), None, None);
         } else if t.starts_with("Doc-tests ") {
+            self.libtest_cut();
             (self.running, self.section) = (None, None);
             self.binary = Some(t.trim_end().to_string());
         } else if let Some(name) = section(t) {
@@ -1156,13 +1352,137 @@ impl Output {
         } else if t.starts_with("Nextest run ID")
             || (t.starts_with("Starting ") && t.contains(" across "))
         {
+            if !self.in_nextest {
+                self.nextest_from = self.cases.len();
+            }
             self.in_nextest = true;
-        } else if let Some((result, binary, name)) =
+        } else if let Some((result, binary, name, retry)) =
             self.in_nextest.then(|| nextest_case(t)).flatten()
         {
+            // A retry's result stands for its test: the last attempt's.
+            if retry {
+                let from = self.nextest_from;
+                if let Some(i) = self.cases[from..]
+                    .iter()
+                    .rposition(|c| c.name == name && c.binary.as_deref() == Some(binary))
+                {
+                    self.cases.remove(from + i);
+                }
+            }
             self.case(name, result, Some(binary.to_string()));
         } else if let Some(a) = annotation(line) {
             self.annotations.push(a);
+        }
+    }
+
+    /// Another tool's summary line: vitest's, jest's, node's, pytest's,
+    /// unittest's, or go's for a package.
+    fn tool_line(&mut self, line: &str) -> bool {
+        if let Some(ran) = self.unittest.take() {
+            if let Some(c) = unittest_result(line, ran, &self.unittest_heads) {
+                self.unittest_heads.clear();
+                self.count(c);
+                return true;
+            }
+            if line.trim().is_empty() {
+                self.unittest = Some(ran);
+            }
+        }
+        if let Some((word, n)) = node_item(line) {
+            if word == "tests" {
+                self.node_done();
+                self.node = Some((Count::new("node"), n.unwrap_or(0)));
+            }
+            let Some((c, _)) = self.node.as_mut() else {
+                return false;
+            };
+            match word {
+                "pass" => c.passed += n.unwrap_or(0),
+                "fail" | "cancelled" => c.failed += n.unwrap_or(0),
+                "skipped" | "todo" => c.skipped += n.unwrap_or(0),
+                "duration_ms" => self.node_done(),
+                _ => {}
+            }
+            return true;
+        }
+        // Another line inside node's summary (`cmd & node --test`) leaves it
+        // open: its last line, a blank one, or the step's end closes it.
+        if line.trim().is_empty() {
+            self.node_done();
+        }
+        if let Some(head) = unittest_head(line) {
+            self.unittest_heads.push(head.to_string());
+        }
+        if let Some(n) = ran_tests(line) {
+            self.unittest = Some(n);
+            return true;
+        }
+        let t = line.trim();
+        if pytest_stopped(t) {
+            self.pytest_stop = Some(t.contains(" during collection"));
+        }
+        let jest_block = [
+            "Test Suites:",
+            "Tests:",
+            "Snapshots:",
+            "Time:",
+            "Ran all test suites",
+        ]
+        .iter()
+        .any(|w| line.starts_with(w));
+        if !jest_block && !t.is_empty() {
+            self.jest_last = None;
+        }
+        if let Some(rest) = line.strip_prefix("Test Suites:") {
+            // `1 failed, 1 of 4 total`: --bail stopped it.
+            self.jest_stop |= rest.contains(" of ");
+        }
+        if let Some(mut c) = jest_summary(line) {
+            // `--bail` can print its summary block twice over.
+            if self.jest_last.as_deref() == Some(line.trim_end()) {
+                return true;
+            }
+            self.jest_last = Some(line.trim_end().to_string());
+            c.incomplete = std::mem::take(&mut self.jest_stop);
+            self.count(c);
+            return true;
+        }
+        if let Some(mut c) = pytest_summary(line) {
+            match self.pytest_stop.take() {
+                // Interrupted while collecting: no test ran, and its errors
+                // are modules that did not load, not tests.
+                Some(true) => {
+                    c.failed = c.failed.saturating_sub(pytest_errors(line));
+                    c.incomplete = true;
+                }
+                Some(false) => c.incomplete = true,
+                None => {}
+            }
+            self.count(c);
+            return true;
+        }
+        match vitest_summary(line).or_else(|| go_package(line)) {
+            Some(c) => {
+                self.count(c);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// node's summary ends: it counts, and it is incomplete when its lines do
+    /// not add up to its `tests` (some of them missing).
+    fn node_done(&mut self) {
+        if let Some((mut c, tests)) = self.node.take() {
+            c.incomplete |= c.passed + c.failed + c.skipped != tests;
+            self.count(c);
+        }
+    }
+
+    fn count(&mut self, c: Count) {
+        match self.counts.iter_mut().find(|x| x.tool == c.tool) {
+            Some(x) => x.add(&c),
+            None => self.counts.push(c),
         }
     }
 
@@ -1255,10 +1575,34 @@ impl Output {
             || (self.in_nextest && nextest_case(t).is_some())
     }
 
+    /// A test binary ended without its `test result:`: what it said of its
+    /// tests counts, as a count cut short.
+    fn libtest_cut(&mut self) {
+        let Some(from) = self.libtest_open.take() else {
+            return;
+        };
+        let c = tally_cases("cargo", &self.cases[from..]);
+        self.cargo
+            .get_or_insert_with(|| Count::new("cargo"))
+            .add(&c);
+        self.cargo_cut = true;
+    }
+
     /// The step's output has ended.
     fn close(&mut self) {
         if let Some(p) = self.panic.take() {
             self.panicked(p);
+        }
+        self.node_done();
+        self.libtest_cut();
+        // nextest never said its Summary: its tests so far, cut short.
+        if self.in_nextest {
+            let mut c = tally_cases("nextest", &self.cases[self.nextest_from..]);
+            c.incomplete = true;
+            self.nextest
+                .get_or_insert_with(|| Count::new("nextest"))
+                .add(&c);
+            self.in_nextest = false;
         }
         self.running = None;
     }
@@ -1271,18 +1615,28 @@ impl Output {
             || !self.reruns.is_empty()
             || !self.annotations.is_empty()
             || !self.panics.is_empty()
+            || !self.counts.is_empty()
+            || !self.summaries.is_empty()
     }
 
-    fn step(self, s: &actlog::Step, keep_tail: bool) -> Step {
+    /// The step `s` as its output says; `loose` for output outside any step.
+    fn step(self, s: &actlog::Step, loose: bool) -> Step {
         let mut tests = Vec::new();
         // Without `--no-fail-fast`, cargo stops at the first binary that
         // fails: it says what to rerun, and never that N targets failed.
         if self.cargo.is_some() || !self.reruns.is_empty() {
             let mut c = self.cargo.unwrap_or_else(|| Count::new("cargo"));
-            c.incomplete = !self.reruns.is_empty() && !self.all_ran;
+            c.incomplete = (!self.reruns.is_empty() && !self.all_ran) || self.cargo_cut;
             tests.push(c);
         }
         tests.extend(self.nextest);
+        tests.extend(self.counts);
+        // A step that never ended (cancelled, timed out, its log cut) may
+        // not have run every test it counted.
+        let ended = matches!(s.result.as_deref(), Some("success" | "failure"));
+        if !ended && !loose {
+            tests.iter_mut().for_each(|c| c.incomplete = true);
+        }
         let failed = s.result.as_deref() == Some("failure");
         Step {
             name: s.name.clone(),
@@ -1295,7 +1649,12 @@ impl Output {
             cases: self.cases,
             reruns: self.reruns,
             annotations: self.annotations,
-            tail: if failed || keep_tail {
+            summaries: self
+                .summaries
+                .into_iter()
+                .map(|m| m.trim_end().to_string())
+                .collect(),
+            tail: if failed || loose {
                 self.tail.into()
             } else {
                 Vec::new()
@@ -1332,6 +1691,27 @@ fn libtest_case(rest: &str) -> Option<(&str, &'static str)> {
         _ => return None,
     };
     Some((name, result))
+}
+
+/// `running 2 tests`: a test binary starts.
+fn libtest_running(line: &str) -> bool {
+    line.strip_prefix("running ").is_some_and(|r| {
+        let (n, word) = r.trim_end().split_once(' ').unwrap_or(("", ""));
+        n.parse::<u64>().is_ok() && (word == "tests" || word == "test")
+    })
+}
+
+/// A count of `cases`, one per test.
+fn tally_cases(tool: &str, cases: &[Case]) -> Count {
+    let mut c = Count::new(tool);
+    for case in cases {
+        match case.result.as_str() {
+            "passed" => c.passed += 1,
+            "failed" => c.failed += 1,
+            _ => c.skipped += 1,
+        }
+    }
+    c
 }
 
 /// `NAME ... ` with no result yet, or the test's own output after it: one test
@@ -1444,11 +1824,16 @@ fn nextest_summary(t: &str) -> Option<Count> {
     Some(c)
 }
 
-/// `PASS [   0.008s] (1/5) demo::facts fact_one`: the result, the binary, the test.
-fn nextest_case(t: &str) -> Option<(&'static str, &str, &str)> {
-    let t = match t.strip_prefix("TRY ") {
-        Some(r) => r.split_once(' ')?.1.trim_start(),
-        None => t,
+/// `PASS [   0.008s] (1/5) demo::facts fact_one`: the result, the binary, the
+/// test, and whether it is a retry (`TRY 2 PASS …`), which stands for the
+/// attempts before it.
+fn nextest_case(t: &str) -> Option<(&'static str, &str, &str, bool)> {
+    let (t, retry) = match t.strip_prefix("TRY ") {
+        Some(r) => {
+            let (n, rest) = r.split_once(' ')?;
+            (rest.trim_start(), n.parse::<u32>().ok()? > 1)
+        }
+        None => (t, false),
     };
     let (status, rest) = t.split_once(" [")?;
     let result = match status {
@@ -1464,7 +1849,205 @@ fn nextest_case(t: &str) -> Option<(&'static str, &str, &str)> {
         None => rest,
     };
     let (binary, name) = rest.split_once(' ')?;
-    Some((result, binary, name.trim()))
+    Some((result, binary, name.trim(), retry))
+}
+
+/// `N word` items, as the tools list them: each item's number and its words.
+fn items(list: &str, sep: char) -> Option<Vec<(u64, &str)>> {
+    list.split(sep)
+        .map(|item| {
+            let (n, word) = item.trim().split_once(' ')?;
+            Some((n.parse().ok()?, word.trim()))
+        })
+        .collect()
+}
+
+/// A tool's count from its items: which words pass, fail and skip. A word
+/// none of them has makes it no count of that tool's.
+fn tally(tool: &str, items: &[(u64, &str)], words: [&[&str]; 3], other: &[&str]) -> Option<Count> {
+    let mut c = Count::new(tool);
+    let mut any = false;
+    for &(n, word) in items {
+        match words.iter().position(|w| w.contains(&word)) {
+            Some(0) => c.passed += n,
+            Some(1) => c.failed += n,
+            Some(_) => c.skipped += n,
+            None if other.contains(&word) => continue,
+            None => return None,
+        }
+        any = true;
+    }
+    any.then_some(c)
+}
+
+/// vitest's, right-aligned: `      Tests  1 failed | 1 passed | 1 skipped | 1 todo (4)`.
+/// Fewer than the total ran when it stopped early (`--bail`).
+fn vitest_summary(line: &str) -> Option<Count> {
+    let list = line.trim_start().strip_prefix("Tests  ")?;
+    let (list, total) = list.trim_end().strip_suffix(')')?.rsplit_once(" (")?;
+    let words: [&[&str]; 3] = [&["passed"], &["failed"], &["skipped", "todo"]];
+    let mut c = tally("vitest", &items(list, '|')?, words, &[])?;
+    let total: u64 = total.parse().ok()?;
+    c.incomplete = c.passed + c.failed + c.skipped < total;
+    Some(c)
+}
+
+/// jest's: `Tests:       1 failed, 1 skipped, 1 todo, 1 passed, 4 total`.
+fn jest_summary(line: &str) -> Option<Count> {
+    let list = line.strip_prefix("Tests:")?;
+    let words: [&[&str]; 3] = [&["passed"], &["failed"], &["skipped", "todo"]];
+    tally("jest", &items(list, ',')?, words, &["total"])
+}
+
+/// pytest's last line, `1 failed, 1 passed, 1 skipped, 1 xfailed, 1 error in
+/// 0.02s`, framed in `=` but under `-q`.
+fn pytest_summary(line: &str) -> Option<Count> {
+    let t = line.trim().trim_matches('=').trim();
+    let (list, time) = t.rsplit_once(" in ")?;
+    let secs = time.split(' ').next()?.strip_suffix('s')?;
+    secs.parse::<f64>().ok()?;
+    let words: [&[&str]; 3] = [
+        &["passed", "xpassed"],
+        &["failed", "error", "errors"],
+        &["skipped", "xfailed"],
+    ];
+    let other = ["deselected", "warning", "warnings", "rerun"];
+    tally("pytest", &items(list, ',')?, words, &other)
+}
+
+/// pytest's `!!!!! stopping after 1 failures !!!!!` (`-x`, `--maxfail`), or
+/// `!!!!! Interrupted: 1 error during collection !!!!!`: not every test ran.
+fn pytest_stopped(t: &str) -> bool {
+    let Some(inner) = t.strip_prefix("!!").and_then(|r| r.strip_suffix("!!")) else {
+        return false;
+    };
+    let inner = inner.trim_matches('!').trim();
+    inner.starts_with("stopping after ")
+        || inner.starts_with("Interrupted: ")
+        || inner.starts_with("KeyboardInterrupt")
+}
+
+/// The errors on pytest's last line (`1 error in 0.10s`).
+fn pytest_errors(line: &str) -> u64 {
+    let t = line.trim().trim_matches('=').trim();
+    let list = t.rsplit_once(" in ").map_or(t, |(l, _)| l);
+    items(list, ',')
+        .unwrap_or_default()
+        .iter()
+        .filter(|(_, w)| matches!(*w, "error" | "errors"))
+        .map(|(n, _)| n)
+        .sum()
+}
+
+/// unittest's `FAIL: test_x (mod.T.test_x)` or `ERROR: …` over a failure,
+/// its subtest's `(i=2)` left off: the test (or `setUpClass (mod.T)`).
+fn unittest_head(line: &str) -> Option<&str> {
+    let rest = line
+        .strip_prefix("FAIL: ")
+        .or_else(|| line.strip_prefix("ERROR: "))?
+        .trim_end();
+    let end = rest.find(')')?;
+    rest[..end].contains(" (").then(|| &rest[..=end])
+}
+
+/// unittest's `Ran 5 tests in 0.003s`: how many ran.
+fn ran_tests(line: &str) -> Option<u64> {
+    let (n, rest) = line.strip_prefix("Ran ")?.split_once(' ')?;
+    (rest.starts_with("test in ") || rest.starts_with("tests in "))
+        .then(|| n.parse().ok())
+        .flatten()
+}
+
+/// Its next line: `OK`, `OK (skipped=1)`, or `FAILED (failures=1, errors=1,
+/// skipped=1, expected failures=1)`. unittest counts each failing subtest in
+/// `failures`, but the test once in `Ran`; a class's or module's setUp error
+/// in `errors`, and not its tests, which did not run. So the failures are the
+/// tests its headers (`heads`) name, when there is one per failure.
+fn unittest_result(line: &str, ran: u64, heads: &[String]) -> Option<Count> {
+    let line = line.trim_end();
+    let rest = line
+        .strip_prefix("OK")
+        .or_else(|| line.strip_prefix("FAILED"))?;
+    let mut c = Count::new("unittest");
+    let list = match rest.trim() {
+        "" => "",
+        r => r.strip_prefix('(')?.strip_suffix(')')?,
+    };
+    let (mut failures, mut unexpected) = (0, 0);
+    for item in list.split(',').filter(|i| !i.trim().is_empty()) {
+        let (word, n) = item.trim().split_once('=')?;
+        let n: u64 = n.parse().ok()?;
+        match word {
+            "failures" | "errors" => failures += n,
+            "unexpected successes" => unexpected += n,
+            "skipped" | "expected failures" => c.skipped += n,
+            _ => return None,
+        }
+    }
+    c.failed = failures + unexpected;
+    if heads.len() as u64 == failures && failures > 0 {
+        let fixture = |h: &String| {
+            [
+                "setUpClass ",
+                "tearDownClass ",
+                "setUpModule ",
+                "tearDownModule ",
+            ]
+            .iter()
+            .any(|f| h.starts_with(f))
+        };
+        let mut tests: Vec<&String> = heads.iter().filter(|h| !fixture(h)).collect();
+        tests.sort();
+        tests.dedup();
+        c.failed = tests.len() as u64 + unexpected;
+        // A module that did not load (`unittest.loader._FailedTest`), or a
+        // setUp that failed: their tests never ran.
+        c.incomplete =
+            heads.iter().any(fixture) || heads.iter().any(|h| h.contains("._FailedTest"));
+    }
+    if c.failed + c.skipped > ran {
+        c.failed = ran.saturating_sub(c.skipped);
+        c.incomplete = true;
+    }
+    c.passed = ran.saturating_sub(c.failed + c.skipped);
+    Some(c)
+}
+
+/// node's closing lines, TAP's `# pass 1` or spec's `ℹ pass 1`: the word, and
+/// its number (none for `duration_ms 92.4`).
+fn node_item(line: &str) -> Option<(&str, Option<u64>)> {
+    let rest = line
+        .strip_prefix("# ")
+        .or_else(|| line.strip_prefix("ℹ "))?;
+    let (word, n) = rest.trim().split_once(' ')?;
+    let known = [
+        "tests",
+        "suites",
+        "pass",
+        "fail",
+        "cancelled",
+        "skipped",
+        "todo",
+        "duration_ms",
+    ];
+    known.contains(&word).then(|| (word, n.trim().parse().ok()))
+}
+
+/// go test's line for a package: `ok  \tpkg\t0.009s` or `FAIL\tpkg\t0.006s`
+/// (`[build failed]`); it counts packages.
+fn go_package(line: &str) -> Option<Count> {
+    let (status, rest) = line.split_once('\t')?;
+    let pkg = rest.split(['\t', ' ']).next()?;
+    if pkg.is_empty() {
+        return None;
+    }
+    let mut c = Count::new("go");
+    match status.trim_end() {
+        "ok" => c.passed = 1,
+        "FAIL" => c.failed = 1,
+        _ => return None,
+    }
+    Some(c)
 }
 
 // ---- results.jsonl ------------------------------------------------------------
@@ -1512,6 +2095,14 @@ enum Line {
         text: String,
         #[serde(default)]
         left_out: bool,
+        #[serde(flatten)]
+        at: Annotation,
+    },
+    /// What a step wrote to GITHUB_STEP_SUMMARY.
+    Summary {
+        key: String,
+        step: String,
+        markdown: String,
     },
     Tail {
         key: String,
@@ -1546,6 +2137,12 @@ impl Results {
     /// results.jsonl: the build, then each job with its steps and what they
     /// printed, then the errors outside the jobs; one JSON object per line.
     pub fn to_jsonl(&self) -> String {
+        self.to_jsonl_with(|_| false)
+    }
+
+    /// [`Self::to_jsonl`], with each notice's `left_out` from `left_out` (its
+    /// text: bana.conf's report.left_out), or as results.jsonl said it.
+    pub fn to_jsonl_with(&self, left_out: impl Fn(&str) -> bool) -> String {
         let mut lines = vec![Line::Build(self.build.clone())];
         for j in &self.jobs {
             lines.push(Line::Job {
@@ -1578,9 +2175,19 @@ impl Results {
                         key: key.into(),
                         step: step.into(),
                         text: a.message.clone(),
-                        left_out: false,
+                        left_out: a.left_out || left_out(&a.message),
+                        at: Annotation {
+                            level: String::new(),
+                            message: String::new(),
+                            ..a.clone()
+                        },
                     },
                     _ => Line::Annotation(keyed(key, step, a)),
+                }));
+                lines.extend(s.summaries.iter().map(|m| Line::Summary {
+                    key: key.into(),
+                    step: step.into(),
+                    markdown: m.clone(),
                 }));
                 if !s.tail.is_empty() {
                     lines.push(Line::Tail {
@@ -1647,15 +2254,25 @@ impl Results {
                 Line::Rerun { key, step, target } => r.step_mut(&key, &step).reruns.push(target),
                 Line::Annotation(k) => r.step_mut(&k.key, &k.step).annotations.push(k.item),
                 Line::Notice {
-                    key, step, text, ..
+                    key,
+                    step,
+                    text,
+                    left_out,
+                    at,
                 } => {
                     let a = Annotation {
                         level: "notice".into(),
                         message: text,
-                        ..Annotation::default()
+                        left_out,
+                        ..at
                     };
                     r.step_mut(&key, &step).annotations.push(a);
                 }
+                Line::Summary {
+                    key,
+                    step,
+                    markdown,
+                } => r.step_mut(&key, &step).summaries.push(markdown),
                 Line::Tail { key, step, lines } => r.step_mut(&key, &step).tail = lines,
                 Line::Error(e) => r.errors.push(e),
             }
@@ -1699,6 +2316,7 @@ impl Results {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     /// The owner's log of a failed example run under act on a Mac, as pasted (its
     /// repeated "Error occurred running finally" shortened); and the same lines
@@ -2532,6 +3150,155 @@ Error: copy /Users/l/.cache/act/tjrb-xyz-bana-actions-plan@1a2b3c4/x: file exist
         assert_eq!(plan.tail, ["changed files"]);
     }
 
+    /// `out` as one act step's output in plain text: job `t`, step `s`, which
+    /// ends with `end` (`✅  Success`, `❌  Failure`), or not at all.
+    fn in_a_step(out: &str, end: Option<&str>) -> Results {
+        let mut log = String::from(
+            "[ci/t] ⭐ Run Set up job\n[ci/t]   ✅  Success - Set up job\n[ci/t] ⭐ Run Main s\n",
+        );
+        for l in out.lines() {
+            log += &format!("[ci/t]   | {l}\n");
+        }
+        if let Some(end) = end {
+            let job = if end.contains("Success") {
+                "succeeded"
+            } else {
+                "failed"
+            };
+            log += &format!(
+                "[ci/t]   {end} - Main s [1.0s]\n[ci/t]   ✅  Success - Complete job\n[ci/t] 🏁  Job {job}\n"
+            );
+        }
+        fold_text(&log)
+    }
+
+    #[test]
+    fn counts_that_stopped_short_or_said_too_much() {
+        macro_rules! sample {
+            ($name:literal) => {
+                (
+                    $name,
+                    include_str!(concat!("../tests/fixtures/results/", $name)),
+                )
+            };
+        }
+        const FAIL: Option<&str> = Some("❌  Failure");
+        for ((name, log), want, cases) in [
+            // nextest 0.9.146 --no-capture: each test's libtest lines pass
+            // through at column 0, and count once, as nextest's.
+            (
+                sample!("nextest-no-capture.txt"),
+                count("nextest", 4, 1, 1, false),
+                5,
+            ),
+            // A flaky test: its last attempt stands.
+            (
+                sample!("nextest-retry.txt"),
+                count("nextest", 2, 0, 0, false),
+                2,
+            ),
+            // unittest (python 3.11) counts each failing subtest, and the test once.
+            (
+                sample!("unittest-subtests.txt"),
+                count("unittest", 2, 1, 0, false),
+                0,
+            ),
+            // A setUpClass that failed: its class's tests never ran.
+            (
+                sample!("unittest-setup-class.txt"),
+                count("unittest", 1, 1, 1, true),
+                0,
+            ),
+            // A module that did not load.
+            (
+                sample!("unittest-import-error.txt"),
+                count("unittest", 1, 1, 0, true),
+                0,
+            ),
+            // pytest 9 -x: 2 of 4 never ran.
+            (sample!("pytest-x.txt"), count("pytest", 1, 1, 0, true), 0),
+            // A module that did not load stopped it while collecting: no test ran.
+            (
+                sample!("pytest-collection-error.txt"),
+                count("pytest", 0, 0, 0, true),
+                0,
+            ),
+            // vitest 5 --bail 1: 3 of its 4 ran.
+            (
+                sample!("vitest-bail.txt"),
+                count("vitest", 2, 1, 0, true),
+                0,
+            ),
+            // jest 30 --bail: 1 of 4 suites ran.
+            (sample!("jest-bail.txt"), count("jest", 1, 1, 0, true), 0),
+            // jest 30 --bail, with the failure last: its summary twice over.
+            (
+                sample!("jest-bail-twice.txt"),
+                count("jest", 3, 1, 0, false),
+                0,
+            ),
+        ] {
+            let r = in_a_step(log, FAIL);
+            let s = step(&r, "t", "s");
+            assert_eq!(s.tests, [want], "{name}");
+            assert_eq!(s.cases.len(), cases, "{name}: {:?}", s.cases);
+        }
+        let r = in_a_step(
+            include_str!("../tests/fixtures/results/nextest-no-capture.txt"),
+            FAIL,
+        );
+        let s = step(&r, "t", "s");
+        assert_eq!(
+            failed(s),
+            [(
+                "tests::accepted",
+                Some("src/lib.rs:12:45"),
+                Some("accepted")
+            )]
+        );
+        let r = in_a_step(
+            include_str!("../tests/fixtures/results/nextest-retry.txt"),
+            FAIL,
+        );
+        assert!(step(&r, "t", "s").failed_cases().next().is_none());
+
+        // node's summary with another line inside it (`cmd & node --test`):
+        // its failure still counts; one cut short is incomplete.
+        let tap = include_str!("../tests/fixtures/results/node-tap.txt");
+        let r = in_a_step(
+            &tap.replace("# pass 1\n", "# pass 1\n[web] build done\n"),
+            FAIL,
+        );
+        assert_eq!(step(&r, "t", "s").tests, [count("node", 1, 1, 2, false)]);
+        let cut = &tap[..tap.find("# fail").unwrap()];
+        let r = in_a_step(cut, FAIL);
+        assert_eq!(step(&r, "t", "s").tests, [count("node", 1, 0, 0, true)]);
+
+        // A test binary that never said its `test result:` (a hang the step's
+        // timeout ended): what it said so far, cut short.
+        let hang = "     Running unittests src/lib.rs (target/debug/deps/demo-7f33b6e5)\n\n\
+                    running 2 tests\ntest tests::a ... ok\ntest tests::b ... ok\n\n\
+                    test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\
+                    \x20    Running tests/facts.rs (target/debug/deps/facts-1234)\n\n\
+                    running 40 tests\ntest fact_one ... ok\n\
+                    test fact_hangs has been running for over 60 seconds\n";
+        let r = in_a_step(hang, FAIL);
+        assert_eq!(step(&r, "t", "s").tests, [count("cargo", 3, 0, 0, true)]);
+        // The same log cut before the step ended: every count is incomplete.
+        let whole = "running 2 tests\ntest tests::a ... ok\ntest tests::b ... ok\n\n\
+                     test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        let r = in_a_step(whole, None);
+        assert_eq!(step(&r, "t", "s").tests, [count("cargo", 2, 0, 0, true)]);
+        let r = in_a_step(whole, Some("✅  Success"));
+        assert_eq!(step(&r, "t", "s").tests, [count("cargo", 2, 0, 0, false)]);
+        // nextest that never said its Summary.
+        let r = in_a_step(
+            "    Starting 3 tests across 1 binary\n        PASS [   0.004s] (1/3) demo tests::a\n",
+            FAIL,
+        );
+        assert_eq!(step(&r, "t", "s").tests, [count("nextest", 1, 0, 0, true)]);
+    }
+
     #[test]
     fn what_a_line_says() {
         assert_eq!(
@@ -2632,11 +3399,19 @@ Error: copy /Users/l/.cache/act/tjrb-xyz-bana-actions-plan@1a2b3c4/x: file exist
         );
         assert_eq!(
             nextest_case("TRY 2 PASS [   0.010s] (3/5) demo::facts fact_two"),
-            Some(("passed", "demo::facts", "fact_two"))
+            Some(("passed", "demo::facts", "fact_two", true))
+        );
+        assert_eq!(
+            nextest_case("TRY 1 FAIL [   0.010s] (3/5) demo::facts fact_two"),
+            Some(("failed", "demo::facts", "fact_two", false))
         );
         assert_eq!(
             nextest_case("SIGSEGV [   0.100s] demo crash"),
-            Some(("failed", "demo", "crash"))
+            Some(("failed", "demo", "crash", false))
+        );
+        assert_eq!(
+            nextest_case("FLAKY 2/2 [   0.004s] (1/2) demo tests::flaky"),
+            None
         );
         assert_eq!(nextest_case("SLOW [> 60.000s] demo slow"), None);
         assert_eq!(
@@ -2647,8 +3422,321 @@ Error: copy /Users/l/.cache/act/tjrb-xyz-bana-actions-plan@1a2b3c4/x: file exist
     }
 
     #[test]
+    fn every_tools_counts_as_research_found_them() {
+        // Each tool as it printed on the same four tests (one passes, one
+        // fails, one is skipped, one is todo; pytest and unittest add an error
+        // and an expected failure): passed, failed, skipped.
+        macro_rules! sample {
+            ($name:literal) => {
+                (
+                    $name,
+                    include_str!(concat!("../tests/fixtures/results/", $name)),
+                )
+            };
+        }
+        for ((name, log), want) in [
+            (sample!("cargo-test.txt"), count("cargo", 1, 1, 1, true)),
+            (
+                sample!("cargo-test-no-fail-fast.txt"),
+                count("cargo", 5, 1, 1, false),
+            ),
+            (sample!("nextest.txt"), count("nextest", 4, 1, 1, false)),
+            (sample!("vitest.txt"), count("vitest", 1, 1, 2, false)),
+            (sample!("jest.txt"), count("jest", 1, 1, 2, false)),
+            (sample!("node-tap.txt"), count("node", 1, 1, 2, false)),
+            (sample!("node-spec.txt"), count("node", 1, 1, 2, false)),
+            (sample!("pytest.txt"), count("pytest", 1, 2, 2, false)),
+            (sample!("pytest-q.txt"), count("pytest", 1, 2, 2, false)),
+            (sample!("unittest.txt"), count("unittest", 1, 2, 2, false)),
+            // Packages: example.com/demo failed, example.com/demo/sub passed.
+            (sample!("go-test.txt"), count("go", 1, 1, 0, false)),
+        ] {
+            let r = fold_text(log);
+            let s = &r.jobs[0].steps[0];
+            assert_eq!(s.tests, [want], "{name}");
+            assert_eq!(r.build.result, "failure", "{name}: a test failed in it");
+        }
+        // playwright's list ends in lines that say no tool's count.
+        let r = fold_text(include_str!("../tests/fixtures/results/playwright.txt"));
+        assert!(r.jobs.is_empty(), "{:?}", r.jobs);
+
+        for (line, want) in [
+            (
+                "      Tests  2 passed (2)",
+                Some(count("vitest", 2, 0, 0, false)),
+            ),
+            (" Test Files  1 failed (1)", None),
+            (
+                "Tests:       3 passed, 3 total",
+                Some(count("jest", 3, 0, 0, false)),
+            ),
+            (
+                "===== 3 passed, 1 deselected, 2 warnings in 61.02s (0:01:01) =====",
+                Some(count("pytest", 3, 0, 0, false)),
+            ),
+            ("no tests ran in 0.01s", None),
+            ("2 warnings in 0.01s", None),
+            (
+                "    Finished `test` profile [unoptimized] target(s) in 0.52s",
+                None,
+            ),
+            ("Built 3 crates, 1 failed in 2s", None),
+            (
+                "ok  \texample.com/x\t(cached)",
+                Some(count("go", 1, 0, 0, false)),
+            ),
+            (
+                "FAIL\texample.com/x [build failed]",
+                Some(count("go", 0, 1, 0, false)),
+            ),
+            ("?   \texample.com/x\t[no test files]", None),
+            ("FAIL", None),
+        ] {
+            let got = vitest_summary(line)
+                .or_else(|| jest_summary(line))
+                .or_else(|| pytest_summary(line))
+                .or_else(|| go_package(line));
+            assert_eq!(got, want, "{line}");
+        }
+        assert_eq!(
+            unittest_result("OK", 3, &[]),
+            Some(count("unittest", 3, 0, 0, false))
+        );
+        assert_eq!(unittest_result("NO TESTS RAN", 0, &[]), None);
+        // More failures than tests, and no header to say which: unknown.
+        assert_eq!(
+            unittest_result("FAILED (failures=3)", 2, &[]),
+            Some(count("unittest", 0, 2, 0, true))
+        );
+        assert_eq!(
+            unittest_head("FAIL: test_many (__main__.T.test_many) (i=2)"),
+            Some("test_many (__main__.T.test_many)")
+        );
+        assert_eq!(
+            unittest_head("ERROR: setUpClass (t_cls.A)"),
+            Some("setUpClass (t_cls.A)")
+        );
+        assert_eq!(unittest_head("FAIL: tests/a.py::x"), None);
+        assert!(pytest_stopped("!!!!!!! stopping after 1 failures !!!!!!!"));
+        assert!(pytest_stopped(
+            "!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!"
+        ));
+        assert!(!pytest_stopped("!! x !!"));
+        assert_eq!(pytest_errors("=== 1 failed, 2 errors in 0.10s ==="), 2);
+        assert_eq!(ran_tests("Ran 1 test in 0.000s"), Some(1));
+        // TAP from another tool, and node's lines with no `# tests` first.
+        let r = fold_text("# tests 3\n# pass  2\n# fail  1\n\n# pass 5\n");
+        assert_eq!(r.jobs[0].steps[0].tests, [count("node", 2, 1, 0, false)]);
+    }
+
+    #[test]
+    fn step_summaries_annotations_and_notices() {
+        let r = fold_json(RUN1);
+        assert_eq!(
+            step(&r, "node", "summary one").summaries,
+            ["## node job\n| a | b |\n|---|---|\n| 1 | 2 |"]
+        );
+        assert_eq!(
+            step(&r, "node", "summary two").summaries,
+            ["second step summary"]
+        );
+        assert_eq!(
+            step(&r, "host", "summary from host mode").summaries,
+            ["host summary"],
+            "host mode too"
+        );
+        let a = &step(&r, "node", "annotations").annotations;
+        assert_eq!(
+            (a[0].title.as_deref(), a[2].col),
+            (Some("Heads up"), Some(31))
+        );
+        let upload = step(&r, "host", "actions/upload-artifact@v4");
+        assert_eq!(
+            (
+                upload.annotations[0].level.as_str(),
+                upload.annotations[0].message.as_str()
+            ),
+            (
+                "error",
+                "request blocked: no rule allows host \"192.0.2.2\""
+            )
+        );
+        // Other tools in run 1: unittest (in a container) and node's spec.
+        assert_eq!(
+            step(&r, "py", "unittest").tests,
+            [count("unittest", 1, 0, 1, false)]
+        );
+        assert_eq!(
+            step(&r, "node", "node tests").tests,
+            [count("node", 1, 1, 2, false)]
+        );
+
+        let lines: Vec<Value> = r
+            .to_jsonl()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let of =
+            |kind: &str| -> Vec<&Value> { lines.iter().filter(|v| v["kind"] == kind).collect() };
+        let notices = of("notice");
+        assert_eq!(notices.len(), 1);
+        assert_eq!(
+            (
+                &notices[0]["step"],
+                &notices[0]["text"],
+                &notices[0]["title"],
+                &notices[0]["left_out"]
+            ),
+            (
+                &json!("annotations"),
+                &json!("a notice"),
+                &json!("Heads up"),
+                &json!(false)
+            )
+        );
+        assert!(notices[0].get("level").is_none());
+        let summaries: Vec<(&Value, &Value)> = of("summary")
+            .iter()
+            .map(|v| (&v["key"], &v["step"]))
+            .collect();
+        assert_eq!(
+            summaries,
+            [
+                (&json!("host"), &json!("summary from host mode")),
+                (&json!("node"), &json!("summary one")),
+                (&json!("node"), &json!("summary two")),
+            ]
+        );
+        let errors: Vec<&Value> = of("annotation")
+            .into_iter()
+            .filter(|v| v["level"] == "error")
+            .collect();
+        assert_eq!(errors.len(), 2);
+
+        // Run 2: a step that fails still logs its summary, after its result.
+        let r = fold_json(include_str!("../tests/fixtures/results/act-run2.jsonl"));
+        let s = step(&r, "failsum", "fails but writes a summary");
+        assert_eq!(
+            (s.result.as_deref(), &s.summaries[..]),
+            (
+                Some("failure"),
+                &["### failed step summary".to_string()][..]
+            )
+        );
+        assert!(!s.tail.iter().any(|l| l.contains("failed step summary")));
+        assert_eq!(Results::from_jsonl(&r.to_jsonl()), r);
+
+        // Run 3: bana ci's log with act's --json lines, as a hand run keeps it.
+        let r = fold_text(include_str!("../tests/fixtures/results/act-run3.txt"));
+        assert_eq!(
+            step(&r, "node", "summary one").summaries,
+            ["## node job\n| a | b |\n|---|---|\n| 1 | 2 |"]
+        );
+        assert_eq!(
+            step(&r, "node", "node tests").tests,
+            [count("node", 1, 1, 2, false)]
+        );
+        assert_eq!(r.build.result, "failure");
+
+        // A summary in plain text: act's line, then its bare lines.
+        let text = "[ci/a] ⭐ Run Main t
+[ci/a]   | out
+[ci/a]   ✅  Success - Main t [1ms]
+[ci/a]   ⚙  Summary - ## a
+| x | y |
+
+done
+[ci/a] 🏁  Job succeeded
+";
+        let r = fold_text(text);
+        let s = step(&r, "a", "t");
+        assert_eq!(s.summaries, ["## a\n| x | y |\n\ndone"]);
+        assert_eq!(s.tail, Vec::<String>::new());
+    }
+
+    #[test]
+    fn jobs_that_never_ran() {
+        let (jsonl, list) = (
+            include_str!("../tests/fixtures/act/skip.jsonl"),
+            include_str!("../tests/fixtures/act/skip.list"),
+        );
+        let results = |r: &Results| -> Vec<(String, String)> {
+            r.jobs
+                .iter()
+                .map(|j| (j.key.clone(), j.result.clone()))
+                .collect()
+        };
+        let pairs = |p: &[(&str, &str)]| -> Vec<(String, String)> {
+            p.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        };
+        // The plan job set web=false; nightly's `if:` is the tier's.
+        let r = fold_json_listed(jsonl, &actlog::parse_list(list));
+        assert_eq!(
+            results(&r),
+            pairs(&[
+                ("plan", "success"),
+                ("nightly", "skipped"),
+                ("web", "not_planned"),
+                ("rust", "success")
+            ])
+        );
+        assert_eq!(r.build.result, "success");
+        assert_eq!(
+            results(&fold_json(jsonl)),
+            pairs(&[("plan", "success"), ("rust", "success")]),
+            "without act -l, act says nothing of them"
+        );
+
+        // bana plan's JSON, from a job of any name.
+        let plan = r#"{"jobID":"setup","matrix":{},"step":"plan","stepID":["p"],"stage":"Main","msg":"  ⚙  ::set-output:: json={\"tier\":\"quick\",\"rust\":true,\"package\":false}","command":"set-output","name":"json","arg":"{}"}
+{"jobID":"setup","matrix":{},"step":"plan","stepID":["p"],"stage":"Main","msg":"ok","stepResult":"success"}
+{"jobID":"setup","matrix":{},"msg":"done","jobResult":"success"}
+{"jobID":"rust","matrix":{},"step":"t","stepID":["0"],"stage":"Main","msg":"ok","stepResult":"success"}
+{"jobID":"rust","matrix":{},"msg":"done","jobResult":"success"}
+{"jobID":"macos","matrix":{},"msg":"🚧  Skipping unsupported platform -- Try running with `-P macos-latest=...`"}"#;
+        let list = [
+            (0, "setup".to_string()),
+            (0, "macos".to_string()),
+            (1, "rust".to_string()),
+            (1, "package".to_string()),
+            (1, "web".to_string()),
+        ];
+        let r = fold_json_listed(plan, &list);
+        assert_eq!(
+            results(&r),
+            pairs(&[
+                ("setup", "success"),
+                ("macos", "unsupported"),
+                ("rust", "success"),
+                ("package", "not_planned"),
+                ("web", "skipped")
+            ])
+        );
+        assert_eq!(r.build.tier.as_deref(), Some("quick"));
+
+        // In text, act's line for the output is the same.
+        let text = "[ci/plan] ⭐ Run Main p
+[ci/plan]   ✅  Success - Main p [1ms]
+[ci/plan]   ⚙  ::set-output:: web=false
+[ci/plan] 🏁  Job succeeded
+";
+        let mut f = Folder::default();
+        for l in text.lines() {
+            f.text(l);
+        }
+        assert_eq!(f.plan.get("web"), Some(&false));
+    }
+
+    #[test]
     fn results_jsonl_reads_back() {
-        for r in [fold_text(PASTE), fold_json(RUN1), fold_text(CARGO)] {
+        for r in [
+            fold_text(PASTE),
+            fold_json(RUN1),
+            fold_text(CARGO),
+            fold_text(include_str!("../tests/fixtures/results/vitest.txt")),
+        ] {
             let jsonl = r.to_jsonl();
             for line in jsonl.lines() {
                 let v: Value = serde_json::from_str(line).unwrap();

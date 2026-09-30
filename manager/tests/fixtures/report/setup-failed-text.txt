@@ -1,0 +1,89 @@
+time="2026-09-30T13:35:59Z" level=info msg="Using docker host 'unix:///var/run/docker.sock', and daemon socket 'unix:///var/run/docker.sock'"
+time="2026-09-30T13:35:59Z" level=info msg="Start server on http://192.0.2.2:34567"
+[ci/lint-1 ] ⭐ Run Set up job
+[ci/lint-1 ] 🚀  Start image=catthehacker/ubuntu:act-24.04
+[ci/rust   ] ⭐ Run Set up job
+[ci/py     ] ⭐ Run Set up job
+[ci/py     ] 🚀  Start image=catthehacker/ubuntu:act-24.04
+[ci/lint-2 ] ⭐ Run Set up job
+[ci/lint-2 ] 🚀  Start image=catthehacker/ubuntu:act-24.04
+[ci/lint-2 ]   🐳  docker pull image=catthehacker/ubuntu:act-24.04 platform=linux/amd64 username= forcePull=true
+[ci/lint-1 ]   🐳  docker pull image=catthehacker/ubuntu:act-24.04 platform=linux/amd64 username= forcePull=true
+[ci/py     ]   🐳  docker pull image=catthehacker/ubuntu:act-24.04 platform=linux/amd64 username= forcePull=true
+[ci/rust   ]   ✅  Success - Set up job
+[ci/rust   ] ⭐ Run Main cargo test
+[ci/rust   ]   | [1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 0.00s
+[ci/rust   ]   | [1m[92m     Running[0m unittests src/lib.rs (/tmp/claude-0/-home-user-bana/a098c434-4782-518b-8100-69c3d243761b/scratchpad/wave3/check/proj-target/debug/deps/demo-7f33b6e559525f28)
+[ci/rust   ]   | 
+[ci/rust   ]   | running 4 tests
+[ci/rust   ]   | test tests::adds ... [32mok[m
+[ci/rust   ]   | test tests::fact_answer ... [31mFAILED[m
+[ci/rust   ]   | test tests::slow ... [33mignored[m
+[ci/rust   ]   | test tests::fact_sign ... [32mok[m
+[ci/rust   ]   | 
+[ci/rust   ]   | failures:
+[ci/rust   ]   | 
+[ci/rust   ]   | ---- tests::fact_answer stdout ----
+[ci/rust   ]   | 
+[ci/rust   ]   | thread 'tests::fact_answer' (3559) panicked at src/lib.rs:5:32:
+[ci/rust   ]   | assertion `left == right` failed: the answer
+[ci/rust   ]   |   left: 41
+[ci/rust   ]   |  right: 42
+[ci/rust   ]   | note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+[ci/rust   ]   | 
+[ci/rust   ]   | 
+[ci/rust   ]   | failures:
+[ci/rust   ]   |     tests::fact_answer
+[ci/rust   ]   | 
+[ci/rust   ]   | test result: [31mFAILED[m. 2 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+[ci/rust   ]   | 
+[ci/rust   ]   | [1m[91merror[0m: test failed, to rerun pass `--lib`
+[ci/rust   ]   ❌  Failure - Main cargo test [30.694466ms]
+[ci/rust   ] exit status 101
+[ci/rust   ] ⭐ Run Complete job
+[ci/rust   ]   ✅  Success - Complete job
+[ci/rust   ] 🏁  Job failed
+[ci/lint-2 ] Error response from daemon: unknown: failed to resolve reference "docker.io/catthehacker/ubuntu:act-24.04": unexpected status from HEAD request to https://registry-1.docker.io/v2/catthehacker/ubuntu/manifests/act-24.04: 429 Too Many Requests
+[ci/lint-2 ]   ❌  Failure - Set up job
+[ci/lint-2 ] 🏁  Job failed
+[ci/py     ]   🐳  docker create image=catthehacker/ubuntu:act-24.04 platform=linux/amd64 entrypoint=["tail" "-f" "/dev/null"] cmd=[] network="bridge"
+[ci/py     ]   🐳  docker run image=catthehacker/ubuntu:act-24.04 platform=linux/amd64 entrypoint=["tail" "-f" "/dev/null"] cmd=[] network="bridge"
+[ci/py     ]   🐳  docker exec cmd=[node --no-warnings -e console.log(process.execPath)] user= workdir=
+[ci/lint-1 ]   🐳  docker create image=catthehacker/ubuntu:act-24.04 platform=linux/amd64 entrypoint=["tail" "-f" "/dev/null"] cmd=[] network="bridge"
+[ci/py     ]   ✅  Success - Set up job
+[ci/lint-1 ]   🐳  docker run image=catthehacker/ubuntu:act-24.04 platform=linux/amd64 entrypoint=["tail" "-f" "/dev/null"] cmd=[] network="bridge"
+[ci/py     ] ⭐ Run Main unit tests
+[ci/py     ]   🐳  docker exec cmd=[bash -e /var/run/act/workflow/0] user= workdir=
+[ci/py     ]   | test_dev (test_a.T.test_dev) ... skipped 'no device'
+[ci/py     ]   | test_one (test_a.T.test_one) ... ok
+[ci/py     ]   | test_two (test_a.T.test_two) ... ok
+[ci/py     ]   | 
+[ci/py     ]   | ----------------------------------------------------------------------
+[ci/py     ]   | Ran 3 tests in 0.000s
+[ci/py     ]   | 
+[ci/py     ]   | OK (skipped=1)
+[ci/py     ]   ✅  Success - Main unit tests [156.284797ms]
+[ci/py     ] ⭐ Run Main driver
+[ci/py     ]   🐳  docker exec cmd=[bash -e /var/run/act/workflow/1] user= workdir=
+[ci/lint-1 ]   🐳  docker exec cmd=[node --no-warnings -e console.log(process.execPath)] user= workdir=
+[ci/py     ]   ❓  ::notice::driver check left out, no audio device here
+[ci/py     ]   ✅  Success - Main driver [101.067425ms]
+[ci/lint-1 ]   ✅  Success - Set up job
+[ci/lint-1 ] 🧪  Matrix: map[arch:x64]
+[ci/py     ] ⭐ Run Complete job
+[ci/py     ] Cleaning up container for job py
+[ci/lint-1 ] ⭐ Run Main fmt
+[ci/lint-1 ]   🐳  docker exec cmd=[bash -e /var/run/act/workflow/0] user= workdir=
+[ci/lint-1 ]   | fmt x64 ok
+[ci/lint-1 ]   ✅  Success - Main fmt [122.660494ms]
+[ci/py     ]   ✅  Success - Complete job
+[ci/py     ] 🏁  Job succeeded
+[ci/lint-1 ] ⭐ Run Main clippy
+[ci/lint-1 ]   🐳  docker exec cmd=[bash -e /var/run/act/workflow/1] user= workdir=
+[ci/lint-1 ]   | clippy ok
+[ci/lint-1 ]   ✅  Success - Main clippy [105.427044ms]
+[ci/lint-1 ] ⭐ Run Complete job
+[ci/lint-1 ] Cleaning up container for job lint
+[ci/lint-1 ]   ✅  Success - Complete job
+[ci/lint-1 ] 🏁  Job failed
+Error: Error response from daemon: unknown: failed to resolve reference "docker.io/catthehacker/ubuntu:act-24.04": unexpected status from HEAD request to https://registry-1.docker.io/v2/catthehacker/ubuntu/manifests/act-24.04: 429 Too Many Requests

@@ -11,6 +11,9 @@
 #                            act's output stays in ~/.bana/<prefix>/ci/last.log, for bana fix
 #   bana fix [BUILD | last | --log FILE|-] [--open | --headless]   a failed run to Claude Code, on a branch
 #                            of its own in a worktree (bana fix help: brief, list, push, drop)
+#   bana report [BUILD | last | --log FILE|-] [--json]   the CI report (Markdown): a daemon build's,
+#                            the last bana ci's (the newer by default), or act's output from
+#                            elsewhere; checks and tests per standard (bana.conf's report.* keys)
 #   bana mcp                 bana's tools for Claude Code in a fix (an MCP server on stdin and
 #                            stdout); bana daemon install registers it with Claude Code here
 # CI on push, on this machine (a daemon runs each push through act and posts commit statuses):
@@ -803,6 +806,46 @@ manager() {
     --tier-input "$(conf tier_input tier)" "$@"
 }
 
+# bana report: bana-manager renders it, from a build's results or act's plain text, with this
+# checkout's bana.conf (its report.* keys are the standards).
+report() {
+  local src=() json=() a b='' f last=$home/ci/last.log machine=$host
+  while (($#)); do
+    case $1 in
+    --json) json=(--json) ;;
+    --log)
+      [[ $# -ge 2 ]] || usage
+      src=(--text "$2")
+      machine=''
+      shift
+      ;;
+    last) src=(--text "$last" --env "$home/ci/last.env") ;;
+    *) [[ $1 =~ ^[0-9]+$ ]] || usage; src=(--build "$home/builds/$1") ;;
+    esac
+    shift
+  done
+  if ((!${#src[@]})); then
+    # The newer of the last bana ci here and the newest daemon build.
+    for f in "$home"/builds/*/build.json; do
+      [[ -f $f ]] || continue
+      a=${f%/build.json} && a=${a##*/}
+      [[ $a =~ ^[0-9]+$ ]] && { [[ -z $b ]] || ((a > b)); } && b=$a
+    done
+    if [[ -f $last ]] && { [[ -z $b ]] || [[ $last -nt $home/builds/$b/build.json ]]; }; then
+      src=(--text "$last" --env "$home/ci/last.env")
+    elif [[ -n $b ]]; then src=(--build "$home/builds/$b")
+    else die "Nothing to report: no bana ci here, and no daemon build (bana report --log FILE takes act's output)"; fi
+  fi
+  case ${src[0]} in
+  --build) [[ -f ${src[1]}/build.json || -f ${src[1]}/results.jsonl ]] || die "No daemon build ${src[1]##*/}" ;;
+  *) [[ ${src[1]} == - || -f ${src[1]} ]] || die "No ${src[1]}${src[2]:+: bana ci keeps one}" ;;
+  esac
+  [[ -z $conf_file ]] || src+=(--conf "$conf_file")
+  [[ -z $repo ]] || src+=(--repo "$repo")
+  [[ -z $machine ]] || src+=(--machine "$machine")
+  exec "$(bm report)" report "${src[@]}" ${json[@]+"${json[@]}"}
+}
+
 cmd=${1:-}
 shift || true
 case $cmd in
@@ -849,6 +892,7 @@ init)
   source "$bana_root/lib/init.sh"
   init_main "$@"
   ;;
+report) report "$@" ;;
 mcp)
   # Claude Code starts it; stdout is the protocol's alone.
   need_repo

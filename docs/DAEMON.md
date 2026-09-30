@@ -93,7 +93,8 @@ your next login or `bana daemon install`.
   (the same commit and tier again, even if it was built), and on a failed build *Fix with Claude*
   ([FIX.md](FIX.md)), then the fix's card: its rounds, *Keep*, *Push*, *Compare on GitHub*, *More rounds* and
   *Discard*;
-- the history (the last 100 builds), and the pushes not built.
+- the build's *Report* (once it ended): the CI report's table, the rest as text, with *Copy* and *Download*;
+- the history (the last 100 builds, each with its tests' share, `tests 95%`), and the pushes not built.
 
 The runner pool's sections follow, under *Runner pool (optional)*. `bana manager` opens this page too while the
 project's daemon runs.
@@ -157,6 +158,38 @@ A fix gets `fix.rounds` rounds, one at a time, and none while the daemon is paus
 the failing commit, runs when a fix is made or registered: from the page or 🧱, or `bana fix` while the daemon
 runs. When a fix's builds leave the history (pruned, or its fix dropped), its refs in the daemon's clone go too. The daemon touches your checkout only when you click:
 *Fix with Claude* (the worktree), *Keep*, *Push* and *Discard*.
+
+## The CI report
+
+When a build ends, the daemon writes `results.jsonl` and `report.md` beside its log: the report of
+[README.md](../README.md#the-ci-report), with the standards (`report.*`) of the built commit's bana.conf. The
+page's *Report* tab, `bana report N`, `GET /ci/v1/builds/N/report` and the MCP server's `ci_report` show it.
+The statuses stay as they were.
+
+The report is made from `results.jsonl` alone, one JSON object per line, `schema` 1. A builder other than act
+can print act's `--json` lines (below) and have the daemon's fold, statuses, page and log work unchanged, or
+write this file itself into the build's directory before the build ends: the daemon then takes it as it is, and
+adds only the build's ref, commit, tier and times from `build.json`, and the repo, machine and bana commit where
+it has none. An ended build without a report (one from before bana wrote them) gets it when it is asked for.
+
+| `kind` | Fields |
+|---|---|
+| `build` | `schema`, `builder` (`act 0.2.89`), `bana`, `repo`, `ref`, `sha`, `tier`, `machine`, `network`, `trigger`, `started`, `ended` (Unix seconds), `result`: `success`, `failure`, `error` or `unknown` |
+| `job` | `key` (`package (linux-arm64)`), `job` (its id), `matrix`, `result`: `success`, `failure`, `skipped`, `unsupported` (no platform here), `not_planned` (the plan left it out), `cancelled` or `unknown`; `ms` |
+| `step` | `key`, `step` (its name), `stage` (`Pre`, `Main`, `Post`; empty for Set up job and Complete job), `result`, `ms`, `owner`: `project`, `bana` or `act`, `continued` (continue-on-error) |
+| `tests` | `key`, `step`, `tool` (`cargo`, `nextest`, `vitest`, `jest`, `node`, `pytest`, `unittest`, `go`, whose counts are packages and are shown apart), `passed`, `failed`, `skipped`, `incomplete` (not every test ran: the tool stopped early, or the step never ended) |
+| `test` | `key`, `step`, `name`, `result` (`passed`, `failed`, `skipped`), `binary`, `at` (FILE:LINE:COL), `message` |
+| `rerun` | `key`, `step`, `target` (cargo's `--lib`, `-p crate --test facts`) |
+| `annotation` | `key`, `step`, `level`, `message`, `title`, `file`, `line`, `col` |
+| `notice` | `key`, `step`, `text`, `left_out` (true: the step did not check here; bana sets it when report.left_out matches, and a builder may set it itself), `title`, `file`, `line`, `col` |
+| `summary` | `key`, `step`, `markdown` (the step's GITHUB_STEP_SUMMARY) |
+| `tail` | `key`, `step`, `lines`: a failed step's last lines |
+| `error` | `owner`, `text`, and `key` and `step` when it names one: act's or bana's errors |
+
+Lines come in that order, a job's steps after it, a step's lines after it; unknown kinds and fields are skipped.
+act's `--json` lines that the daemon reads: `jobID`, `matrix`, `step`, `stepID` (`stepid` for Set up job),
+`stage`, `msg` with `raw_output` (a step's output), `stepResult` with `executionTime` (ns), `jobResult`, and
+optionally `command` (`summary`, `error`, `warning`, `notice`); `actlog.rs` has the details.
 
 ## Sleep, wake and restarts
 
@@ -260,7 +293,7 @@ Logs stay on the machine.
 |---|---|
 | `~/.bana/<prefix>/daemon/` | the snapshot: `bana-manager`, bana, and `settings` |
 | `~/.bana/<prefix>/src/` | the daemon's clone |
-| `~/.bana/<prefix>/builds/<id>/` | each build: `build.json`, `act.jsonl` (act's log), `event.json`, `artifacts/` |
+| `~/.bana/<prefix>/builds/<id>/` | each build: `build.json`, `act.jsonl` (act's log), `event.json`, `results.jsonl` and `report.md` (the CI report), `artifacts/` |
 | `~/.bana/<prefix>/act-cache/` | act's actions, and the macOS jobs' copies while they run |
 | `~/.bana/<prefix>/fix/` | *Fix with Claude* and `bana fix`: each fix's worktree, and beside it `<sha7>.d/` with its brief and `rounds.json` ([FIX.md](FIX.md)) |
 | `~/.bana/<prefix>/state.json` | paused, the queue, the heads seen, each branch's last green commit |

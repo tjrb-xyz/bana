@@ -189,6 +189,39 @@ The page's fix card has the same: the rounds, *Keep*, *Push*, *More rounds* and 
 bana-manager: the daemon's (`bana daemon install`), else one bana builds with cargo the first time.
 [docs/FIX.md](docs/FIX.md) has the rest, and a checklist to run once on a Mac.
 
+## The CI report
+
+A report of how a run went, as percentages per standard, in Markdown:
+
+```sh
+bana report                  # the newer of the last bana ci here and the daemon's last build
+bana report 41               # daemon build 41 (the build page's Report tab has it too)
+bana report last             # the last bana ci here
+pbpaste | bana report --log -   # act's output from elsewhere (or --log FILE)
+bana report --json           # {markdown, standards}
+```
+
+A standard is a group of checks, named in bana.conf, in the order you want them; an `all` row comes last:
+
+```
+report.rust = rust                 # a job (its id, or a matrix entry's name: "package (*)")
+report.web = "web/pnpm test" e2e   # JOB/STEP: some steps of a job
+report.engine = test:real_*        # tests by name, wherever they ran (cargo's and nextest's; a::real_x too)
+report.left_out = "*left out*"     # ::notice:: text that means a step did not check here
+```
+
+With no `report.*` key, each job is a standard. *Checks* are the project's own steps that passed or failed (not
+bana's, not act's, not Pre or Post). *Tests* are the counts the test tools printed (cargo, nextest, vitest, jest,
+node, pytest, unittest; go's packages apart): passed of those run, skipped apart. A run that stopped early (cargo at
+its first failing binary, pytest `-x`, a bail, a step that never ended) reads `95% of 22 run (incomplete)`, nothing
+counted reads `—`, and a job that did not run here (skipped, no platform, not planned at the tier, left out, or failed
+before its first step) is listed as not run, never as a pass or a failure. Below the table come the failures (tests,
+where they failed, the rerun command), what was bana's or act's, what did not run, and the steps' own summaries.
+Each daemon build writes one when it ends, with its commit's standards (a fix round's: its failing commit's);
+`bana ci` ends with the table and keeps the report in `~/.bana/<prefix>/ci/last.report.md`. Nothing goes to GitHub.
+[docs/DAEMON.md](docs/DAEMON.md#the-ci-report) has results.jsonl, what the report is made from, for a builder other
+than act.
+
 ## bana up: a runner pool (optional)
 
 | On | `bana up` makes | Labels |
@@ -360,7 +393,8 @@ for several CPUs. [examples/example](examples/example) has its `.github/bana.con
 and `ci.yml`, its workflow trimmed to where the jobs run (`bana init`'s tests run on it). The mac hook installs
 Homebrew's SCons, ragel and CMake and the project's audio driver, and checks for rustup. The linux hook installs
 rustup and checks that sudo does not ask. Its `plan.*` keys are its path rules. Its `daemon.*` keys build every
-branch but the bots', at `quick`, and no tags.
+branch but the bots', at `quick`, and no tags. Its `report.*` keys are its CI report's standards: toolchain,
+rust, engine (the `real_*` tests), web, macos, streaming, sdk, linux_service and packaging.
 
 On a Mac, `bana init --check` finds a place for every job of it, and still exits 1: `package`'s matrix splits
 over machines (the Linux targets in containers, `osx-arm64` on the Mac itself), and act runs every Linux
@@ -430,6 +464,7 @@ send the jobs elsewhere without a change to the workflow.
 ```sh
 bana ci [TIER] [-j JOB] [--x64] [--list] [--event FILE] [-- ACT-OPTIONS]
 bana fix [BUILD | last | --log FILE|-] [--open | --headless]   # and brief, list, push, drop: docs/FIX.md
+bana report [BUILD | last | --log FILE|-] [--json]   # the CI report, per standard
 bana mcp             # bana's tools for Claude Code, by hand (an MCP server on stdio)
 bana daemon install [--port N] [--no-tray] [--no-open] [--now] [--no-claude]
 bana daemon status|log|open|poke|run|uninstall   # docs/DAEMON.md

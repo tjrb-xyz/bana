@@ -131,6 +131,9 @@ tiers = quick nightly
 daemon.poll = 10
 act.args = $host_args
 act.image = ${image:-none}
+report.work = linux/work host
+report.tests = broken
+report.answers = test:tests::*
 EOF
 cat >.github/workflows/ci.yml <<'EOF'
 name: ci
@@ -347,6 +350,8 @@ running_job() { # SHA KEY: the build of SHA runs, and so does its job KEY
   api /local | jq_ 'j["running"] and j["running"]["sha"] == "'"$1"'" and any(c["key"] == "'"$2"'" and c["state"] == "running" for c in j["running"]["jobs"]) or ""' | grep -q True
 }
 build_log() { cat "$d/builds/$1/act.jsonl"; }
+# A standard's row of build ID's report.md.
+report_row() { grep "^| $2 |" "$d/builds/$1/report.md" || true; } # ID NAME
 state_of() { builds_of "$1" | tail -n 1 | cut -d'|' -f2; }
 
 # ---- Claude Code's side of a fix ----------------------------------------------------------
@@ -454,6 +459,11 @@ for j in linux host broken; do
 done
 check "pass: statuses link to the daemon's page" has "$FAKE_LOG" "target_url=http://127.0.0.1:$port/#build=$id"
 check "pass: in the job, HEAD is the pushed commit" has <(build_log "$id") "HEAD $a"
+check "pass: report.md, titled with the push" same "$(head -1 "$d/builds/$id/report.md")" "# CI report: acme/wid · main ${a:0:7} · quick · passed"
+check "pass: the report's meta line, with act's version" bash -c "[[ '$(sed -n 3p "$d/builds/$id/report.md")' == 'Build #$id on '*' · act '[0-9]* ]]"
+check "pass: every check of work passed" same "$(report_row "$id" work)" "| work | 100% (3/3) | — | |"
+check "pass: a job not run is no pass" same "$(report_row "$id" '\*\*all\*\*')" "| **all** | 100% (7/7) | — | 1 |"
+check "pass: and says why" has "$d/builds/$id/report.md" "- never: skipped"
 clean pass
 
 # ---- 2. a push that fails -----------------------------------------------------------------
@@ -472,6 +482,15 @@ check "fail: bana/broken failed at test" bash -c "[[ '$(last "$b" bana/broken)' 
 check "fail: bana/linux passed" same "$(last "$b" bana/linux | cut -d'|' -f1)" success
 check "fail: the push's before (the last green) is in the job's history" has <(build_log "$id") "before $a reachable"
 check "fail: in the job, HEAD is the pushed commit" has <(build_log "$id") "HEAD $b"
+check "fail: report.md: broken's checks and cargo's count, which cargo cut short" same "$(report_row "$id" tests)" \
+  "| tests | 50% (1/2) | 50% of 2 run (incomplete) | |"
+check "fail: tests by name" same "$(report_row "$id" answers)" "| answers | — | 50% of 2 run (incomplete) | |"
+check "fail: the failing test, and where" has "$d/builds/$id/report.md" "- \`tests::the_answer\` at src/lib.rs:9:5: "
+check "fail: and cargo's rerun" has "$d/builds/$id/report.md" "- Rerun: \`cargo test --lib\`"
+check "fail: the page's report is report.md" same "$(api "/builds/$id/report" | jq_ 'j["markdown"]')" "$(cat "$d/builds/$id/report.md")"
+check "fail: with its rows" same "$(api "/builds/$id/report" | jq_ '[r["name"] for r in j["standards"]]')" "['work', 'tests', 'answers', 'all']"
+check "fail: the history's chip" same "$(api /builds | jq_ '[b.get("tests") for b in j["builds"] if b["id"] == '"$id"'][0]')" "tests 50% (incomplete)"
+check "fail: bana report $id prints it" same "$(cd "$w" && bash "$bana" report "$id" 2>&1)" "$(cat "$d/builds/$id/report.md")"
 clean fail
 
 # ---- 2b. Fix with Claude on the failed build ------------------------------------------------
@@ -530,6 +549,10 @@ check "loop: fix_brief names the fix, its branch and worktree" same \
 check "loop: fix_brief has the failing test" same "$(jq_ '[t["name"] for t in j["failures"][0]["tests"]]' <<<"$r")" "['tests::the_answer']"
 check "loop: fix_brief has round 0's result and the rounds" same \
   "$(jq_ '"%s %s %s %s" % (j["recheck"]["state"], j["rounds"]["used"], j["rounds"]["max"], j["rounds"]["left"])' <<<"$r")" "failure 0 5 5"
+r=$(tool "$wt" ci_report '{}') || r='{}'
+check "loop: ci_report: the fix's build's report" same "$(jq_ '"%s %s" % (j["build"], j["markdown"] == open("'"$d/builds/$id/report.md"'").read())' <<<"$r")" "$id True"
+check "loop: ci_report: and its rows" same \
+  "$(jq_ '"%(passed)s %(failed)s %(skipped)s %(incomplete)s" % j["standards"][1]["tests"]' <<<"$r")" "1 1 0 True"
 
 # Claude's first try changes the test's output but not its outcome, and adds a file.
 sed -i.bak 's/left: 41/left: 40/' "$wt/ci/cargo-test.txt" && rm -f "$wt/ci/cargo-test.txt.bak"
@@ -703,6 +726,8 @@ check "hand: bana ci failed" test "$code" -ne 0
 check "hand: and points to bana fix" has <(printf '%s\n' "$out") "bana fix: hand this failure"
 check "hand: it kept its log" has "$d/ci/last.log" "tests::the_answer"
 check "hand: and what ran" has "$d/ci/last.env" "sha=$h"
+check "hand: it ends with the CI report's table" has <(printf '%s\n' "$out") "| tests | 50% (1/2) | 50% of 2 run (incomplete) | |"
+check "hand: and keeps the report" same "$(head -1 "$d/ci/last.report.md")" "# CI report: acme/wid · main ${h:0:7} · quick · failed"
 out=$(cd "$w" && bash "$bana" fix last 2>&1) && code=0 || code=$?
 [[ $code == 0 ]] || echo "$out" >&2
 wt=$d/fix/$h7

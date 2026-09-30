@@ -329,6 +329,8 @@ check "lock: an act that never started holds nothing" has "$FAKE_LOG" "act workf
 
 # ---- bana ci keeps act's output, for bana fix -------------------------------------------------
 fresh
+# No bana-manager here (none of this checkout's either): no CI report at the end.
+export CARGO_TARGET_DIR=$T/w/none
 mkdir -p .github/workflows && echo 'on: workflow_dispatch' >.github/workflows/ci.yml
 git add .github && git -c user.name=t -c user.email=t@t commit -q -m one
 echo 'on: push' >.github/workflows/ci.yml && echo new >new.txt && echo mine >'my notes.txt'
@@ -366,6 +368,7 @@ FAKE_ACT_OUT='all green' bash "$bana" ci nightly --event event.json -- --network
 check "log: exit 0 is kept" same "$st" 0
 check "log: a second bana ci starts, and its log replaces the last" same "$(cat "$ci/last.log")" "all green"
 check "log: no bana fix after a pass" lacks "$T/out" "bana fix"
+check "log: without bana-manager, no CI report" test ! -e "$ci/last.report.md"
 check "log: act's own --network wins, in the first line" has "$T/out" "network host)"
 check "log: and in last.env" same "$(env_of network)" "host"
 check "log: last.env: the event file, the tier, no job" same "$(env_of event) $(env_of tier) $(env_of job)" \
@@ -527,7 +530,14 @@ print(s["type"], s["command"], *s["args"])' "$(claude_arg 2)")" "stdio $dp/daemo
 
   # A failed bana ci: the fix is at the commit it ran, not at HEAD.
   two=$(commit two) && x2=${two:0:7}
-  FAKE_ACT_OUT=$(cat "$paste") FAKE_ACT_EXIT=1 bash "$bana" ci -j rust >/dev/null 2>&1 || true
+  FAKE_ACT_OUT=$(cat "$paste") FAKE_ACT_EXIT=1 bash "$bana" ci -j rust >"$T/out" 2>&1 || true
+  check "ci: with bana-manager here, the CI report's table at the end" same \
+    "$(sed -n '/^| Standard |/,/^$/p' "$T/out" | sed -n '3,4p')" "| rust | 0% (0/1) | 95% of 22 run (incomplete) | |
+| **all** | 0% (0/1) | 95% of 22 run (incomplete) | |"
+  check "ci: and where the rest is" has "$T/out" "The CI report: $d/ci/last.report.md (bana report)"
+  check "ci: last.report.md, titled with the run's commit" same "$(head -1 "$d/ci/last.report.md")" \
+    "# CI report: acme/widget · ${br#refs/heads/} $x2 · quick · failed"
+  check "ci: as bana report last has it" same "$(bash "$bana" report last 2>&1)" "$(cat "$d/ci/last.report.md")"
   three=$(commit three) && x3=${three:0:7}
   # Had Ctrl-C stopped it, it would not have failed.
   cp "$d/ci/last.env" "$T/last.env"
@@ -592,6 +602,29 @@ JSON
   check "fix 42: in your checkout, not in that worktree" has "$d/fix/$x3.d/fix.json" "\"checkout\": \"$(pwd -P)\""
   bash "$bana" fix 44 >"$T/out" 2>&1 || true
   check "fix 44: a build that ended in error has no fix" has "$T/out" "build 44 did not fail"
+
+  # bana report: the same runs, as the CI report, per standard (bana.conf's report.* keys).
+  bash "$bana" report last >"$T/out" 2>&1 || true
+  check "report last: the last bana ci's, titled with its commit and tier" same "$(head -1 "$T/out")" \
+    "# CI report: acme/widget · ${br#refs/heads/} $x2 · quick · failed"
+  check "report last: the owner's log: cargo stopped early, so of 22 run" has "$T/out" \
+    "| rust | 0% (0/1) | 95% of 22 run (incomplete) | |"
+  check "report last: bana's failure is not the project's" has "$T/out" "- bana: \`Error occurred running finally"
+  bash "$bana" report --log - <"$paste" >"$T/out" 2>&1 || true
+  check "report --log -: a paste on stdin" same "$(sed -n 3p "$T/out")" "A pasted log"
+  printf '%s\n' 'report.engine = test:real*' 'report.rust = "rust/cargo test*"' >>.github/bana.conf
+  bash "$bana" report --log "$paste" >"$T/out" 2>&1 || true
+  check "report: bana.conf's standards, in its order" same "$(sed -n '/^| Standard/,/^$/p' "$T/out" | cut -d'|' -f2 | sed 1,2d | tr -d ' ' | tr '\n' ,)" "engine,rust,**all**,,"
+  check "report: tests by name, from a step cargo stopped" has "$T/out" "| engine | — | 85% of 7 run (incomplete) | |"
+  bash "$bana" report 42 --json >"$T/out" 2>&1 || true
+  check "report 42 --json: a daemon build's, markdown and standards" same "$(python3 -c 'import json, sys
+r = json.load(open(sys.argv[1]))
+print(r["markdown"].splitlines()[0], [s["name"] for s in r["standards"]])' "$T/out" 2>&1)" \
+    "# CI report: acme/widget · ${br#refs/heads/} $x3 · quick · failed ['engine', 'rust', 'all']"
+  bash "$bana" report >"$T/out" 2>&1 || true
+  check "report: by default the newer, here daemon build 44" has "$T/out" "Build #44 on "
+  bash "$bana" report 45 >"$T/out" 2>&1 || true
+  check "report 45: no such build" has "$T/out" "No daemon build 45"
 
   # --open: Claude Code's link, to open (a Mac) or xdg-open.
   : >"$FAKE_LOG"
@@ -749,7 +782,7 @@ print(len(p.encode("utf-16-le")) // 2 <= 5000, "tests::case_3" in p)' "$d/fix/$x
     same "$(claude_arg 3) $(claude_arg 4) $(claude_arg 5) $(claude_arg 6)" "-n bana fix $x5 --permission-mode dontAsk"
   sd5=$(cd "$d/fix/$x5.d" && pwd -P)
   check "fix --headless: Read, Grep, Glob, Edit and Write in the worktree only (and the fix's files), bana's tools, and fix.allow" \
-    same "$(claude_arg 7) $(claude_arg 8)" "--allowedTools Read(/$wt5/**) Grep(/$wt5/**) Glob(/$wt5/**) Read(/$sd5/**) Edit(/$wt5/**) Write(/$wt5/**) mcp__bana__fix_brief mcp__bana__ci_log mcp__bana__run_jobs mcp__bana__fix_status mcp__bana__commit_fix Bash(cargo test:*)"
+    same "$(claude_arg 7) $(claude_arg 8)" "--allowedTools Read(/$wt5/**) Grep(/$wt5/**) Glob(/$wt5/**) Read(/$sd5/**) Edit(/$wt5/**) Write(/$wt5/**) mcp__bana__fix_brief mcp__bana__ci_log mcp__bana__run_jobs mcp__bana__fix_status mcp__bana__ci_report mcp__bana__commit_fix Bash(cargo test:*)"
   check "fix --headless: but not the worktree's .git, nor Claude Code's settings there" \
     same "$(claude_arg 9) $(claude_arg 10)" "--disallowedTools Edit(/$wt5/.git) Edit(/$wt5/.git/**) Edit(/$wt5/.claude/**)"
   check "fix --headless: which its settings deny too" has "$wt5/.claude/settings.local.json" "\"Edit(/$wt5/.claude/**)\""
@@ -780,7 +813,7 @@ print(list(s), s["bana"]["args"])' "$(claude_arg 17)")" "['bana'] ['mcp', '--dir
   FAKE_CLAUDE_FIX='' FAKE_CLAUDE_SUBTYPE=error_max_turns bash "$bana" fix --log "$paste" --headless >"$T/out" 2>&1 || rc=$?
   check "fix --headless: fails when Claude Code does" same "$rc" 1
   check "fix --headless: no Bash without fix.allow" same "$(claude_arg 8)" \
-    "Read(/$wt5/**) Grep(/$wt5/**) Glob(/$wt5/**) Read(/$sd5/**) Edit(/$wt5/**) Write(/$wt5/**) mcp__bana__fix_brief mcp__bana__ci_log mcp__bana__run_jobs mcp__bana__fix_status mcp__bana__commit_fix"
+    "Read(/$wt5/**) Grep(/$wt5/**) Glob(/$wt5/**) Read(/$sd5/**) Edit(/$wt5/**) Write(/$wt5/**) mcp__bana__fix_brief mcp__bana__ci_log mcp__bana__run_jobs mcp__bana__fix_status mcp__bana__ci_report mcp__bana__commit_fix"
   check "fix --headless: a fix with rounds gets no round 0 again, nor says so" lacks "$d/fix/$x5.d/prompt.txt" "round 0"
   check "fix --headless: the gate blocked once for the red round" same "$(tr '\n' ' ' <"$FAKE_STATE/claude.stops")" "2 0 "
   check "fix --headless: with what failed" has "$d/fix/$x5.d/claude.jsonl" "Round 0 failed: rust (build 9). You have 5 rounds left"

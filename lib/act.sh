@@ -16,6 +16,7 @@
 #   One act runs at a time on this machine: bana ci refuses while another one runs.
 #   A run keeps act's output in ~/.bana/<prefix>/ci/last.log, and what ran in last.env, for
 #   bana fix (bana.conf: ci.log = no runs act as before, which keeps its colours in containers).
+#   With bana-manager here, it ends with the CI report's table (all of it in last.report.md).
 #   bana.conf's act.args go to act too (e.g. --reuse to keep containers, and their builds).
 #   Anything after -- goes to act, and wins over act.args.
 
@@ -246,6 +247,7 @@ act_main() {
 act_logged() { # ACT-ARGUMENT...
   local dir=$home/ci sha ref dirty v b='' started status stopped=''
   mkdir -p "$dir"
+  rm -f "$dir/last.report.md"
   sha=$(git -C "$root" rev-parse -q --verify HEAD 2>/dev/null) || true
   ref=$(git -C "$root" symbolic-ref -q HEAD 2>/dev/null) || true
   dirty=$(git -C "$root" -c core.quotePath=false status --porcelain 2>/dev/null |
@@ -267,11 +269,33 @@ act_logged() { # ACT-ARGUMENT...
   mv -f "$dir/last.log.part" "$dir/last.log"
   mv -f "$dir/last.env.part" "$dir/last.env"
   act_unmapped "$dir/last.log"
+  act_report "$dir"
   if ((status)) && [[ -z $stopped ]]; then
     echo "act's output: $dir/last.log"
     say "bana fix: hand this failure to Claude Code on a fix branch"
   fi
   exit "$status"
+}
+
+# The CI report of the run (bana report last), when a bana-manager that makes one is here
+# (none is built for it): last.report.md, and its table on the terminal.
+act_report() { # DIR
+  local b m='' opts=()
+  for b in "$home/daemon/bana-manager" "${CARGO_TARGET_DIR:-$bana_root/manager/target}/release/bana-manager"; do
+    if bm_has "$b" report; then m=$b; break; fi
+  done
+  [[ -n $m ]] || return 0
+  [[ -z $conf_file ]] || opts+=(--conf "$conf_file")
+  [[ -z $repo ]] || opts+=(--repo "$repo")
+  if "$m" report --text "$1/last.log" --env "$1/last.env" ${opts[@]+"${opts[@]}"} --machine "$host" \
+    >"$1/last.report.md.part" 2>/dev/null; then
+    mv -f "$1/last.report.md.part" "$1/last.report.md"
+    echo
+    sed -n '/^| Standard |/,/^$/p' "$1/last.report.md"
+    echo "The CI report: $1/last.report.md (bana report)"
+  else
+    rm -f "$1/last.report.md.part"
+  fi
 }
 
 # The jobs act skipped for want of a place, when no act.platform key says so (a label bana

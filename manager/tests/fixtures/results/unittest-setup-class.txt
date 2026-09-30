@@ -1,0 +1,23 @@
+E.Fs
+======================================================================
+ERROR: setUpClass (t_cls.A)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/py/t_cls.py", line 4, in setUpClass
+    def setUpClass(cls): raise RuntimeError("no db")
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: no db
+
+======================================================================
+FAIL: test_b2 (t_cls.B.test_b2)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/py/t_cls.py", line 9, in test_b2
+    def test_b2(self): self.fail("b2")
+                       ^^^^^^^^^^^^^^^
+AssertionError: b2
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.001s
+
+FAILED (failures=1, errors=1, skipped=1)

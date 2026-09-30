@@ -196,7 +196,8 @@ fn a_session_as_claude_code_opens_it() {
             "ci_log",
             "run_jobs",
             "fix_status",
-            "commit_fix"
+            "commit_fix",
+            "ci_report"
         ]
     );
     assert_eq!(by_id(&replies, 3)["result"], by_id(&replies, 2)["result"]);
@@ -210,7 +211,8 @@ fn a_session_as_claude_code_opens_it() {
             (&json!(false), &json!(false)),
             "{t}"
         );
-        let reader = ["fix_brief", "ci_log", "fix_status"].contains(&t["name"].as_str().unwrap());
+        let reader = ["fix_brief", "ci_log", "fix_status", "ci_report"]
+            .contains(&t["name"].as_str().unwrap());
         assert_eq!(a["readOnlyHint"], reader, "{t}");
     }
     let hints = |name: &str| {

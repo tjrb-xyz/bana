@@ -1,0 +1,6 @@
+--- FAIL: TestAccepted (0.00s)
+    a_test.go:4: accepted
+FAIL
+FAIL	example.com/demo	0.006s
+ok  	example.com/demo/sub	0.009s
+FAIL

@@ -70,12 +70,13 @@ new worktree and, if the server is missing there or does not connect, passes it 
 | `ci_log` | no | more of a build's (or a round's) log: a job, a step, a search, the last lines |
 | `run_jobs` | no | one round (below): the failed jobs on the worktree as it is, until they end |
 | `fix_status` | no | open, working, green, red, out of rounds, kept or pushed, and whether the worktree changed since the last round |
-
-A tool called with arguments that do not fit says why as its result, so Claude can call it again.
+| `ci_report` | no | the CI report of the fix's build (or of a build named): checks and tests per standard, as Markdown and as data |
 | `commit_fix` | yes | commits the green round's tree on the fix's branch |
 
+A tool called with arguments that do not fit says why as its result, so Claude can call it again.
+
 Claude Code runs as you, with your own settings and permission mode, plus what the settings file adds: those
-four tools allowed, rules that deny `git push` (`git -C … push`, `git -c …` and `git config … alias` too) and
+five tools allowed, rules that deny `git push` (`git -C … push`, `git -c …` and `git config … alias` too) and
 edits to the worktree's `.git` file and `.claude` folder, and, with the daemon, the Stop gate. bana's own git in
 the worktree (the gate, run_jobs, commit_fix) first checks that its `.git` still names a worktree of your
 checkout, and runs with hooks and `core.fsmonitor` off. The rules are a guard against Claude pushing, not a lock: a script Claude writes and runs can
@@ -172,7 +173,7 @@ would forget any of your worktrees that is missing just then.
 Only when you type it: `bana fix --headless [BUILD | last | --log FILE|-]` runs Claude Code unattended in the
 worktree (`claude -p`), and needs the daemon. It registers the fix, so round 0 runs. Then Claude may read and
 search files inside the worktree (and the fix's own files beside it), edit and write them there but for its
-`.git` and `.claude`, and use bana's five tools, commit_fix included; `--permission-mode dontAsk` denies anything
+`.git` and `.claude`, and use bana's six tools, commit_fix included; `--permission-mode dontAsk` denies anything
 else without asking, and bana's MCP server is the only one it gets. There is no shell unless `fix.allow` in
 bana.conf names narrow rules:
 

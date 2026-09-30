@@ -1,0 +1,71 @@
+   Compiling demo v0.1.0 (/tmp/demo)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.24s
+────────────
+ Nextest run ID 63c8e4cd-9eec-4080-b7b9-da64dc5376e2 with nextest profile: default
+    Starting 5 tests across 2 binaries (1 test skipped)
+       START [         ] (1/5) demo tests::accepted
+
+running 1 test
+
+thread 'tests::accepted' (15970) panicked at src/lib.rs:12:45:
+accepted
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/panicking.rs:80:14
+   2: demo::tests::accepted
+             at ./src/lib.rs:12:45
+   3: demo::tests::accepted::{{closure}}
+             at ./src/lib.rs:12:26
+   4: core::ops::function::FnOnce::call_once
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/ops/function.rs:250:5
+   5: core::ops::function::FnOnce::call_once
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+test tests::accepted ... FAILED
+
+failures:
+
+failures:
+    tests::accepted
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.08s
+
+        FAIL [   0.091s] (1/5) demo tests::accepted
+       START [         ] (2/5) demo tests::adds
+
+running 1 test
+test tests::adds ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+        PASS [   0.006s] (2/5) demo tests::adds
+       START [         ] (3/5) demo::facts fact_one
+
+running 1 test
+test fact_one ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+        PASS [   0.006s] (3/5) demo::facts fact_one
+       START [         ] (4/5) demo::facts fact_two
+
+running 1 test
+test fact_two ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+        PASS [   0.006s] (4/5) demo::facts fact_two
+       START [         ] (5/5) demo::facts real::raw_file_end_stops_with_done
+
+running 1 test
+test real::raw_file_end_stops_with_done ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+        PASS [   0.005s] (5/5) demo::facts real::raw_file_end_stops_with_done
+────────────
+     Summary [   0.118s] 5 tests run: 4 passed, 1 failed, 1 skipped
+        FAIL [   0.091s] (1/5) demo tests::accepted
+error: test run failed

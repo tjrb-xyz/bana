@@ -23,6 +23,35 @@
 //!   skipped by `if:` gets a `jobResult` of `skipped`);
 //! - plain text on stderr at the end: `Error: Job 'lint' failed`,
 //!   `Error: workflow is not valid. …`.
+//!
+//! A builder other than act (a custom one, later) has two ways in. It can
+//! print the subset of these lines the daemon reads: `jobID`, `matrix`,
+//! `step`, `stepID`, `stage`, `msg` with `raw_output`, `stepResult` with
+//! `executionTime`, `jobResult`, and optionally `command` (`summary`, `error`,
+//! `warning`, `notice`). The fold, the statuses, the page and the log then work
+//! as they do for act. Or it writes the build's results.jsonl itself
+//! ([`crate::results`], `schema` 1) into the build's directory before the
+//! build ends: the daemon takes it as it is, with build.json's ref, commit,
+//! tier and times. It is all the CI report ([`crate::report`]) is made from:
+//! one JSON object per line, by `kind`:
+//! - `build`: schema, builder (`act 0.2.89`), bana, repo, ref, sha, tier,
+//!   machine, network, trigger, started, ended, result;
+//! - `job`: key, job (its id), matrix, result (success, failure, skipped,
+//!   unsupported, not_planned, cancelled, unknown), ms;
+//! - `step`: key, step, stage, result, ms, owner (project, bana, act), continued;
+//! - `tests`: key, step, tool, passed, failed, skipped, incomplete (go's
+//!   counts are packages, shown apart);
+//! - `test`: key, step, name, result, binary, at, message;
+//! - `rerun`: key, step, target;
+//! - `annotation`: key, step, level, message, title, file, line, col;
+//! - `notice`: key, step, text, left_out (true leaves its step out, as
+//!   report.left_out does), title, file, line, col;
+//! - `summary`: key, step, markdown;
+//! - `tail`: key, step, lines;
+//! - `error`: owner, text, key, step.
+//!
+//! docs/DAEMON.md has the same, for a project; report.rs's example fixture
+//! (tests/fixtures/report/example.jsonl) is one written by hand.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -874,6 +903,9 @@ pub struct BuildView {
     /// What its `bana` status says ([`Report::describe`]).
     pub description: String,
     pub jobs: Vec<JobChip>,
+    /// The history's chip from its CI report (`tests 95%`), once it ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tests: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

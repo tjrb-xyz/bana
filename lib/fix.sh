@@ -195,7 +195,7 @@ fix_headless() { # BANA-MANAGER FIX WT DIR
   # It reads the worktree and the fix's own files, and edits the worktree, but not its .git
   # (which names the git directory bana's own git trusts there) nor Claude Code's settings.
   allow="Read(/$wt/**) Grep(/$wt/**) Glob(/$wt/**) Read(/$dir/**) Edit(/$wt/**) Write(/$wt/**)"
-  allow+=" mcp__bana__fix_brief mcp__bana__ci_log mcp__bana__run_jobs mcp__bana__fix_status mcp__bana__commit_fix"
+  allow+=" mcp__bana__fix_brief mcp__bana__ci_log mcp__bana__run_jobs mcp__bana__fix_status mcp__bana__ci_report mcp__bana__commit_fix"
   deny="Edit(/$wt/.git) Edit(/$wt/.git/**) Edit(/$wt/.claude/**)"
   extra=$(conf fix.allow) turns=$(conf fix.turns 60) budget=$(conf fix.budget_usd 5)
   [[ -z $extra ]] || allow+=" $extra"

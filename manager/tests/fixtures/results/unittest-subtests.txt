@@ -1,0 +1,29 @@
+FFF..
+======================================================================
+FAIL: test_many (__main__.T.test_many) (i=2)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/py/t_sub.py", line 6, in test_many
+    self.assertLess(i, 2)
+AssertionError: 2 not less than 2
+
+======================================================================
+FAIL: test_many (__main__.T.test_many) (i=3)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/py/t_sub.py", line 6, in test_many
+    self.assertLess(i, 2)
+AssertionError: 3 not less than 2
+
+======================================================================
+FAIL: test_many (__main__.T.test_many) (i=4)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/py/t_sub.py", line 6, in test_many
+    self.assertLess(i, 2)
+AssertionError: 4 not less than 2
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.001s
+
+FAILED (failures=3)

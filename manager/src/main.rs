@@ -28,6 +28,15 @@
 //! ci/last.log, a pasted log) into results.jsonl on stdout
 //! (bana_manager::results): what bana fix and bana report read.
 //!
+//!   bana-manager report (--build DIR | --text FILE|- [--env FILE]) [--conf FILE]
+//!                [--repo OWNER/REPO] [--machine NAME] [--json]
+//!
+//! prints the CI report (bana_manager::report) as Markdown: of a daemon build
+//! (its directory, builds/<id>: the report.md its end wrote, with the built
+//! commit's standards, else one made now), or of act's plain text (a hand run's
+//! ci/last.log, with its last.env; a pasted log), per standard (bana.conf's
+//! report.* keys, in --conf). `--json`: {markdown, standards}.
+//!
 //!   bana-manager fix prepare --dir ~/.bana/<prefix> --checkout DIR
 //!                (--build N | --run | --log FILE|- [--sha S] [--ref R] [--tier T])
 //!                [--repo OWNER/REPO] [--workflow FILE] [--bana CMD] [--recheck] [--headless]
@@ -73,7 +82,7 @@ use tokio::sync::Notify;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: bana-manager --script PATH --repo OWNER/REPO [--port N] [--workflow FILE] [--tiers A,B] [--tier-input NAME] [--gh PATH] [--token T]\n       bana-manager daemon --dir DIR [--no-tray]\n       bana-manager results (--json FILE | --text FILE|-)\n       bana-manager fix prepare --dir DIR --checkout DIR (--build N | --run | --log FILE|- [--sha S] [--ref R] [--tier T]) [--repo OWNER/REPO] [--workflow FILE] [--bana CMD] [--recheck] [--headless]\n       bana-manager fix brief --dir DIR [FIX]\n       bana-manager fix status --dir DIR [FIX]\n       bana-manager fix gate --dir DIR\n       bana-manager fix push --dir DIR FIX\n       bana-manager fix drop --dir DIR FIX [--force] [--delete-branch]\n       bana-manager fix result FILE\n       bana-manager mcp --dir DIR [--config]"
+        "usage: bana-manager --script PATH --repo OWNER/REPO [--port N] [--workflow FILE] [--tiers A,B] [--tier-input NAME] [--gh PATH] [--token T]\n       bana-manager daemon --dir DIR [--no-tray]\n       bana-manager results (--json FILE | --text FILE|-)\n       bana-manager report (--build DIR | --text FILE|- [--env FILE]) [--conf FILE] [--repo OWNER/REPO] [--machine NAME] [--json]\n       bana-manager fix prepare --dir DIR --checkout DIR (--build N | --run | --log FILE|- [--sha S] [--ref R] [--tier T]) [--repo OWNER/REPO] [--workflow FILE] [--bana CMD] [--recheck] [--headless]\n       bana-manager fix brief --dir DIR [FIX]\n       bana-manager fix status --dir DIR [FIX]\n       bana-manager fix gate --dir DIR\n       bana-manager fix push --dir DIR FIX\n       bana-manager fix drop --dir DIR FIX [--force] [--delete-branch]\n       bana-manager fix result FILE\n       bana-manager mcp --dir DIR [--config]"
     );
     std::process::exit(2)
 }
@@ -134,6 +143,11 @@ fn main() {
     if args.peek().is_some_and(|a| a == "results") {
         args.next();
         results(args);
+        return;
+    }
+    if args.peek().is_some_and(|a| a == "report") {
+        args.next();
+        report(args);
         return;
     }
     if args.peek().is_some_and(|a| a == "fix") {
@@ -302,6 +316,87 @@ fn results(mut args: impl Iterator<Item = String>) {
     };
     use std::io::Write;
     let _ = std::io::stdout().lock().write_all(r.to_jsonl().as_bytes());
+}
+
+/// `report`: a build's CI report, as Markdown (or JSON) on stdout.
+fn report(mut args: impl Iterator<Item = String>) {
+    use bana_manager::report;
+    let (mut build, mut text, mut env, mut conf) = (None, None, None, None);
+    let (mut repo, mut machine, mut json) = (None, None, false);
+    while let Some(a) = args.next() {
+        let mut value = || args.next().unwrap_or_else(|| usage());
+        match a.as_str() {
+            "--build" => build = Some(PathBuf::from(value())),
+            "--text" => text = Some(value()),
+            "--env" => env = Some(value()),
+            "--conf" => conf = Some(value()),
+            "--repo" => repo = Some(value()),
+            "--machine" => machine = Some(value()),
+            "--json" => json = true,
+            _ => usage(),
+        }
+    }
+    let read = |path: &str| -> String {
+        let mut bytes = Vec::new();
+        let r = match path {
+            "-" => std::io::stdin().read_to_end(&mut bytes).map(|_| ()),
+            p => std::fs::read(p).map(|b| bytes = b),
+        };
+        if let Err(e) = r {
+            fail(&format!("{path}: {e}"));
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let print = |rep: &report::Report| {
+        let out = if json {
+            serde_json::to_string(rep).unwrap_or_default() + "\n"
+        } else {
+            rep.markdown.clone()
+        };
+        use std::io::Write;
+        let _ = std::io::stdout().lock().write_all(out.as_bytes());
+    };
+    // The report a build's end wrote, with its commit's standards.
+    let only_build = text.is_none() && env.is_none();
+    if let Some(rep) = build
+        .as_deref()
+        .filter(|_| only_build)
+        .and_then(report::read_written)
+    {
+        return print(&rep);
+    }
+    let mut meta = report::Meta::default();
+    let mut r = match (build, text, &env) {
+        (Some(dir), None, None) => {
+            meta.build = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.parse().ok());
+            report::read_build(&dir).unwrap_or_else(|e| fail(&e))
+        }
+        (None, Some(path), _) => {
+            let mut r = bana_manager::results::fold_text(&read(&path));
+            match &env {
+                Some(e) => meta.note = report::hand_run(&mut r, &read(e)),
+                None => r.build.trigger = Some("paste".into()),
+            }
+            r
+        }
+        _ => usage(),
+    };
+    if let Some(repo) = repo {
+        if !valid_repo(&repo) {
+            fail("--repo: OWNER/REPO");
+        }
+        r.build.repo.get_or_insert(repo);
+    }
+    if let Some(m) = machine.filter(|m| !m.is_empty()) {
+        r.build.machine.get_or_insert(m);
+    }
+    let conf = conf
+        .map(|c| report::read_conf(&read(&c)))
+        .unwrap_or_default();
+    print(&report::report(&r, &conf, &meta));
 }
 
 /// `fix prepare|brief`: bana fix's side in Rust. Prints what prepare made as

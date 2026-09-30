@@ -10,7 +10,8 @@
 //! version and the client's capabilities on every request).
 //!
 //! The tools, for the fix loop: `fix_brief`, `ci_log`, `run_jobs`,
-//! `fix_status` and `commit_fix` ([`tools`]). Each result is an object, as
+//! `fix_status` and `commit_fix`; and `ci_report`, a build's CI report
+//! ([`tools`]). Each result is an object, as
 //! `structuredContent` and as the same JSON in a text block; a tool that fails,
 //! or is called with arguments that do not fit, says why with `isError`.
 //! Replies stay under [`REPLY_MAX`] bytes. It reads the fix's files itself, and
@@ -24,6 +25,7 @@
 
 use crate::actlog::{self, BuildState};
 use crate::fix::{self, Fix};
+use crate::report;
 use crate::results::{self, Results};
 use crate::rounds::{self, Rounds};
 use serde_json::{json, Map, Value};
@@ -288,6 +290,19 @@ pub fn tools() -> Value {
                 "files": {"type": "array", "items": {"type": "string"}}
             }, "required": ["commit", "branch", "files"]},
             "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false},
+        },
+        {
+            "name": "ci_report",
+            "title": "The CI report",
+            "description": "A build's CI report: report.md (Markdown: checks and tests per standard, what failed, what was not the project's, what did not run here, the step summaries) and its table as data. Standards are bana.conf's report.* keys (else one per job, then all); percentages count only what ran, `incomplete` says not every test ran, and skipped tests are apart. By default the fix's own build (or its hand run or log), else the newest build.",
+            "inputSchema": {"type": "object", "properties": {
+                "build": {"type": "integer", "minimum": 1, "description": "The build's number"}
+            }, "additionalProperties": false},
+            "outputSchema": {"type": "object", "properties": {
+                "build": {"type": ["integer", "null"]}, "markdown": {"type": "string"},
+                "standards": {"type": "array", "items": {"type": "object"}}
+            }, "required": ["markdown", "standards"]},
+            "annotations": reader,
         },
     ])
 }
@@ -594,7 +609,8 @@ impl Server {
             "run_jobs" => self.run_jobs(a),
             "fix_status" => self.fix_status(),
             "commit_fix" => self.commit_fix(a),
-            // ci_report (the CI report) and the release tools come here.
+            "ci_report" => self.ci_report(a),
+            // The release tools come here.
             _ => return None,
         })
     }
@@ -771,6 +787,62 @@ impl Server {
             "matched": matched,
             "lines": lines,
         }))
+    }
+
+    fn ci_report(&self, a: &Map<String, Value>) -> Answer {
+        let build = match a.get("build").map(Value::as_u64) {
+            Some(Some(b)) if b > 0 => Some(b),
+            Some(_) => return Err(Fail::Args("build: a build's number".into())),
+            None => None,
+        };
+        let here = match build {
+            Some(_) => None,
+            None => fix::here(&self.dir, &self.cwd),
+        };
+        let build = match (build, here.as_ref().map(|f| (f, f.build))) {
+            (Some(b), _) | (None, Some((_, Some(b)))) => b,
+            // A fix from a hand run or a pasted log: its results, with the
+            // failing commit's standards.
+            (None, Some((f, None))) => return Ok(self.fix_report(f)),
+            (None, None) => {
+                let list = self.api("GET", "/ci/v1/builds?limit=100", None, 30)?;
+                list["builds"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|b| {
+                        b["fix"].is_null()
+                            && matches!(b["state"].as_str(), Some("success" | "failure" | "error"))
+                    })
+                    .and_then(|b| b["id"].as_u64())
+                    .ok_or_else(|| Fail::Tool("no build has ended here yet".into()))?
+            }
+        };
+        let r = self.api("GET", &format!("/ci/v1/builds/{build}/report"), None, 30)?;
+        Ok(json!({"build": build, "markdown": r["markdown"], "standards": r["standards"]}))
+    }
+
+    /// The report of fix `f`'s own results (a hand run's or a pasted log's).
+    fn fix_report(&self, f: &Fix) -> Value {
+        let state = self.state_dir(f);
+        let r = Results::from_jsonl(
+            &std::fs::read_to_string(state.join("results.jsonl")).unwrap_or_default(),
+        );
+        let conf = ["bana.conf", ".github/bana.conf"]
+            .iter()
+            .find_map(|name| {
+                fix::run_git(
+                    "git",
+                    None,
+                    Path::new(&f.checkout),
+                    &["show", &format!("{}:{name}", f.sha)],
+                    30,
+                )
+                .ok()
+            })
+            .unwrap_or_default();
+        let rep = report::report(&r, &report::read_conf(&conf), &report::Meta::default());
+        json!({"build": null, "markdown": rep.markdown, "standards": rep.standards})
     }
 
     /// A call to the daemon that must work: its JSON, or why not.
@@ -1408,6 +1480,27 @@ mod tests {
                 json!({"build": 99, "job": "plan"})
             ))
             .contains("no build 99"));
+
+            // The CI report: the fix's own build by default, or one named.
+            let rep = call(&mut s, 30, "ci_report", json!({}));
+            let rep = ok(&rep);
+            assert_eq!(rep["build"], 1, "{rep}");
+            let md = rep["markdown"].as_str().unwrap();
+            assert!(
+                md.starts_with("# CI report: o/r · main ") && md.contains(" · failed\n"),
+                "{md}"
+            );
+            assert_eq!(
+                rep["standards"].as_array().unwrap().last().unwrap()["name"],
+                "all"
+            );
+            let rep = call(&mut s, 31, "ci_report", json!({"build": build}));
+            assert_eq!(ok(&rep)["build"], build);
+            assert!(failed(&call(&mut s, 32, "ci_report", json!({"build": 99})))
+                .contains("no build 99"));
+            assert!(
+                failed(&call(&mut s, 33, "ci_report", json!({"build": "1"}))).contains("build")
+            );
 
             // commit_fix: the new file only when asked for.
             let why = failed(&call(

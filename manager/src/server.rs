@@ -524,6 +524,7 @@ fn local_routes(d: Daemon) -> Router {
         .route("/builds", get(builds).post(run_now))
         .route("/builds/{id}", get(build))
         .route("/builds/{id}/log", get(build_log))
+        .route("/builds/{id}/report", get(build_report))
         .route("/builds/{id}/cancel", post(cancel_build))
         .route("/builds/{id}/rerun", post(rerun))
         .route("/builds/{id}/fix", post(fix_build))
@@ -613,6 +614,21 @@ async fn build_log(State(d): D, Path(id): Path<u64>, Query(q): Query<LogQuery>) 
     match d.log(id, job.as_deref(), q.from) {
         Ok(page) => Json(page).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+/// A build's CI report: report.md as `markdown`, and its table as `standards`.
+async fn build_report(State(d): D, Path(id): Path<u64>) -> Response {
+    match d.ci_report(id).await {
+        None => err(StatusCode::NOT_FOUND, format!("no build {id}")),
+        Some(None) => err(
+            StatusCode::NOT_FOUND,
+            format!("no report for build {id}: a build gets one when it ends"),
+        ),
+        Some(Some(r)) => {
+            Json(json!({"build": id, "markdown": r.markdown, "standards": r.standards}))
+                .into_response()
+        }
     }
 }
 
@@ -1325,6 +1341,7 @@ esac"#,
             ("GET", "/ci/v1/builds"),
             ("GET", "/ci/v1/builds/1"),
             ("GET", "/ci/v1/builds/1/log?from=0"),
+            ("GET", "/ci/v1/builds/1/report"),
             ("POST", "/ci/v1/builds"),
             ("POST", "/ci/v1/builds/1/cancel"),
             ("POST", "/ci/v1/builds/1/rerun"),
@@ -1474,6 +1491,51 @@ esac"#,
         assert_eq!(
             call(&app, "GET", "/ci/v1/builds/999", None, true).await.0,
             404
+        );
+
+        // Its CI report, as the build's end wrote it; none without report.md.
+        let (code, r) = call(
+            &app,
+            "GET",
+            &format!("/ci/v1/builds/{id}/report"),
+            None,
+            true,
+        )
+        .await;
+        assert_eq!(code, 200, "{r}");
+        let md = std::fs::read_to_string(d.settings().dir.join(format!("builds/{id}/report.md")));
+        assert_eq!(r["markdown"].as_str(), md.as_deref().ok(), "{r}");
+        assert!(
+            r["markdown"]
+                .as_str()
+                .unwrap()
+                .starts_with("# CI report: o/r · main "),
+            "{r}"
+        );
+        assert_eq!(
+            r["standards"].as_array().unwrap().last().unwrap()["name"],
+            "all",
+            "{r}"
+        );
+        // An ended build without its report (one from before bana wrote
+        // them, or one that ended while the daemon was down) gets it now.
+        let kept = d.settings().dir.join(format!("builds/{id}/report.md"));
+        std::fs::remove_file(&kept).unwrap();
+        let (code, again) = call(
+            &app,
+            "GET",
+            &format!("/ci/v1/builds/{id}/report"),
+            None,
+            true,
+        )
+        .await;
+        assert_eq!((code, &again["markdown"]), (200, &r["markdown"]), "{again}");
+        assert!(kept.exists());
+        let (code, v) = call(&app, "GET", "/ci/v1/builds/999/report", None, true).await;
+        assert_eq!(code, 404, "{v}");
+        assert!(
+            v["error"].as_str().unwrap().starts_with("no build 999"),
+            "{v}"
         );
         assert_eq!(
             call(&app, "GET", "/ci/v1/builds/999/log", None, true)

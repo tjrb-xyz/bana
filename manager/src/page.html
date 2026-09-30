@@ -71,6 +71,8 @@ tr.sel td { background: var(--bg); }
 .stack { display: grid; gap: 16px; margin-top: 12px; }
 #fix { margin-top: 10px; border-left: 3px solid var(--accent); padding: 2px 0 2px 10px; }
 #fix p { margin: 4px 0; }
+#report-table td:nth-child(2), #report-table td:nth-child(3) { white-space: nowrap; }
+#report-text { max-height: 480px; }
 code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px; background: var(--bg); border-radius: 4px; padding: 1px 4px; }
 </style>
 </head>
@@ -131,6 +133,15 @@ code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px
       </div>
       <div class="chips" id="jobs" style="margin-top:10px"></div>
       <pre class="mono" id="log"></pre>
+      <div id="report" hidden>
+        <p id="report-head"></p>
+        <div class="wrap"><table id="report-table"></table></div>
+        <div class="row">
+          <button id="report-copy" type="button">Copy</button>
+          <button id="report-download" type="button" title="report.md">Download</button>
+        </div>
+        <pre class="mono" id="report-text"></pre>
+      </div>
     </div>
 
     <h3>History</h3>
@@ -348,7 +359,7 @@ const githubUrl = (u) => typeof u === "string" && /^https:\/\/github\.com\//.tes
 function route() {
   const h = new URLSearchParams(location.hash.slice(1));
   const b = Number(h.get("build"));
-  return { build: Number.isInteger(b) && b > 0 ? b : null, job: h.get("job") || null };
+  return { build: Number.isInteger(b) && b > 0 ? b : null, job: h.get("job") || null, report: h.get("report") === "1" };
 }
 
 let local = null, builds = [], shown = null, logState = null;
@@ -390,7 +401,7 @@ function historyRows(l) {
     return `<tr class="${id === sel ? "sel" : ""}"><td><span class="dot ${esc(b.state)}"></span><a href="#build=${id}">#${id}</a> <span class="muted">${esc(when)}</span></td>
       <td>${esc(b.ref)}</td><td class="mono">${esc(shortSha(b.sha))}</td><td>${esc(b.tier)}</td><td>${esc(why)}</td>
       <td>${b.started_at ? esc(dur(b.elapsed)) : ""}</td><td>${esc(st)}</td>
-      <td title="${esc(b.description)}">${esc(b.state)}${b.reason ? ": " + esc(b.reason) : ""}</td></tr>`;
+      <td title="${esc(b.description)}">${esc(b.state)}${b.reason ? ": " + esc(b.reason) : ""}${b.tests ? ` <a class="chip" href="#build=${id}&report=1">${esc(b.tests)}</a>` : ""}</td></tr>`;
   }).join("");
 }
 
@@ -441,6 +452,7 @@ async function renderBuild() {
     $("build-meta").replaceChildren();
     $("jobs").replaceChildren();
     $("log").replaceChildren();
+    $("report").hidden = true;
     $("build-cancel").hidden = $("build-rerun").hidden = $("build-fix").hidden = $("fix").hidden = true;
     logState = null;
     return;
@@ -464,15 +476,55 @@ async function renderBuild() {
 
   // The job asked for; else a finished build's failed job opens.
   const failed = !running && (v.jobs || []).find((j) => j.state === "failure");
-  const job = r.job || (r.build || !running ? failed && failed.key : null) || null;
+  const ended = ["success", "failure", "error"].includes(v.state), report = ended && r.report;
+  const job = report ? "" : r.job || (r.build || !running ? failed && failed.key : null) || null;
   const chips = [["", "All jobs", "", null]].concat((v.jobs || []).map((j) => [j.key, j.key, j.state, j.step]));
-  $("jobs").replaceChildren(...chips.map(([key, label, state, step]) => {
-    const a = text("a", label + (step ? " · " + step : ""), "chip " + state + ((key || null) === job ? " sel" : ""));
+  const links = chips.map(([key, label, state, step]) => {
+    const a = text("a", label + (step ? " · " + step : ""), "chip " + state + (!report && (key || null) === job ? " sel" : ""));
     a.title = state || "every job's lines";
     a.href = "#build=" + id + (key ? "&job=" + encodeURIComponent(key) : "");
     return a;
+  });
+  if (ended) {
+    const a = text("a", "Report", "chip" + (report ? " sel" : ""));
+    a.title = "The CI report: checks and tests per standard";
+    a.href = "#build=" + id + "&report=1";
+    links.push(a);
+  }
+  $("jobs").replaceChildren(...links);
+  $("log").hidden = report;
+  $("report").hidden = !report;
+  if (report) { logState = null; renderReport(id); }
+  else startLog(id, job, running || v.state === "queued");
+}
+
+// The CI report (report.md, written when the build ended): its table as a
+// table, the rest as text. Its words go in as text only.
+async function renderReport(id) {
+  if (!shown || shown.id !== id) return;
+  // The build's end writes it just after the build ends: a miss is asked again.
+  const miss = shown.report && shown.report.error;
+  if (!shown.report || (miss && Date.now() - shown.report.at > 5000)) {
+    try { shown.report = await api("GET", `/builds/${id}/report`); } catch (e) { shown.report = { error: e.message, at: Date.now() }; }
+  } else if (!miss) return; // drawn: the page's refresh keeps its scroll and selection
+  const rep = shown.report, md = rep.markdown || "";
+  const lines = md.split("\n"), at = lines.findIndex((l) => l.startsWith("| Standard |"));
+  let end = at;
+  while (at >= 0 && end < lines.length && lines[end].startsWith("|")) end++;
+  // A row's cells: split at | but not at \|, and without **.
+  const cells = (l) => l.replace(/\\\|/g, "\u0000").slice(1, -1).split("|")
+    .map((c) => c.split("\u0000").join("|").trim().replace(/^\*\*(.*)\*\*$/, "$1"));
+  const rows = at < 0 ? [] : [lines[at]].concat(lines.slice(at + 2, end));
+  $("report-table").replaceChildren(...rows.map((l, i) => {
+    const tr = document.createElement("tr");
+    tr.append(...cells(l).map((c) => text(i ? "td" : "th", c)));
+    return tr;
   }));
-  startLog(id, job, running || v.state === "queued");
+  const head = at < 0 ? [] : lines.slice(0, at);
+  $("report-head").textContent = rep.error ? "No report: " + rep.error : head.join(" ").replace(/^# /, "").replace(/\s+/g, " ").trim();
+  $("report-text").textContent = (at < 0 ? lines : lines.slice(end)).join("\n").trim();
+  $("report-text").hidden = !$("report-text").textContent;
+  $("report-copy").hidden = $("report-download").hidden = !md;
 }
 
 // Fix with Claude: the daemon makes the fix (a branch at the failing commit, in
@@ -725,6 +777,22 @@ $("build-rerun").addEventListener("click", async () => {
   if (!shown) return;
   const r = await actLocal("POST", `/builds/${shown.id}/rerun`);
   if (r && r.build) location.hash = "build=" + Number(r.build);
+});
+$("report-copy").addEventListener("click", () => {
+  const md = shown && shown.report && shown.report.markdown;
+  if (!md) return;
+  (navigator.clipboard ? navigator.clipboard.writeText(md) : Promise.reject()).then(
+    () => { $("report-copy").textContent = "Copied"; setTimeout(() => { $("report-copy").textContent = "Copy"; }, 2000); },
+    () => { getSelection().selectAllChildren($("report-text")); });
+});
+$("report-download").addEventListener("click", () => {
+  const md = shown && shown.report && shown.report.markdown;
+  if (!md) return;
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([md], { type: "text/markdown" }));
+  a.download = `report-${shown.id}.md`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 });
 $("pause").addEventListener("click", () => { if (local) actLocal("POST", "/daemon", { paused: !local.watcher.paused }); });
 $("poll").addEventListener("click", () => actLocal("POST", "/daemon/poll"));

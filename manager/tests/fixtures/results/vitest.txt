@@ -1,0 +1,33 @@
+
+ RUN  v5.0.2 /tmp/claude-0/-home-user-bana/a098c434-4782-518b-8100-69c3d243761b/scratchpad/research-report/samples/vitest
+
+ ❯ demo.test.js (4 tests | 1 failed | 1 skipped | 1 todo) 9ms
+   × accepted 6ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  demo.test.js > accepted
+AssertionError: expected false to be true // Object.is equality
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ demo.test.js:3:38
+      1| import { test, expect } from 'vitest';
+      2| test('adds', () => expect(1 + 1).toBe(2));
+      3| test('accepted', () => expect(false).toBe(true));
+       |                                      ^
+      4| test.skip('slow', () => {});
+      5| test.todo('later');
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 1 passed | 1 skipped | 1 todo (4)
+   Start at  07:59:48
+   Duration  171ms (transform 45%, import 27%, tests 20%, worker 9%)
+

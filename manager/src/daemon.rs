@@ -583,6 +583,9 @@ pub struct Record {
     pub port: Option<u16>,
     /// By context.
     pub statuses: BTreeMap<String, Posting>,
+    /// The CI report's rows (report.md's table), once the build ended.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub standards: Vec<crate::report::Row>,
 }
 
 /// Lines of one build's log, from a byte offset in act.jsonl.
@@ -787,6 +790,22 @@ impl Daemon {
             .unwrap_or(Value::Null);
         v["compare"] = event["compare"].clone();
         Some(v)
+    }
+
+    /// A build's CI report, as its end wrote it: report.md and its rows.
+    /// An ended build without one (it ended just now, or while the daemon
+    /// was down, or before bana wrote reports) gets it written now. None
+    /// for a build not there; `Some(None)` for one that has not ended.
+    pub async fn ci_report(&self, id: u64) -> Option<Option<crate::report::Report>> {
+        let ended = self.0.lock().records.get(&id)?.build.state.finished();
+        let dir = self.0.build_dir(id);
+        if let Some(r) = crate::report::read_written(&dir) {
+            return Some(Some(r));
+        }
+        if ended {
+            self.0.write_report(id).await;
+        }
+        Some(crate::report::read_written(&dir))
     }
 
     /// A build's log lines from byte `from` of act.jsonl: one job's (by key), or all.
@@ -1492,6 +1511,7 @@ impl Shared {
                 .map(|(_, d)| d)
                 .unwrap_or_default(),
             jobs: b.chips(),
+            tests: crate::report::chip(&r.standards),
         }
     }
 
@@ -1659,6 +1679,7 @@ impl Shared {
                 .cloned()
                 .collect()
         };
+        let mut ended = Vec::new();
         for rec in running {
             let id = rec.request.id;
             if let (Some(pid), Some(start)) = (rec.pid, &rec.pid_start) {
@@ -1694,6 +1715,7 @@ impl Shared {
             if !retry {
                 let report = self.report(r);
                 want_now(r, &report, &mut inner.seq);
+                ended.push(id);
             }
             self.save(r);
             if !retry && rec.request.trigger == Trigger::Retry {
@@ -1714,6 +1736,9 @@ impl Shared {
                     self.add_round_build(fix, n, new, job);
                 }
             }
+        }
+        for id in ended {
+            self.write_report(id).await;
         }
         self.clear_stale_lock().await;
         let inner = self.lock();
@@ -2322,7 +2347,10 @@ impl Shared {
     async fn run_build(&self, id: u64, cancel: mpsc::UnboundedReceiver<String>) {
         match self.prepare(id).await {
             Ok(list) => self.act(id, list, cancel).await,
-            Err(why) => self.could_not_start(id, &why),
+            Err(why) => {
+                self.could_not_start(id, &why);
+                self.write_report(id).await;
+            }
         }
         let _ = std::fs::remove_file(self.build_dir(id).join("secrets"));
         let pid = self.lock().records.get(&id).and_then(|r| r.pid);
@@ -2495,12 +2523,75 @@ impl Shared {
         else {
             return String::new();
         };
+        self.conf_at(&f.sha).await
+    }
+
+    /// The bana.conf of commit `sha`, in src, where bana looks for it (empty if none).
+    async fn conf_at(&self, sha: &str) -> String {
         for name in ["bana.conf", ".github/bana.conf"] {
-            if let Ok(text) = self.git(&["show", &format!("{}:{name}", f.sha)], 30).await {
+            if let Ok(text) = self.git(&["show", &format!("{sha}:{name}")], 30).await {
                 return text;
             }
         }
         String::new()
+    }
+
+    /// At the build's end: results.jsonl and report.md in its directory, with
+    /// the standards of the built commit's bana.conf, and the report's rows in
+    /// build.json (the history's chip).
+    async fn write_report(&self, id: u64) {
+        let Some(rec) = self.lock().records.get(&id).cloned() else {
+            return;
+        };
+        // A round's standards are the failing commit's, as its act settings
+        // are (round.conf): Claude's snapshot could relabel what failed.
+        let conf = match &rec.request.fix {
+            Some(fix) => match std::fs::read_to_string(self.build_dir(id).join("round.conf")) {
+                Ok(text) => text,
+                Err(_) => self.base_conf(fix).await,
+            },
+            None => self.conf_at(&rec.request.sha).await,
+        };
+        let s = &self.settings;
+        let version = self
+            .output("act", &["--version"], &self.src(), 10)
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| {
+                let out = String::from_utf8_lossy(&o.stdout).into_owned();
+                out.lines()
+                    .next()?
+                    .split_whitespace()
+                    .last()
+                    .map(String::from)
+            });
+        let (repo, machine, bana) = (s.repo.clone(), s.machine.clone(), s.bana_commit.clone());
+        let dir = self.build_dir(id);
+        let made = tokio::task::spawn_blocking(move || {
+            // What a builder's own results.jsonl says stays.
+            crate::report::write_build(&dir, id, &conf, |b| {
+                b.repo = b.repo.take().or(Some(repo));
+                b.machine = b.machine.take().or(Some(machine));
+                b.bana = b.bana.take().or(bana);
+                if let (Some(v), "act") = (version, b.builder.as_str()) {
+                    b.builder = format!("act {v}");
+                }
+            })
+        })
+        .await;
+        match made {
+            Ok(Ok(rows)) => {
+                let mut inner = self.lock();
+                if let Some(rec) = inner.records.get_mut(&id) {
+                    rec.standards = rows;
+                    self.save(rec);
+                }
+                self.publish(&inner);
+            }
+            Ok(Err(e)) => eprintln!("bana daemon: build {id}: report: {e}"),
+            Err(e) => eprintln!("bana daemon: build {id}: report: {e}"),
+        }
     }
 
     fn could_not_start(&self, id: u64, why: &str) {
@@ -2600,16 +2691,19 @@ impl Shared {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                let mut inner = self.lock();
-                let inner = &mut *inner;
-                if let Some(rec) = inner.records.get_mut(&id) {
-                    let old = rec.build.clone();
-                    rec.build.last_error = Some(format!("{}: {e}", s.bash));
-                    rec.build.finish(Some(1), None, now());
-                    let updates = actlog::status_updates(&old, &rec.build, &self.report(rec));
-                    want(rec, updates, &mut inner.seq);
-                    self.save(rec);
+                {
+                    let mut inner = self.lock();
+                    let inner = &mut *inner;
+                    if let Some(rec) = inner.records.get_mut(&id) {
+                        let old = rec.build.clone();
+                        rec.build.last_error = Some(format!("{}: {e}", s.bash));
+                        rec.build.finish(Some(1), None, now());
+                        let updates = actlog::status_updates(&old, &rec.build, &self.report(rec));
+                        want(rec, updates, &mut inner.seq);
+                        self.save(rec);
+                    }
                 }
+                self.write_report(id).await;
                 return;
             }
         };
@@ -2747,6 +2841,8 @@ impl Shared {
                 (git_ref, sha)
             })
         };
+        // src is still at the built commit: the next build checks out its own.
+        self.write_report(id).await;
         if let Some((git_ref, sha)) = pin {
             if let Err(e) = self
                 .git(&["update-ref", &watch::green_pin(&git_ref), &sha], 30)
@@ -4216,6 +4312,103 @@ exec git \"$@\"
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_build_ends_with_its_ci_report() {
+        let p = Project::new("report");
+        let d = start(&p, "bana_commit = b1df450\n").await;
+        // Each build's standards are its own commit's.
+        let conf = p.work.join(".github/bana.conf");
+        std::fs::create_dir_all(conf.parent().unwrap()).unwrap();
+        std::fs::write(&conf, "# the checks\nreport.planning = plan\n").unwrap();
+        let a = p.commit("pass", "passes");
+        p.push("main");
+        poll(&d).await;
+        assert_eq!(finished(&d, 1).await.build.state, BuildState::Success);
+        std::fs::write(
+            &conf,
+            "report.lint = lint\nreport.left_out = \"*left out*\"\n",
+        )
+        .unwrap();
+        p.commit("fail", "fails");
+        p.push("main");
+        poll(&d).await;
+        let rec = finished(&d, 2).await;
+        assert_eq!(rec.build.state, BuildState::Failure);
+
+        let read = |id: u64, name: &str| {
+            std::fs::read_to_string(p.dir.join(format!("builds/{id}/{name}"))).unwrap()
+        };
+        let md = read(1, "report.md");
+        let mut lines = md.lines();
+        assert_eq!(
+            lines.next(),
+            Some(format!("# CI report: o/r · main {} · quick · passed", &a[..7]).as_str()),
+            "{md}"
+        );
+        assert!(
+            // act is not on PATH here, so no version, and no `act` alone.
+            lines.nth(1).unwrap().starts_with("Build #1 on t · bana "),
+            "{md}"
+        );
+        assert!(md.contains("\n| planning | 100% (2/2) | — | |\n"), "{md}");
+        let r = crate::results::Results::from_jsonl(&read(1, "results.jsonl"));
+        assert_eq!(
+            (
+                r.build.repo.as_deref(),
+                r.build.machine.as_deref(),
+                r.build.bana.as_deref()
+            ),
+            (Some("o/r"), Some("t"), Some("b1df450"))
+        );
+        assert_eq!(r.build.result, "success");
+
+        let md = read(2, "report.md");
+        assert!(md.contains(" · quick · failed\n"), "{md}");
+        assert!(md.contains("\n| lint | 66% (2/3) | — | |\n"), "{md}");
+        assert!(
+            md.contains("\n## Failures\n\n**lint › cargo clippy**\n"),
+            "{md}"
+        );
+        assert!(
+            !md.contains("planning"),
+            "the built commit's standards: {md}"
+        );
+        let rows = d.0.lock().records[&2].standards.clone();
+        assert_eq!(
+            rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["lint", "all"]
+        );
+        let written = crate::report::read_written(&p.dir.join("builds/2")).unwrap();
+        assert_eq!((&written.markdown, &written.standards), (&md, &rows));
+        assert_eq!(d.ci_report(2).await, Some(Some(written)));
+        assert_eq!(d.ci_report(9).await, None);
+        // Nothing counted as tests: no chip in the history.
+        assert!(d.builds(None, 10).iter().all(|b| b.tests.is_none()));
+        // A builder other than act wrote results.jsonl: the report is its,
+        // with build.json's ref, commit and tier; written when asked for.
+        std::fs::remove_file(p.dir.join("builds/2/report.md")).unwrap();
+        std::fs::write(
+            p.dir.join("builds/2/results.jsonl"),
+            "{\"kind\":\"build\",\"schema\":1,\"builder\":\"make 4.3\",\"result\":\"success\"}\n\
+             {\"kind\":\"job\",\"key\":\"lint\",\"job\":\"lint\",\"result\":\"success\"}\n\
+             {\"kind\":\"step\",\"key\":\"lint\",\"step\":\"make lint\",\"stage\":\"Main\",\"result\":\"success\"}\n\
+             {\"kind\":\"tests\",\"key\":\"lint\",\"step\":\"make lint\",\"tool\":\"cargo\",\"passed\":3}\n",
+        )
+        .unwrap();
+        let md = d.ci_report(2).await.unwrap().unwrap().markdown;
+        assert!(
+            md.contains(" · quick · passed\n\nBuild #2 on t · make 4.3 · bana "),
+            "{md}"
+        );
+        assert!(
+            md.contains("\n| lint | 100% (1/1) | 100% (3/3) | |\n"),
+            "{md}"
+        );
+        assert_eq!(read(2, "report.md"), md);
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_ref_keeps_one_queued_build_and_green_moves_only_on_success() {
         let p = Project::new("queue");
         let d = start(&p, "").await;
@@ -4767,6 +4960,11 @@ exec git \"$@\"
             (two.build.state, two.build.reason.as_deref()),
             (BuildState::Error, Some(INTERRUPTED))
         );
+        let md = std::fs::read_to_string(p.dir.join("builds/2/report.md")).unwrap();
+        assert!(
+            md.starts_with("# CI report: "),
+            "its report, when it ended: {md}"
+        );
         assert!(d.summary().queue.is_empty() && d.0.lock().records.len() == 2);
         posted(&d).await;
         let errors: Vec<Post> = p
@@ -5296,6 +5494,9 @@ exec git \"$@\"
         p.push("other");
         poll(&d).await;
         until("build 4", || !p.read("pid.4").is_empty()).await;
+        // Standards of Claude's own, which the round's report does not take.
+        std::fs::create_dir_all(wt.join(".github")).unwrap();
+        std::fs::write(wt.join(".github/bana.conf"), "report.claude = *\n").unwrap();
         let snap = snapshot(&p, &wt, sha7, "pass");
         let r1 = d.ask_round(sha7, &snap, None, false).await.unwrap();
         assert_eq!(
@@ -5334,6 +5535,8 @@ exec git \"$@\"
             "not cancelled"
         );
         assert_eq!(finished(&d, 5).await.request.round, Some(1));
+        let md = d.ci_report(5).await.unwrap().unwrap().markdown;
+        assert!(md.contains("\n| rust | ") && !md.contains("claude"), "{md}");
         assert_eq!(finished(&d, 6).await.build.state, BuildState::Success);
 
         // Rounds post nothing, count as built nowhere and move no green head.

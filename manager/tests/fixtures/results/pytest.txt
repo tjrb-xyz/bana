@@ -1,0 +1,29 @@
+============================= test session starts ==============================
+platform linux -- Python 3.11.15, pytest-9.0.2, pluggy-1.6.0
+rootdir: /tmp/claude-0/-home-user-bana/a098c434-4782-518b-8100-69c3d243761b/scratchpad/research-report/samples/py
+collected 5 items
+
+test_demo.py .FsxE                                                       [100%]
+
+==================================== ERRORS ====================================
+_________________________ ERROR at setup of test_error _________________________
+file /tmp/claude-0/-home-user-bana/a098c434-4782-518b-8100-69c3d243761b/scratchpad/research-report/samples/py/test_demo.py, line 8
+  def test_error(broken_fixture): pass
+E       fixture 'broken_fixture' not found
+>       available fixtures: cache, capfd, capfdbinary, caplog, capsys, capsysbinary, capteesys, doctest_namespace, monkeypatch, pytestconfig, record_property, record_testsuite_property, record_xml_attribute, recwarn, subtests, tmp_path, tmp_path_factory, tmpdir, tmpdir_factory
+>       use 'pytest --fixtures [testpath]' for help on them.
+
+/tmp/claude-0/-home-user-bana/a098c434-4782-518b-8100-69c3d243761b/scratchpad/research-report/samples/py/test_demo.py:8
+=================================== FAILURES ===================================
+________________________________ test_accepted _________________________________
+
+>   def test_accepted(): assert False, "accepted"
+                         ^^^^^^^^^^^^^^^^^^^^^^^^
+E   AssertionError: accepted
+E   assert False
+
+test_demo.py:3: AssertionError
+=========================== short test summary info ============================
+FAILED test_demo.py::test_accepted - AssertionError: accepted
+ERROR test_demo.py::test_error
+========== 1 failed, 1 passed, 1 skipped, 1 xfailed, 1 error in 0.02s ==========

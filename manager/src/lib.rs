@@ -16,6 +16,7 @@ pub mod daemon;
 pub mod fix;
 pub mod guard;
 pub mod mcp;
+pub mod report;
 pub mod results;
 pub mod rounds;
 pub mod server;

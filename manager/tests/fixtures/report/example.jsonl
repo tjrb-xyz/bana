@@ -1,0 +1,54 @@
+{"kind":"build","schema":1,"builder":"act 0.2.89","bana":"a4b6f87212d190304c530041b9bbd5fed72f0dd3","repo":"tjrb-xyz/example","ref":"refs/heads/speaker-check","sha":"d4b5174aa0f1d2c3b4a5968778695a4b3c2d1e0f","tier":"quick","machine":"mbp","network":"host","trigger":"push","started":1790000000,"ended":1790000760,"result":"failure"}
+{"kind":"job","key":"plan","job":"plan","result":"success","ms":21000}
+{"kind":"step","key":"plan","step":"Set up job","stage":"","result":"success","ms":null,"owner":"project"}
+{"kind":"step","key":"plan","step":"actions/checkout@v4","stage":"Main","result":"success","ms":1000,"owner":"project"}
+{"kind":"step","key":"plan","step":"plan","stage":"Main","result":"success","ms":1000,"owner":"project"}
+{"kind":"step","key":"plan","step":"Complete job","stage":"","result":"success","ms":null,"owner":"project"}
+{"kind":"job","key":"rust","job":"rust","result":"failure","ms":310000}
+{"kind":"step","key":"rust","step":"Set up job","stage":"","result":"success","ms":null,"owner":"project"}
+{"kind":"step","key":"rust","step":"actions/checkout@v4","stage":"Main","result":"success","ms":1000,"owner":"project"}
+{"kind":"step","key":"rust","step":"dtolnay/rust-toolchain@stable","stage":"Main","result":"success","ms":1000,"owner":"project"}
+{"kind":"step","key":"rust","step":"tjrb-xyz/bana/actions/keep-builds@a4b6f87","stage":"Main","result":"success","ms":1000,"owner":"bana"}
+{"kind":"step","key":"rust","step":"cargo test --workspace","stage":"Main","result":"failure","ms":298608,"owner":"project"}
+{"kind":"tests","key":"rust","step":"cargo test --workspace","tool":"cargo","passed":21,"failed":1,"skipped":0,"incomplete":true}
+{"kind":"test","key":"rust","step":"cargo test --workspace","name":"real_c3_the_engine_accepts_only_its_token_and_no_origin","result":"failed","binary":"tests/facts.rs","at":"crates/example-engine/tests/facts.rs:457:18","message":"accepted"}
+{"kind":"test","key":"rust","step":"cargo test --workspace","name":"real_a1_a_muted_gate_is_silent","result":"passed","binary":"tests/facts.rs"}
+{"kind":"test","key":"rust","step":"cargo test --workspace","name":"real_a2_stop_is_inactive_without_a_reason","result":"passed","binary":"tests/facts.rs"}
+{"kind":"test","key":"rust","step":"cargo test --workspace","name":"real_b1_file_playback_is_live","result":"passed","binary":"tests/facts.rs"}
+{"kind":"test","key":"rust","step":"cargo test --workspace","name":"real_b2_raw_file_end_stops_with_done","result":"passed","binary":"tests/facts.rs"}
+{"kind":"test","key":"rust","step":"cargo test --workspace","name":"real_b3_volume_limit_clamps_the_signal","result":"passed","binary":"tests/facts.rs"}
+{"kind":"test","key":"rust","step":"cargo test --workspace","name":"real_c1_the_engine_starts_with_a_token","result":"passed","binary":"tests/facts.rs"}
+{"kind":"test","key":"rust","step":"cargo test --workspace","name":"real_c2_the_engine_refuses_no_token","result":"passed","binary":"tests/facts.rs"}
+{"kind":"test","key":"rust","step":"cargo test --workspace","name":"real_d1_ok_is_not_running","result":"passed","binary":"tests/facts.rs"}
+{"kind":"test","key":"rust","step":"cargo test --workspace","name":"real_d2_a_missing_device_fails","result":"passed","binary":"tests/facts.rs"}
+{"kind":"test","key":"rust","step":"cargo test --workspace","name":"config::parses_the_defaults","result":"passed","binary":"src/lib.rs"}
+{"kind":"test","key":"rust","step":"cargo test --workspace","name":"config::rejects_a_bad_port","result":"passed","binary":"src/lib.rs"}
+{"kind":"rerun","key":"rust","step":"cargo test --workspace","target":"-p example-engine --test facts"}
+{"kind":"tail","key":"rust","step":"cargo test --workspace","lines":["test real_c3_the_engine_accepts_only_its_token_and_no_origin ... FAILED","","failures:","","---- real_c3_the_engine_accepts_only_its_token_and_no_origin stdout ----","","thread 'real_c3_the_engine_accepts_only_its_token_and_no_origin' (4711) panicked at crates/example-engine/tests/facts.rs:457:18:","accepted","","test result: FAILED. 21 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.84s","","error: test failed, to rerun pass `-p example-engine --test facts`"]}
+{"kind":"step","key":"rust","step":"Post tjrb-xyz/bana/actions/keep-builds@a4b6f87","stage":"Post","result":"success","ms":32,"owner":"bana"}
+{"kind":"step","key":"rust","step":"Post dtolnay/rust-toolchain@stable","stage":"Post","result":"success","ms":161,"owner":"project"}
+{"kind":"step","key":"rust","step":"Complete job","stage":"","result":"success","ms":null,"owner":"project"}
+{"kind":"job","key":"web","job":"web","result":"success","ms":95000}
+{"kind":"step","key":"web","step":"Set up job","stage":"","result":"success","ms":null,"owner":"project"}
+{"kind":"step","key":"web","step":"pnpm/action-setup@v4","stage":"Main","result":"success","ms":1000,"owner":"project"}
+{"kind":"step","key":"web","step":"Chromium (its system libraries only the first time on your own runner)","stage":"Main","result":"success","ms":1000,"owner":"project"}
+{"kind":"step","key":"web","step":"pnpm test","stage":"Main","result":"success","ms":41000,"owner":"project"}
+{"kind":"tests","key":"web","step":"pnpm test","tool":"vitest","passed":32,"failed":0,"skipped":2,"incomplete":false}
+{"kind":"summary","key":"web","step":"pnpm test","markdown":"## Vitest Test Report\n\n| Passed | Failed | Skipped |\n|---|---|---|\n| 32 | 0 | 2 |"}
+{"kind":"step","key":"web","step":"Complete job","stage":"","result":"success","ms":null,"owner":"project"}
+{"kind":"job","key":"macos","job":"macos","result":"failure","ms":140000}
+{"kind":"step","key":"macos","step":"Set up job","stage":"","result":"success","ms":null,"owner":"project"}
+{"kind":"step","key":"macos","step":"cargo build --release -p example-coreaudio","stage":"Main","result":"success","ms":120000,"owner":"project"}
+{"kind":"step","key":"macos","step":"The example's devices appear in CoreAudio","stage":"Main","result":"success","ms":1000,"owner":"project"}
+{"kind":"step","key":"macos","step":"On a dedicated CI Mac only","stage":"Main","result":"success","ms":1000,"owner":"project"}
+{"kind":"notice","key":"macos","step":"On a dedicated CI Mac only","text":"Not a dedicated CI Mac: the driver's install is left out","left_out":false}
+{"kind":"step","key":"macos","step":"Post tjrb-xyz/bana/actions/keep-builds@a4b6f87","stage":"Post","result":"failure","ms":40,"owner":"bana"}
+{"kind":"step","key":"macos","step":"Complete job","stage":"","result":"success","ms":null,"owner":"project"}
+{"kind":"job","key":"streaming","job":"streaming","result":"success","ms":60000}
+{"kind":"step","key":"streaming","step":"Set up job","stage":"","result":"success","ms":null,"owner":"project"}
+{"kind":"step","key":"streaming","step":"scripts/ci.sh streaming","stage":"Main","result":"success","ms":52000,"owner":"project"}
+{"kind":"tests","key":"streaming","step":"scripts/ci.sh streaming","tool":"cargo","passed":18,"failed":0,"skipped":0,"incomplete":false}
+{"kind":"step","key":"streaming","step":"Complete job","stage":"","result":"success","ms":null,"owner":"project"}
+{"kind":"job","key":"package (linux-arm64)","job":"package","result":"not_planned","matrix":{"target":"linux-arm64"},"ms":null}
+{"kind":"job","key":"package (macos-arm64)","job":"package","result":"unsupported","matrix":{"target":"macos-arm64"},"ms":null}
+{"kind":"error","owner":"bana","text":"symlink log-only /Users/lilly/.cache/act/68f407a87fd03002/act/actions/tjrb-xyz-bana-actions-keep-builds@a4b6f87212d190304c530041b9bbd5fed72f0dd3/tests/stand-ins/apt-get: file exists","key":"macos","step":"Post tjrb-xyz/bana/actions/keep-builds@a4b6f87"}

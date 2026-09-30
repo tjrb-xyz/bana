@@ -4045,6 +4045,7 @@ mod tests {
             message: "unused import `x`".into(),
             file: Some("src/a.rs".into()),
             line: Some(3),
+            ..Annotation::default()
         }];
         let ann = Results {
             jobs: vec![Job {

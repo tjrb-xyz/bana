@@ -1,0 +1,19 @@
+============================= test session starts ==============================
+platform linux -- Python 3.11.15, pytest-9.0.2, pluggy-1.6.0
+rootdir: /tmp/py
+collected 4 items
+
+test_a.py .F
+
+=================================== FAILURES ===================================
+____________________________________ test_2 ____________________________________
+
+>   def test_2(): assert False
+                  ^^^^^^^^^^^^
+E   assert False
+
+test_a.py:2: AssertionError
+=========================== short test summary info ============================
+FAILED test_a.py::test_2 - assert False
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+========================= 1 failed, 1 passed in 0.01s ==========================

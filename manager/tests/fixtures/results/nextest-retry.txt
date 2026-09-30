@@ -1,0 +1,8 @@
+    Starting 2 tests across 1 binary
+    TRY 1 FAIL [   0.004s] (1/2) demo tests::flaky
+  RETRY 2/2 [         ] (1/2) demo tests::flaky
+    TRY 2 PASS [   0.004s] (1/2) demo tests::flaky
+        PASS [   0.004s] (2/2) demo tests::fact_ok
+────────────
+     Summary [   0.015s] 2 tests run: 2 passed (1 flaky), 0 failed, 0 skipped
+   FLAKY 2/2 [   0.004s] (1/2) demo tests::flaky
