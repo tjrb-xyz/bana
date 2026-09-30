@@ -229,7 +229,9 @@ replace them. act enforces only a step's `timeout-minutes`; `daemon.timeout` gua
 
 Caches: macOS jobs run on the Mac in a fresh copy of the commit under `~/.bana/<prefix>/act-cache`, without
 gitignored files such as `target/`, so they build from scratch every time; the daemon removes the copy after the
-build. Linux jobs run in fresh containers, unless bana.conf has `act.args = --reuse`. Reused containers keep
+build. Linux jobs run in fresh containers, unless bana.conf has `act.args = --reuse`. Jobs that need systemd
+(`<prefix>-systemd`, `act.platform.<label> = machine`) run after the rest, in the Mac's Linux machine (`vm`), in a
+copy under `~/.cache/bana/act-<prefix>` there, which act removes after each job. Reused containers keep
 their builds, and also the files deleted since, so a workflow that uses it should run `keep-builds`, which under
 the daemon cleans the job's copy but for bana.conf's `keep`.
 
@@ -261,7 +263,8 @@ taken at install; `path` goes first on the daemon's PATH. Install also records t
 ## Trust
 
 **A push runs as you on your Mac.** An eligible push runs that commit's workflow and scripts with your user:
-macOS jobs outside any container, with your home directory, SSH keys and Keychain in reach. Linux containers are
+macOS jobs outside any container, with your home directory, SSH keys and Keychain in reach, and systemd's jobs as
+the Linux machine's user, who has passwordless sudo there. Linux containers are
 no boundary either, since OrbStack shares `/Users` into its VM. That is acceptable only because the repository
 is private and write access is the gate: use the daemon only on a private repository whose writers you trust.
 Bot branches are left out by default, and pull requests from forks never run.

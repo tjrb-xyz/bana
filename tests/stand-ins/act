@@ -1,5 +1,5 @@
 #!/bin/sh
-# Stand-in act: records how bana calls it, and its pid and environment in $FAKE_STATE;
+# Stand-in act (-l: FAKE_ACT_LIST, if set): records how bana calls it, and its pid and environment in $FAKE_STATE;
 # FAKE_ACT_SLEEP=N keeps it running N seconds (as the same pid). It prints FAKE_ACT_OUT, and
 # exits with FAKE_ACT_EXIT, saying so on stderr as act does. With FAKE_ACT_INT=1 (trapped
 # before FAKE_ACT_OUT), a SIGINT ends it as it ends act: a last line a moment later (tee must
@@ -9,6 +9,8 @@
 # matrix line.
 echo "act $*" >>"$FAKE_LOG"
 [ "$1" != --version ] || { echo "act version 0.2.89"; exit 0; }
+# act -l: FAKE_ACT_LIST, when set, as its table.
+[ "$1" != -l ] || [ -z "${FAKE_ACT_LIST:-}" ] || { printf '%s\n' "$FAKE_ACT_LIST"; exit 0; }
 if [ -d "$FAKE_STATE/labels" ]; then
   job='' entry='' verbose='' dry='' prev=''
   for a in "$@"; do

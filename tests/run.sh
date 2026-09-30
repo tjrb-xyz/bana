@@ -427,6 +427,93 @@ wait "$p" && st=0 || st=$?
 check "log: Ctrl-C killing act: bana ci still ends the log" has "$ci/last.log" "act: started"
 check "log: Ctrl-C killing act: its status" same "$st $(env_of exit) $(env_of stopped)" "130 130 1"
 
+# ---- bana ci: jobs that need systemd, in the Mac's Linux machine (act.platform: machine) ---------
+fresh
+mkdir -p .github/workflows && echo 'on: workflow_dispatch' >.github/workflows/ci.yml
+src=$(pwd -P)
+vmdir=$FAKE_STATE/orb/bana
+mkdir -p "$vmdir/home/.local/bin" && echo aarch64 >"$vmdir/arch"
+# The machine's act: the stand-in, saying what $FAKE_STATE/vm.out says (and exiting with vm.exit).
+cat >"$vmdir/home/.local/bin/act-0.2.89" <<'EOF'
+#!/bin/sh
+[ "$1" = --version ] || { FAKE_ACT_OUT=$(cat "$FAKE_STATE/vm.out"); FAKE_ACT_EXIT=$(cat "$FAKE_STATE/vm.exit" 2>/dev/null || echo 0); }
+export FAKE_ACT_OUT FAKE_ACT_EXIT
+exec act "$@"
+EOF
+chmod +x "$vmdir/home/.local/bin/act-0.2.89"
+# shellcheck disable=SC2016 # act's backquotes
+skip='{"job":"ci/sd","jobID":"sd","level":"info","msg":"🚧  Skipping unsupported platform -- Try running with `-P wid-systemd=...`"}'
+printf '%s\n' '{"jobID":"sd","msg":"sd in the machine"}' '{"jobID":"plan","msg":"plan again"}' 'not json' \
+  '{"level":"error","msg":"act broke"}' >"$FAKE_STATE/vm.out"
+GITHUB_TOKEN=tok-123 FAKE_ACT_OUT="$skip" FAKE_OS=Darwin FAKE_ARCH=arm64 BANA_PROJECT_ROOT=$src BANA_ACT_LOCKED=1 \
+  bash "$bana" ci quick -- --json >"$T/out" 2>"$T/err" && st=0 || st=$?
+check "machine: bana ci passes" same "$st" 0
+check "machine: two acts" same "$(grep -c '^act workflow_dispatch' "$FAKE_LOG")" 2
+check "machine: the first skips the machine's label" has "$FAKE_LOG" "-P wid-systemd= "
+check "machine: the second runs in the Linux machine" has "$FAKE_LOG" "orb -m bana bash -c"
+check "machine: made ready first (hook.linux ran there)" has "$FAKE_LOG" "linux hook as 1000 on aarch64"
+check "machine: its jobs in act's host mode there" has "$FAKE_LOG" "-P wid-systemd=-self-hosted"
+check "machine: and the Linux jobs they need" has "$FAKE_LOG" "-P wid-linux=-self-hosted"
+check "machine: only the skipped job" has "$FAKE_LOG" "-j sd --action-cache-path"
+check "machine: act's cache on the machine's disk" has "$FAKE_LOG" "--action-cache-path $vmdir/home/.cache/bana/act-wid"
+check "machine: the second has the first's options" has "$FAKE_LOG" "--json -P wid-linux=-self-hosted"
+check "machine: the job's own lines come out" has "$T/out" "sd in the machine"
+check "machine: not those of the jobs it needs, which ran already" lacks "$T/out" "plan again"
+check "machine: lines that are not act's JSON do" has "$T/out" "not json"
+check "machine: and errors" has "$T/out" "act broke"
+check "machine: the token reaches the machine's act" has "$FAKE_STATE/act.env" "GITHUB_TOKEN=tok-123"
+check "machine: not on a command line" lacks "$FAKE_LOG" "tok-123"
+check "machine: no token file left" same "$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'bana-token.*' -user "$(id -un)" 2>/dev/null | wc -l | tr -d ' ')" 0
+echo 3 >"$FAKE_STATE/vm.exit"
+: >"$FAKE_LOG"
+FAKE_ACT_OUT="$skip" FAKE_OS=Darwin FAKE_ARCH=arm64 BANA_PROJECT_ROOT=$src BANA_ACT_LOCKED=1 \
+  bash "$bana" ci quick -- --json >"$T/out" 2>&1 && st=0 || st=$?
+check "machine: the second act's failure is bana ci's" same "$st" 3
+rm -f "$FAKE_STATE/vm.exit"
+: >"$FAKE_LOG"
+FAKE_ACT_EXIT=2 FAKE_ACT_OUT="$skip" FAKE_OS=Darwin FAKE_ARCH=arm64 BANA_PROJECT_ROOT=$src BANA_ACT_LOCKED=1 \
+  bash "$bana" ci quick -- --json >"$T/out" 2>&1 && st=0 || st=$?
+check "machine: the first act's failure stays, and the second still runs" same "$st $(grep -c '^act workflow_dispatch' "$FAKE_LOG")" "2 2"
+: >"$FAKE_LOG"
+FAKE_ACT_OUT='{"jobID":"plan","msg":"all here"}' FAKE_OS=Darwin FAKE_ARCH=arm64 BANA_PROJECT_ROOT=$src BANA_ACT_LOCKED=1 \
+  bash "$bana" ci quick -- --json >/dev/null 2>&1
+check "machine: nothing skipped for it, no second act" same "$(grep -c '^act workflow_dispatch' "$FAKE_LOG")" 1
+check "machine: nor the machine" lacks "$FAKE_LOG" "orb -m"
+: >"$FAKE_LOG"
+FAKE_ACT_OUT="$skip" FAKE_OS=Linux FAKE_ARCH=x86_64 BANA_PROJECT_ROOT=$src BANA_ACT_LOCKED=1 \
+  bash "$bana" ci quick -- --json >/dev/null 2>&1
+check "machine: on Linux, act skips those jobs (not run here)" same "$(grep -c '^act workflow_dispatch' "$FAKE_LOG")" 1
+# By hand: act's text names the job, and act -l gives its id.
+# shellcheck disable=SC2016 # act's backquotes
+: >"$FAKE_LOG"
+FAKE_ACT_LIST='Stage  Job ID  Job name       Workflow name  Workflow file  Events
+0      plan    plan           ci             ci.yml         workflow_dispatch
+1      sd      Needs systemd  ci             ci.yml         workflow_dispatch' \
+FAKE_ACT_OUT='[ci/Needs systemd] 🚧  Skipping unsupported platform -- Try running with `-P wid-systemd=...`' \
+  FAKE_OS=Darwin FAKE_ARCH=arm64 bash "$bana" ci >"$T/out" 2>&1 && st=0 || st=$?
+check "machine by hand: passes" same "$st" 0
+check "machine by hand: the job by its id, from act -l" has "$FAKE_LOG" "-j sd --action-cache-path"
+check "machine by hand: both acts in last.log" has "$HOME/.bana/wid/ci/last.log" "sd in the machine"
+# The daemon's cancel (SIGINT to bana ci alone) reaches act, and no second act starts.
+: >"$FAKE_LOG"
+FAKE_ACT_INT=1 FAKE_ACT_OUT="$skip" FAKE_OS=Darwin FAKE_ARCH=arm64 BANA_PROJECT_ROOT=$src BANA_ACT_LOCKED=1 \
+  "${own_group[@]}" bash "$bana" ci quick -- --json >"$T/out" 2>&1 &
+p=$!
+for ((i = 0; i < 100; i++)); do grep -qs Skipping "$T/out" && break; sleep 0.1; done
+kill -INT "$p"
+wait "$p" && st=0 || st=$?
+check "machine cancel: act got the SIGINT" has "$T/out" "act: interrupted, its containers removed"
+check "machine cancel: no second act" same "$(grep -c '^act workflow_dispatch' "$FAKE_LOG")" 1
+check "machine cancel: act's status" same "$st" 1
+# In the machine: bana linux-prepare, as a user, and act from its releases.
+fresh
+FAKE_UID=0 FAKE_OS=Linux bash "$bana" linux-prepare 0.2.89 >"$T/out" 2>&1 && st=0 || st=$?
+check "linux-prepare: not as root" has "$T/out" "run as a normal user"
+FAKE_OS=Linux FAKE_ARCH=aarch64 BANA_SYS_ROOT=$FAKE_STATE/vmroot bash "$bana" linux-prepare 0.2.89 >"$T/out" 2>&1 && st=0 || st=$?
+check "linux-prepare: act from its releases, for this CPU" has "$FAKE_LOG" \
+  "https://github.com/nektos/act/releases/download/v0.2.89/act_Linux_arm64.tar.gz"
+check "linux-prepare: a failed download says so" has "$T/out" "Could not download act 0.2.89"
+
 # ---- bana fix: a failure handed to Claude Code, on a branch of its own -----------------------------
 # bana fix runs bana-manager (fix prepare makes the worktree, the brief and the prompt): the one
 # BANA_TEST_MANAGER names, else one the real cargo builds here. Claude Code is the stand-in, which
@@ -869,8 +956,8 @@ vmhome=$FAKE_STATE/orb/bana/home
 check "vm: the linux hook ran in it, as a user, on arm64" has "$FAKE_LOG" "linux hook as 1000 on aarch64"
 check "vm: the x86_64 one on x86_64" has "$FAKE_LOG" "linux hook as 1000 on x86_64"
 check "vm: its runner is named after the Mac, without USB labels" has "$FAKE_LOG" \
-  "--name wid-mbp-linux-arm64-1 --labels wid-linux,linux-arm64,mbp,big-disk,gpu --work"
-check "vm: the x86_64 runner" has "$FAKE_LOG" "--name wid-mbp-linux-x64-1 --labels wid-linux,linux-x64,mbp,big-disk,gpu --work"
+  "--name wid-mbp-linux-arm64-1 --labels wid-linux,wid-systemd,linux-arm64,mbp,big-disk,gpu --work"
+check "vm: the x86_64 runner" has "$FAKE_LOG" "--name wid-mbp-linux-x64-1 --labels wid-linux,wid-systemd,linux-x64,mbp,big-disk,gpu --work"
 check "vm: a systemd service (sudo svc.sh install USER)" has "$FAKE_LOG" "sudo ./svc.sh install"
 check "vm: its runners live in the machine's own home" test -e "$vmhome/.bana/wid/runners/wid-mbp-linux-arm64-1/.runner"
 check "vm: bana.conf's path leads its runner's PATH" has "$FAKE_LOG" "runner PATH starts $vmhome/.cargo/bin"
@@ -924,9 +1011,9 @@ export FAKE_OS=Linux FAKE_ARCH=x86_64 FAKE_HOST=pve-ci FAKE_UID=1000 BANA_SYS_RO
 FAKE_MISSING="scons git" bash "$bana" up --linux 2 >"$T/out" 2>&1 || { cat "$T/out"; false; }
 check "linux: installs only the missing packages" has "$FAKE_LOG" "apt-get install -y -q git scons"
 check "linux: the first runner holds the USB device" has "$FAKE_LOG" \
-  "--name wid-pve-ci-linux-x64-1 --labels wid-linux,linux-x64,pve-ci,big-disk,usb-audio,usb-1c75-af70 --work"
+  "--name wid-pve-ci-linux-x64-1 --labels wid-linux,wid-systemd,linux-x64,pve-ci,big-disk,usb-audio,usb-1c75-af70 --work"
 check "linux: the second does not (two jobs never share a device)" has "$FAKE_LOG" \
-  "--name wid-pve-ci-linux-x64-2 --labels wid-linux,linux-x64,pve-ci,big-disk --work"
+  "--name wid-pve-ci-linux-x64-2 --labels wid-linux,wid-systemd,linux-x64,pve-ci,big-disk --work"
 check "linux: its kernel has snd-usb-audio, so no kernel packages" lacks "$FAKE_LOG" "linux-image"
 
 # A Debian cloud kernel (no sound drivers), and Ubuntu's virtual one.
@@ -1308,7 +1395,8 @@ else
   rm .github/bana.conf
   git -c user.name=t -c user.email=t@t commit -qam "no bana.conf"
   mkdir -p "$FAKE_STATE/labels" "$FAKE_STATE/matrix"
-  for j in plan rust web background-linux; do printf 'self-hosted\nexample-linux\n' >"$FAKE_STATE/labels/$j"; done
+  for j in plan rust web; do printf 'self-hosted\nexample-linux\n' >"$FAKE_STATE/labels/$j"; done
+  printf 'self-hosted\nexample-systemd\n' >"$FAKE_STATE/labels/background-linux"
   printf 'self-hosted\nexample-macos\n' >"$FAKE_STATE/labels/macos"
   for t in linux-arm64 linux-x64; do printf 'self-hosted\nexample-linux\n%s\n' "$t" >"$FAKE_STATE/labels/package@target:$t"; done
   printf 'self-hosted\nexample-macos\nosx-arm64\n' >"$FAKE_STATE/labels/package@target:macos-arm64"
@@ -1327,6 +1415,8 @@ else
     "act workflow_dispatch -n --pull=false -W .github/workflows/ci.yml -P bana-none=x -P ubuntu-latest= -P ubuntu-22.04= -P ubuntu-20.04= -P ubuntu-18.04= -j plan"
   check "init: Linux jobs in act.image" has "$T/out" "plan                        self-hosted example-linux              Linux container catthehacker/ubuntu:act-24.04  bana up runners"
   check "init: on Linux, a Mac's job is not run" has "$T/out" "macos                       self-hosted example-macos              a Mac's job, not run on Linux"
+  check "init: on Linux, a job for the Mac's Linux machine is not run" grep -qE \
+    "^  background-linux +self-hosted example-systemd +not run on Linux: needs a Mac's Linux machine +bana up runners" "$T/out"
   check "init: the matrix entries, each where it goes" has "$T/out" "package target=macos-arm64  self-hosted example-macos osx-arm64"
   check "init: a SPLIT matrix" has "$T/out" "ci.yml:74: package: SPLIT: its entries go to different runners, and act 0.2.89 runs them all on the first one's: bana ci -j package -- --matrix target:linux-arm64,"
   check "init: systemd's jobs, once" same "$(grep -c 'systemctl --user and loginctl' "$T/out")" 1
@@ -1343,6 +1433,8 @@ else
   check "init: the workflow as it was" same "$(git status --porcelain)" ""
   FAKE_OS=Darwin FAKE_ARCH=arm64 bash "$bana" init >"$T/out" 2>&1 || true
   check "init: on a Mac, this Mac" has "$T/out" "macos                       self-hosted example-macos              this Mac (host mode)"
+  check "init: on a Mac, the Linux machine for systemd's jobs" grep -qE \
+    "^  background-linux +self-hosted example-systemd +the Linux machine bana \\(host mode, systemd\\)" "$T/out"
   check "init: without --check, nothing written: says to rerun on a terminal" has "$T/out" "Nothing written: rerun on a terminal to write."
   check "init: the CPU the Mac's containers lack: the package job checks it already (uname -m)" lacks "$T/out" "asks for linux-x64"
 
@@ -1415,7 +1507,7 @@ while select.select([fd], [], [], 60)[0]:
         buf = b""
 sys.exit(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))')
   "${on_terminal[@]}" l,y,y bash "$bana" init >"$T/out" 2>&1 || true
-  check "init (terminal): asks about the label it does not know" has "$T/out" "Label depot-ubuntu-24.04-4 (jobs depot): [l]inux / [m]ac / [s]kip / an image [linux]"
+  check "init (terminal): asks about the label it does not know" has "$T/out" "Label depot-ubuntu-24.04-4 (jobs depot): [l]inux / [m]ac / mac[h]ine (systemd) / [s]kip / an image [linux]"
   check "init (terminal): bana.conf keeps its lines" same "$(head -3 .github/bana.conf)" "$(printf 'repo = acme/widget\nprefix = wid\nworkflow = ci.yml')"
   check "init (terminal): and gets the answer" has .github/bana.conf "act.platform.depot-ubuntu-24.04-4 = linux"
   check "init (terminal): in a block of its own" has .github/bana.conf "# bana init $(date +%Y-%m-%d)"

@@ -328,7 +328,8 @@ runner_tarball() { # KIND ARCH
 # host, --label ones, and (for the runner that holds them) the USB audio devices.
 labels_for() { # KIND(linux|macos) USB(1|'')
   local kind=$1 l
-  l="$prefix-$kind,$([[ $kind == macos ]] && echo osx || echo linux)-$(cpu),$host"
+  # Every Linux runner is a systemd service, so its jobs have systemd (act.platform: machine).
+  l="$prefix-$kind,$([[ $kind == linux ]] && echo "$prefix-systemd,")$([[ $kind == macos ]] && echo osx || echo linux)-$(cpu),$host"
   [[ -z $extra_labels ]] || l+=",$extra_labels"
   if [[ -n $2 && -z $no_usb ]]; then
     local u
@@ -450,6 +451,22 @@ linux_prepare() {
   [[ -n $no_usb ]] || sound_kernel
   run_hook linux
   add_paths
+}
+
+# act VERSION as ~/.local/bin/act-VERSION, from act's releases, unless it is there: bana ci runs
+# it in a Mac's Linux machine for the jobs that need systemd.
+act_install() { # VERSION
+  local v=$1 bin=$HOME/.local/bin a tmp
+  [[ ! -x $bin/act-$v ]] || return 0
+  [[ $v =~ ^[0-9][0-9.]*$ ]] || die "act version '$v'?"
+  case $(cpu) in arm64) a=arm64 ;; x64) a=x86_64 ;; *) die "no act for $(uname -m)" ;; esac
+  say "Installing act $v in $host"
+  mkdir -p "$bin"
+  tmp=$(mktemp -d)
+  curl -fsSL "https://github.com/nektos/act/releases/download/v$v/act_Linux_$a.tar.gz" | tar -xz -C "$tmp" act ||
+    { rm -rf "$tmp"; die "Could not download act $v"; }
+  mv "$tmp/act" "$bin/act-$v"
+  rm -rf "$tmp"
 }
 
 # A runner's service keeps the PATH it was configured with: bana.conf's path goes first.
@@ -922,6 +939,11 @@ linux-one) # K: the K-th Linux runner of a Mac's Linux machine
   add_runner "$prefix-$host-linux-$(cpu)-${1:?K}" "$(labels_for linux '')"
   ;;
 linux-here) linux_up "${1:-1}" ;;
+linux-prepare) # ACT-VERSION: a Mac's Linux machine, ready for bana ci's jobs that need systemd
+  [[ $(id -u) == 0 ]] && die "run as a normal user"
+  linux_prepare
+  act_install "${1:?ACT-VERSION}"
+  ;;
 status-here)
   for d in "$home"/runners/*/; do [[ -e $d/.runner ]] && printf '  %s\n' "$(basename "$d")"; done
   true

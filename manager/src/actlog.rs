@@ -16,7 +16,9 @@
 //!   passes after another failed says `failure` (tests/fixtures/act/matrix-fail);
 //! - a composite action's inner steps under their parent's `step`, with a longer
 //!   `stepID`;
-//! - "Skipping unsupported platform" for a job whose `runs-on` has no platform;
+//! - "Skipping unsupported platform" for a job whose `runs-on` has no platform
+//!   (bana ci's second act, in a Mac's Linux machine, may then run it: its
+//!   lines come after, and make it run);
 //! - nothing for a job skipped by `if:` or blocked by a failed `needs`: only
 //!   `act -l` knows those;
 //! - with `-v`, `debug` lines as well, some from jobs that never run (one
@@ -439,7 +441,9 @@ impl Build {
             }
             return;
         }
-        if job.state == JobState::Waiting {
+        // A job act skipped here may run in a second act (bana ci's, in a Mac's
+        // Linux machine): its first line of its own makes it run.
+        if matches!(job.state, JobState::Waiting | JobState::Unsupported) {
             job.state = JobState::Running;
         }
         job.started.get_or_insert(at);
@@ -1431,6 +1435,20 @@ mod tests {
                         ],
                     ),
                     ("bana/linux", &[JOB_RUNNING, "success: passed in 1s"]),
+                ],
+            },
+            Case {
+                name: "a job the first act skipped, run by a second in the Linux machine",
+                run: fixture!("machine"),
+                cancel: None,
+                exit: Some(0),
+                reason: None,
+                state: BuildState::Success,
+                jobs: &[("systemd", Success, None), ("linux", Success, None)],
+                statuses: &[
+                    ("bana", &[RUNNING, "success: passed on mbp in 11s · 2 jobs"]),
+                    ("bana/linux", &[JOB_RUNNING, "success: passed in 1s"]),
+                    ("bana/systemd", &[JOB_RUNNING, "success: passed in 1s"]),
                 ],
             },
             Case {

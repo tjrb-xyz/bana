@@ -12,7 +12,8 @@
 #     -n, --dry-run    what would run
 #     --event FILE     run with this event (a push's payload), whose inputs carry the tier
 #   Linux jobs (<prefix>-linux, ubuntu-*) run in containers from bana.conf's act.image; on a
-#   Mac, macOS jobs (<prefix>-macos) run on the Mac itself, with its CoreAudio and USB devices.
+#   Mac, macOS jobs (<prefix>-macos) run on the Mac itself, with its CoreAudio and USB devices,
+#   and jobs that need systemd (<prefix>-systemd) run next, in the Mac's Linux machine (vm).
 #   One act runs at a time on this machine: bana ci refuses while another one runs.
 #   A run keeps act's output in ~/.bana/<prefix>/ci/last.log, and what ran in last.env, for
 #   bana fix (bana.conf: ci.log = no runs act as before, which keeps its colours in containers).
@@ -52,7 +53,8 @@ act_conf_keys() { # PREFIX.
 
 # Where a job runs, by the first of its runs-on labels that has a place (act's rule): bana.conf's
 # act.platform.<label> (lowercase) is linux (a container of act.image), mac (this Mac, in act's
-# host mode; elsewhere the job is not run), skip [reason] (not run), or an image of its own.
+# host mode; elsewhere the job is not run), machine (the Mac's Linux machine, where systemd runs,
+# in act's host mode; elsewhere not run), skip [reason] (not run), or an image of its own.
 # LABEL<TAB>VALUE lines: the built-in ones, then bana.conf's, which win (but for self-hosted,
 # which would take every self-hosted job, and a label with '=', which act cannot map).
 act_platform_table() {
@@ -60,7 +62,7 @@ act_platform_table() {
   {
     printf '%s\t%s\n' "$prefix-linux" linux ubuntu-latest linux ubuntu-24.04 linux ubuntu-22.04 linux \
       ubuntu-20.04 catthehacker/ubuntu:act-20.04 ubuntu-18.04 "skip no act image for 18.04" \
-      "$prefix-macos" mac macos-latest mac
+      "$prefix-macos" mac macos-latest mac "$prefix-systemd" machine
     for l in $(act_conf_keys act.platform.); do printf '%s\t%s\n' "$l" "$(act_conf "act.platform.$l")"; done
   } | awk -F'\t' '{ l = tolower($1) } l == "self-hosted" || index(l, "=") { next } !(l in v) { o[++n] = l } { v[l] = $2 }
     END { for (i = 1; i <= n; i++) printf "%s\t%s\n", o[i], v[o[i]] }' |
@@ -86,10 +88,29 @@ act_platforms() { # IMAGE
     case $v in
     linux) v=$1 ;;
     mac) if [[ $os == Darwin ]]; then v=-self-hosted; else v=; fi ;;
-    skip | "skip "*) v= ;;
+    # A second act runs these jobs, in the Linux machine (act_machine): this one skips them.
+    machine | skip | "skip "*) v= ;;
     esac
     printf '%s\n' -P "$l=$v"
   done < <(act_platform_table)
+}
+
+# The second act's -P options, in the Linux machine: its jobs, and the Linux jobs they need
+# (plan and the like), in act's host mode there; the rest are not run there.
+act_platforms_machine() {
+  local l v
+  while IFS=$'\t' read -r l v; do
+    case $v in machine | linux) v=-self-hosted ;; *) v= ;; esac
+    printf '%s\n' -P "$l=$v"
+  done < <(act_platform_table)
+}
+
+# The labels whose jobs run in the Linux machine, lowercase and space-separated, when they can:
+# on a Mac with OrbStack or Lima. Elsewhere none, and act skips those jobs ("not run here").
+act_machine_labels() {
+  [[ $os == Darwin ]] || return 0
+  command -v orb >/dev/null || command -v limactl >/dev/null || return 0
+  act_platform_table | awk -F'\t' '$2 == "machine" { printf "%s ", $1 }'
 }
 act_started() { LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | awk '{ $1 = $1; print }'; }
 
@@ -125,7 +146,7 @@ act_lock() { # LABEL
 
 act_main() {
   local tier='' x64='' list='' dry='' event='' secrets='' locked jobs=() pass=() args=() extra=()
-  local wf root here tiers image arch net i o dc all=()
+  local wf root here tiers image arch net i o dc all=() mlabels=''
   while (($#)); do
     case $1 in
     -j | --job) jobs=(-j "${2:?-j JOB}"); shift ;;
@@ -231,9 +252,140 @@ act_main() {
   done
   say "act: ${tier:-the workflow} from $(basename "$wf"), Linux jobs in $image ($arch, network $net)$([[ $os == Darwin ]] && echo ", macOS jobs on this Mac")"
   args=(workflow_dispatch "${args[@]}" ${extra[@]+"${extra[@]}"} ${jobs[@]+"${jobs[@]}"} ${pass[@]+"${pass[@]}"})
+  [[ -n $dry ]] || mlabels=$(act_machine_labels)
   # The daemon reads act's output itself, and a dry run leaves the last run's log.
-  [[ $locked != 1 && -z $dry && $(conf ci.log yes) != no ]] || exec act "${args[@]}"
+  if [[ $locked == 1 || -n $dry || $(conf ci.log yes) == no ]]; then
+    [[ -n $mlabels ]] || exec act "${args[@]}"
+    act_both "${args[@]}"
+    exit
+  fi
   act_logged "${args[@]}"
+}
+
+# act, then a second act in the Linux machine for the jobs the first skipped for a machine
+# label (act_machine_labels), and act's exit status: the first failure's. Without such labels,
+# act itself (exec: act_both then runs as a pipeline's command, or as bana ci's last). The
+# daemon (BANA_ACT_LOCKED) signals bash only: an INT or TERM goes on to the act running then,
+# and a stopped run starts no second act. By hand, Ctrl-C reaches act itself.
+# Uses act_main's locals.
+act_both() { # ACT-ARGUMENT...
+  local out st=0 ids m
+  [[ -n $mlabels ]] || exec act "$@"
+  out=$(mktemp "${TMPDIR:-/tmp}/bana-act.XXXXXX")
+  act_stop='' act_child='' act_vm_pid=''
+  if [[ $locked == 1 ]]; then trap act_forward INT TERM; else trap 'act_stop=1' INT; fi
+  # What act says also goes to OUT, where its skipped jobs are found: .done marks each copy's end.
+  # bash starts a background command with SIGINT ignored: trap - gives act its SIGINT back.
+  (trap - INT; exec act "$@") > >(tee "$out.1"; : >"$out.1.done") 2> >(tee "$out.2" >&2; : >"$out.2.done") &
+  act_child=$!
+  act_wait "$act_child" || st=$?
+  act_child=''
+  act_copied "$out.1" "$out.2"
+  if [[ -z $act_stop ]]; then
+    ids=$(act_machine_jobs "$out.1" "$out.2")
+    [[ -z $ids ]] || act_machine "$ids" "$@" || { m=$?; ((st)) || st=$m; }
+  fi
+  trap - INT TERM
+  rm -f "$out" "$out".*
+  return "$st"
+}
+
+# The daemon's INT or TERM, on to the act running now: here, or in the Linux machine (whose
+# pid is in a file there, as orb or limactl may not pass signals on).
+act_forward() {
+  act_stop=1
+  [[ -z $act_child ]] || kill -INT "$act_child" 2>/dev/null || true
+  # shellcheck disable=SC2016 # expanded in the machine
+  [[ -z $act_vm_pid ]] || vm_run "$vm" sh -c 'kill -INT "$(cat "$1")"' _ "$act_vm_pid" 2>/dev/null || true
+}
+
+# Waits for PID, also through the signals bash traps meanwhile; its exit status.
+act_wait() { # PID
+  local st=0
+  wait "$1" || st=$?
+  while kill -0 "$1" 2>/dev/null; do st=0; wait "$1" || st=$?; done
+  return "$st"
+}
+
+# Until each FILE's copy has ended (FILE.done), for a few seconds at most.
+act_copied() { # FILE...
+  local f n
+  for f in "$@"; do
+    for ((n = 0; n < 100; n++)); do [[ ! -e $f.done ]] || break; sleep 0.05; done
+  done
+}
+
+# The jobs act skipped for a machine label, by id, one a line. act's JSON lines carry the id; its
+# text names the job ([workflow/name]), whose id act -l has.
+act_machine_jobs() { # FILE...
+  local list
+  list=$(act -l -C "$root" -W "$wf" 2>/dev/null) || true
+  # shellcheck disable=SC2016 # act's backquotes
+  {
+    printf '%s\n' "$list" | sed 's/^/L	/'
+    sed -n 's/.*"jobID":"\([^"]*\)".*Skipping unsupported platform -- Try running with `-P \([^`]*\)=\.\.\.`.*/I	\1	\2/p' "$@"
+    sed -n 's/^[^[{]*\[\(.*\)\].*Skipping unsupported platform -- Try running with `-P \([^`]*\)=\.\.\.`.*/N	\1	\2/p' "$@"
+  } | awk -F'\t' -v labels=" $mlabels " '
+    $1 == "L" { if (!a) { a = index($2, "Job ID"); b = index($2, "Job name"); c = index($2, "Workflow name"); next }
+      id = substr($2, a, b - a); nm = substr($2, b, c - b); gsub(/^ +| +$/, "", id); gsub(/^ +| +$/, "", nm)
+      if (nm != "") byname[nm] = id; next }
+    { if (!index(labels, " " tolower($3) " ")) next
+      if ($1 == "I") id = $2
+      else { j = $2; sub(/.*\//, "", j); sub(/ +$/, "", j); id = (j in byname) ? byname[j] : j }
+      if (!(id in seen)) { seen[id] = 1; print id } }'
+}
+
+# The second act: IDS (one a line) in the Linux machine, in act's host mode, where systemd runs.
+# The machine is made and made ready first (bana linux-prepare: packages.linux, hook.linux,
+# and act, at this act's version), then act runs there on the same checkout, event and
+# options, with the jobs' platforms (act_platforms_machine) and a cache on the machine's own
+# disk. Under --json only the jobs' own lines (and errors) come out: the jobs they need ran in
+# the first act already. Uses act_main's locals.
+act_machine() { # IDS ACT-ARGUMENT...
+  local ids=$1 a=() vc=() j json='' v pf tf st=0 i
+  shift
+  for ((i = 1; i <= $#; i++)); do
+    case ${!i} in
+    -P | -j | --job) i=$((i + 1)) ;;
+    *) [[ ${!i} != --json ]] || json=1; a+=("${!i}") ;;
+    esac
+  done
+  while IFS= read -r j; do a+=("$j"); done < <(act_platforms_machine)
+  for j in $ids; do a+=(-j "$j"); done
+  v=$(act --version 2>/dev/null | awk 'NR == 1 { print $NF }')
+  [[ -n $v ]] || { warn "act has no version to install in the Linux machine"; return 1; }
+  say "act: $(printf '%s' "$ids" | tr '\n' ' ')in the Linux machine $vm (host mode, with systemd)"
+  { vm_up "$vm" native && vm_bana "$vm" linux-prepare "$v"; } >&2 ||
+    { warn "The Linux machine $vm is not ready: its jobs did not run"; return 1; }
+  pf=/tmp/bana-act-$prefix.pid
+  # The token reaches the machine in a file, not on a command line.
+  tf=$(mktemp "${TMPDIR:-/tmp}/bana-token.XXXXXX")
+  chmod 600 "$tf"
+  printf '%s' "${GITHUB_TOKEN:-}" >"$tf"
+  # vm_run's command itself, so that act_child is orb's (or limactl's) pid, not a subshell's.
+  case $(vm_kind) in orbstack) vc=(orb -m "$vm") ;; *) vc=(limactl shell "$vm") ;; esac
+  act_vm_pid=$pf
+  # shellcheck disable=SC2016 # expanded in the machine
+  (trap - INT; exec "${vc[@]}" bash -c 'cd "$1" || exit 1
+    pf=$2 v=$3 tf=$4 c=$5; shift 5
+    GITHUB_TOKEN=$(cat "$tf"); export GITHUB_TOKEN
+    echo $$ >"$pf"
+    exec "$HOME/.local/bin/act-$v" "$@" --action-cache-path "$HOME/.cache/bana/$c"' \
+    bana-act "$here" "$pf" "$v" "$tf" "act-$prefix" "${a[@]}") > >(act_only "$json" "$ids") &
+  act_child=$!
+  act_wait "$act_child" || st=$?
+  act_child='' act_vm_pid=''
+  rm -f "$tf"
+  return "$st"
+}
+
+# act's output with JSON: only IDS' lines, lines that are not JSON, and errors; else all of it.
+act_only() { # JSON(1|'') IDS
+  [[ -n $1 ]] || { cat; return; }
+  awk -v ids=" $(printf '%s' "$2" | tr '\n' ' ') " '
+    !/^\{/ { print; fflush(); next }
+    match($0, /"jobID":"[^"]*"/) { id = substr($0, RSTART + 9, RLENGTH - 10); if (index(ids, " " id " ")) { print; fflush() } next }
+    /"level":"(error|fatal|panic)"/ { print; fflush() }'
 }
 
 # A run by hand keeps act's output, and what ran, for bana fix: in ~/.bana/<prefix>/ci,
@@ -261,7 +413,7 @@ act_logged() { # ACT-ARGUMENT...
   # Ctrl-C reaches act, which stops its jobs and ends; tee -i and bash (trapping it) wait
   # for that, so the log ends as act's output does.
   trap 'stopped=1' INT
-  if act "$@" 2>&1 | tee -i "$dir/last.log.part"; then status=0; else status=${PIPESTATUS[0]}; fi
+  if act_both "$@" 2>&1 | tee -i "$dir/last.log.part"; then status=0; else status=${PIPESTATUS[0]}; fi
   trap - INT
   printf '%s\n' "sha=$sha" "ref=$ref" "dirty=$dirty" "tier=$tier" "job=${jobs[1]:-}" "event=$event" \
     "network=$net" "act=$v" "bana=$b" "started=$started" "ended=$(date +%s)" "exit=$status" \
