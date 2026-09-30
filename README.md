@@ -52,7 +52,7 @@ page, at `http://127.0.0.1:8470/`, so it works only on the machine that ran it.
 
 **In the menu bar**, 🧱 alone is idle; `🧱 4m +2` is building for 4 minutes with 2 queued; `🧱 !` means the
 last build failed; `🧱 paused`, `🧱 no Docker` (start OrbStack), `🧱 busy` (waiting for your `bana ci`) and
-`🧱 !gh` (statuses not posted) say why builds wait. A left click opens the page; a right click has *Cancel build*,
+`🧱 !gh` (statuses not posted) say why builds wait; `🧱 v0.1.0?` asks whether to publish a release. A left click opens the page; a right click has *Cancel build*,
 *Pause new builds* and *Quit bana*, which stops local CI until the next login.
 
 **The page**, *Local CI*, has the queue, the running build with its jobs and live log, and the history. *Run now*
@@ -62,7 +62,7 @@ builds a branch at any tier, which is how a nightly runs. *Pause new builds* let
 **Which pushes run:** branches matching `daemon.branches` (all but `dependabot/*` and `renovate/*`), tags
 matching `daemon.tags` (none by default), and not a head commit with `[skip ci]` or another of GitHub's skip
 markers. The rules come from the install, not from the pushed commit. A commit already built at that tier does
-not run again. A branch keeps one queued build, and a newer push replaces it; a running build finishes.
+not run again, unless a tag names it: a tag's build is its release ([Releases](#releases)). A branch keeps one queued build, and a newer push replaces it; a running build finishes.
 
 **A green build's files.** What a green build's jobs upload with `actions/upload-artifact@v4` becomes its files,
 in `~/.bana/<prefix>/builds/<id>/dist/`: each zip is checked against the digest its upload step printed, then
@@ -268,6 +268,7 @@ install.bin = ~/.local/bin             # where commands are linked (--bin-dir, I
 install.config = ~/.config/example     # the settings: given to the hook, removed only by --purge
 install.env.EXAMPLE_LOG_DIR = ~/Library/Logs/example   # given to the hook (~ is the home)
 release.files = example-*.tar.gz example-*.deb         # the files that are the release (default *)
+release.platforms = linux-arm64 linux-x64 macos-arm64  # the release's page lists those with no archive
 ```
 
 The hook runs as `sh HOOK STAGE` from the archive: `pre-install` from the unpacked files before they are current
@@ -284,6 +285,44 @@ install.config are never `~` or `/` themselves); install.ps1 uses `%LOCALAPPDATA
 `current\bin` on your user PATH, and keeps settings in `%APPDATA%\NAME`. It also works as `irm URL | iex`: a
 failure then returns to your prompt with `$LASTEXITCODE` 1.
 Every value must be printable ASCII.
+
+## Releases
+
+With the daemon and `daemon.tags = v*`, a tag you push is a release candidate: bana builds it at
+`daemon.tag_tier`, and when that build passes with its files, asks whether to publish it. You choose the version
+and make the tag; bana never makes, moves or deletes one.
+
+```sh
+gh auth refresh -h github.com -s workflow  # once, before the first release: gh may need the workflow scope
+git tag -a v0.1.0 -m "example 0.1.0" && git push origin v0.1.0
+bana daemon poke                 # fetch now: the push hook covers branches, not tags
+bana daemon status               # release v0.1.0: building (#57), then: waiting for your answer
+bana daemon open                 # the Release card: files, Tested, the notes; Publish v0.1.0 or Not now
+```
+
+While it builds, bana writes notes from git: every commit on the first-parent line since the previous release,
+as a pull request (a merge or a squash, `Title (#12)`) or as another change. You edit them on the page, or ask
+Claude Code in the checkout, where `bana daemon install` registered bana's tools: *write the release notes for
+v0.1.0*. Claude reads the release and the pull requests, writes notes for the project's users and saves them
+for you to review; it cannot publish.
+
+*Publish v0.1.0* checks the files against `SHA256SUMS`, that the tag is still the commit built and that the
+previous release is still the one the notes start from, then runs
+`gh release create v0.1.0 --verify-tag` with the notes, a `## Tested` section (the CI report's table) and an
+`## Install` section, and uploads the files `release.files` names, the installers and `SHA256SUMS`. A tag with a
+`-` after its version (`v0.2.0-rc1`) is a prerelease; a hotfix of an older line never becomes Latest. Nothing is
+published without your click: not from the menu bar, not by Claude.
+
+People install a release with its installer, from GitHub:
+
+```sh
+gh release download v0.1.0 -R OWNER/REPO -p install.sh -O - | sh            # macOS, Linux (private repositories too)
+curl -fsSL https://github.com/OWNER/REPO/releases/download/v0.1.0/install.sh | sh   # a public repository
+gh release download v0.1.0 -R OWNER/REPO -p install.ps1 -O - | Out-String | iex    # Windows
+```
+
+[docs/DAEMON.md](docs/DAEMON.md#releases) has the rest: how the previous release is found, the checks before a
+publish, Claude's tools, and the settings that keep Claude from publishing around bana.
 
 ## bana up: a runner pool (optional)
 
@@ -456,7 +495,7 @@ for several CPUs. [examples/example](examples/example) has its `.github/bana.con
 and `ci.yml`, its workflow trimmed to where the jobs run (`bana init`'s tests run on it). The mac hook installs
 Homebrew's SCons, ragel and CMake and the project's audio driver, and checks for rustup. The linux hook installs
 rustup and checks that sudo does not ask. Its `plan.*` keys are its path rules. Its `daemon.*` keys build every
-branch but the bots', at `quick`, and no tags. Its `report.*` keys are its CI report's standards: toolchain,
+branch but the bots', at `quick`, and `v*` tags at `release`, which it publishes from the daemon's page. Its `report.*` keys are its CI report's standards: toolchain,
 rust, engine (the `real_*` tests), web, macos, streaming, sdk, linux_service and packaging. Its `install.*` keys
 make its installer per-user, with `install-hook.sh` (shipped in each archive) asking before it installs the Mac's
 audio devices with sudo.
@@ -491,7 +530,8 @@ workflow made:
    `flock`.
 7. `package` checks the machine's CPU is its target's. Under act a target of another CPU is left out with a
    notice rather than built mislabelled; on a pool a mismatch fails the job.
-8. `.github/bana.conf` has the `daemon.*` keys.
+8. `.github/bana.conf` has the `daemon.*` keys, with `daemon.tags = v*`, and `install.*` and `release.files`
+   for its releases.
 
 On the MacBook, in the example's checkout:
 
@@ -509,6 +549,16 @@ git push                                     # 🧱 4m in the menu bar, then ban
 
 A pull request's checks then show `bana` and `bana/<job>` from the MacBook. A nightly runs from the page:
 *Run now*, a branch at `nightly`, which posts `bana nightly`.
+
+Its first release, as a prerelease to try the whole path once:
+
+```sh
+gh auth refresh -h github.com -s workflow
+git tag -a v0.1.0-rc1 -m "example 0.1.0-rc1" && git push origin v0.1.0-rc1 && bana daemon poke
+# 🧱 v0.1.0-rc1? when the release build passes: the notes (or ask Claude Code for better ones), then Publish
+gh release view v0.1.0-rc1 -R tjrb-xyz/example   # its files, the installers and SHA256SUMS
+gh release download v0.1.0-rc1 -R tjrb-xyz/example -p install.sh -O - | sh   # on the Mac, and on a Linux arm64 machine
+```
 
 ### A runner pool for the example instead
 

@@ -30,6 +30,7 @@
 #                               (default ~/.config/NAME)
 #   install.env.KEY = VALUE     given to the hook as KEY (a leading ~ is your home)
 #   release.files = GLOBS       the files of DIST that are the release (default *)
+#   (release.platforms is the daemon's: the platforms a release's page expects)
 # install.prefix, install.bin and install.config are install.sh's (prefix and config not ~
 # or / themselves: uninstalling removes what is in them); install.ps1 keeps
 # Windows' places (%LOCALAPPDATA%\Programs\NAME, %APPDATA%\NAME). Every value is printable

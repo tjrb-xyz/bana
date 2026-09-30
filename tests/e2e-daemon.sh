@@ -26,7 +26,9 @@
 # pushes the branch with bana fix push, which the daemon builds as any push. Then a hand
 # bana ci that fails, bana fix last (the claude stand-in), and run_jobs until green. Last,
 # a matrix that uploads an archive per CPU: the green build keeps them as its files with the
-# project's installer, which installs demo under a scratch home, as bana install does.
+# project's installer, which installs demo under a scratch home, as bana install does. Then
+# a release: the pushed tag v0.1.0 builds at the tag tier, bana asks, the notes are saved,
+# and Publish runs gh release create --verify-tag (the stand-in's release store).
 set -euo pipefail
 
 if [[ ${BANA_E2E:-} != 1 ]]; then
@@ -87,8 +89,8 @@ until_ok() { # SECONDS WHAT COMMAND...
 
 # rustup and cargo find their toolchains through HOME: keep yours for the daemon's build.
 export RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup} CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}
-export HOME=$T/home FAKE_LOG=$T/gh.log FAKE_STATE=$T/state
-mkdir -p "$HOME" "$FAKE_STATE" "$T/bin"
+export HOME=$T/home FAKE_LOG=$T/gh.log FAKE_STATE=$T/state FAKE_RELEASE_STORE=$T/releases
+mkdir -p "$HOME" "$FAKE_STATE" "$FAKE_RELEASE_STORE" "$T/bin"
 : >"$FAKE_LOG"
 # Only this world's git config: no signing, no rewrites from the machine's.
 unset GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GITHUB_TOKEN GH_TOKEN BANA_HOME BANA_PROJECT_ROOT BANA_BUILD
@@ -131,6 +133,7 @@ repo = acme/wid
 prefix = wid
 tiers = quick nightly
 daemon.poll = 10
+daemon.tags = v*
 # The gh stand-in's token is no token: act fetches upload-artifact from GitHub without one.
 daemon.token = none
 act.args = $host_args
@@ -839,6 +842,70 @@ out=$(cd "$w" && bash "$bana" install "$id" --uninstall --yes 2>&1) && code=0 ||
 [[ $code == 0 ]] || echo "$out" >&2
 check "install: and --uninstall takes it away" same "$code|$(ls "$HOME/.local/bin" 2>/dev/null)" "0|"
 clean files
+
+# ---- 8. a release: the tag builds, bana asks, and publishes on the owner's yes ---------------
+say "8. a release: v0.1.0 is pushed, built, asked about, and published"
+git -C "$w" tag -a v0.1.0 -m "wid 0.1.0"
+git -C "$w" push -q origin v0.1.0
+(cd "$w" && bash "$bana" daemon poke >/dev/null)
+rel() { api /releases/v0.1.0 | jq_ "$1"; }
+asking() { [[ $(rel 'j["state"]') == asking && $(rel 'j["seeded"]') == True ]]; }
+answered() { [[ $(rel 'j["state"]') =~ ^(asking|blocked)$ && $(rel 'j["seeded"]') == True ]]; }
+until_ok 900 "v0.1.0 asked about, or blocked" answered
+if [[ $(rel 'j["state"]') == blocked ]]; then
+  # Two legs that fetch one action at once can race in act's action cache: a re-run takes
+  # the release over.
+  echo "   v0.1.0 blocked: $(rel 'j["reason"]'); re-running build #$(rel 'j["build"]["id"]')"
+  api "/builds/$(rel 'j["build"]["id"]')/rerun" -X POST >/dev/null
+  check "release: a re-run takes it over" same "$(rel 'j["state"]')" building
+  until_ok 900 "v0.1.0 asked about" asking
+fi
+until_ok 60 "the daemon idle" idle
+id=$(rel 'j["build"]["id"]')
+dist=$d/builds/$id/dist
+check "release: its build is the tag's, at the tag tier" same "$(rel '"%s %s %s" % (j["build"]["ref"], j["build"]["tier"], j["build"]["state"])')" "v0.1.0 nightly success"
+check "release: the installer is the tag's" has "$dist/install.sh" "TAG='v0.1.0'"
+check "release: bana asks (the summary)" same "$(api /local | jq_ '"%s %s" % (j["release"]["tag"], j["release"]["state"])')" "v0.1.0 asking"
+check "release: a first release, found with gh" same "$(rel '"%s|%s" % (j["previous"]["tag"] or "", j["previous"]["how"])')" "|gh release list"
+check "release: git's notes list the pushes" same "$(rel '"packages" in j["notes"]["text"] and j["notes"]["source"]')" git
+check "release: the report's table, for Tested" has <(rel 'j["tested"]') "| Standard |"
+check "release: nothing was written on GitHub yet" same "$(grep -cE 'gh release (create|edit|upload|delete) [^-]' "$FAKE_LOG" || true)" 0
+check "bana daemon status: waiting for your answer" has <(cd "$w" && bash "$bana" daemon status) "release v0.1.0: waiting for your answer"
+rev=$(rel 'j["notes"]["rev"]')
+code=$(api /releases/v0.1.0/notes -o /dev/null -w '%{http_code}' -X PUT -H 'content-type: application/json' \
+  -d '{"notes":"The first wid.\n","rev":0}' 2>/dev/null || true)
+check "release: a stale rev is refused" same "$code" 409
+# Claude's side, over MCP stdio as Claude Code drives it: what bana knows, GitHub's
+# pull requests and notes (reads), then the notes saved for the owner to review.
+r=$(tool "$w" release_context '{}') || r='{}'
+check "mcp: release_context: the release bana asks about, and its rev" same \
+  "$(jq_ '"%s %s %s %s" % (j["tag"], j["state"], j["notes"]["rev"], j["changes"]["counts"]["commits"] > 0)' <<<"$r")" "v0.1.0 asking $rev True"
+r=$(tool "$w" pull_requests '{"numbers": [1]}') || r='{}'
+check "mcp: pull_requests: one query, and what GitHub lacks" same "$(jq_ 'j["missing"]' <<<"$r")" "[1]"
+check "mcp: pull_requests: through gh api graphql" has "$FAKE_LOG" "gh api graphql -f query=query("
+r=$(tool "$w" github_notes '{"tag": "v0.1.0"}') || r='{}'
+check "mcp: github_notes: GitHub's, for the tested commit" has "$FAKE_LOG" \
+  "gh api -X POST repos/acme/wid/releases/generate-notes -f tag_name=v0.1.0 -f target_commitish=$(rel 'j["sha"]')"
+check "mcp: github_notes: a first release" same "$(jq_ '"%s %s" % (j["previous_tag"], "commits/v0.1.0" in j["body"])' <<<"$r")" "None True"
+r=$(tool "$w" save_release_notes '{"tag": "v0.1.0", "notes": "The first wid.\n", "rev": '"$rev"'}') || r='{}'
+saved=$(jq_ 'j["rev"]' <<<"$r")
+check "mcp: save_release_notes: saved over the rev read" same "$saved" "$((rev + 1))"
+check "release: the page shows them as Claude's" same "$(rel '"%s|%s" % (j["notes"]["source"], j["notes"]["text"])')" "claude|The first wid."
+r=$(tool "$w" save_release_notes '{"tag": "v0.1.0", "notes": "x", "rev": '"$rev"'}') || r='{}'
+check "mcp: save_release_notes: a stale rev is Claude's error" same "$(jq_ '"%s %s" % (j["isError"], "changed since rev" in j.get("text", ""))' <<<"$r")" "True True"
+check "release: and no tool wrote on GitHub" same "$(grep -cE 'gh release (create|edit|upload|delete) [^-]' "$FAKE_LOG" || true)" 0
+code=$(api /releases/v0.1.0/publish -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' -d "{\"rev\":$saved}")
+check "release: Publish, with that rev" same "$code" 202
+published() { [[ $(rel 'j["state"]') == published ]]; }
+until_ok 120 "v0.1.0 published" published
+check "release: published, with its URL" same "$(rel 'j["url"]')" "https://github.com/acme/wid/releases/tag/v0.1.0"
+check "release: gh release create --verify-tag, from dist" has "$FAKE_LOG" "gh release create v0.1.0 -R acme/wid --verify-tag --title wid v0.1.0 --notes-file $d/releases/v0.1.0.notes.md --latest "
+check "release: its files are SHA256SUMS's, and SHA256SUMS" same "$(tr '\n' ' ' <"$FAKE_RELEASE_STORE/v0.1.0/assets")" \
+  "$(awk '{ print $2 }' "$dist/SHA256SUMS" | tr '\n' ' ')SHA256SUMS "
+check "release: its notes, then Tested and Install" same "$(grep -E '^## |^The first' "$FAKE_RELEASE_STORE/v0.1.0/notes" | tr '\n' '|')" \
+  "The first wid.|## Tested|## Install|"
+check "release: the ask is over" same "$(api /local | jq_ 'j["release"]')" ""
+clean release
 
 stop_daemon
 check "stop: the daemon leaves no lock" test ! -e "$HOME/.bana/act.lock"

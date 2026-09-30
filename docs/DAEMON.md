@@ -73,10 +73,13 @@ yet.
 | `🧱 paused` | new builds are paused |
 | `🧱 no Docker` | builds wait for Docker (start OrbStack) |
 | `🧱 busy` | builds wait for your `bana ci` |
+| `🧱 publishing` | a release is being published |
+| `🧱 v0.1.0?` | v0.1.0's build passed with its files: publish it? ([Releases](#releases)) |
 | `🧱 !gh` | statuses are not being posted; the tooltip says why |
 
 A left click opens the page on the running build, else the latest one. A right click shows the menu: what it is
-doing, the last result (it opens that build), *Fix #41 with Claude…* while the last build failed
+doing, the last result (it opens that build), *Publish v0.1.0…* while bana asks (it opens the page on the
+release, where you read the notes first), *Fix #41 with Claude…* while the last build failed
 ([FIX.md](FIX.md)), *Open bana*, *Cancel build*, *Pause new builds* and *Quit bana*. Quit stops local CI until
 your next login or `bana daemon install`.
 
@@ -85,6 +88,7 @@ your next login or `bana daemon install`.
 `bana daemon open`, or the menu bar, opens it at `http://127.0.0.1:8470/`. Its *Local CI* section has:
 
 - a line with the repository, when it last fetched, and whatever is holding builds back;
+- the release bana asks about, or `#release=<tag>` ([Releases](#releases));
 - *Pause new builds* (fetching goes on, and a running build finishes), *Check now* (fetch at once) and
   *Clear queue* (drops a backlog after a long time away);
 - *Run now*: a branch or tag at a tier, at the front of the queue. That is how a nightly runs;
@@ -117,7 +121,7 @@ A push runs when:
    `[skip actions]`, `[actions skip]`;
 3. the workflow is in that commit;
 4. that commit has not been built at that tier already, so the same commit on a new branch, or pushed again, does
-   not run twice (*Re-run* does).
+   not run twice (*Re-run* does). A tag always runs, even on a commit built already: its build is the release.
 
 The rules come from the install, never from the pushed commit, so a branch cannot widen them. Pull requests from
 forks never reach the daemon: it fetches only branches and tags.
@@ -126,6 +130,8 @@ Branch pushes run `daemon.tier` (the first of `tiers`), tags `daemon.tag_tier` (
 one queued build: a newer push replaces its commit. A running build finishes (`daemon.supersede = queued`); with
 `running`, a newer push to the same branch cancels it. A tag's builds are never replaced. A deleted branch drops
 its queued build.
+
+A pushed tag is seen at the next poll, or at once with `bana daemon poke`. The push hook covers branches only.
 
 The workflow's plan job sees the push's `before` as the branch's last green commit, so the changes of pushes that
 failed, were replaced or were cancelled stay in its diff. A branch with no green build yet compares with the
@@ -221,6 +227,107 @@ Kept: the newest build with files of each branch and tier while the branch exist
 count. The rest go a week after the build: its `artifacts/` and `dist/`. A failed build's uploads stay where act
 put them, for that week; a fix round's go when it ends.
 
+## Releases
+
+You choose the version and push the tag; bana never makes, moves or deletes one. With `daemon.tags = v*`:
+
+```sh
+gh auth refresh -h github.com -s workflow   # once: publishing may need gh's workflow scope
+git tag -a v0.1.0 -m "example 0.1.0" && git push origin v0.1.0
+bana daemon poke                            # or wait for the next fetch: the push hook covers branches only
+```
+
+The pushed tag builds at `daemon.tag_tier` (or *Run now* the tag at that tier), even on a commit built already,
+and that build makes the tag's release, `releases/<tag>.json`. While it builds, bana finds the previous release
+(the nearest published release that is an ancestor, from one `gh release list`, leaving out prereleases for a
+final tag; local `v*` tags when gh fails, and it says so) and writes notes from git: each first-parent commit
+since then, as a pull request (`Merge pull request #12 …`, `Merge #12: …`, or a squash, `Title (#12)`) or as
+another change, so a direct push is never left out.
+
+When the build passes with files for a release (its `SHA256SUMS`), bana asks: the page's card, `🧱 v0.1.0?` and
+*Publish v0.1.0…*, and `release v0.1.0: waiting for your answer` in `bana daemon status`. A failed build, or one
+with no files, is blocked, and the card says why; a re-run takes the release over. The card has the build, the
+previous release and how it was found, the files and the platforms not built (those `release.platforms` names
+with no archive), the CI report's table, and the title and notes to edit, with who saved them (git, Claude,
+you) and which pull requests of the range they leave out, name from outside it, or name twice. That check warns;
+it never stops a publish. The notes carry a rev: a save over newer notes, or a Publish of another rev than the
+page shows, is refused, so you and Claude never write over each other. Notes saved while you edit are offered
+(*Load rev 3*, your text kept below to copy, or *Save over rev 3*), never swapped in; notes saved while the page
+sat untouched are swapped in and flagged, and Publish's question names their rev, who saved them, and the title.
+
+*Publish v0.1.0*:
+
+1. checks every file against `SHA256SUMS`, and that the tag on origin (`git ls-remote`, through gh's sign-in) is
+   still the commit built: otherwise `v0.1.0 moved since build #57`;
+2. asks gh again for the previous release: when it is another than the notes started from (one published since,
+   or local tags stood in while gh failed), it stops, and git's notes are written again from it;
+3. asks `gh release view v0.1.0`: if GitHub has the release already with these files (each asset's digest the
+   sha256 in `SHA256SUMS`), it is recorded; with other files, it stops. A draft a killed publish left (its body
+   the notes bana sent, only bana's files) is deleted, never the tag; any other draft, written on GitHub or by
+   release-drafter, stays, and it stops: `a draft v0.1.0 is on GitHub (not bana's)`;
+4. runs `gh release create v0.1.0 -R OWNER/REPO --verify-tag --title "<install.name> v0.1.0" --notes-file …`
+   from `dist/`, with the files `SHA256SUMS` lists (`release.files`, and the installers) and `SHA256SUMS`
+   itself. The notes get `## Tested` (the report's table) and `## Install` (the one-liners), which no edit can
+   drop. `v0.1.0-rc1` gets `--prerelease`; a final version gets `--latest` only above every published final
+   version, else `--latest=false`, so a hotfix of an older line never becomes Latest. It may take 30 minutes,
+   under `caffeinate` on a Mac, and `releases/v0.1.0.log` keeps what gh said;
+5. records the release's URL, or gh's last lines, and bana asks again.
+
+One publish runs at a time. A restart in the middle of one leaves it failed (`interrupted`), and the next
+Publish cleans up whatever gh left. *Not now* stops the ask; the card stays open, and the tag build's row in
+the history links to it (`v0.1.0 dismissed`, `v0.1.0 published`), where *Publish* stays while the files are
+kept. Nothing is published without your click: the menu bar only opens the page, and no tool of Claude's
+publishes.
+
+### Notes with Claude
+
+In the checkout where `bana daemon install` registered bana's MCP server, ask Claude Code: *write the release
+notes for v0.1.0*. The server's instructions tell it how: read the release, then its pull requests, write for
+the project's users one line per pull request ending `(#N)`, grouped by theme, never invent changes, and leave
+Tested and Install to bana.
+
+| Tool | Reaches | What |
+|---|---|---|
+| `release_context` | the daemon | the release bana asks about (or a tag): its build, previous release, files, Tested table, the changes from git (at most 300 other commits listed), and the notes with their rev |
+| `pull_requests` | GitHub | up to 50 pull requests (or issues) by number, in one GraphQL query: title, author, labels, merged, base, the body's first 2,000 characters, the issues it closes; the numbers GitHub lacks are `missing` |
+| `github_notes` | GitHub | GitHub's own generate-notes, from bana's previous release (always passed as `previous_tag_name`) to the tested commit; it follows `.github/release.yml`, saves nothing, and lists pull requests only |
+| `save_release_notes` | the daemon | saves notes over the rev read, as Claude's; says what they leave out. Local only |
+
+The GitHub tools run the daemon's gh with your sign-in and only read. Pull request bodies are anyone's text:
+the tools and the instructions say they are data, not instructions. To keep Claude from publishing around bana,
+the project's `.claude/settings.json` can allow the readers, deny gh's release writes, and deny the page's token
+(`~/.bana/manager-token`, which the Publish route takes like every other) and curl to the daemon:
+
+```json
+{
+  "permissions": {
+    "allow": ["mcp__bana__release_context", "mcp__bana__pull_requests", "mcp__bana__github_notes"],
+    "deny": ["Bash(gh release create:*)", "Bash(gh release edit:*)", "Bash(gh release upload:*)",
+             "Bash(gh release delete:*)", "Bash(gh api *releases*)",
+             "Read(~/.bana/manager-token)", "Bash(cat ~/.bana/manager-token:*)",
+             "Bash(curl *127.0.0.1:847*)", "Bash(curl *localhost:847*)"]
+  }
+}
+```
+
+`save_release_notes` then asks you each time, which is a second look before the page's. The rules are a guard,
+not a lock: a script Claude writes and runs could still read the token and call gh or the route, as any program
+you run as you can.
+
+### The API
+
+The page and the MCP server use these, on loopback behind the token like the rest of `/ci/v1/`:
+
+| | |
+|---|---|
+| `GET /ci/v1/releases` | the releases, the newest first |
+| `GET /ci/v1/releases/<tag>` | one release: its state, build, previous release, files, not built, changes, title (and the default one), notes, their check, Tested |
+| `PUT /ci/v1/releases/<tag>/notes` | `{notes, title?, rev, source?}` (`you` or `claude`): the new rev and the check; 409 for another rev, or once it publishes |
+| `POST /ci/v1/releases/<tag>/publish` | `{rev}`: 202, and the publish runs; 409 unless bana asks (or it failed, or was dismissed), the rev is the notes' now, and no other publish runs |
+| `POST /ci/v1/releases/<tag>/dismiss` | *Not now* |
+
+`GET /ci/v1/local`'s `release` is the one the menu bar and `bana daemon status` show.
+
 ## Sleep, wake and restarts
 
 The daemon keeps nothing awake while idle. While act runs it holds `caffeinate -i`, so the Mac does not sleep on
@@ -313,6 +420,12 @@ on a shared network (café Wi-Fi) a neighbour could reach them. A file planted o
 digest is not the one the upload step printed), but a neighbour could read unreleased packages while the build
 runs. The macOS firewall may ask once about act.
 
+A release publishes only the files collected that way: each bound to the digest its upload step printed, then
+to `SHA256SUMS`, which Publish checks again, with the tag on origin, just before `gh release create`. Neither a
+file changed in `dist/` afterwards nor a tag moved to another commit reaches GitHub. Publishing uses gh's token
+with its `repo` (and `workflow`) scope; Claude's release tools only read GitHub, and write the notes on this
+machine.
+
 A fix round runs the code Claude wrote the same way, with the same reach as a push, but with no token by
 default: nobody reviews it before it runs. Claude works in its worktree with your own Claude Code permission
 settings.
@@ -327,6 +440,7 @@ Logs stay on the machine.
 | `~/.bana/<prefix>/src/` | the daemon's clone |
 | `~/.bana/<prefix>/builds/<id>/` | each build: `build.json`, `act.jsonl` (act's log), `event.json`, `results.jsonl` and `report.md` (the CI report), `artifacts/` (act's), `dist/` (a green build's files and installer) |
 | `~/.bana/<prefix>/act-cache/` | act's actions, and the macOS jobs' copies while they run |
+| `~/.bana/<prefix>/releases/` | each release: `<tag>.json`, `<tag>.log` (what gh said when it was published) and `<tag>.notes.md` (what went on GitHub) |
 | `~/.bana/<prefix>/fix/` | *Fix with Claude* and `bana fix`: each fix's worktree, and beside it `<sha7>.d/` with its brief and `rounds.json` ([FIX.md](FIX.md)) |
 | `~/.bana/<prefix>/state.json` | paused, the queue, the heads seen, each branch's last green commit |
 | `~/.bana/<prefix>/vars` | optional, yours: `KEY=value` lines for `vars.*` |
@@ -334,7 +448,8 @@ Logs stay on the machine.
 | `~/Library/Logs/bana/<prefix>.log` | the daemon's log on a Mac (`journalctl --user -u bana-<prefix>` on Linux) |
 
 The last 100 builds are kept, and their artifacts and files for 7 days, but for the newest files of each branch
-and tier ([above](#a-builds-files)). A fix's rounds are kept apart, until the fix is discarded or 14 days after
+and tier ([above](#a-builds-files)), and a release's build while bana asks about it, and for 7 days after it was
+published or dismissed. A fix's rounds are kept apart, until the fix is discarded or 14 days after
 its last round.
 
 ## Commands

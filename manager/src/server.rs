@@ -4,14 +4,15 @@
 //!
 //! In daemon mode ([`daemon_router`]) the same page and pool routes, plus the
 //! daemon's: its summary, the builds and their logs, what the page's buttons
-//! do, the fixes Fix with Claude makes, and their rounds (run_jobs). Those
-//! call [`Daemon`]'s methods, with numeric ids, refs among the heads fetched,
-//! tiers from the settings, fixes by their commit's hex digits and jobs by
-//! their ids.
+//! do, the fixes Fix with Claude makes, and their rounds (run_jobs), and the
+//! releases bana asks about. Those call [`Daemon`]'s methods, with numeric
+//! ids, refs among the heads fetched, tiers from the settings, fixes by their
+//! commit's hex digits, jobs by their ids and releases by their tags.
 
 use crate::daemon::{Daemon, RoundError, ROUND_WAIT};
 use crate::fix;
 use crate::guard::{err, guarded, health, Access};
+use crate::release;
 use crate::{
     attach_jobs, parse_local, parse_pool, parse_runs, runs_to_detail, valid_ref, valid_runner,
     valid_tier, Local, PoolRunner, RunView,
@@ -20,7 +21,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -541,7 +542,96 @@ fn local_routes(d: Daemon) -> Router {
         .route("/daemon", post(set_daemon))
         .route("/daemon/poll", post(poll))
         .route("/queue/clear", post(clear_queue))
+        .route("/releases", get(releases))
+        .route("/releases/{tag}", get(release_state))
+        .route("/releases/{tag}/notes", put(release_notes))
+        .route("/releases/{tag}/publish", post(publish_release))
+        .route("/releases/{tag}/dismiss", post(dismiss_release))
         .with_state(d)
+}
+
+/// The releases, the newest first.
+async fn releases(State(d): D) -> Json<Value> {
+    Json(json!({ "releases": d.releases() }))
+}
+
+fn no_release(tag: &str) -> Response {
+    err(StatusCode::NOT_FOUND, format!("no release {tag}"))
+}
+
+fn release_error(e: release::Error) -> Response {
+    match e {
+        release::Error::Missing(m) => err(StatusCode::NOT_FOUND, m),
+        release::Error::Refused(m) => err(StatusCode::CONFLICT, m),
+        release::Error::Bad(m) => err(StatusCode::BAD_REQUEST, m),
+    }
+}
+
+/// One release: its record, its build's files and CI report table, the
+/// changes since the previous release, the notes with their rev and check.
+async fn release_state(State(d): D, Path(tag): Path<String>) -> Response {
+    if !release::valid_tag(&tag) {
+        return no_release(&tag);
+    }
+    match d.release(&tag) {
+        Some(v) => Json(v).into_response(),
+        None => no_release(&tag),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SaveNotes {
+    notes: String,
+    #[serde(default)]
+    title: Option<String>,
+    rev: u64,
+    /// `you` (the page), or `claude` (the MCP).
+    #[serde(default)]
+    source: Option<String>,
+}
+
+/// Saves the notes over those at `rev`: {rev, missing_prs, outside_range,
+/// duplicated}. 409 for a stale rev, or a release publishing or published.
+async fn release_notes(State(d): D, Path(tag): Path<String>, Json(b): Json<SaveNotes>) -> Response {
+    if !release::valid_tag(&tag) {
+        return no_release(&tag);
+    }
+    let source = b.source.as_deref().unwrap_or("you");
+    match d.save_notes(&tag, &b.notes, b.title.as_deref(), b.rev, source) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => release_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Publish {
+    rev: u64,
+}
+
+/// The owner's yes: 202, and the publish runs. 409 unless bana asks about
+/// it (or it failed, or was dismissed), the rev is the notes' now, and no
+/// other publish runs.
+async fn publish_release(State(d): D, Path(tag): Path<String>, Json(b): Json<Publish>) -> Response {
+    if !release::valid_tag(&tag) {
+        return no_release(&tag);
+    }
+    match d.publish_release(&tag, b.rev) {
+        Ok(v) => (StatusCode::ACCEPTED, Json(v)).into_response(),
+        Err(e) => release_error(e),
+    }
+}
+
+/// Not now.
+async fn dismiss_release(State(d): D, Path(tag): Path<String>) -> Response {
+    if !release::valid_tag(&tag) {
+        return no_release(&tag);
+    }
+    match d.dismiss_release(&tag) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => release_error(e),
+    }
 }
 
 /// Open, like the manager's: `bana manager` and `bana daemon` look for it.
@@ -1422,6 +1512,140 @@ esac"#,
         p.remove();
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_release_is_read_edited_answered_and_published_through_its_routes() {
+        let p = Project::new("srv-release");
+        let d = start_daemon(&p, "daemon.tags = v*\n").await;
+        let m = Manager::new(Tools::from_settings(d.settings()), "t".into());
+        let access = Arc::new(Access::loopback(TOKEN, 8470, &["/ci/v1/"]));
+        let app = daemon_router(m, d.clone(), access);
+        p.commit("files", "packages");
+        p.tag("v0.1.0");
+        assert_eq!(
+            call(&app, "POST", "/ci/v1/daemon/poll", None, true).await.0,
+            200
+        );
+        until("its release to ask", || {
+            d.release("v0.1.0")
+                .is_some_and(|v| v["state"] == "asking" && v["seeded"] == true)
+        })
+        .await;
+        let (code, v) = call(&app, "GET", "/ci/v1/releases", None, true).await;
+        assert_eq!(
+            (code, &v["releases"][0]["tag"]),
+            (200, &json!("v0.1.0")),
+            "{v}"
+        );
+        let (code, v) = call(&app, "GET", "/ci/v1/releases/v0.1.0", None, true).await;
+        assert_eq!(
+            (code, &v["state"], &v["notes"]["rev"]),
+            (200, &json!("asking"), &json!(1))
+        );
+        assert_eq!(v["page_url"], "http://127.0.0.1:8470/#release=v0.1.0");
+        let (code, l) = call(&app, "GET", "/ci/v1/local", None, true).await;
+        assert_eq!(
+            (code, &l["release"]["state"]),
+            (200, &json!("asking")),
+            "{l}"
+        );
+        for bad in ["..", "v1%2Fx", "-v1", "v1%5E%7B%7D", "nope"] {
+            let (code, _) = call(&app, "GET", &format!("/ci/v1/releases/{bad}"), None, true).await;
+            assert_eq!(code, 404, "{bad}");
+        }
+        let put = |body: Value| {
+            let app = app.clone();
+            async move {
+                call(
+                    &app,
+                    "PUT",
+                    "/ci/v1/releases/v0.1.0/notes",
+                    Some(body),
+                    true,
+                )
+                .await
+            }
+        };
+        let (code, v) = put(json!({"notes": "- Faster (#7)", "rev": 0})).await;
+        assert_eq!(code, 409, "a stale rev: {v}");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("read it, then save over it"),
+            "{v}"
+        );
+        let big = "x".repeat(release::NOTES_MAX + 1);
+        assert_eq!(put(json!({"notes": big, "rev": 1})).await.0, 400);
+        assert_eq!(
+            put(json!({"notes": "x", "rev": 1, "source": "gh"})).await.0,
+            400
+        );
+        assert_eq!(
+            put(json!({"notes": "x", "rev": 1, "extra": 1})).await.0,
+            422
+        );
+        let (code, v) =
+            put(json!({"notes": "- Faster (#7)\n- #7 again", "rev": 1, "source": "claude"})).await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(
+            (
+                &v["rev"],
+                &v["missing_prs"],
+                &v["outside_range"],
+                &v["duplicated"]
+            ),
+            (&json!(2), &json!([]), &json!([7]), &json!([7]))
+        );
+        let (_, v) = call(&app, "GET", "/ci/v1/releases/v0.1.0", None, true).await;
+        assert_eq!(
+            (&v["notes"]["source"], &v["check"]["outside_range"]),
+            (&json!("claude"), &json!([7]))
+        );
+        assert_eq!(v["notes"]["text"], "- Faster (#7)\n- #7 again");
+        // The title Publish gives: the notes', else `<install.name> <tag>`.
+        let default = format!("{} v0.1.0", d.settings().prefix);
+        assert_eq!(
+            (&v["title"], &v["default_title"]),
+            (&json!(default), &json!(default))
+        );
+
+        // Not now, then Publish after all: 409 for a stale rev, 202 with the one seen.
+        let post = |path: &'static str, body: Option<Value>| {
+            let app = app.clone();
+            async move { call(&app, "POST", path, body, true).await }
+        };
+        assert_eq!(post("/ci/v1/releases/v0.1.0/dismiss", None).await.0, 200);
+        assert_eq!(post("/ci/v1/releases/v0.1.0/dismiss", None).await.0, 409);
+        assert_eq!(
+            call(&app, "GET", "/ci/v1/local", None, true).await.1["release"],
+            Value::Null
+        );
+        assert_eq!(
+            post("/ci/v1/releases/v0.9.0/publish", Some(json!({"rev": 2})))
+                .await
+                .0,
+            404
+        );
+        assert_eq!(
+            post("/ci/v1/releases/v0.1.0/publish", Some(json!({"rev": 1})))
+                .await
+                .0,
+            409
+        );
+        let (code, v) = post("/ci/v1/releases/v0.1.0/publish", Some(json!({"rev": 2}))).await;
+        assert_eq!((code, &v["state"]), (202, &json!("publishing")), "{v}");
+        until("published", || {
+            d.release("v0.1.0")
+                .is_some_and(|v| v["state"] == "published")
+        })
+        .await;
+        let (code, v) = post("/ci/v1/releases/v0.1.0/publish", Some(json!({"rev": 2}))).await;
+        assert_eq!(code, 409, "{v}");
+        assert_eq!(put(json!({"notes": "late", "rev": 2})).await.0, 409);
+        d.shutdown().await;
+        p.remove();
+    }
+
     #[tokio::test]
     async fn daemon_routes_need_the_token_a_known_host_and_no_foreign_origin() {
         let (p, d, app) = daemon_app("srv-guard").await;
@@ -1455,6 +1679,11 @@ esac"#,
             ("POST", "/ci/v1/daemon"),
             ("POST", "/ci/v1/daemon/poll"),
             ("POST", "/ci/v1/queue/clear"),
+            ("GET", "/ci/v1/releases"),
+            ("GET", "/ci/v1/releases/v0.1.0"),
+            ("PUT", "/ci/v1/releases/v0.1.0/notes"),
+            ("POST", "/ci/v1/releases/v0.1.0/publish"),
+            ("POST", "/ci/v1/releases/v0.1.0/dismiss"),
             ("GET", "/ci/v1/state"),
         ] {
             let what = format!("{method} {path}");

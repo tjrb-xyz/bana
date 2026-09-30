@@ -17,6 +17,11 @@
 //! the job containers too. A build the daemon left running (a stop, a crash) is
 //! ended at the next start, and run again once if nothing moved on.
 //!
+//! A build of a tag at `daemon.tag_tier` makes the tag's release: bana finds
+//! the previous release and the changes since ([`crate::notes`]), asks when
+//! the build passed with files, and publishes on the owner's yes, never
+//! before ([`crate::release`]).
+//!
 //! A fix's rounds ([`crate::rounds`]) are builds too: one per failed job
 //! (`bana ci <tier> -j <job>`), with the fix's ref and before, at the failing
 //! commit (round 0, queued when the fix is made or registered) or at a
@@ -43,6 +48,9 @@
 //! - `fix/`: the fixes Fix with Claude made in the owner's checkout
 //!   ([`crate::fix`]): `<sha7>/`, the worktree, and `<sha7>.d/`, where the
 //!   daemon keeps `rounds.json`.
+//! - `releases/`: `<tag>.json`, a release a tag's build at the tag tier made
+//!   ([`crate::release`]); `<tag>.log`, what gh said when it was published,
+//!   and `<tag>.notes.md`, what went on GitHub.
 //!
 //! JSON goes to a temporary file, is synced, then renamed over the old one.
 //!
@@ -80,6 +88,8 @@ use crate::actlog::{
     self, Build, BuildState, BuildView, Event, Report, Status, StatusState, Summary, Watcher,
 };
 use crate::fix;
+use crate::notes;
+use crate::release::{self, Release};
 use crate::rounds::{self, Ask, Round, RoundBuild, Rounds};
 use crate::sweep;
 use crate::watch::{
@@ -257,6 +267,8 @@ pub struct Settings {
     pub ladder_short: [Duration; 2],
     /// How long the marker's processes have between SIGTERM and SIGKILL.
     pub grace: Duration,
+    /// How long `gh release create` may take (it uploads every file).
+    pub publish_timeout: Duration,
 }
 
 impl Settings {
@@ -415,6 +427,7 @@ impl Settings {
             ladder: [Duration::from_secs(60), Duration::from_secs(30)],
             ladder_short: [Duration::from_secs(20), Duration::from_secs(10)],
             grace: Duration::from_secs(5),
+            publish_timeout: Duration::from_secs(30 * 60),
         })
     }
 
@@ -670,6 +683,8 @@ struct Inner {
     /// Polls done, for tests.
     polls: u64,
     stopping: bool,
+    /// releases/<tag>.json, by tag ([`crate::release`]).
+    releases: BTreeMap<String, Release>,
 }
 
 struct Shared {
@@ -682,6 +697,8 @@ struct Shared {
     post_now: Notify,
     /// Counts the changes to rounds.json files: a round's long poll waits on it.
     rounds: tokio::sync::watch::Sender<u64>,
+    /// A release's previous release and changes are to be found.
+    seed: Notify,
     stop: tokio::sync::watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// daemon.lock, locked while this daemon runs ([`claim`]).
@@ -740,6 +757,14 @@ impl Daemon {
             .flat_map(|r| r.statuses.values().map(|p| p.seq))
             .max()
             .unwrap_or(0);
+        // A publish the last daemon ran did not finish: Publish again cleans up.
+        let mut releases = release::load(&dir);
+        for r in releases.values_mut() {
+            if release::interrupted(r) {
+                eprintln!("bana daemon: publishing {} was interrupted", r.tag);
+                release::save(&dir, r);
+            }
+        }
         let summary = tokio::sync::watch::Sender::new(Summary::default());
         let (stop, _) = tokio::sync::watch::channel(false);
         let shared = Arc::new(Shared {
@@ -756,6 +781,7 @@ impl Daemon {
                 seq,
                 polls: 0,
                 stopping: false,
+                releases,
             }),
             summary,
             poll: Notify::new(),
@@ -763,6 +789,7 @@ impl Daemon {
             post: Notify::new(),
             post_now: Notify::new(),
             rounds: tokio::sync::watch::Sender::new(0),
+            seed: Notify::new(),
             stop,
             tasks: Mutex::new(Vec::new()),
             claimed: Mutex::new(Some(claimed)),
@@ -777,6 +804,7 @@ impl Daemon {
             tokio::spawn(shared.clone().watcher()),
             tokio::spawn(shared.clone().runner()),
             tokio::spawn(shared.clone().poster()),
+            tokio::spawn(shared.clone().seeder()),
         ];
         *shared.tasks.lock().unwrap_or_else(|e| e.into_inner()) = tasks;
         Ok(Self(shared))
@@ -1083,6 +1111,170 @@ impl Daemon {
                 )
             })
             .collect()
+    }
+
+    /// The releases, the newest first: `GET /ci/v1/releases`.
+    pub fn releases(&self) -> Vec<Value> {
+        let inner = self.0.lock();
+        let mut all: Vec<&Release> = inner.releases.values().collect();
+        all.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
+        all.into_iter()
+            .map(|r| {
+                json!({"tag": r.tag, "state": r.state, "build": r.build, "sha": r.sha,
+                    "reason": r.reason, "url": r.url, "updated_at": r.updated_at})
+            })
+            .collect()
+    }
+
+    /// All bana knows of release `tag`, without asking GitHub: the page's
+    /// card, and Claude's release_context. `previous` is null until found,
+    /// and its `tag` null for a first release; `files` are those a release
+    /// uploads (SHA256SUMS lists them); `tested` is the build's CI report
+    /// table, as `## Tested` will have it; `title` is the one Publish gives.
+    /// When git could not read the changes, or local tags stood in for gh,
+    /// a read asks for them again (at most once a minute).
+    pub fn release(&self, tag: &str) -> Option<Value> {
+        let s = &self.0.settings;
+        let (mut v, build) = {
+            let mut inner = self.0.lock();
+            let r = inner.releases.get_mut(tag)?;
+            let guessed = r
+                .previous
+                .as_ref()
+                .is_some_and(|p| p.how.starts_with("tags"));
+            let open = !matches!(
+                r.state,
+                release::State::Publishing | release::State::Published
+            );
+            if open && !r.seed && (r.seed_error.is_some() || guessed) && now() - r.retried_at >= 60
+            {
+                (r.seed, r.retried_at) = (true, now());
+                self.0.seed.notify_one();
+            }
+            let r = inner.releases.get(tag)?;
+            let rec = inner.records.get(&r.build);
+            let files: Vec<&DistEntry> = rec
+                .and_then(|b| b.dist.as_ref())
+                .map(|d| d.available().iter().filter(|f| f.release).collect())
+                .unwrap_or_default();
+            let mut platforms: Vec<String> =
+                files.iter().filter_map(|f| f.platform.clone()).collect();
+            platforms.sort();
+            platforms.dedup();
+            let changes = r.changes.as_ref().map(|c| {
+                let mut v = json!(c);
+                let n = c.prs.len() + c.other.len();
+                v["counts"] = json!({"commits": n as u64 + c.more, "prs": c.prs.len(), "other": c.other.len()});
+                v
+            });
+            let check = r.check();
+            let v = json!({
+                "repo": s.repo, "tag": r.tag, "sha": r.sha, "state": r.state,
+                "reason": r.reason, "progress": r.progress, "url": r.url,
+                "answered_at": r.answered_at, "updated_at": r.updated_at,
+                "build": rec.map(|b| self.0.view(&inner, b)), "machine": s.machine,
+                "previous": r.previous, "seeded": !r.seed, "seed_error": r.seed_error,
+                "files": files, "not_built": release::not_built(&r.platforms, &platforms),
+                "changes": changes, "notes": r.notes.clone().unwrap_or_default(),
+                "title": r.notes.as_ref().and_then(|n| n.title.clone())
+                    .or_else(|| r.title.clone())
+                    .unwrap_or_else(|| format!("{} {}", s.prefix, r.tag)),
+                "default_title": r.title.clone().unwrap_or_else(|| format!("{} {}", s.prefix, r.tag)),
+                "check": {"missing_prs": check.missing, "outside_range": check.outside_range,
+                    "duplicated": check.duplicated},
+                "install": files.iter().any(|f| f.name == "install.sh")
+                    .then(|| format!("bana install {}", r.build)),
+                "dir": self.0.build_dir(r.build).join("dist"),
+                "page_url": format!("http://127.0.0.1:{}/#release={}", s.port, r.tag),
+            });
+            (v, r.build)
+        };
+        v["tested"] = json!(
+            std::fs::read_to_string(self.0.build_dir(build).join("report.md"))
+                .ok()
+                .and_then(|m| release::tested(&m))
+        );
+        Some(v)
+    }
+
+    /// Saves release `tag`'s notes over those at `rev` (`source`: `you`, the
+    /// page, or `claude`): the new rev, and what they say of the range's pull
+    /// requests. The page and Claude never write over each other: a save
+    /// with another rev is refused.
+    pub fn save_notes(
+        &self,
+        tag: &str,
+        text: &str,
+        title: Option<&str>,
+        rev: u64,
+        source: &str,
+    ) -> Result<Value, release::Error> {
+        let mut inner = self.0.lock();
+        let inner = &mut *inner;
+        let r = inner
+            .releases
+            .get_mut(tag)
+            .ok_or_else(|| release::Error::Missing(format!("no release {tag}")))?;
+        let rev = release::save_notes(r, text, title, rev, source, now())?;
+        self.0.save_release(r);
+        let check = r.check();
+        self.0.publish(inner);
+        Ok(json!({"tag": tag, "rev": rev, "missing_prs": check.missing,
+            "outside_range": check.outside_range, "duplicated": check.duplicated,
+            "page_url": format!("http://127.0.0.1:{}/#release={tag}", self.0.settings.port)}))
+    }
+
+    /// Not now: bana stops asking about release `tag`.
+    pub fn dismiss_release(&self, tag: &str) -> Result<Value, release::Error> {
+        let mut inner = self.0.lock();
+        let inner = &mut *inner;
+        let r = inner
+            .releases
+            .get_mut(tag)
+            .ok_or_else(|| release::Error::Missing(format!("no release {tag}")))?;
+        release::dismiss(r, now())?;
+        self.0.save_release(r);
+        self.0.publish(inner);
+        Ok(json!({"tag": tag, "state": "dismissed"}))
+    }
+
+    /// The owner's yes, with the rev of the notes they saw: the publish runs
+    /// ([`Shared::publish_task`]), one at a time.
+    pub fn publish_release(&self, tag: &str, rev: u64) -> Result<Value, release::Error> {
+        let mut inner = self.0.lock();
+        let inner = &mut *inner;
+        if let Some(p) = inner
+            .releases
+            .values()
+            .find(|r| r.state == release::State::Publishing)
+        {
+            return Err(release::Error::Refused(format!(
+                "{} is publishing: one publish at a time",
+                p.tag
+            )));
+        }
+        let r = inner
+            .releases
+            .get_mut(tag)
+            .ok_or_else(|| release::Error::Missing(format!("no release {tag}")))?;
+        release::can_publish(r, rev)?;
+        let files = inner
+            .records
+            .get(&r.build)
+            .and_then(|b| b.dist.as_ref())
+            .is_some_and(|d| d.available().iter().any(|f| f.name == "SHA256SUMS"));
+        if !files {
+            return Err(release::Error::Refused(format!(
+                "build #{}'s files are gone: re-run it",
+                r.build
+            )));
+        }
+        (r.state, r.reason, r.updated_at) = (release::State::Publishing, None, now());
+        r.progress = Some("starting".into());
+        self.0.save_release(r);
+        self.0.publish(inner);
+        tokio::spawn(self.0.clone().publish_task(tag.to_string()));
+        Ok(json!({"tag": tag, "state": "publishing", "rev": rev}))
     }
 
     /// Fix with Claude (the page, the menu bar): makes, or goes on with, the
@@ -1612,6 +1804,12 @@ impl Shared {
                 .find(|r| r.build.state.finished() && !r.request.is_fix())
                 .map(|r| self.view(inner, r)),
             failed: newest_failed(&inner.records),
+            release: release::shown(&inner.releases, now()).map(|r| actlog::ReleaseAsk {
+                tag: r.tag.clone(),
+                state: r.state.as_str().into(),
+                build: r.build,
+                reason: r.reason.clone(),
+            }),
         };
         self.summary.send_replace(summary);
     }
@@ -1654,6 +1852,7 @@ impl Shared {
         };
         inner.state.queue.insert(at, id);
         self.save_state(&inner.state);
+        self.release_queued(inner, id);
         self.publish(inner);
         id
     }
@@ -1674,6 +1873,7 @@ impl Shared {
         let fix = rec.request.fix.clone();
         inner.records.remove(&id);
         let _ = std::fs::remove_dir_all(self.build_dir(id));
+        self.release_sync(inner, id);
         if let Some(req) = retry {
             self.settle_interrupted(inner, &req);
         }
@@ -1781,6 +1981,9 @@ impl Shared {
             if !retry && rec.request.trigger == Trigger::Retry {
                 self.settle_interrupted(inner, &rec.request);
             }
+            if !retry {
+                self.release_sync(inner, id);
+            }
             if retry {
                 let req = Request {
                     trigger: Trigger::Retry,
@@ -1811,6 +2014,491 @@ impl Shared {
             self.sync_rounds(&inner, &fix);
         }
         self.save_state(&inner.state);
+    }
+
+    // ---- releases --------------------------------------------------------------
+
+    fn save_release(&self, r: &Release) {
+        release::save(&self.settings.dir, r);
+    }
+
+    /// Build `id` was queued, or its tag moved while it waits: a build of a
+    /// tag at the tag tier makes, or takes over, the tag's release, whose
+    /// previous release and changes are then found ([`Self::seeder`]).
+    fn release_queued(&self, inner: &mut Inner, id: u64) {
+        let Some(q) = inner.records.get(&id).map(|r| &r.request) else {
+            return;
+        };
+        if q.is_fix() || q.tier != self.settings.rules.tag_tier {
+            return;
+        }
+        let Some(tag) = q
+            .git_ref
+            .strip_prefix("refs/tags/")
+            .filter(|t| release::valid_tag(t))
+        else {
+            return;
+        };
+        let (tag, sha) = (tag.to_string(), q.sha.clone());
+        if let Some(r) = release::queued(inner.releases.get(&tag), &tag, &sha, id, now()) {
+            self.save_release(&r);
+            inner.releases.insert(tag, r);
+            self.seed.notify_one();
+        }
+    }
+
+    /// Build `id` ended (its files collected, its report written), or left
+    /// the queue: the release it builds asks, or says why it cannot.
+    fn release_sync(&self, inner: &mut Inner, id: u64) {
+        let Some(tag) = inner
+            .releases
+            .values()
+            .find(|r| r.build == id && r.state == release::State::Building)
+            .map(|r| r.tag.clone())
+        else {
+            return;
+        };
+        let outcome = match inner.records.get(&id) {
+            None => Err(format!("build #{id} was taken off the queue")),
+            Some(rec) => match release_outcome(rec) {
+                Some(o) => o,
+                None => return,
+            },
+        };
+        if let Some(r) = inner.releases.get_mut(&tag) {
+            if release::ended(r, id, outcome, now()) {
+                match &r.reason {
+                    None => {
+                        eprintln!("bana daemon: {tag} passed with its files: asking to publish it")
+                    }
+                    Some(why) => eprintln!("bana daemon: {tag} cannot be published: {why}"),
+                }
+                self.save_release(r);
+            }
+        }
+        self.publish(inner);
+    }
+
+    /// Finds each queued release's previous release and the changes since
+    /// it, one at a time.
+    async fn seeder(self: Arc<Self>) {
+        let mut stop = self.stop.subscribe();
+        loop {
+            if *stop.borrow() {
+                return;
+            }
+            let due: Vec<(String, String)> = self
+                .lock()
+                .releases
+                .values()
+                .filter(|r| r.seed)
+                .map(|r| (r.tag.clone(), r.sha.clone()))
+                .collect();
+            for (tag, sha) in due {
+                let found = self.find_changes(&tag, &sha).await;
+                if let Err(e) = &found {
+                    eprintln!("bana daemon: {tag}: the changes: {e}");
+                }
+                let conf = self.conf_at(&sha).await;
+                let title = Some(release::title(&conf, &self.settings.prefix, &tag));
+                let platforms = release::platforms(&conf);
+                let mut inner = self.lock();
+                let inner = &mut *inner;
+                if let Some(r) = inner.releases.get_mut(&tag) {
+                    let mut changed = release::seeded(r, &sha, found, &self.settings.repo, now());
+                    if r.sha == sha && (r.title != title || r.platforms != platforms) {
+                        (r.title, r.platforms, changed) = (title, platforms, true);
+                    }
+                    if changed {
+                        self.save_release(r);
+                    }
+                }
+                self.publish(inner);
+            }
+            tokio::select! {
+                _ = self.seed.notified() => {}
+                _ = stop.changed() => return,
+            }
+        }
+    }
+
+    /// Release `tag`'s previous release (one `gh release list`, then the
+    /// tags in src; [`notes::previous_release`]) and the first-parent
+    /// commits since it up to `sha`.
+    async fn find_changes(
+        &self,
+        tag: &str,
+        sha: &str,
+    ) -> Result<(notes::Previous, notes::Changes), String> {
+        let s = &self.settings;
+        let args = notes::list_args(&s.repo);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let list = match self.output(&s.gh, &args, &self.src(), 30).await {
+            Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
+            Ok(o) => Err(format!("gh release list: {}", failure(&o))),
+            Err(e) => Err(e),
+        };
+        let tags: Vec<String> = self
+            .git(&["tag", "-l"], 30)
+            .await
+            .map_err(|e| format!("git tag: {e}"))?
+            .lines()
+            .filter(|t| !t.is_empty())
+            .map(String::from)
+            .collect();
+        let (git, path, src) = (s.git.clone(), s.path.clone(), self.src());
+        let (tag_, sha_) = (tag.to_string(), sha.to_string());
+        let previous = tokio::task::spawn_blocking(move || {
+            let run = |args: &[&str]| {
+                std::process::Command::new(&git)
+                    .args(args)
+                    .current_dir(&src)
+                    .env("PATH", &path)
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .stdin(Stdio::null())
+                    .stderr(Stdio::null())
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+            };
+            notes::previous_release(
+                list.as_deref().map_err(String::as_str),
+                &tags,
+                &tag_,
+                |t| {
+                    run(&[
+                        "merge-base",
+                        "--is-ancestor",
+                        &format!("refs/tags/{t}"),
+                        &sha_,
+                    ])
+                    .is_some()
+                },
+                |t| {
+                    run(&["rev-list", "--count", &format!("refs/tags/{t}..{sha_}")])
+                        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+                },
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        let args = notes::log_args(previous.tag.as_deref(), sha);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let log = self
+            .git(&args, 60)
+            .await
+            .map_err(|e| format!("git log: {e}"))?;
+        let mut changes = notes::parse_range(&log);
+        if changes.more > 0 {
+            let range = match &previous.tag {
+                Some(p) => format!("refs/tags/{p}..{sha}"),
+                None => sha.to_string(),
+            };
+            let n = self
+                .git(&["rev-list", "--first-parent", "--count", &range], 60)
+                .await
+                .ok()
+                .and_then(|n| n.trim().parse::<u64>().ok());
+            if let Some(n) = n {
+                changes.more = n.saturating_sub(notes::LOG_LIMIT as u64).max(changes.more);
+            }
+        }
+        Ok((previous, changes))
+    }
+
+    /// What the publish of `tag` does now, on its record and the page.
+    fn progress(&self, tag: &str, what: &str) {
+        let mut inner = self.lock();
+        if let Some(r) = inner.releases.get_mut(tag) {
+            r.progress = Some(what.to_string());
+            self.save_release(r);
+        }
+        self.publish(&inner);
+    }
+
+    /// Publishes release `tag` ([`Self::publish_steps`]): published, with its
+    /// URL, or failed, with why, and bana asks again.
+    async fn publish_task(self: Arc<Self>, tag: String) {
+        let end = self.publish_steps(&tag).await;
+        let mut inner = self.lock();
+        let inner = &mut *inner;
+        if let Some(r) = inner.releases.get_mut(&tag) {
+            match end {
+                Ok(url) => {
+                    eprintln!("bana daemon: {tag} is published: {url}");
+                    (r.state, r.url, r.reason) = (release::State::Published, Some(url), None);
+                    r.answered_at = Some(now());
+                }
+                Err(e) => {
+                    eprintln!("bana daemon: publishing {tag} failed: {e}");
+                    (r.state, r.reason) = (release::State::Failed, Some(e));
+                }
+            }
+            (r.progress, r.updated_at) = (None, now());
+            self.save_release(r);
+        }
+        self.publish(inner);
+    }
+
+    /// The publish: every file still as SHA256SUMS says; the tag on origin
+    /// still at the built commit; the previous release still the notes' one
+    /// ([`release::rebased`]); on GitHub, a release already published with
+    /// these files (by their digests) is taken as this one, and a draft a
+    /// killed gh left is deleted (never with --cleanup-tag), but no other
+    /// draft; then `gh release create --verify-tag` from dist/ with the
+    /// notes, `## Tested` and `## Install`, the files and SHA256SUMS. The
+    /// release's URL, or why not.
+    async fn publish_steps(&self, tag: &str) -> Result<String, String> {
+        let s = &self.settings;
+        let (sha, build, text, title) = {
+            let inner = self.lock();
+            let r = inner.releases.get(tag).ok_or("the release is gone")?;
+            let n = r.notes.clone().unwrap_or_default();
+            (r.sha.clone(), r.build, n.text, n.title)
+        };
+        let dist = self.build_dir(build).join("dist");
+        let log = s.dir.join("releases").join(format!("{tag}.log"));
+
+        self.progress(tag, "checking the files against SHA256SUMS");
+        let at = dist.clone();
+        let manifest =
+            tokio::task::spawn_blocking(move || -> Result<Vec<(String, String)>, String> {
+                let sums = std::fs::read_to_string(at.join("SHA256SUMS"))
+                    .map_err(|e| format!("SHA256SUMS: {e}"))?;
+                let mut manifest = release::manifest(&sums)?;
+                for (hash, name) in &manifest {
+                    let got = crate::artifacts::sha256(&at.join(name))
+                        .map_err(|e| format!("{name}: {e}"))?;
+                    if got != *hash {
+                        return Err(format!(
+                            "{name} changed since build #{build}: nothing was published"
+                        ));
+                    }
+                }
+                let own = crate::artifacts::sha256(&at.join("SHA256SUMS"))
+                    .map_err(|e| format!("SHA256SUMS: {e}"))?;
+                manifest.push((own, "SHA256SUMS".into()));
+                Ok(manifest)
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+        let upload: Vec<String> = manifest.iter().map(|(_, n)| n.clone()).collect();
+        let files = &upload[..upload.len() - 1];
+
+        self.progress(tag, "checking the tag on origin");
+        let cred = self.credentials();
+        let (plain, deref) = (format!("refs/tags/{tag}"), format!("refs/tags/{tag}^{{}}"));
+        let mut args: Vec<&str> = cred.iter().map(String::as_str).collect();
+        args.extend(["ls-remote", "origin", &plain, &deref]);
+        let listed = self
+            .git(&args, 60)
+            .await
+            .map_err(|e| format!("git ls-remote: {e}"))?;
+        match release::peeled(&listed, tag) {
+            Some(at) if at == sha => {}
+            Some(_) => {
+                return Err(format!(
+                    "{tag} moved since build #{build}: nothing was published"
+                ))
+            }
+            None => return Err(format!("{tag} is not on origin: nothing was published")),
+        }
+
+        self.progress(tag, "checking the previous release");
+        match self.find_changes(tag, &sha).await {
+            Ok(found) => {
+                let mut inner = self.lock();
+                let inner = &mut *inner;
+                if let Some(r) = inner.releases.get_mut(tag) {
+                    let why = release::rebased(r, &sha, found, &s.repo, now());
+                    self.save_release(r);
+                    if let Some(why) = why {
+                        return Err(why);
+                    }
+                }
+            }
+            Err(e) => eprintln!("bana daemon: {tag}: the previous release: {e}"),
+        }
+
+        // What a killed gh release create of bana's left: the notes it sent.
+        let notes_file = s.dir.join("releases").join(format!("{tag}.notes.md"));
+        let sent = std::fs::read_to_string(&notes_file).ok();
+        let mut deleted = 0;
+        loop {
+            self.progress(tag, "looking for the release on GitHub");
+            let view = self
+                .gh(
+                    &log,
+                    &[
+                        "release",
+                        "view",
+                        tag,
+                        "-R",
+                        &s.repo,
+                        "--json",
+                        release::VIEW_FIELDS,
+                    ],
+                    60,
+                )
+                .await;
+            match release::existing(view.as_deref().map_err(String::as_str))? {
+                release::Existing::None => break,
+                release::Existing::Draft { body, assets }
+                    if !release::orphan(&body, &assets, sent.as_deref(), &upload) =>
+                {
+                    return Err(format!(
+                        "a draft {tag} is on GitHub (not bana's): publish or delete it there; nothing was published"
+                    ))
+                }
+                release::Existing::Draft { .. } if deleted < 5 => {
+                    self.progress(tag, "deleting a draft an earlier publish left");
+                    self.gh(
+                        &log,
+                        &["release", "delete", tag, "-R", &s.repo, "--yes"],
+                        60,
+                    )
+                    .await
+                    .map_err(|e| format!("gh release delete: {e}"))?;
+                    deleted += 1;
+                }
+                release::Existing::Draft { .. } => {
+                    return Err(format!(
+                        "drafts of {tag} are still on GitHub after 5 deletes"
+                    ))
+                }
+                release::Existing::Published { url, assets } => {
+                    return if release::same_files(&assets, &manifest) {
+                        Ok(url)
+                    } else {
+                        Err(format!(
+                            "a release {tag} is on GitHub already, with other files: {url}"
+                        ))
+                    };
+                }
+            }
+        }
+
+        let flags = if notes::is_prerelease(tag) || notes::version(tag).is_none() {
+            release::flags(tag, Err(""))
+        } else {
+            let args = release::finals_args(&s.repo);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let finals = self.gh(&log, &args, 60).await;
+            release::flags(tag, finals.as_deref().map_err(String::as_str))
+        };
+        let conf = self.conf_at(&sha).await;
+        let title = title.unwrap_or_else(|| release::title(&conf, &s.prefix, tag));
+        let tested = std::fs::read_to_string(self.build_dir(build).join("report.md"))
+            .ok()
+            .and_then(|m| release::tested(&m));
+        let mut platforms: Vec<String> = files
+            .iter()
+            .filter_map(|f| crate::artifacts::platform(f))
+            .collect();
+        platforms.sort();
+        let install = release::install(&s.repo, tag, files, &platforms);
+        std::fs::write(
+            &notes_file,
+            release::body(&text, tested.as_deref(), install.as_deref()),
+        )
+        .map_err(|e| format!("{}: {e}", notes_file.display()))?;
+        let args = release::create_args(&s.repo, tag, &title, &notes_file, &flags, &upload);
+        self.progress(
+            tag,
+            &format!("gh release create: uploading {} files", upload.len()),
+        );
+        let out = self.create(&args, &dist, &log).await?;
+        Ok(out
+            .lines()
+            .map(str::trim)
+            .rfind(|l| l.starts_with("https://"))
+            .map(String::from)
+            .unwrap_or_else(|| format!("https://github.com/{}/releases/tag/{tag}", s.repo)))
+    }
+
+    /// gh in src, its words in the release's log: its stdout, or its last
+    /// lines when it failed.
+    async fn gh(&self, log: &Path, args: &[&str], secs: u64) -> Result<String, String> {
+        let o = self
+            .output(&self.settings.gh, args, &self.src(), secs)
+            .await;
+        let o = match o {
+            Ok(o) => o,
+            Err(e) => {
+                append(log, &format!("$ gh {}\n{e}\n", args.join(" ")));
+                return Err(e);
+            }
+        };
+        let (out, err) = (
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+        );
+        append(log, &format!("$ gh {}\n{out}{err}", args.join(" ")));
+        if o.status.success() {
+            Ok(out)
+        } else {
+            Err(match release::tail(&err) {
+                t if t.is_empty() => format!("gh exited with {}", o.status.code().unwrap_or(-1)),
+                t => t,
+            })
+        }
+    }
+
+    /// `gh release create` from dist/, kept awake on macOS, stopped after
+    /// the publish timeout (Publish again cleans up the draft it leaves).
+    async fn create(&self, args: &[String], dist: &Path, log: &Path) -> Result<String, String> {
+        let s = &self.settings;
+        append(log, &format!("$ gh {}\n", args.join(" ")));
+        let child = Command::new(&s.gh)
+            .args(args)
+            .current_dir(dist)
+            .env("PATH", &s.path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| format!("{}: {e}", s.gh))?;
+        if cfg!(target_os = "macos") {
+            if let Some(pid) = child.id() {
+                let _ = Command::new(&s.caffeinate)
+                    .args(["-i", "-w", &pid.to_string()])
+                    .env("PATH", &s.path)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+            }
+        }
+        let o = match tokio::time::timeout(s.publish_timeout, child.wait_with_output()).await {
+            Err(_) => {
+                let why = format!(
+                    "gh release create took longer than {}: it was stopped (Publish again deletes the draft it left)",
+                    minutes(s.publish_timeout)
+                );
+                append(log, &format!("{why}\n"));
+                return Err(why);
+            }
+            Ok(Err(e)) => return Err(format!("{}: {e}", s.gh)),
+            Ok(Ok(o)) => o,
+        };
+        let (out, err) = (
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+        );
+        append(log, &format!("{out}{err}"));
+        if o.status.success() {
+            Ok(out)
+        } else {
+            Err(match release::tail(&err) {
+                t if t.is_empty() => format!(
+                    "gh release create exited with {}",
+                    o.status.code().unwrap_or(-1)
+                ),
+                t => t,
+            })
+        }
     }
 
     // ---- fix rounds ----------------------------------------------------------
@@ -2245,6 +2933,8 @@ impl Shared {
                             r.request.sha = sha;
                             self.save(r);
                         }
+                        // A tag pushed again while its build waits: its release follows.
+                        self.release_queued(inner, id);
                     }
                     Action::Drop { id, why } => {
                         eprintln!("bana daemon: build {id} dropped: {why}");
@@ -2427,6 +3117,8 @@ impl Shared {
                 self.settle_interrupted(&mut inner, &req);
             }
             self.sync_rounds_of(&inner, id);
+            // Its files are collected and its report written: its release may ask.
+            self.release_sync(&mut inner, id);
             let forgotten = self.prune(&mut inner);
             self.save_state(&inner.state);
             self.publish(&inner);
@@ -3397,7 +4089,8 @@ impl Shared {
         };
         let fixes = self.settings.dir.join("fix");
         let gone = |fix: &str| !fixes.join(format!("{fix}.d/fix.json")).exists();
-        let keep = kept_files(&inner.records, &inner.state.heads);
+        let mut keep = kept_files(&inner.records, &inner.state.heads);
+        keep.extend(release::kept_builds(&inner.releases, now()));
         let old = to_prune(&inner.records, &keep, busy, gone, now());
         let mut forgotten: Vec<String> = Vec::new();
         for id in old {
@@ -3594,6 +4287,62 @@ fn newest_failed(records: &BTreeMap<u64, Record>) -> Option<u64> {
         .find(|r| matches!(r.build.state, BuildState::Success | BuildState::Failure))
         .filter(|r| r.build.state == BuildState::Failure)
         .map(|r| r.request.id)
+}
+
+/// What a build of a release's tag says for it, once it has ended: Ok when
+/// it passed with files for a release (SHA256SUMS lists them), else why not.
+fn release_outcome(rec: &Record) -> Option<Result<(), String>> {
+    let id = rec.request.id;
+    Some(match rec.build.state {
+        BuildState::Queued | BuildState::Running => return None,
+        BuildState::Success => match &rec.dist {
+            None => Err("no files: the workflow uploads no v4 artifacts".into()),
+            Some(d) if d.removed => Err(format!("build #{id}'s files were removed")),
+            Some(d) if d.problem.is_some() => Err(format!(
+                "files not collected: {}",
+                d.problem.as_deref().unwrap_or_default()
+            )),
+            Some(d)
+                if d.files.iter().any(|f| f.name == "SHA256SUMS")
+                    && d.files.iter().any(|f| f.release && f.name != "SHA256SUMS") =>
+            {
+                Ok(())
+            }
+            Some(_) => Err(
+                "no files for a release: no SHA256SUMS (an archive per platform, release.files)"
+                    .into(),
+            ),
+        },
+        BuildState::Failure => {
+            let at = rec
+                .build
+                .chips()
+                .into_iter()
+                .find(|j| j.state == actlog::JobState::Failure)
+                .map(|j| format!(" at {}", j.key))
+                .unwrap_or_default();
+            Err(format!("build #{id} failed{at}"))
+        }
+        BuildState::Error => Err(format!(
+            "build #{id}: {}",
+            rec.build
+                .reason
+                .as_deref()
+                .or(rec.build.last_error.as_deref())
+                .unwrap_or("ended in error")
+        )),
+    })
+}
+
+/// Appends to a log file; a log that cannot be written is left out.
+fn append(path: &Path, text: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(text.as_bytes());
+    }
 }
 
 fn built(records: &BTreeMap<u64, Record>) -> Built {
@@ -3880,6 +4629,8 @@ pub(crate) mod tests {
     use std::process::Command as Std;
 
     const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/act");
+    /// tests/stand-ins/gh, whose release store the daemon's gh uses.
+    const STANDIN_GH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/stand-ins/gh");
 
     /// Stand-in `bana`: `ci --list` prints the fixture's `act -l`; `ci …`
     /// records its arguments, environment, secrets and pid, waits while `hold`
@@ -3899,7 +4650,7 @@ if [[ $1 == installer ]]; then
   printf '%s\n' "$@" "$BANA_PROJECT_ROOT" "$PWD" >"$ctl/installer.$b"
   [[ ! -e $ctl/installer-fails ]] || { echo "bana installer: install.name: not 'a b'" >&2; exit 1; }
   echo '#!/bin/sh' >"$2/install.sh"
-  (cd "$2" && for f in install.sh *.tar.gz; do echo "0  $f"; done) >"$2/SHA256SUMS"
+  (cd "$2" && { sha256sum install.sh *.tar.gz 2>/dev/null || shasum -a 256 install.sh *.tar.gz; }) >"$2/SHA256SUMS"
   exit 0
 fi
 [[ $1 == ci ]] || exit 2
@@ -3947,11 +4698,18 @@ exit 0
     /// Stand-in `gh`: answers `auth token` and logs each `api` call (its
     /// arguments, tab-separated). `gh-down` makes calls fail; `gh-no-url`
     /// refuses a target_url as GitHub would (422); `gh-422` refuses statuses
-    /// for the commit it names.
+    /// for the commit it names. `release …` goes to tests/stand-ins/gh, with
+    /// its releases in `releases/` and its log in `gh-release.log`; `gh-fail-at`
+    /// and `gh-slow` say its FAKE_GH_FAIL_AT and FAKE_GH_SLOW.
     const GH: &str = "#!/bin/sh
 ctl='CTL'
 if [ \"$1 $2\" = 'auth token' ]; then echo gho_fromgh; exit 0; fi
 if [ -e \"$ctl/gh-down\" ]; then echo 'error connecting to api.github.com' >&2; exit 1; fi
+if [ \"$1\" = release ]; then
+  FAKE_LOG=\"$ctl/gh-release.log\" FAKE_RELEASE_STORE=\"$ctl/releases\" \\
+    FAKE_GH_FAIL_AT=$(cat \"$ctl/gh-fail-at\" 2>/dev/null) FAKE_GH_SLOW=$(cat \"$ctl/gh-slow\" 2>/dev/null) \\
+    exec 'STANDIN' \"$@\"
+fi
 if [ -e \"$ctl/gh-422\" ]; then case \"$*\" in *\"$(cat \"$ctl/gh-422\")\"*)
   echo 'gh: No commit found for SHA: x (HTTP 422)' >&2; exit 1 ;; esac; fi
 case \"$*\" in *target_url=*)
@@ -4026,7 +4784,8 @@ exec git \"$@\"
             let ctl_s = ctl.to_string_lossy();
             for (file, body) in [("bana", BANA), ("gh", GH), ("docker", DOCKER), ("git", GIT)] {
                 let path = bin.join(file);
-                std::fs::write(&path, body.replace("CTL", &ctl_s).replace("FX", FIXTURES)).unwrap();
+                let body = body.replace("CTL", &ctl_s).replace("FX", FIXTURES);
+                std::fs::write(&path, body.replace("STANDIN", STANDIN_GH)).unwrap();
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
@@ -4090,6 +4849,13 @@ exec git \"$@\"
             git(&self.work, &["add", "-A"]);
             git(&self.work, &["commit", "-q", "-m", message]);
             git(&self.work, &["rev-parse", "HEAD"])
+        }
+
+        /// Tags the checkout's HEAD (annotated), or moves the tag there, and pushes it.
+        pub(crate) fn tag(&self, name: &str) {
+            git(&self.work, &["tag", "-f", "-a", "-m", name, name]);
+            let to = format!("refs/tags/{name}");
+            git(&self.work, &["push", "-q", "--force", "origin", &to]);
         }
 
         pub(crate) fn push(&self, branch: &str) {
@@ -4391,6 +5157,7 @@ exec git \"$@\"
             seq: 6,
             polls: 0,
             stopping: false,
+            releases: BTreeMap::new(),
         };
         assert_eq!(
             to_post(&inner),
@@ -6260,5 +7027,533 @@ exec git \"$@\"
         records.insert(4, failed);
         records.insert(5, no_installer);
         assert_eq!(kept_files(&records, &heads), [1, 10].into());
+    }
+
+    // ---- releases ----------------------------------------------------------
+
+    fn rel(d: &Daemon, tag: &str) -> Option<Release> {
+        d.0.lock().releases.get(tag).cloned()
+    }
+
+    /// The newest build of `tag`.
+    fn tag_build(d: &Daemon, tag: &str) -> Option<u64> {
+        let want = format!("refs/tags/{tag}");
+        let inner = d.0.lock();
+        let found = inner
+            .records
+            .values()
+            .rev()
+            .find(|r| r.request.git_ref == want);
+        found.map(|r| r.request.id)
+    }
+
+    async fn rel_in(d: &Daemon, tag: &str, state: release::State) -> Release {
+        until(&format!("{tag} {}", state.as_str()), || {
+            rel(d, tag).is_some_and(|r| r.state == state && !r.seed)
+        })
+        .await;
+        rel(d, tag).unwrap()
+    }
+
+    /// Publish, with `rev`, until it has ended.
+    async fn publish_now(d: &Daemon, tag: &str, rev: u64) -> Release {
+        d.publish_release(tag, rev).unwrap();
+        until(&format!("{tag}'s publish"), || {
+            rel(d, tag).is_some_and(|r| r.state != release::State::Publishing)
+        })
+        .await;
+        rel(d, tag).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tag_build_asks_and_is_published_only_on_the_owners_yes() {
+        use release::State;
+        let p = Project::new("release");
+        let d = start(&p, "daemon.tags = v*\n").await;
+        p.set("hold", true);
+        let first = git(&p.work, &["rev-parse", "HEAD"]);
+        std::fs::write(
+            p.work.join(".github/bana.conf"),
+            "install.name = example\nrelease.platforms = linux-arm64, linux-x64 macos-arm64\n",
+        )
+        .unwrap();
+        let a = p.commit("files", "packages");
+        p.push("main");
+        p.tag("v0.1.0");
+        poll(&d).await;
+        let id = tag_build(&d, "v0.1.0").expect("the tag is queued");
+        let r = rel(&d, "v0.1.0").expect("its release");
+        assert_eq!(
+            (r.state, r.build, r.sha.as_str()),
+            (State::Building, id, a.as_str())
+        );
+        assert!(p.dir.join("releases/v0.1.0.json").is_file());
+        let ask = d.summary().release.unwrap();
+        assert_eq!((ask.state.as_str(), ask.build), ("building", id));
+        // While it builds: the previous release (none: the first) and bana's notes.
+        let r = rel_in(&d, "v0.1.0", State::Building).await;
+        assert_eq!(
+            r.previous,
+            Some(notes::Previous {
+                tag: None,
+                how: "gh release list".into()
+            })
+        );
+        let n = r.notes.unwrap();
+        assert_eq!((n.rev, n.source.as_str()), (1, "git"));
+        assert_eq!(
+            n.text,
+            format!(
+                "## Other changes\n\n- packages ({})\n- the start ({})\n\n**Full changelog**: https://github.com/o/r/commits/v0.1.0\n",
+                &a[..7],
+                &first[..7]
+            )
+        );
+        p.set("hold", false);
+        assert_eq!(finished(&d, id).await.build.state, BuildState::Success);
+        let r = rel_in(&d, "v0.1.0", State::Asking).await;
+        assert_eq!((r.build, r.reason), (id, None));
+        let ask = d.summary().release.unwrap();
+        assert_eq!((ask.tag.as_str(), ask.state.as_str()), ("v0.1.0", "asking"));
+        assert_eq!(actlog::tray_view(&d.summary()).title, "🧱 v0.1.0?");
+        // Nothing was written on GitHub: one list, for the previous release.
+        assert_eq!(
+            p.read("gh-release.log"),
+            "gh release list -R o/r --exclude-drafts -L 100 --json tagName,isPrerelease\n"
+        );
+
+        let v = d.release("v0.1.0").unwrap();
+        let tar = "demo-nightly-abc123-linux-x64.tar.gz";
+        let names: Vec<&str> = v["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["SHA256SUMS", tar, "install.sh"], "{v}");
+        assert_eq!(v["not_built"], json!(["linux-arm64", "macos-arm64"]));
+        assert_eq!(
+            (&v["title"], &v["default_title"]),
+            (&json!("example v0.1.0"), &json!("example v0.1.0"))
+        );
+        assert_eq!(v["install"], json!(format!("bana install {id}")));
+        assert!(
+            v["tested"].as_str().unwrap().contains("| Standard |"),
+            "{v}"
+        );
+        assert_eq!(
+            v["changes"]["counts"],
+            json!({"commits": 2, "prs": 0, "other": 2})
+        );
+        assert_eq!(
+            (&v["build"]["id"], &v["notes"]["rev"]),
+            (&json!(id), &json!(1))
+        );
+
+        // The owner's edit over the rev they saw; then their yes, with that rev.
+        let stale = d.save_notes("v0.1.0", "x", None, 0, "you");
+        assert!(
+            matches!(stale, Err(release::Error::Refused(_))),
+            "{stale:?}"
+        );
+        let saved = d.save_notes(
+            "v0.1.0",
+            "Packages for everyone.\n",
+            Some("Example 0.1"),
+            1,
+            "you",
+        );
+        assert_eq!(saved.unwrap()["rev"], 2);
+        assert_eq!(d.release("v0.1.0").unwrap()["title"], "Example 0.1");
+        assert!(matches!(
+            d.publish_release("v0.1.0", 1),
+            Err(release::Error::Refused(_))
+        ));
+        assert!(matches!(
+            d.publish_release("v9", 2),
+            Err(release::Error::Missing(_))
+        ));
+        let r = publish_now(&d, "v0.1.0", 2).await;
+        assert_eq!((r.state, r.reason.as_deref()), (State::Published, None));
+        assert_eq!(
+            r.url.as_deref(),
+            Some("https://github.com/o/r/releases/tag/v0.1.0")
+        );
+        let store = p.flag("releases/v0.1.0");
+        let notes_file = p.dir.join("releases/v0.1.0.notes.md");
+        assert_eq!(
+            std::fs::read_to_string(store.join("argv")).unwrap(),
+            format!(
+                "release\ncreate\nv0.1.0\n-R\no/r\n--verify-tag\n--title\nExample 0.1\n--notes-file\n{}\n--latest\ninstall.sh\n{tar}\nSHA256SUMS\n",
+                notes_file.display()
+            )
+        );
+        // Every file SHA256SUMS lists, and SHA256SUMS.
+        let sums =
+            std::fs::read_to_string(p.dir.join(format!("builds/{id}/dist/SHA256SUMS"))).unwrap();
+        let mut listed: Vec<&str> = sums
+            .lines()
+            .filter_map(|l| l.split_whitespace().nth(1))
+            .collect();
+        listed.push("SHA256SUMS");
+        let assets = std::fs::read_to_string(store.join("assets")).unwrap();
+        assert_eq!(assets.lines().collect::<Vec<_>>(), listed);
+        let body = std::fs::read_to_string(store.join("notes")).unwrap();
+        assert!(
+            body.starts_with("Packages for everyone.\n\n## Tested\n\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("\n| Standard | Checks | Tests | Not run here |\n"),
+            "{body}"
+        );
+        assert!(
+            body.ends_with("\n\n## Install\n\n```sh\ngh release download v0.1.0 -R o/r -p install.sh -O - | sh\n```\n\nPlatforms: linux-x64. SHA256SUMS lists every file.\n"),
+            "{body}"
+        );
+        let log = p.read("gh-release.log");
+        assert!(
+            log.contains("gh release view v0.1.0 -R o/r --json isDraft,url,body,assets\n"),
+            "{log}"
+        );
+        assert!(log.contains("gh release list -R o/r --exclude-drafts --exclude-pre-releases -L 100 --json tagName\n"));
+        assert_eq!(
+            (
+                log.matches("release create").count(),
+                log.contains("release delete")
+            ),
+            (1, false)
+        );
+        assert!(std::fs::read_to_string(p.dir.join("releases/v0.1.0.log"))
+            .unwrap()
+            .contains("$ gh release create v0.1.0"));
+        // The ask is over; the release stays as it is.
+        assert_eq!(d.summary().release, None);
+        assert!(matches!(
+            d.publish_release("v0.1.0", 2),
+            Err(release::Error::Refused(_))
+        ));
+        assert!(matches!(
+            d.save_notes("v0.1.0", "y", None, 2, "claude"),
+            Err(release::Error::Refused(_))
+        ));
+        let again = d.rerun(id).unwrap();
+        finished(&d, again).await;
+        let r = rel(&d, "v0.1.0").unwrap();
+        assert_eq!(
+            (r.state, r.build),
+            (State::Published, id),
+            "a re-run leaves it"
+        );
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_publish_checks_before_it_writes_and_asks_again_when_it_fails() {
+        use release::State;
+        let p = Project::new("publish");
+        let mut s = p.settings("daemon.tags = v*\n");
+        s.publish_timeout = Duration::from_secs(1);
+        let d = start_with(s).await;
+        let a = p.commit("files", "packages");
+        p.tag("v0.1.0");
+        poll(&d).await;
+        let id = tag_build(&d, "v0.1.0").unwrap();
+        finished(&d, id).await;
+        rel_in(&d, "v0.1.0", State::Asking).await;
+        let lines = || p.read("gh-release.log").lines().count();
+        let creates = || p.read("gh-release.log").matches("release create").count();
+
+        // A file changed since the build: nothing reaches GitHub, and bana asks again.
+        let sh = p.dir.join(format!("builds/{id}/dist/install.sh"));
+        let original = std::fs::read(&sh).unwrap();
+        std::fs::write(&sh, "#!/bin/sh\necho other\n").unwrap();
+        let r = publish_now(&d, "v0.1.0", 1).await;
+        let why = format!("install.sh changed since build #{id}: nothing was published");
+        assert_eq!(
+            (r.state, r.reason.as_deref()),
+            (State::Failed, Some(why.as_str()))
+        );
+        assert_eq!(lines(), 1, "the list only");
+        assert_eq!(actlog::tray_view(&d.summary()).title, "🧱 v0.1.0?");
+        std::fs::write(&sh, &original).unwrap();
+
+        // The tag moved on origin since the build.
+        p.commit("pass", "later");
+        p.tag("v0.1.0");
+        let r = publish_now(&d, "v0.1.0", 1).await;
+        let why = format!("v0.1.0 moved since build #{id}: nothing was published");
+        assert_eq!(r.reason.as_deref(), Some(why.as_str()));
+        assert_eq!(lines(), 1);
+        git(&p.work, &["tag", "-f", "-a", "-m", "back", "v0.1.0", &a]);
+        git(
+            &p.work,
+            &["push", "-q", "--force", "origin", "refs/tags/v0.1.0"],
+        );
+
+        // A draft that is not bana's (written on GitHub, release-drafter's)
+        // stays, and nothing is published.
+        std::fs::create_dir_all(p.flag("releases/v0.1.0")).unwrap();
+        p.set("releases/v0.1.0/draft", true);
+        std::fs::write(p.flag("releases/v0.1.0/notes"), "## Next\n\n- drafted\n").unwrap();
+        let r = publish_now(&d, "v0.1.0", 1).await;
+        assert_eq!(
+            r.reason.as_deref(),
+            Some("a draft v0.1.0 is on GitHub (not bana's): publish or delete it there; nothing was published")
+        );
+        assert!(p.flag("releases/v0.1.0/draft").exists());
+        assert!(!p.read("gh-release.log").contains("release delete"));
+        std::fs::remove_dir_all(p.flag("releases/v0.1.0")).unwrap();
+
+        // A create that fails: gh's words, and bana asks again.
+        std::fs::write(p.flag("gh-fail-at"), "create").unwrap();
+        let r = publish_now(&d, "v0.1.0", 1).await;
+        assert_eq!(r.state, State::Failed);
+        assert!(
+            r.reason
+                .as_deref()
+                .unwrap()
+                .ends_with("\ngh auth refresh -h github.com -s workflow"),
+            "{r:?}"
+        );
+        assert_eq!(d.summary().release.map(|r| r.state), Some("failed".into()));
+
+        // One publish at a time; a create that takes too long is stopped.
+        p.set("gh-fail-at", false);
+        std::fs::write(p.flag("gh-slow"), "3").unwrap();
+        d.publish_release("v0.1.0", 1).unwrap();
+        assert_eq!(actlog::tray_view(&d.summary()).title, "🧱 publishing");
+        let second = d.publish_release("v0.1.0", 1);
+        assert!(
+            matches!(&second, Err(release::Error::Refused(m)) if m.contains("one publish at a time")),
+            "{second:?}"
+        );
+        until("the timeout", || {
+            rel(&d, "v0.1.0").is_some_and(|r| r.state == State::Failed)
+        })
+        .await;
+        assert_eq!(
+            rel(&d, "v0.1.0").unwrap().reason.as_deref(),
+            Some("gh release create took longer than 1s: it was stopped (Publish again deletes the draft it left)")
+        );
+        p.set("gh-slow", false);
+        // The killed gh left its draft, as gh would; Publish again deletes it,
+        // never with the tag (here, then a create that fails).
+        assert!(p.flag("releases/v0.1.0/draft").exists());
+        std::fs::write(p.flag("gh-fail-at"), "create").unwrap();
+        let r = publish_now(&d, "v0.1.0", 1).await;
+        assert_eq!(r.state, State::Failed);
+        let log = p.read("gh-release.log");
+        assert!(
+            log.contains("gh release delete v0.1.0 -R o/r --yes\n"),
+            "{log}"
+        );
+        assert!(!log.contains("cleanup-tag") && !p.flag("releases/v0.1.0").exists());
+        p.set("gh-fail-at", false);
+
+        // On GitHub already with other files: refused; with these names but
+        // other bytes (or no digests), too. With these files: it is this one,
+        // published by a run that was never recorded; no create.
+        std::fs::create_dir_all(p.flag("releases/v0.1.0")).unwrap();
+        std::fs::write(p.flag("releases/v0.1.0/assets"), "other.tar.gz\n").unwrap();
+        let r = publish_now(&d, "v0.1.0", 1).await;
+        let url = "https://github.com/o/r/releases/tag/v0.1.0";
+        let why = format!("a release v0.1.0 is on GitHub already, with other files: {url}");
+        assert_eq!(r.reason.as_deref(), Some(why.as_str()));
+        let n = creates();
+        let tar = "demo-nightly-abc123-linux-x64.tar.gz";
+        std::fs::write(
+            p.flag("releases/v0.1.0/assets"),
+            format!("SHA256SUMS\n{tar}\ninstall.sh\n"),
+        )
+        .unwrap();
+        let r = publish_now(&d, "v0.1.0", 1).await;
+        assert_eq!(r.reason.as_deref(), Some(why.as_str()), "no digests");
+        let dist = p.dir.join(format!("builds/{id}/dist"));
+        let digest = |name: &str| {
+            let h = crate::artifacts::sha256(&dist.join(name)).unwrap();
+            format!("{name} sha256:{h}\n")
+        };
+        let other = format!("{tar} sha256:{}\n", "0".repeat(64));
+        let right = [digest("SHA256SUMS"), digest(tar), digest("install.sh")];
+        std::fs::write(
+            p.flag("releases/v0.1.0/digests"),
+            format!("{}{}{other}", right[0], right[2]),
+        )
+        .unwrap();
+        let r = publish_now(&d, "v0.1.0", 1).await;
+        assert_eq!(r.reason.as_deref(), Some(why.as_str()), "other bytes");
+        std::fs::write(p.flag("releases/v0.1.0/digests"), right.concat()).unwrap();
+        let r = publish_now(&d, "v0.1.0", 1).await;
+        assert_eq!((r.state, r.url.as_deref()), (State::Published, Some(url)));
+        assert_eq!(creates(), n, "no create");
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn latest_goes_to_the_newest_final_and_blocked_releases_say_why() {
+        use release::State;
+        let p = Project::new("latest");
+        let d = start(&p, "daemon.tags = v*\n").await;
+        // v0.2.0 is on GitHub (published elsewhere): v0.1.1 is a hotfix below it.
+        std::fs::create_dir_all(p.flag("releases/v0.2.0")).unwrap();
+        p.commit("files", "packages");
+        p.tag("v0.1.1");
+        poll(&d).await;
+        let id = tag_build(&d, "v0.1.1").unwrap();
+        finished(&d, id).await;
+        rel_in(&d, "v0.1.1", State::Asking).await;
+        // An empty draft someone made on GitHub stays: no body is bana's.
+        std::fs::create_dir_all(p.flag("releases/v0.1.1")).unwrap();
+        p.set("releases/v0.1.1/draft", true);
+        let r = publish_now(&d, "v0.1.1", 1).await;
+        assert_eq!(r.state, State::Failed, "{r:?}");
+        assert!(p.flag("releases/v0.1.1/draft").exists());
+        std::fs::remove_dir_all(p.flag("releases/v0.1.1")).unwrap();
+        let r = publish_now(&d, "v0.1.1", 1).await;
+        assert_eq!(r.state, State::Published, "{r:?}");
+        assert!(!p.read("gh-release.log").contains("release delete"));
+        let argv = std::fs::read_to_string(p.flag("releases/v0.1.1/argv")).unwrap();
+        assert!(
+            argv.contains(&format!("\n--title\n{} v0.1.1\n", p.prefix)),
+            "{argv}"
+        );
+        assert!(
+            argv.contains("\n--latest=false\n") && !argv.contains("\n--latest\n"),
+            "{argv}"
+        );
+
+        // A prerelease of the same commit: --prerelease, no latest; its notes
+        // start from v0.1.1, published and an ancestor.
+        p.tag("v0.3.0-rc1");
+        poll(&d).await;
+        let id = tag_build(&d, "v0.3.0-rc1").unwrap();
+        finished(&d, id).await;
+        let r = rel_in(&d, "v0.3.0-rc1", State::Asking).await;
+        assert_eq!(r.previous.unwrap().tag.as_deref(), Some("v0.1.1"));
+        assert_eq!(
+            r.notes.unwrap().text,
+            "**Full changelog**: https://github.com/o/r/compare/v0.1.1...v0.3.0-rc1\n"
+        );
+        publish_now(&d, "v0.3.0-rc1", 1).await;
+        let argv = std::fs::read_to_string(p.flag("releases/v0.3.0-rc1/argv")).unwrap();
+        assert!(
+            argv.contains("\n--prerelease\n") && !argv.contains("--latest"),
+            "{argv}"
+        );
+        assert!(p.flag("releases/v0.3.0-rc1/prerelease").exists());
+
+        // A green build with no files, and a failed one: blocked, and why.
+        p.commit("pass", "no files");
+        p.tag("v0.4.0");
+        poll(&d).await;
+        let id = tag_build(&d, "v0.4.0").unwrap();
+        finished(&d, id).await;
+        let r = rel_in(&d, "v0.4.0", State::Blocked).await;
+        assert_eq!(
+            r.reason.as_deref(),
+            Some("no files: the workflow uploads no v4 artifacts")
+        );
+        assert_eq!(d.summary().release.map(|r| r.state), Some("blocked".into()));
+        assert_eq!(
+            actlog::tray_view(&d.summary()).title,
+            actlog::BRICK,
+            "bana does not ask"
+        );
+        p.commit("fail", "broken");
+        p.tag("v0.5.0");
+        poll(&d).await;
+        let id = tag_build(&d, "v0.5.0").unwrap();
+        finished(&d, id).await;
+        let r = rel_in(&d, "v0.5.0", State::Blocked).await;
+        assert!(r
+            .reason
+            .unwrap()
+            .starts_with(&format!("build #{id} failed at ")));
+        // A re-run takes over.
+        let again = d.rerun(id).unwrap();
+        assert_eq!(
+            rel(&d, "v0.5.0").map(|r| (r.state, r.build)),
+            Some((State::Building, again))
+        );
+        finished(&d, again).await;
+        let r = rel_in(&d, "v0.5.0", State::Blocked).await;
+        assert!(r
+            .reason
+            .unwrap()
+            .starts_with(&format!("build #{again} failed")));
+        // A queued build taken off the queue says so.
+        p.set("hold", true);
+        let held = d.rerun(id).unwrap();
+        let queued = d.rerun(id).unwrap();
+        until("the held build", || {
+            d.0.lock().running.as_ref().is_some_and(|r| r.id == held)
+        })
+        .await;
+        d.cancel(queued, "cancelled from the page").unwrap();
+        let why = format!("build #{queued} was taken off the queue");
+        assert_eq!(
+            rel(&d, "v0.5.0").unwrap().reason.as_deref(),
+            Some(why.as_str())
+        );
+        p.set("hold", false);
+        finished(&d, held).await;
+        let lines = p.read("gh-release.log");
+        assert_eq!(lines.matches("release create").count(), 2, "{lines}");
+
+        // While gh fails, local tags stand in for the previous release: v0.5.0
+        // was never published. A read asks gh again, and gives v0.1.1.
+        std::fs::write(p.flag("gh-fail-at"), "list").unwrap();
+        p.commit("files", "more packages");
+        p.tag("v0.6.0");
+        poll(&d).await;
+        let id = tag_build(&d, "v0.6.0").unwrap();
+        finished(&d, id).await;
+        let r = rel_in(&d, "v0.6.0", State::Asking).await;
+        let prev = r.previous.unwrap();
+        assert!(
+            prev.tag.as_deref() == Some("v0.5.0") && prev.how.starts_with("tags (gh failed"),
+            "{prev:?}"
+        );
+        p.set("gh-fail-at", false);
+        d.release("v0.6.0").unwrap();
+        until("gh's previous release", || {
+            rel(&d, "v0.6.0").is_some_and(|r| {
+                !r.seed
+                    && r.previous
+                        .is_some_and(|p| p.tag.as_deref() == Some("v0.1.1"))
+            })
+        })
+        .await;
+        assert_eq!(rel(&d, "v0.6.0").unwrap().rev(), 2, "git's notes again");
+        // v0.5.0 is published elsewhere before the owner's yes: Publish stops,
+        // and the notes start from it.
+        std::fs::create_dir_all(p.flag("releases/v0.5.0")).unwrap();
+        let r = publish_now(&d, "v0.6.0", 2).await;
+        assert_eq!(
+            (r.state, r.reason.as_deref()),
+            (State::Failed, Some("the previous release is now v0.5.0 (the notes started from v0.1.1): bana wrote them again from it, read them, then Publish again; nothing was published"))
+        );
+        assert!(r.notes.unwrap().text.contains("/compare/v0.5.0...v0.6.0"));
+        assert!(!p.read("gh-release.log").contains("create v0.6.0"));
+        let r = publish_now(&d, "v0.6.0", 3).await;
+        assert_eq!(r.state, State::Published, "{r:?}");
+
+        // A publish the daemon did not see end fails at the next start.
+        d.shutdown().await;
+        let path = p.dir.join("releases/v0.4.0.json");
+        let mut r: Release = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        r.state = State::Publishing;
+        write_json(&path, &r).unwrap();
+        let d = start(&p, "daemon.tags = v*\n").await;
+        let r = rel(&d, "v0.4.0").unwrap();
+        assert_eq!(
+            (r.state, r.reason.as_deref()),
+            (State::Failed, Some(release::INTERRUPTED))
+        );
+        d.shutdown().await;
+        p.remove();
     }
 }

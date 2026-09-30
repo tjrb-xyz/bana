@@ -3,9 +3,12 @@
 //! from [`actlog::tray_view`], tested on Linux; this file only shows them.
 //!
 //! - left click: opens the page on the running build (else the latest);
-//! - right click: the menu (the status, the last result, Fix #N with Claude…
-//!   while the last build failed, Open bana, Cancel build, Pause new builds,
-//!   Quit bana).
+//! - right click: the menu (the status, the last result, Publish vX… while
+//!   bana asks to publish a release, Fix #N with Claude… while the last build
+//!   failed, Open bana, Cancel build, Pause new builds, Quit bana).
+//!
+//! Publish vX… opens the page on the release's card, where the notes are
+//! read first: nothing is published from the menu.
 //!
 //! Fix #N with Claude… has the daemon make the fix (as the page's button
 //! does), then opens Claude Code's claude-cli:// link, whose handler opens a
@@ -30,7 +33,9 @@ use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuIt
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 const TICK: Duration = Duration::from_secs(60);
-/// Where Fix #N with Claude… goes in the menu: after the last result.
+/// Where Publish vX… goes in the menu: after the last result.
+const RELEASE_AT: usize = 2;
+/// Where Fix #N with Claude… goes: after the last result, and Publish vX….
 const FIX_AT: usize = 2;
 
 pub enum Wake {
@@ -74,10 +79,13 @@ impl Tray {
 
 struct Items {
     /// The menu itself (it shares its items with the status item's), where
-    /// the fix item comes and goes.
+    /// the release and fix items come and go.
     menu: Menu,
     status: MenuItem,
     last: MenuItem,
+    release: MenuItem,
+    /// The release item is in the menu now.
+    release_shown: Cell<bool>,
     fix: MenuItem,
     /// The fix item is in the menu now.
     fix_shown: Cell<bool>,
@@ -98,6 +106,8 @@ struct Shown {
     open: Option<u64>,
     /// The build Fix with Claude… is for.
     fix: Option<u64>,
+    /// The release Publish vX… opens.
+    release: Option<String>,
 }
 
 fn menu() -> (Menu, Items) {
@@ -122,6 +132,8 @@ fn menu() -> (Menu, Items) {
         menu: menu.clone(),
         status,
         last,
+        release: MenuItem::new("Publish…", true, None),
+        release_shown: Cell::new(false),
         fix: MenuItem::new("Fix with Claude…", true, None),
         fix_shown: Cell::new(false),
         open,
@@ -141,16 +153,32 @@ fn show(tray: &TrayIcon, it: &Items, s: &mut Shown) {
     s.last = summary.last.as_ref().map(|b| b.id);
     s.open = v.open_build;
     s.fix = v.fix_build;
+    s.release = v.release_tag.clone();
     tray.set_title(Some(&v.title));
     let _ = tray.set_tooltip(Some(&v.tooltip));
     it.status.set_text(&v.status_line);
     it.last
         .set_text(v.last_line.as_deref().unwrap_or("Last: none yet"));
     it.last.set_enabled(v.last_line.is_some());
+    match &v.release_line {
+        Some(line) => {
+            it.release.set_text(line);
+            it.release.set_enabled(v.release_enabled);
+            if !it.release_shown.get() && it.menu.insert(&it.release, RELEASE_AT).is_ok() {
+                it.release_shown.set(true);
+            }
+        }
+        None => {
+            if it.release_shown.get() && it.menu.remove(&it.release).is_ok() {
+                it.release_shown.set(false);
+            }
+        }
+    }
     match &v.fix_line {
         Some(line) => {
             it.fix.set_text(line);
-            if !it.fix_shown.get() && it.menu.insert(&it.fix, FIX_AT).is_ok() {
+            let at = FIX_AT + usize::from(it.release_shown.get());
+            if !it.fix_shown.get() && it.menu.insert(&it.fix, at).is_ok() {
                 it.fix_shown.set(true);
             }
         }
@@ -180,6 +208,11 @@ fn open(url: &str, id: Option<u64>) {
         }
         Err(e) => eprintln!("bana-manager: open: {e}"),
     }
+}
+
+/// Publish `tag`…: the page, on the release's card (a tag is `[A-Za-z0-9._-]`).
+fn open_release(url: &str, tag: &str) {
+    open(&format!("{url}&release={tag}"), None);
 }
 
 /// Fix #`id` with Claude…: the daemon makes the fix (git may take a while, so
@@ -271,6 +304,7 @@ pub fn run(quit: Arc<Notify>, start: impl FnOnce(Tray)) -> ! {
                     last: None,
                     open: None,
                     fix: None,
+                    release: None,
                 });
                 true
             }
@@ -289,7 +323,14 @@ pub fn run(quit: Arc<Notify>, start: impl FnOnce(Tray)) -> ! {
                     if let Some(t) = &tray {
                         t.set_title(Some(format!("{BRICK} stopping")));
                     }
-                    for i in [&it.last, &it.fix, &it.open, &it.cancel, &it.quit] {
+                    for i in [
+                        &it.last,
+                        &it.release,
+                        &it.fix,
+                        &it.open,
+                        &it.cancel,
+                        &it.quit,
+                    ] {
                         i.set_enabled(false);
                     }
                     it.pause.set_enabled(false);
@@ -300,6 +341,10 @@ pub fn run(quit: Arc<Notify>, start: impl FnOnce(Tray)) -> ! {
                         open(&s.url, s.open);
                     } else if e.id == it.last.id() {
                         open(&s.url, s.last);
+                    } else if e.id == it.release.id() {
+                        if let Some(tag) = &s.release {
+                            open_release(&s.url, tag);
+                        }
                     } else if e.id == it.fix.id() {
                         if let Some(id) = s.fix {
                             fix(s, id);

@@ -73,7 +73,9 @@ new worktree and, if the server is missing there or does not connect, passes it 
 | `ci_report` | no | the CI report of the fix's build (or of a build named): checks and tests per standard, as Markdown and as data |
 | `commit_fix` | yes | commits the green round's tree on the fix's branch |
 
-A tool called with arguments that do not fit says why as its result, so Claude can call it again.
+A tool called with arguments that do not fit says why as its result, so Claude can call it again. The same server has
+the release tools, for a release's notes ([DAEMON.md](DAEMON.md#notes-with-claude)); a fix's settings do not
+allow them.
 
 Claude Code runs as you, with your own settings and permission mode, plus what the settings file adds: those
 five tools allowed, rules that deny `git push` (`git -C … push`, `git -c …` and `git config … alias` too) and

@@ -862,6 +862,21 @@ pub struct Summary {
     /// The newest build that failed, unless one since passed (builds that
     /// ended in error are passed over): the menu bar's "Fix #N with Claude…".
     pub failed: Option<u64>,
+    /// The release bana asks about, or publishes; else one that builds, or
+    /// was blocked, this week ([`crate::release::shown`]).
+    pub release: Option<ReleaseAsk>,
+}
+
+/// A release, as the menu bar and `bana daemon status` show it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ReleaseAsk {
+    pub tag: String,
+    /// building, blocked, asking, publishing or failed.
+    pub state: String,
+    pub build: u64,
+    /// Why it is blocked, or why the publish failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// The daemon's view of GitHub and of this machine.
@@ -962,6 +977,11 @@ pub struct TrayView {
     /// `Fix #41 with Claude…`, and its build, while the last build failed.
     pub fix_line: Option<String>,
     pub fix_build: Option<u64>,
+    /// `Publish v0.1.0…` while bana asks, and its tag; `Publishing v0.1.0…`
+    /// (not enabled) while it publishes. It opens the page on the release.
+    pub release_line: Option<String>,
+    pub release_tag: Option<String>,
+    pub release_enabled: bool,
 }
 
 pub fn tray_view(s: &Summary) -> TrayView {
@@ -980,12 +1000,20 @@ pub fn tray_view(s: &Summary) -> TrayView {
         .last
         .as_ref()
         .is_some_and(|b| matches!(b.state, BuildState::Failure | BuildState::Error));
+    let rel = s
+        .release
+        .as_ref()
+        .filter(|r| matches!(r.state.as_str(), "asking" | "failed" | "publishing"));
+    let publishing = rel.filter(|r| r.state == "publishing");
+    let asking = rel.filter(|r| r.state != "publishing");
     let doing = match &s.running {
         Some(b) if n > 0 => format!("{} +{n}", minutes(b.elapsed)),
         Some(b) => minutes(b.elapsed),
         None if w.paused => "paused".into(),
         None if n > 0 && !w.docker => "no Docker".into(),
         None if n > 0 && w.lock_holder.is_some() => "busy".into(),
+        None if publishing.is_some() => "publishing".into(),
+        None if asking.is_some() => format!("{}?", asking.map_or("", |r| &r.tag)),
         None if w.post_error.is_some() => "!gh".into(),
         None if last_failed => "!".into(),
         None => String::new(),
@@ -1039,6 +1067,15 @@ pub fn tray_view(s: &Summary) -> TrayView {
             }
         }
     };
+    match (publishing, asking) {
+        (Some(r), _) => tip.push(format!("publishing {} {}", s.prefix, r.tag)),
+        (_, Some(r)) if r.state == "failed" => tip.push(format!(
+            "publishing {} {} failed: publish it again?",
+            s.prefix, r.tag
+        )),
+        (_, Some(r)) => tip.push(format!("{} {} passed: publish it?", s.prefix, r.tag)),
+        _ => {}
+    }
     if let Some(e) = &w.post_error {
         tip.push(format!("statuses not posted: {e}"));
     }
@@ -1063,6 +1100,12 @@ pub fn tray_view(s: &Summary) -> TrayView {
         open_build: s.running.as_ref().or(s.last.as_ref()).map(|b| b.id),
         fix_line: s.failed.map(|id| format!("Fix #{id} with Claude…")),
         fix_build: s.failed,
+        release_line: rel.map(|r| match r.state.as_str() {
+            "publishing" => format!("Publishing {}…", r.tag),
+            _ => format!("Publish {}…", r.tag),
+        }),
+        release_tag: rel.map(|r| r.tag.clone()),
+        release_enabled: asking.is_some(),
     }
 }
 
@@ -1982,6 +2025,15 @@ mod tests {
         }
     }
 
+    fn ask(state: &str) -> Option<ReleaseAsk> {
+        Some(ReleaseAsk {
+            tag: "v0.1.0".into(),
+            state: state.into(),
+            build: 9,
+            reason: None,
+        })
+    }
+
     fn queued(n: usize) -> Vec<QueuedView> {
         (0..n)
             .map(|i| QueuedView {
@@ -2081,6 +2133,48 @@ mod tests {
                 },
                 "🧱 0m",
             ),
+            ("bana asks", |s| s.release = ask("asking"), "🧱 v0.1.0?"),
+            (
+                "bana asks, and gh is signed out",
+                |s| {
+                    s.release = ask("asking");
+                    s.watcher.post_error = Some("gh is signed out".into());
+                },
+                "🧱 v0.1.0?",
+            ),
+            (
+                "bana asks after a failure",
+                |s| {
+                    s.release = ask("asking");
+                    (s.last, s.failed) = (Some(build(3, BuildState::Failure, Some(0))), Some(3));
+                },
+                "🧱 v0.1.0?",
+            ),
+            (
+                "a build runs while bana asks",
+                |s| {
+                    (s.running, s.release) =
+                        (Some(build(4, BuildState::Running, None)), ask("asking"))
+                },
+                "🧱 0m",
+            ),
+            (
+                "paused while bana asks",
+                |s| (s.watcher.paused, s.release) = (true, ask("asking")),
+                "🧱 paused",
+            ),
+            (
+                "publishing",
+                |s| s.release = ask("publishing"),
+                "🧱 publishing",
+            ),
+            (
+                "a publish failed: bana asks again",
+                |s| s.release = ask("failed"),
+                "🧱 v0.1.0?",
+            ),
+            ("a release building", |s| s.release = ask("building"), "🧱"),
+            ("a release blocked", |s| s.release = ask("blocked"), "🧱"),
         ];
         for (name, tweak, title) in rows {
             let mut s = summary();
@@ -2092,6 +2186,19 @@ mod tests {
             // Fix with Claude: offered for the summary's newest failed build.
             let fix = s.failed.map(|id| (format!("Fix #{id} with Claude…"), id));
             assert_eq!(v.fix_line.zip(v.fix_build), fix, "{name}");
+            // Publish v0.1.0…: while bana asks; not enabled while it publishes.
+            let rel = s.release.as_ref().map(|r| r.state.as_str());
+            let line = match rel {
+                Some("asking" | "failed") => Some(("Publish v0.1.0…".to_string(), true)),
+                Some("publishing") => Some(("Publishing v0.1.0…".to_string(), false)),
+                _ => None,
+            };
+            assert_eq!(
+                v.release_line.map(|l| (l, v.release_enabled)),
+                line,
+                "{name}"
+            );
+            assert_eq!(v.release_tag.is_some(), line.is_some(), "{name}");
         }
 
         // The words, building and idle.
@@ -2141,6 +2248,23 @@ mod tests {
             Some("Last: failed main 1a2b3c4 · 16 min ago")
         );
 
+        let mut s = summary();
+        s.release = ask("asking");
+        assert_eq!(
+            tray_view(&s).tooltip,
+            "bana: example idle · example v0.1.0 passed: publish it?"
+        );
+        s.release = ask("failed");
+        assert_eq!(
+            tray_view(&s).tooltip,
+            "bana: example idle · publishing example v0.1.0 failed: publish it again?"
+        );
+        s.release = ask("publishing");
+        assert_eq!(
+            tray_view(&s).tooltip,
+            "bana: example idle · publishing example v0.1.0"
+        );
+
         let v = tray_view(&summary());
         assert_eq!(
             (v.title.as_str(), v.last_line, v.open_build, v.fix_line),
@@ -2177,5 +2301,10 @@ mod tests {
         assert!(v["last"].is_null() && v["failed"].is_null());
         s.failed = Some(3);
         assert_eq!(serde_json::to_value(&s).unwrap()["failed"], 3);
+        s.release = ask("asking");
+        assert_eq!(
+            serde_json::to_value(&s).unwrap()["release"],
+            serde_json::json!({"tag": "v0.1.0", "state": "asking", "build": 9})
+        );
     }
 }

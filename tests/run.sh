@@ -219,6 +219,7 @@ bash "$bana" settings >"$T/out" 2>/dev/null
 check "settings: act.platform.*, built in and bana.conf's" has "$T/out" "act.platform.ubuntu-18.04 = skip no act image for 18.04"
 check "settings: with bana.conf's" has "$T/out" "act.platform.macos-14 = mac"
 check "settings: tart_name" has "$T/out" "tart_name = bana-tart"
+check "settings: release.platforms (none declared)" has "$T/out" "release.platforms = "
 # shellcheck disable=SC2016 # act's backquotes
 FAKE_ACT_OUT=$(printf '%s\n' '[ci/win   ] 🚧  Skipping unsupported platform -- Try running with `-P windows-11-arm=...`' \
   '[ci/mac] 🚧  Skipping unsupported platform -- Try running with `-P macos-14=...`' \
@@ -1160,6 +1161,8 @@ export FAKE_OS=Darwin FAKE_ARCH=arm64 FAKE_HOST=MBP
 bash "$bana" daemon install --port 8471 --no-open >"$T/out" 2>&1 || { cat "$T/out"; false; }
 check "daemon: the doctor reads act's version" has "$T/out" "act: act version 0.2.89"
 check "daemon: the doctor finds unzip and a sha256 tool, for a build's files" has "$T/out" "unzip and sha256: a green build's uploads are kept"
+check "daemon: the doctor asks gh for release create's flags" has "$FAKE_LOG" "gh release create --help"
+check "daemon: and finds --verify-tag and --latest" lacks "$T/out" "no --verify-tag or --latest"
 hook=$(git rev-parse --git-path hooks)/reference-transaction
 check "daemon: a push hook in this checkout" test -x "$hook"
 check "daemon: it pokes this daemon's port" has "$hook" "http://127.0.0.1:8471/ci/v1/daemon/poll"
@@ -1280,6 +1283,21 @@ check "daemon status: statuses not posted" has "$T/out" "statuses: gh is signed 
 check "daemon status: the running build" has "$T/out" "running: #12 main (quick, 3 min): running on mbp: linux"
 check "daemon status: the queue" has "$T/out" "queued: 2 (next: #13 feat/x)"
 check "daemon status: the last build" has "$T/out" "last: #11 main failure: failed on mbp: mac (test)"
+check "daemon status: no release line without one" lacks "$T/out" "release "
+cp "$FAKE_STATE/local.json" "$T/local.json"
+sed 's/"port":8471}/"port":8471,"release":{"tag":"v0.1.0","state":"asking","build":12}}/' "$T/local.json" >"$FAKE_STATE/local.json"
+bash "$bana" daemon status >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "daemon status: the release bana asks about" has "$T/out" "  release v0.1.0: waiting for your answer (bana daemon open)"
+sed 's/"port":8471}/"port":8471,"release":{"tag":"v0.1.0","state":"failed","build":12,"reason":"HTTP 404: Not Found\\ngh auth refresh -h github.com -s workflow"}}/' \
+  "$T/local.json" >"$FAKE_STATE/local.json"
+bash "$bana" daemon status >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "daemon status: a publish that failed, and gh's first line" has "$T/out" \
+  "  release v0.1.0: publishing failed, waiting for your answer (bana daemon open): HTTP 404: Not Found"
+check "daemon status: only its first line" lacks "$T/out" "auth refresh"
+sed 's/"port":8471}/"port":8471,"release":{"tag":"v0.2.0","state":"building","build":14}}/' "$T/local.json" >"$FAKE_STATE/local.json"
+bash "$bana" daemon status >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "daemon status: a release building" has "$T/out" "  release v0.2.0: building (#14)"
+cp "$T/local.json" "$FAKE_STATE/local.json"
 : >"$FAKE_LOG"
 bash "$bana" daemon poke >/dev/null
 check "daemon poke: asks it to fetch" has "$FAKE_LOG" "-X POST http://127.0.0.1:8471/ci/v1/daemon/poll"
@@ -1375,6 +1393,10 @@ FAKE_GH_SCOPES="'gist'" bash "$bana" daemon install >"$T/out" 2>&1 || true
 check "doctor: pool runners here" has "$T/out" "This machine has runners in acme/widget's pool (wid-box-linux-x64-1)"
 check "doctor: then no separate push warning" lacks "$T/out" "a push trigger"
 check "doctor: a token without the repo scope" has "$T/out" "lacks the repo scope"
+bash "$bana" daemon uninstall --purge >/dev/null
+FAKE_GH_OLD=1 bash "$bana" daemon install >"$T/out" 2>&1 || true
+check "doctor: a gh without release create --verify-tag and --latest" has "$T/out" \
+  "gh release create has no --verify-tag or --latest: releases cannot be published from bana until gh is newer"
 bash "$bana" daemon uninstall --purge >/dev/null
 FAKE_GH=0 bash "$bana" daemon install >"$T/out" 2>&1 || true
 check "doctor: gh signed out" has "$T/out" "gh auth login"

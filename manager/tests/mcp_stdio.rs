@@ -197,7 +197,11 @@ fn a_session_as_claude_code_opens_it() {
             "run_jobs",
             "fix_status",
             "commit_fix",
-            "ci_report"
+            "ci_report",
+            "release_context",
+            "pull_requests",
+            "github_notes",
+            "save_release_notes"
         ]
     );
     assert_eq!(by_id(&replies, 3)["result"], by_id(&replies, 2)["result"]);
@@ -206,13 +210,24 @@ fn a_session_as_claude_code_opens_it() {
         assert_eq!(t["outputSchema"]["type"], "object", "{t}");
         assert!(!t["description"].as_str().unwrap().is_empty());
         let a = &t["annotations"];
+        let name = t["name"].as_str().unwrap();
+        // Only the tools that read GitHub reach outside this machine.
+        let github = ["pull_requests", "github_notes"].contains(&name);
         assert_eq!(
             (&a["destructiveHint"], &a["openWorldHint"]),
-            (&json!(false), &json!(false)),
+            (&json!(false), &json!(github)),
             "{t}"
         );
-        let reader = ["fix_brief", "ci_log", "fix_status", "ci_report"]
-            .contains(&t["name"].as_str().unwrap());
+        let reader = [
+            "fix_brief",
+            "ci_log",
+            "fix_status",
+            "ci_report",
+            "release_context",
+            "pull_requests",
+            "github_notes",
+        ]
+        .contains(&name);
         assert_eq!(a["readOnlyHint"], reader, "{t}");
     }
     let hints = |name: &str| {
@@ -224,6 +239,7 @@ fn a_session_as_claude_code_opens_it() {
     };
     assert_eq!(hints("run_jobs"), (json!(false), json!(true)));
     assert_eq!(hints("commit_fix"), (json!(false), json!(false)));
+    assert_eq!(hints("save_release_notes"), (json!(false), json!(true)));
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -445,6 +461,82 @@ fn a_fixs_tools_answer_from_its_files_without_the_daemon() {
     }
     let why = tool_error(by_id(&replies, 5));
     assert!(why.contains("no round has run yet"), "{why}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_release_tools_ask_github_with_gh_and_bana_for_the_rest() {
+    let root = scratch("release");
+    let dir = root.join("home/wid");
+    std::fs::create_dir_all(dir.join("daemon")).unwrap();
+    std::fs::create_dir_all(root.join("prs")).unwrap();
+    std::fs::write(
+        root.join("prs/12.json"),
+        json!({"__typename": "PullRequest", "number": 12, "title": "Faster start",
+            "url": "https://github.com/o/r/pull/12", "author": {"login": "ada"},
+            "labels": {"nodes": []}, "mergedAt": "2026-09-01T10:00:00Z", "baseRefName": "main",
+            "body": "Starts in half the time.", "closingIssuesReferences": {"nodes": []}})
+        .to_string(),
+    )
+    .unwrap();
+    let gh = root.join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\nFAKE_LOG='{r}/gh.log' FAKE_PRS='{r}/prs' exec '{}/../tests/stand-ins/gh' \"$@\"\n",
+            env!("CARGO_MANIFEST_DIR"),
+            r = root.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Nothing listens on the settings' port.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .unwrap()
+        .port();
+    std::fs::write(
+        dir.join("daemon/settings"),
+        format!("port = {port}\nrepo = o/r\ngh = {}\n", gh.display()),
+    )
+    .unwrap();
+    let replies = session(
+        &dir,
+        &root,
+        &[
+            initialize(0, "2025-11-25"),
+            call(1, "pull_requests", json!({"numbers": [12, 13]})),
+            call(2, "release_context", json!({})),
+            call(3, "github_notes", json!({"tag": "v1.0.0"})),
+            call(
+                4,
+                "save_release_notes",
+                json!({"tag": "v1.0.0", "notes": "x", "rev": 1}),
+            ),
+            call(
+                5,
+                "save_release_notes",
+                json!({"tag": "v1.0.0", "notes": "x"}),
+            ),
+        ],
+    );
+    let prs = structured(by_id(&replies, 1));
+    assert_eq!(
+        (&prs["items"][0]["title"], &prs["missing"]),
+        (&json!("Faster start"), &json!([13])),
+        "{prs}"
+    );
+    let log = std::fs::read_to_string(root.join("gh.log")).unwrap();
+    assert!(log.starts_with("gh api graphql -f query="), "{log}");
+    for id in [2, 3, 4] {
+        let why = tool_error(by_id(&replies, id));
+        assert!(why.starts_with("the bana daemon is not running"), "{why}");
+    }
+    assert_eq!(
+        tool_error(by_id(&replies, 5)),
+        "save_release_notes: rev is required"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 

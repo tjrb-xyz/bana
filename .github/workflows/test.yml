@@ -5,6 +5,8 @@ name: test
 on:
   push:
   pull_request:
+  # By hand (Actions, test, Run workflow): release-selftest only.
+  workflow_dispatch:
 permissions:
   contents: read
 env:
@@ -14,6 +16,7 @@ env:
   ACT_SHA256_DARWIN_ARM64: 48ae218af96725f7635a66de2b87e1e346893b02add0f16b92f560296b2151fc
 jobs:
   scripts:
+    if: github.event_name != 'workflow_dispatch'
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -38,6 +41,7 @@ jobs:
         if: runner.os == 'macOS'
         run: SH=/bin/sh tests/install.sh && SH=/bin/sh tests/install-real.sh
   manager:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -52,6 +56,7 @@ jobs:
   # through the gh stand-in, a cancel from the API, kill -9 and a restart, and the fix
   # loop with the test as Claude Code (bana's MCP server over stdio).
   e2e:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -70,6 +75,7 @@ jobs:
   # the daemon end to end with host jobs only (no Docker on GitHub's Macs). One job,
   # so one build of the manager.
   macos-daemon:
+    if: github.event_name != 'workflow_dispatch'
     runs-on: macos-latest
     timeout-minutes: 25
     steps:
@@ -182,3 +188,50 @@ jobs:
           got=$(back)
           echo "read back: $got"
           test "$got" = "success none"
+
+  # What bana's publish relies on, against the real GitHub, which bana's tests cannot
+  # reach: a draft release found by its tag, an asset named with ~ and + read back with
+  # its name and digest, generate-notes with previous_tag_name, and deleting the draft
+  # leaves no tag. By hand only: it writes a draft on this repository, then deletes it.
+  release-selftest:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: bana-selftest-${{ github.run_id }}
+    steps:
+      - name: a draft release, read back, generate-notes, deleted
+        run: |
+          set -euo pipefail
+          R=$GITHUB_REPOSITORY
+          say() { echo "$*"; echo "- $*" >>"$GITHUB_STEP_SUMMARY"; }
+          gh --version | head -1
+          gh release create --help | grep -q -- --verify-tag
+          gh release create --help | grep -q -- '--latest'
+          gh release list -R "$R" --exclude-drafts -L 100 --json tagName,isPrerelease >/dev/null
+          asset='a_0.1~rc1+g1.deb'
+          printf 'bana self-test\n' >"$RUNNER_TEMP/$asset"
+          want=sha256:$(sha256sum "$RUNNER_TEMP/$asset" | cut -d' ' -f1)
+          trap 'gh release delete "$TAG" -R "$R" --yes >/dev/null 2>&1 || true' EXIT
+          (cd "$RUNNER_TEMP" && gh release create "$TAG" -R "$R" --draft --target "$GITHUB_SHA" \
+            --title "bana self-test" --notes "bana's self-test: deleted at once" "$asset")
+          view=$(gh release view "$TAG" -R "$R" --json isDraft,url,assets)
+          echo "$view"
+          test "$(jq -r .isDraft <<<"$view")" = true
+          say "gh release view finds a draft by its tag"
+          say "an asset uploaded as $asset reads back as $(jq -r '.assets[0].name' <<<"$view")"
+          got=$(jq -r '.assets[0].digest // "none"' <<<"$view")
+          test "$got" = "$want" || { say "its digest reads back as $got, not $want"; exit 1; }
+          say "its digest reads back as the file's sha256"
+          prev=$(gh api "repos/$R/tags" --jq '.[0].name // ""')
+          args=(-f "tag_name=$TAG" -f "target_commitish=$GITHUB_SHA")
+          [ -z "$prev" ] || args+=(-f "previous_tag_name=$prev")
+          notes=$(gh api -X POST "repos/$R/releases/generate-notes" "${args[@]}")
+          jq -e '.name and .body' <<<"$notes" >/dev/null
+          say "generate-notes answers (previous_tag_name: ${prev:-none}): $(jq -r '.body' <<<"$notes" | tail -1)"
+          gh release delete "$TAG" -R "$R" --yes
+          if gh api "repos/$R/git/ref/tags/$TAG" >/dev/null 2>&1; then say "deleting the draft left the tag $TAG"; exit 1; fi
+          say "deleting the draft leaves no tag"

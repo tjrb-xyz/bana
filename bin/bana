@@ -201,7 +201,7 @@ settings() {
     daemon.branches daemon.tags daemon.tier daemon.tag_tier daemon.poll daemon.timeout \
     daemon.supersede daemon.token fix.rounds fix.token fix.allow fix.turns fix.budget_usd \
     install.name install.bins install.hook install.hook_ps1 install.prefix install.bin install.config \
-    release.files tart_name; do
+    release.files release.platforms tart_name; do
     case $k in
     repo) v=$repo ;; prefix) v=$prefix ;; vm) v=$vm ;; vm_x64) v=$vm_x64 ;; linux_user) v=$linux_user ;;
     hook.*) v=$(conf_path "$k") ;;

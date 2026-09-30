@@ -2128,7 +2128,10 @@ fn git_command(git: &str, path: Option<&str>, cwd: &Path, hooks: bool) -> Comman
 }
 
 /// A child's output, or none when it took longer than `secs` (it is killed).
-fn wait(child: std::process::Child, secs: u64) -> Option<std::io::Result<std::process::Output>> {
+pub(crate) fn wait(
+    child: std::process::Child,
+    secs: u64,
+) -> Option<std::io::Result<std::process::Output>> {
     let pid = child.id();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {

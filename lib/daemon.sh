@@ -167,6 +167,11 @@ d_doctor() { # ROOT
     warn "  gh's token lacks the repo scope, which posting statuses needs: gh auth refresh -s repo"
   fi
   echo "  GitHub CLI: signed in"
+  # Publish runs gh release create --verify-tag (never a new tag) with --latest or --latest=false.
+  v=$(gh release create --help 2>/dev/null || true)
+  if ! grep -q -- --verify-tag <<<"$v" || ! grep -q -- --latest <<<"$v"; then
+    warn "  gh release create has no --verify-tag or --latest: releases cannot be published from bana until gh is newer (brew upgrade gh)"
+  fi
   d_git "$gh" ls-remote --quiet "https://github.com/$repo.git" HEAD >/dev/null ||
     die "git cannot read https://github.com/$repo.git through the GitHub CLI: gh auth status, and check the repo setting"
   echo "  git: reads $repo through gh"
@@ -668,6 +673,19 @@ daemon_status() {
   [[ ${v:-0} == 0 ]] || echo "  queued: $v (next: #$(d_val "$flat" queue.0.id) $(d_val "$flat" queue.0.ref))"
   v=$(d_val "$flat" last.id)
   [[ -z $v ]] || echo "  last: #$v $(d_val "$flat" last.ref) $(d_val "$flat" last.state): $(d_val "$flat" last.description)"
+  # The release bana asks about (Linux has no menu bar: this line is the ask there).
+  v=$(d_val "$flat" release.tag)
+  if [[ -n $v && $v != null ]]; then
+    case $(d_val "$flat" release.state) in
+    asking) echo "  release $v: waiting for your answer (bana daemon open)" ;;
+    failed)
+      h=$(d_val "$flat" release.reason)
+      echo "  release $v: publishing failed, waiting for your answer (bana daemon open): ${h%%\\n*}" ;;
+    publishing) echo "  release $v: publishing" ;;
+    building) echo "  release $v: building (#$(d_val "$flat" release.build))" ;;
+    blocked) echo "  release $v: not asked: $(d_val "$flat" release.reason)" ;;
+    esac
+  fi
 }
 
 daemon_main() {
