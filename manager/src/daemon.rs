@@ -5477,7 +5477,8 @@ exec git \"$@\"
                 "installer\ndist\n--label\nquick-{}\n{}\n{}\n",
                 &a[..10],
                 src.display(),
-                dir.display()
+                // $PWD, which bash reads with getcwd: resolved (on a Mac /var is /private/var).
+                std::fs::canonicalize(&dir).unwrap().display()
             )
         );
         // The zips it took are gone; the upload-artifact@v3 one is not a zip.

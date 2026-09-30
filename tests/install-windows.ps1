@@ -75,12 +75,14 @@ try {
   # irm | iex under a Restricted policy: no script file may run, the hook runs as a script block.
   Clear-Content -LiteralPath $env:FAKE_LOG
   $hook = Join-Path $prefix 'v1.1.0\install-hook.ps1'
-  & $shell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Restricted -File $hook post-install *> $out
+  # Continue: Windows PowerShell 5.1 turns a native command's stderr into a terminating error
+  # under Stop, and this one is meant to fail.
+  & { $ErrorActionPreference = 'Continue'; & $shell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Restricted -File $hook post-install *> $out }
   Check "Restricted: a script file does not run" { $LASTEXITCODE -ne 0 -and -not (Get-Content -LiteralPath $env:FAKE_LOG) }
   $env:INSTALL_URL = "http://127.0.0.1:$port/v1.2.0"
   $env:INSTALL_YES = '1'
   $ps1 = Join-Path $Fixtures 'v1.2.0\install.ps1'
-  & $shell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Restricted -Command "if ((Get-ExecutionPolicy) -ne 'Restricted') { exit 3 }; Get-Content -Raw -LiteralPath '$ps1' | Invoke-Expression" *> $out
+  & { $ErrorActionPreference = 'Continue'; & $shell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Restricted -Command "if ((Get-ExecutionPolicy) -ne 'Restricted') { exit 3 }; Get-Content -Raw -LiteralPath '$ps1' | Invoke-Expression" *> $out }
   Remove-Item Env:INSTALL_URL, Env:INSTALL_YES
   Check "Restricted: irm | iex installs v1.2.0" { (Get-Target $current) -eq (Join-Path $prefix 'v1.2.0') }
   Check "... and the hook ran, as a script block" { ((Get-Content -LiteralPath $env:FAKE_LOG) -join '|') -like 'ps1-hook pre-install v1.2.0 prev=v1.1.0 *|ps1-hook post-install v1.2.0 prev=v1.1.0 *' }
