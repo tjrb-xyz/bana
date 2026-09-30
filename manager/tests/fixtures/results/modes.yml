@@ -1,0 +1,26 @@
+name: ci
+on: workflow_dispatch
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - name: cargo test --workspace
+        run: |
+          printf 'test a::one ... ok\ntest a::two ... FAILED\n\nfailures:\n\n---- a::two stdout ----\n\n'
+          printf "thread 'a::two' (7) panicked at src/a.rs:3:5:\naccepted\n"
+          printf 'note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n'
+          printf 'test result: \033[31mFAILED\033[m\017. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n\n'
+          printf 'error: test failed, to rerun pass `--lib`\n'
+          exit 101
+  web:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [a, b]
+    steps:
+      - name: lint
+        run: |
+          echo "::error file=a.ts,line=2::boom"
+          echo "## sum" >> "$GITHUB_STEP_SUMMARY"
+          echo "| a | b |" >> "$GITHUB_STEP_SUMMARY"
+          echo "done"

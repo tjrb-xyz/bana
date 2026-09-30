@@ -1,0 +1,37 @@
+   Compiling demo v0.1.0 (/tmp/claude-0/-home-user-bana/a098c434-4782-518b-8100-69c3d243761b/scratchpad/research-report/samples/cargo/demo)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.30s
+     Running unittests src/lib.rs (target/debug/deps/demo-7f33b6e559525f28)
+
+running 3 tests
+test tests::slow ... ignored
+test tests::adds ... ok
+test tests::accepted ... FAILED
+
+failures:
+
+---- tests::accepted stdout ----
+
+thread 'tests::accepted' (4716) panicked at src/lib.rs:12:45:
+accepted
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/panicking.rs:80:14
+   2: demo::tests::accepted
+             at ./src/lib.rs:12:45
+   3: demo::tests::accepted::{{closure}}
+             at ./src/lib.rs:12:26
+   4: core::ops::function::FnOnce::call_once
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/ops/function.rs:250:5
+   5: core::ops::function::FnOnce::call_once
+             at /rustc/e408947bfd200af42db322daf0fadfe7e26d3bd1/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    tests::accepted
+
+test result: FAILED. 1 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+error: test failed, to rerun pass `--lib`

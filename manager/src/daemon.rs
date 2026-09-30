@@ -28,7 +28,9 @@
 //!   `secrets` (0600) while act runs;
 //! - `act-cache/`: act's action cache;
 //! - `daemon.lock`: locked (flock) while a daemon runs here;
-//! - `vars`: optional, the owner's `KEY=value` lines for `vars.*`.
+//! - `vars`: optional, the owner's `KEY=value` lines for `vars.*`;
+//! - `fix/`: the fixes Fix with Claude made in the owner's checkout
+//!   ([`crate::fix`]): `<sha7>/`, the worktree, and `<sha7>.d/`.
 //!
 //! JSON goes to a temporary file, is synced, then renamed over the old one.
 //!
@@ -56,10 +58,14 @@
 //!   home              bana's home, where act.lock is (${BANA_HOME:-$HOME/.bana})
 //!   git gh docker caffeinate bash   the programs (default: found on path)
 //!   script            the bin/bana builds run (daemon/bin/bana)
+//!   checkout          the owner's checkout (absolute), where Fix with Claude
+//!                     makes its worktrees and branches (none: it cannot)
+//!   bana_commit       the bana commit the snapshot is of, for a fix's brief
 
 use crate::actlog::{
     self, Build, BuildState, BuildView, Event, Report, Status, StatusState, Summary, Watcher,
 };
+use crate::fix;
 use crate::sweep;
 use crate::watch::{
     self, Action, Built, Heads, Project, Pushed, Request, Rules, Supersede, Trigger,
@@ -119,6 +125,8 @@ const KEYS: &[&str] = &[
     "caffeinate",
     "bash",
     "script",
+    "checkout",
+    "bana_commit",
 ];
 
 /// The jobs' GITHUB_TOKEN (`daemon.token`).
@@ -159,6 +167,10 @@ pub struct Settings {
     pub caffeinate: String,
     pub bash: String,
     pub script: PathBuf,
+    /// The owner's checkout: fixes' worktrees and branches are made in it.
+    pub checkout: Option<PathBuf>,
+    /// The bana commit the snapshot is of.
+    pub bana_commit: Option<String>,
     /// The environment the daemon started with; builds get only an allowlist of it.
     pub env: BTreeMap<String, String>,
     /// The first wait after a failed post; it doubles up to 5 minutes.
@@ -272,6 +284,16 @@ impl Settings {
             .or_else(|| env.get("BANA_HOME").map(PathBuf::from))
             .or_else(|| env.get("HOME").map(|h| Path::new(h).join(".bana")))
             .ok_or_else(|| bad("home", "a directory (no HOME here)"))?;
+        let checkout = get("checkout").filter(|c| !c.is_empty()).map(PathBuf::from);
+        if checkout.as_ref().is_some_and(|c| !c.is_absolute()) {
+            return Err(bad("checkout", "an absolute path"));
+        }
+        let bana_commit = get("bana_commit").filter(|c| !c.is_empty());
+        if bana_commit.is_some_and(|c| {
+            !(7..=64).contains(&c.len()) || !c.bytes().all(|b| b.is_ascii_hexdigit())
+        }) {
+            return Err(bad("bana_commit", "a commit"));
+        }
         Ok(Self {
             dir: dir.to_path_buf(),
             repo,
@@ -301,6 +323,8 @@ impl Settings {
             script: get("script")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| dir.join("daemon/bin/bana")),
+            checkout,
+            bana_commit: bana_commit.map(String::from),
             env,
             retry: Duration::from_secs(5),
             recheck: Duration::from_secs(10),
@@ -896,6 +920,71 @@ impl Daemon {
             .collect()
     }
 
+    /// Fix with Claude (the page, the menu bar): makes, or goes on with, the
+    /// fix for failed build `id` in the owner's checkout ([`fix::prepare`]):
+    /// its worktree on `bana/fix-<sha7>`, the brief and the prompt. A build
+    /// that passed, ended in error (cancelled, timed out, could not start) or
+    /// has not ended has none. git may take minutes (a fetch, submodules), so
+    /// it runs off the runtime's threads.
+    pub async fn fix(&self, id: u64) -> Result<fix::Prepared, fix::Error> {
+        {
+            let inner = self.0.lock();
+            let Some(r) = inner.records.get(&id) else {
+                return Err(fix::Error::Missing(format!("no build {id}")));
+            };
+            // Said before the checkout is asked for, as fix::prepare says it.
+            let b = &r.build;
+            let why = match b.state {
+                BuildState::Failure => None,
+                BuildState::Success => Some(format!("build {id} passed")),
+                BuildState::Error => Some(format!("build {id} did not fail: {}", b.stop_reason())),
+                BuildState::Queued | BuildState::Running => {
+                    Some(format!("build {id} has not ended"))
+                }
+            };
+            if let Some(why) = why {
+                return Err(fix::Error::NotFailed(why));
+            }
+        }
+        let p = fix::Prepare::for_daemon(&self.0.settings, fix::Source::Build(id))?;
+        tokio::task::spawn_blocking(move || fix::prepare(&p))
+            .await
+            .unwrap_or_else(|e| Err(fix::Error::Failed(format!("the fix: {e}"))))
+    }
+
+    /// The fixes (their fix.json), the last prepared first.
+    pub fn fixes(&self) -> Vec<fix::Fix> {
+        fix::fixes(&self.0.settings.dir)
+    }
+
+    /// One fix, by its sha7 (or another prefix of its commit): fix.json, how
+    /// many commits its branch has on top of the failing one (`ahead`; none
+    /// when the branch is gone), its brief, and the link that opens Claude
+    /// Code in its worktree.
+    pub async fn fix_state(&self, name: &str) -> Result<Value, fix::Error> {
+        let s = &self.0.settings;
+        let (dir, git, path) = (s.dir.clone(), s.git.clone(), s.path.clone());
+        let name = name.to_string();
+        tokio::task::spawn_blocking(move || {
+            let sha7 = fix::find(&dir, Some(&name), None)?;
+            let f = fix::fixes(&dir)
+                .into_iter()
+                .find(|f| f.fix == sha7)
+                .ok_or_else(|| fix::Error::Missing(format!("no fix {name}")))?;
+            let state = dir.join("fix").join(format!("{sha7}.d"));
+            let read = |file: &str| std::fs::read_to_string(state.join(file)).unwrap_or_default();
+            let prompt = read("prompt.txt");
+            let mut v = json!(f);
+            v["ahead"] = json!(fix::ahead(&f, &git, Some(&path)));
+            v["brief"] = json!(read("brief.md"));
+            v["link"] = json!((!prompt.is_empty()).then(|| fix::link(&f.worktree, &prompt)));
+            v["dir"] = json!(state);
+            Ok(v)
+        })
+        .await
+        .unwrap_or_else(|e| Err(fix::Error::Failed(format!("the fix: {e}"))))
+    }
+
     /// Stops fetching and starting builds, stops the running build (the short
     /// ladder, then the sweeps) and waits for the tasks. The build is left
     /// unfinished, with nothing more to post: the next start decides.
@@ -1039,6 +1128,7 @@ impl Shared {
                 .rev()
                 .find(|r| r.build.state.finished())
                 .map(|r| self.view(inner, r)),
+            failed: newest_failed(&inner.records),
         };
         self.summary.send_replace(summary);
     }
@@ -2373,6 +2463,18 @@ fn to_post(inner: &Inner) -> Vec<(u64, String)> {
     out.into_iter().map(|(_, id, c)| (id, c)).collect()
 }
 
+/// The newest build that failed, unless one since passed: what the menu bar
+/// offers to fix. A build that ended in error (cancelled, timed out) says
+/// nothing either way.
+fn newest_failed(records: &BTreeMap<u64, Record>) -> Option<u64> {
+    records
+        .values()
+        .rev()
+        .find(|r| matches!(r.build.state, BuildState::Success | BuildState::Failure))
+        .filter(|r| r.build.state == BuildState::Failure)
+        .map(|r| r.request.id)
+}
+
 fn built(records: &BTreeMap<u64, Record>) -> Built {
     let mut b = Built::default();
     for r in records.values() {
@@ -2830,6 +2932,11 @@ exec git \"$@\"
             git(&self.work, &["push", "-q", "--force", "origin", &to]);
         }
 
+        /// The owner's checkout, which commits and pushes.
+        pub(crate) fn checkout(&self) -> &Path {
+            &self.work
+        }
+
         fn read(&self, name: &str) -> String {
             std::fs::read_to_string(self.ctl.join(name)).unwrap_or_default()
         }
@@ -2978,6 +3085,16 @@ exec git \"$@\"
             ("/usr/bin", "git", "gh")
         );
         assert_eq!(s.script, Path::new("/x/wid/daemon/bin/bana"));
+        assert!(s.checkout.is_none() && s.bana_commit.is_none(), "{s:?}");
+
+        // What Fix with Claude needs, as install writes it.
+        let text =
+            "repo = o/r\nprefix = w\ncheckout = /Users/me/src/dsper\nbana_commit = b1df450\n";
+        let s = Settings::parse(text, dir, env.clone()).unwrap();
+        assert_eq!(
+            (s.checkout.as_deref(), s.bana_commit.as_deref()),
+            (Some(Path::new("/Users/me/src/dsper")), Some("b1df450"))
+        );
 
         let text = "repo=o/r\nprefix=wid\ntiers=\ndaemon.timeout = 90s\ndaemon.token = none\nhome = /h\ndaemon.supersede = running\ndaemon.tags = v*\n";
         let mut env2 = env.clone();
@@ -3037,6 +3154,15 @@ exec git \"$@\"
             (
                 "repo = o/r\nprefix = w\ndaemon.supersede = always\n",
                 "daemon.supersede",
+            ),
+            ("repo = o/r\nprefix = w\ncheckout = src/dsper\n", "checkout"),
+            (
+                "repo = o/r\nprefix = w\nbana_commit = main\n",
+                "bana_commit",
+            ),
+            (
+                "repo = o/r\nprefix = w\nbana_commit = b1df\n",
+                "bana_commit",
             ),
         ] {
             let e = Settings::parse(text, dir, env.clone()).unwrap_err();
@@ -4078,6 +4204,131 @@ exec git \"$@\"
             "{:?}",
             one.statuses
         );
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fix_with_claude_makes_a_worktree_at_the_failing_commit() {
+        let p = Project::new("fix");
+        let work = p.checkout();
+        let extra = format!("checkout = {}\nbana_commit = b1df450\n", work.display());
+        let d = start(&p, &extra).await;
+        p.commit("pass", "a");
+        p.push("main");
+        poll(&d).await;
+        assert_eq!(finished(&d, 1).await.build.state, BuildState::Success);
+        assert_eq!(d.summary().failed, None);
+        let c = p.commit("fail", "c");
+        p.push("main");
+        poll(&d).await;
+        assert_eq!(finished(&d, 2).await.build.state, BuildState::Failure);
+        assert_eq!(d.summary().failed, Some(2));
+        assert_eq!(
+            actlog::tray_view(&d.summary()).fix_line.as_deref(),
+            Some("Fix #2 with Claude…")
+        );
+        // The owner goes on working: the fix is at the failing commit anyway.
+        let later = p.commit("pass", "later, not pushed");
+
+        let made = d.fix(2).await.unwrap();
+        let sha7 = &c[..7];
+        let wt = std::fs::canonicalize(p.dir.join("fix").join(sha7)).unwrap();
+        assert_eq!(
+            (made.fix.as_str(), made.branch.clone(), made.reused),
+            (sha7, format!("bana/fix-{sha7}"), false)
+        );
+        assert_eq!(Path::new(&made.worktree), wt);
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]), c);
+        assert_eq!(
+            git(&wt, &["symbolic-ref", "HEAD"]),
+            format!("refs/heads/bana/fix-{sha7}")
+        );
+        let local = std::fs::read_to_string(wt.join(".claude/settings.local.json")).unwrap();
+        assert!(local.contains("Bash(git push:*)"), "{local}");
+        assert_eq!(git(&wt, &["status", "--porcelain"]), "");
+        assert_eq!(
+            git(work, &["rev-parse", "HEAD"]),
+            later,
+            "the checkout stays"
+        );
+        assert_eq!(git(work, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+        let state = Path::new(&made.dir);
+        let prompt = std::fs::read_to_string(state.join("prompt.txt")).unwrap();
+        assert!(prompt.contains("lint › cargo clippy"), "{prompt}");
+        assert!(made.link.starts_with("claude-cli://open?cwd="), "{made:?}");
+        let brief = std::fs::read_to_string(state.join("brief.md")).unwrap();
+        assert!(
+            brief.contains("daemon build 2") && brief.contains("b1df450"),
+            "{brief}"
+        );
+
+        // A second click goes on with it.
+        let again = d.fix(2).await.unwrap();
+        assert_eq!(
+            (again.fix.as_str(), again.worktree.as_str(), again.reused),
+            (sha7, made.worktree.as_str(), true)
+        );
+        let fixes = d.fixes();
+        assert_eq!(fixes.len(), 1);
+        assert_eq!(
+            (fixes[0].build, fixes[0].jobs.clone()),
+            (Some(2), vec!["lint".to_string()])
+        );
+        let v = d.fix_state(&c).await.unwrap();
+        assert_eq!(
+            (&v["fix"], &v["ahead"], &v["link"]),
+            (&json!(sha7), &json!(0), &json!(again.link))
+        );
+        assert!(again.link.contains("earlier%20failure"), "{again:?}");
+        let brief = std::fs::read_to_string(state.join("brief.md")).unwrap();
+        assert_eq!(v["brief"], json!(brief));
+
+        // Builds that did not fail, and none at all.
+        let e = d.fix(1).await.unwrap_err();
+        assert_eq!(e, fix::Error::NotFailed("build 1 passed".into()));
+        assert_eq!(
+            d.fix(9).await.unwrap_err(),
+            fix::Error::Missing("no build 9".into())
+        );
+        let other = if c.starts_with("ffff") {
+            "0000"
+        } else {
+            "ffff"
+        };
+        assert!(matches!(
+            d.fix_state(other).await,
+            Err(fix::Error::Missing(_))
+        ));
+        p.commit("syntax", "d");
+        p.push("main");
+        poll(&d).await;
+        let r3 = finished(&d, 3).await;
+        assert_eq!(r3.build.state, BuildState::Error);
+        match d.fix(3).await {
+            Err(fix::Error::NotFailed(why)) => {
+                assert!(
+                    why.starts_with("build 3 did not fail: could not start"),
+                    "{why}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            d.summary().failed,
+            Some(2),
+            "an error says nothing either way"
+        );
+        p.commit("pass", "e");
+        p.push("main");
+        poll(&d).await;
+        assert_eq!(finished(&d, 4).await.build.state, BuildState::Success);
+        assert_eq!(d.summary().failed, None, "a pass since");
+        assert_eq!(actlog::tray_view(&d.summary()).fix_line, None);
+
+        // A daemon installed before fixes names no checkout.
+        let e = fix::Prepare::for_daemon(&p.settings(""), fix::Source::Build(2)).unwrap_err();
+        assert!(e.to_string().contains("bana daemon install again"), "{e}");
         d.shutdown().await;
         p.remove();
     }

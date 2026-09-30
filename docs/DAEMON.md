@@ -70,8 +70,9 @@ yet.
 | `🧱 !gh` | statuses are not being posted; the tooltip says why |
 
 A left click opens the page on the running build, else the latest one. A right click shows the menu: what it is
-doing, the last result (it opens that build), *Open bana*, *Cancel build*, *Pause new builds* and *Quit bana*.
-Quit stops local CI until your next login or `bana daemon install`.
+doing, the last result (it opens that build), *Fix #41 with Claude…* while the last build failed
+([FIX.md](FIX.md)), *Open bana*, *Cancel build*, *Pause new builds* and *Quit bana*. Quit stops local CI until
+your next login or `bana daemon install`.
 
 ## The page
 
@@ -83,7 +84,8 @@ Quit stops local CI until your next login or `bana daemon install`.
 - *Run now*: a branch or tag at a tier, at the front of the queue. That is how a nightly runs;
 - the queue, each build with *Remove*;
 - the build: its jobs, the live log of the one you pick (a failed step opens by itself), *Cancel* and *Re-run*
-  (the same commit and tier again, even if it was built);
+  (the same commit and tier again, even if it was built), and on a failed build *Fix with Claude*
+  ([FIX.md](FIX.md));
 - the history (the last 100 builds), and the pushes not built.
 
 The runner pool's sections follow, under *Runner pool (optional)*. `bana manager` opens this page too while the
@@ -185,7 +187,8 @@ In bana.conf, read at install (`bana settings` shows them):
 
 `act.args` (act options for `bana ci` and the daemon's builds, such as `--reuse`), `act.image` and `act.network` are read from
 the commit being built, like the workflow. `repo`, `prefix`, `workflow`, `tiers`, `tier_input` and `path` are
-taken at install; `path` goes first on the daemon's PATH.
+taken at install; `path` goes first on the daemon's PATH. Install also records the checkout it runs in, where
+*Fix with Claude* makes its branches and worktrees, and bana's commit, which a fix's brief names.
 
 ## Trust
 
@@ -220,6 +223,7 @@ Logs stay on the machine.
 | `~/.bana/<prefix>/src/` | the daemon's clone |
 | `~/.bana/<prefix>/builds/<id>/` | each build: `build.json`, `act.jsonl` (act's log), `event.json`, `artifacts/` |
 | `~/.bana/<prefix>/act-cache/` | act's actions, and the macOS jobs' copies while they run |
+| `~/.bana/<prefix>/fix/` | *Fix with Claude* and `bana fix`: each fix's worktree, and its brief beside it ([FIX.md](FIX.md)) |
 | `~/.bana/<prefix>/state.json` | paused, the queue, the heads seen, each branch's last green commit |
 | `~/.bana/<prefix>/vars` | optional, yours: `KEY=value` lines for `vars.*` |
 | `~/.bana/act.lock` | the lock shared with `bana ci` |

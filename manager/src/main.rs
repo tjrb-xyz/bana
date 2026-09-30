@@ -21,6 +21,22 @@
 //! (hidden) posts one commit status as the daemon's poster does, and says
 //! GitHub's error if any: bana's own CI asks GitHub whether it takes a
 //! loopback target_url.
+//!
+//!   bana-manager results (--json FILE | --text FILE|-)
+//!
+//! folds act's log (the daemon's act.jsonl, or act's plain text: a hand run's
+//! ci/last.log, a pasted log) into results.jsonl on stdout
+//! (bana_manager::results): what bana fix and bana report read.
+//!
+//!   bana-manager fix prepare --dir ~/.bana/<prefix> --checkout DIR
+//!                (--build N | --run | --log FILE|- [--sha S] [--ref R] [--tier T])
+//!                [--repo OWNER/REPO] [--workflow FILE] [--bana CMD]
+//!   bana-manager fix brief --dir ~/.bana/<prefix> [FIX]
+//!
+//! bana fix's Rust side (bana_manager::fix): `prepare` makes (or reuses) the
+//! fix branch's worktree for a daemon build, the last hand run or a pasted log,
+//! writes its brief and prompt, and prints {fix, worktree, branch, link,
+//! command, dir, reused} as JSON; `brief` prints a fix's brief.
 
 use bana_manager::actlog::{Status, StatusState};
 use bana_manager::daemon::{post_status, Daemon, Settings};
@@ -36,7 +52,7 @@ use tokio::sync::Notify;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: bana-manager --script PATH --repo OWNER/REPO [--port N] [--workflow FILE] [--tiers A,B] [--tier-input NAME] [--gh PATH] [--token T]\n       bana-manager daemon --dir DIR [--no-tray]"
+        "usage: bana-manager --script PATH --repo OWNER/REPO [--port N] [--workflow FILE] [--tiers A,B] [--tier-input NAME] [--gh PATH] [--token T]\n       bana-manager daemon --dir DIR [--no-tray]\n       bana-manager results (--json FILE | --text FILE|-)\n       bana-manager fix prepare --dir DIR --checkout DIR (--build N | --run | --log FILE|- [--sha S] [--ref R] [--tier T]) [--repo OWNER/REPO] [--workflow FILE] [--bana CMD]\n       bana-manager fix brief --dir DIR [FIX]"
     );
     std::process::exit(2)
 }
@@ -94,6 +110,16 @@ fn fail(msg: &str) -> ! {
 
 fn main() {
     let mut args = std::env::args().skip(1).peekable();
+    if args.peek().is_some_and(|a| a == "results") {
+        args.next();
+        results(args);
+        return;
+    }
+    if args.peek().is_some_and(|a| a == "fix") {
+        args.next();
+        fix(args);
+        return;
+    }
     let daemon_mode = args.peek().is_some_and(|a| a == "daemon");
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -222,6 +248,138 @@ async fn daemon(
     let _ = stop_http.send(());
     let _ = tokio::time::timeout(Duration::from_secs(5), http).await;
     stopped();
+}
+
+/// `results`: act's log (--json: act.jsonl; --text: act's plain text, `-` for
+/// stdin) as results.jsonl, on stdout.
+fn results(mut args: impl Iterator<Item = String>) {
+    let (json, path) = match (args.next(), args.next(), args.next()) {
+        (Some(flag), Some(path), None) if flag == "--json" || flag == "--text" => {
+            (flag == "--json", path)
+        }
+        _ => usage(),
+    };
+    let mut bytes = Vec::new();
+    let read = match path.as_str() {
+        "-" => std::io::stdin().read_to_end(&mut bytes).map(|_| ()),
+        p => std::fs::read(p).map(|b| bytes = b),
+    };
+    if let Err(e) = read {
+        fail(&format!("{path}: {e}"));
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let r = if json {
+        bana_manager::results::fold_json(&text)
+    } else {
+        bana_manager::results::fold_text(&text)
+    };
+    use std::io::Write;
+    let _ = std::io::stdout().lock().write_all(r.to_jsonl().as_bytes());
+}
+
+/// `fix prepare|brief`: bana fix's side in Rust. Prints what prepare made as
+/// JSON, or a fix's brief; a failure's reason goes to stderr (exit 1).
+fn fix(mut args: impl Iterator<Item = String>) {
+    use bana_manager::fix::{self, Prepare, Source};
+    use bana_manager::valid_ref;
+    let sub = args.next().unwrap_or_else(|| usage());
+    let (mut dir, mut checkout, mut name) = (None, None, None);
+    let (mut build, mut run, mut log) = (None, false, None);
+    let (mut sha, mut git_ref, mut tier) = (None, None, None);
+    let (mut repo, mut workflow, mut bana) = (None, None, None);
+    while let Some(a) = args.next() {
+        let mut value = || args.next().unwrap_or_else(|| usage());
+        match a.as_str() {
+            "--dir" => dir = Some(PathBuf::from(value())),
+            "--checkout" => checkout = Some(PathBuf::from(value())),
+            "--build" => build = Some(value().parse::<u64>().unwrap_or_else(|_| usage())),
+            "--run" => run = true,
+            "--log" => log = Some(value()),
+            "--sha" => sha = Some(value()),
+            "--ref" => git_ref = Some(value()),
+            "--tier" => tier = Some(value()),
+            "--repo" => repo = Some(value()),
+            "--workflow" => workflow = Some(value()),
+            "--bana" => bana = Some(value()),
+            n if sub == "brief" && name.is_none() && !n.starts_with('-') => {
+                name = Some(n.to_string())
+            }
+            _ => usage(),
+        }
+    }
+    let Some(dir) = dir else { usage() };
+    let done = |r: Result<String, fix::Error>| match r {
+        Ok(text) => {
+            use std::io::Write;
+            let _ = std::io::stdout().lock().write_all(text.as_bytes());
+        }
+        Err(e) => {
+            eprintln!("bana-manager: {e}");
+            std::process::exit(1)
+        }
+    };
+    if sub == "brief" {
+        let cwd = std::env::current_dir().ok();
+        return done(fix::brief(&dir, name.as_deref(), cwd.as_deref()));
+    }
+    if sub != "prepare" {
+        usage()
+    }
+    let Some(checkout) = checkout else { usage() };
+    let with_log = sha.is_some() || git_ref.is_some() || tier.is_some();
+    let source = match (build, run, log) {
+        (Some(n), false, None) if !with_log => Source::Build(n),
+        (None, true, None) if !with_log => Source::Run,
+        (None, false, Some(path)) => {
+            let mut bytes = Vec::new();
+            let read = match path.as_str() {
+                "-" => std::io::stdin().read_to_end(&mut bytes).map(|_| ()),
+                p => std::fs::read(p).map(|b| bytes = b),
+            };
+            if let Err(e) = read {
+                fail(&format!("{path}: {e}"));
+            }
+            Source::Log {
+                text: String::from_utf8_lossy(&bytes).into_owned(),
+                sha,
+                git_ref,
+                tier,
+            }
+        }
+        _ => usage(),
+    };
+    if let Source::Log {
+        git_ref: Some(r), ..
+    } = &source
+    {
+        if !valid_ref(r) {
+            fail("--ref: a branch or tag");
+        }
+    }
+    if let Source::Log { tier: Some(t), .. } = &source {
+        if !t.is_empty() && !valid_tier(t) {
+            fail("--tier: letters, digits, '_' and '-'");
+        }
+    }
+    let mut p = Prepare::new(&dir, &checkout, source);
+    if let Some(r) = repo {
+        if !valid_repo(&r) {
+            fail("--repo: OWNER/REPO");
+        }
+        p.repo = Some(r);
+    }
+    if let Some(w) = workflow {
+        if !valid_workflow(&w) {
+            fail("--workflow: a file name in .github/workflows, like ci.yml");
+        }
+        p.workflow = w;
+    }
+    if let Some(b) = bana {
+        p.bana = b;
+    }
+    done(
+        fix::prepare(&p).map(|made| serde_json::to_string_pretty(&made).unwrap_or_default() + "\n"),
+    );
 }
 
 /// `post-status`: one status, through the poster's own code.

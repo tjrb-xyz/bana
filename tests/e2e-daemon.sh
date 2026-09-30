@@ -15,10 +15,11 @@
 #   BANA_E2E_PORT=N          the daemon's port (default 18470)
 #   BANA_E2E_KEEP=1          keep the scratch directory
 #
-# Pushes: one that passes, one that fails, a [skip ci] one, one whose `sleep 600` is
-# cancelled through the daemon's API, and one whose daemon is killed (-9) mid-build and
-# started again (the build runs again, once). After each: no job containers, act
-# workspaces, marker processes, secrets or lock left.
+# Pushes: one that passes, one whose test fails (then Fix with Claude makes its worktree
+# in the checkout), a [skip ci] one, one whose `sleep 600` is cancelled through the
+# daemon's API, and one whose daemon is killed (-9) mid-build and started again (the build
+# runs again, once). After each: no job containers, act workspaces, marker processes,
+# secrets or lock left.
 set -euo pipefail
 
 if [[ ${BANA_E2E:-} != 1 ]]; then
@@ -152,7 +153,7 @@ jobs:
     runs-on: [self-hosted, wid-linux]
     steps:
       - uses: actions/checkout@v4
-      - name: lint
+      - name: test
         run: sh ci/step.sh broken
   never:
     if: false
@@ -170,14 +171,14 @@ case $2 in
 *) echo "before: none" ;;
 esac
 EOF
-# What each job does, by ci/mode: pass, fail (broken's lint fails), sleep (a long step;
-# the host job leaves a process behind first, as nohup would), hold (the host job waits
-# while the file ci/hold names is there).
+# What each job does, by ci/mode: pass, fail (broken's test fails, as cargo says it),
+# sleep (a long step; the host job leaves a process behind first, as nohup would), hold
+# (the host job waits while the file ci/hold names is there).
 cat >ci/step.sh <<'EOF'
 mode=$(cat ci/mode)
 t=$(cat ci/t)
 case $mode:$1 in
-fail:broken) echo "lint: fails on purpose"; exit 1 ;;
+fail:broken) cat ci/cargo-test.txt; exit 101 ;;
 sleep:host)
   (nohup sleep 900 >/dev/null 2>&1 & echo $! >"$t/survivor")
   echo "$$" >"$t/host-sleeping"
@@ -189,6 +190,31 @@ hold:host)
   while [ -e "$(cat ci/hold)" ] && [ $n -lt 600 ]; do sleep 1; n=$((n + 1)); done ;;
 esac
 echo "$1: done ($mode)"
+EOF
+cat >ci/cargo-test.txt <<'EOF'
+     Running unittests src/lib.rs (target/debug/deps/wid-0123456789abcdef)
+
+running 2 tests
+test tests::adds ... ok
+test tests::the_answer ... FAILED
+
+failures:
+
+---- tests::the_answer stdout ----
+
+thread 'tests::the_answer' panicked at src/lib.rs:9:5:
+assertion `left == right` failed
+  left: 41
+ right: 42
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::the_answer
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
 EOF
 echo "$T" >ci/t
 echo "$hold" >ci/hold
@@ -356,13 +382,48 @@ id=$(builds_of "$b" | tail -n 1 | cut -d'|' -f1)
 echo "   build #$id: $(state_of "$b") in $(($(date +%s) - s)) s"
 check "fail: the build failed" same "$(state_of "$b")" failure
 check "fail: bana pending first" same "$(posts "$b" | head -n 1 | cut -d'|' -f1-2)" "bana|pending"
-check "fail: bana failure, naming the job and step" bash -c "[[ '$(last "$b" bana)' == 'failure|broken failed at \"lint\" · '* ]]" ||
+check "fail: bana failure, naming the job and step" bash -c "[[ '$(last "$b" bana)' == 'failure|broken failed at \"test\" · '* ]]" ||
   echo "  got: $(last "$b" bana)" >&2
-check "fail: bana/broken failed at lint" bash -c "[[ '$(last "$b" bana/broken)' == 'failure|failed at \"lint\" after '* ]]"
+check "fail: bana/broken failed at test" bash -c "[[ '$(last "$b" bana/broken)' == 'failure|failed at \"test\" after '* ]]"
 check "fail: bana/linux passed" same "$(last "$b" bana/linux | cut -d'|' -f1)" success
 check "fail: the push's before (the last green) is in the job's history" has <(build_log "$id") "before $a reachable"
 check "fail: in the job, HEAD is the pushed commit" has <(build_log "$id") "HEAD $b"
 clean fail
+
+# ---- 2b. Fix with Claude on the failed build ------------------------------------------------
+say "2b. Fix with Claude on build #$id"
+sha7=${b:0:7}
+wt=$d/fix/$sha7
+check "fix: the summary offers build #$id" same "$(api /local | jq_ 'j["failed"]')" "$id"
+s=$(date +%s)
+asked=$(wc -l <"$FAKE_LOG")
+fixed=$(api "/builds/$id/fix" -X POST)
+echo "   fix $sha7 made in $(($(date +%s) - s)) s"
+fx() { jq_ "$1" <<<"$fixed"; }
+check "fix: named for the failing commit" same "$(fx '"%s %s %s" % (j["fix"], j["branch"], j["reused"])')" "$sha7 bana/fix-$sha7 False"
+check "fix: its worktree, in the daemon's directory" same "$(fx 'j["worktree"]')" "$wt"
+check "fix: at the failing commit" same "$(git -C "$wt" rev-parse HEAD)" "$b"
+check "fix: on its own branch" same "$(git -C "$wt" symbolic-ref HEAD)" "refs/heads/bana/fix-$sha7"
+check "fix: a worktree of the checkout" has <(git -C "$w" worktree list --porcelain) "worktree $wt"
+check "fix: its Claude Code settings deny git push" has "$wt/.claude/settings.local.json" 'Bash(git push:*)'
+check "fix: which git leaves out" same "$(git -C "$wt" status --porcelain)" ""
+check "fix: the checkout stays as it was" same "$(git -C "$w" symbolic-ref HEAD)|$(git -C "$w" status --porcelain)" "refs/heads/main|"
+check "fix: the prompt names the failing test" has "$d/fix/$sha7.d/prompt.txt" "tests::the_answer panicked at src/lib.rs:9:5"
+check "fix: and cargo's rerun" has "$d/fix/$sha7.d/prompt.txt" "Rerun: cargo test --lib"
+check "fix: the link opens Claude Code in the worktree, the prompt typed" same "$(fx 'j["link"].startswith("claude-cli://open?") and (
+  lambda q: q["cwd"] == [j["worktree"]] and q["q"] == [open(j["dir"] + "/prompt.txt").read()])(
+  __import__("urllib.parse").parse.parse_qs(j["link"].split("?", 1)[1]))')" True
+fixed=$(api "/builds/$id/fix" -X POST)
+check "fix: a second click goes on with it" same "$(fx '"%s %s" % (j["worktree"], j["reused"])')" "$wt True"
+check "fix: its branch has nothing on it yet" same "$(api "/fixes/$sha7" | jq_ 'j["ahead"]')" 0
+# The HTTP status of a POST.
+posted_status() { # PATH
+  printf 'Authorization: Bearer %s\n' "$(cat "$HOME/.bana/manager-token")" |
+    curl -sS --noproxy '*' --max-time 10 -H @- -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$port/ci/v1$1"
+}
+check "fix: none for a build that passed (409)" same "$(posted_status "/builds/$(builds_of "$a" | tail -n 1 | cut -d'|' -f1)/fix")" 409
+check "fix: none for a build that is not there (404)" same "$(posted_status /builds/9999/fix)" 404
+check "fix: nothing asked of GitHub" same "$(wc -l <"$FAKE_LOG")" "$asked"
 
 # ---- 3. a [skip ci] push ----------------------------------------------------------------------
 say "3. a [skip ci] push"
@@ -400,6 +461,7 @@ echo "   build #$id: $(state_of "$e") ($(builds_of "$e" | tail -n 1 | cut -d'|' 
 check "cancel: the build ended as error, cancelled" same "$(builds_of "$e" | tail -n 1 | cut -d'|' -f2,5)" "error|cancelled from the page"
 check "cancel: within the ladder's first rung (60 s)" test "$took" -lt 60
 check "cancel: bana says so" same "$(last "$e" bana)" "error|cancelled from the page"
+check "cancel: no fix for a cancelled build (409)" same "$(posted_status "/builds/$id/fix")" 409
 check "cancel: no pending left on any context" same "$(for x in $(contexts "$e"); do last "$e" "$x" | cut -d'|' -f1; done | grep -c pending || true)" 0
 check "cancel: act is gone" not alive "$act_pid"
 check "cancel: so is what its host step left behind (the marker sweep)" not alive "$survivor"

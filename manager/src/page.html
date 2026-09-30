@@ -69,6 +69,9 @@ tr.sel td { background: var(--bg); }
 #pool-box > summary { list-style: none; } #pool-box > summary h2 { display: inline; }
 #pool-box > summary::before { content: "▸ "; color: var(--muted); } #pool-box[open] > summary::before { content: "▾ "; }
 .stack { display: grid; gap: 16px; margin-top: 12px; }
+#fix { margin-top: 10px; border-left: 3px solid var(--accent); padding: 2px 0 2px 10px; }
+#fix p { margin: 4px 0; }
+code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px; background: var(--bg); border-radius: 4px; padding: 1px 4px; }
 </style>
 </head>
 <body>
@@ -106,7 +109,15 @@ tr.sel td { background: var(--bg); }
       <div class="row">
         <button id="build-cancel" class="danger" type="button">Cancel</button>
         <button id="build-rerun" type="button">Re-run</button>
+        <button id="build-fix" type="button" hidden
+          title="A branch of its own at this commit, in a worktree of your checkout, and Claude Code there with a prompt that says what failed">Fix with Claude</button>
         <a id="build-current" href="#">Show the current build</a>
+      </div>
+      <div id="fix" hidden>
+        <p id="fix-line"></p>
+        <p id="fix-how" class="muted" hidden><span id="fix-said"></span> <a id="fix-link" href="#">Open Claude Code there</a><span id="fix-or">,
+          or run <code id="fix-cmd"></code> <button id="fix-copy" type="button">Copy</button> in your checkout</span>.</p>
+        <p class="error" id="fix-error" hidden></p>
       </div>
       <div class="chips" id="jobs" style="margin-top:10px"></div>
       <pre class="mono" id="log"></pre>
@@ -404,7 +415,7 @@ async function renderBuild() {
   if (!shown || shown.id !== id || (v && shown.state !== v.state)) {
     let detail;
     try { detail = await api("GET", `/builds/${id}`); } catch (e) { detail = { error: e.message }; }
-    shown = { id, detail, state: v && v.state };
+    shown = { id, detail, state: v && v.state, fix: await loadFix(v), made: false, error: null };
   }
   shown.view = v;
   const d = shown.detail;
@@ -415,7 +426,7 @@ async function renderBuild() {
     $("build-meta").replaceChildren();
     $("jobs").replaceChildren();
     $("log").replaceChildren();
-    $("build-cancel").hidden = $("build-rerun").hidden = true;
+    $("build-cancel").hidden = $("build-rerun").hidden = $("build-fix").hidden = $("fix").hidden = true;
     logState = null;
     return;
   }
@@ -432,6 +443,9 @@ async function renderBuild() {
   if (v.started_at) add((running ? "running for " : "took ") + dur(v.elapsed));
   $("build-cancel").hidden = !(running || v.state === "queued");
   $("build-rerun").hidden = !["success", "failure", "error"].includes(v.state);
+  // Only a failure: a cancelled, timed-out or never-started build says nothing to fix.
+  $("build-fix").hidden = v.state !== "failure";
+  renderFix(id, v);
 
   // The job asked for; else a finished build's failed job opens.
   const failed = !running && (v.jobs || []).find((j) => j.state === "failure");
@@ -445,6 +459,66 @@ async function renderBuild() {
   }));
   startLog(id, job, running || v.state === "queued");
 }
+
+// Fix with Claude: the daemon makes the fix (a branch at the failing commit, in
+// a worktree of the owner's checkout, with a brief and a prompt), then the
+// page hands Claude Code's claude-cli:// link to its handler, which opens a
+// terminal there with the prompt typed. A browser may refuse a link followed
+// after an await, so the link, and `bana fix N` for a terminal, stay on the page.
+async function loadFix(v) {
+  if (!v || !["success", "failure", "error"].includes(v.state)) return null;
+  try {
+    const f = (await api("GET", "/fixes")).fixes.find((x) => x.sha === v.sha);
+    return f ? await api("GET", `/fixes/${encodeURIComponent(f.fix)}`) : null;
+  } catch (e) { return null; }
+}
+
+// The fix for this build's commit, if there is one, and how to open Claude Code in it.
+function renderFix(id, v) {
+  const f = shown.fix, failed = v.state === "failure";
+  $("fix").hidden = !(f || shown.error);
+  show("fix-error", shown.error);
+  $("fix-line").textContent = "";
+  $("fix-how").hidden = true;
+  if (!f) return;
+  const n = f.ahead;
+  const commits = n === undefined ? "" : n === null ? ", its branch is gone"
+    : n ? `, ${n} commit${n === 1 ? "" : "s"} on it` : ", no commits on it yet";
+  $("fix-line").textContent = `Fix ${f.fix}: ${f.branch}${commits}, in ${f.worktree}`;
+  const link = typeof f.link === "string" && /^claude-cli:\/\//.test(f.link) ? f.link : null;
+  if (!link) return;
+  $("fix-how").hidden = false;
+  $("fix-said").textContent = shown.made ? "Claude Code opens in a terminal there, with the prompt typed: press Enter. If nothing opened:" : "";
+  $("fix-link").textContent = shown.made ? "open it" : "Open Claude Code there";
+  $("fix-link").href = link;
+  $("fix-or").hidden = !failed;
+  $("fix-cmd").textContent = `bana fix ${Number(id)}`;
+  $("fix-copy").textContent = "Copy";
+}
+
+$("build-fix").addEventListener("click", async () => {
+  if (!shown || !shown.view) return;
+  const s = shown, b = $("build-fix");
+  b.disabled = true;
+  b.textContent = "Making the fix…";
+  s.error = null;
+  try {
+    const made = await api("POST", `/builds/${s.id}/fix`);
+    if (/^claude-cli:\/\//.test(made.link)) location.href = made.link;
+    s.made = true;
+    s.fix = (await loadFix(s.view)) || { fix: made.fix, branch: made.branch, worktree: made.worktree, link: made.link };
+  } catch (e) { s.error = "Fix with Claude: " + e.message; }
+  b.disabled = false;
+  b.textContent = "Fix with Claude";
+  if (shown === s) renderFix(s.id, s.view);
+});
+$("fix-copy").addEventListener("click", () => {
+  const t = $("fix-cmd").textContent;
+  // Without the clipboard, the command is selected for a Cmd-C.
+  (navigator.clipboard ? navigator.clipboard.writeText(t) : Promise.reject()).then(
+    () => { $("fix-copy").textContent = "Copied"; },
+    () => { getSelection().selectAllChildren($("fix-cmd")); });
+});
 
 function startLog(id, job, live) {
   const key = id + "|" + (job || "");

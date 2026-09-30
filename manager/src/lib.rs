@@ -13,7 +13,9 @@
 
 pub mod actlog;
 pub mod daemon;
+pub mod fix;
 pub mod guard;
+pub mod results;
 pub mod server;
 pub mod sweep;
 #[cfg(target_os = "macos")]

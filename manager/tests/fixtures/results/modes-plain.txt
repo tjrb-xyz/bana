@@ -1,0 +1,50 @@
+time="2026-09-29T10:02:27Z" level=info msg="Using docker host 'unix:///var/run/docker.sock', and daemon socket 'unix:///var/run/docker.sock'"
+[ci/web-1] ⭐ Run Set up job
+[ci/rust ] ⭐ Run Set up job
+[ci/web-2] ⭐ Run Set up job
+[ci/web-1]   ✅  Success - Set up job
+[ci/rust ]   ✅  Success - Set up job
+[ci/web-2]   ✅  Success - Set up job
+[ci/rust ] ⭐ Run Main cargo test --workspace
+[ci/web-2] 🧪  Matrix: map[os:b]
+[ci/web-1] 🧪  Matrix: map[os:a]
+[ci/web-2] ⭐ Run Main lint
+[ci/web-1] ⭐ Run Main lint
+[ci/web-2]   ❗  ::error file=a.ts,line=2::boom
+[ci/web-2]   | done
+[ci/web-2]   ✅  Success - Main lint [7.130126ms]
+[ci/rust ]   | test a::one ... ok
+[ci/rust ]   | test a::two ... FAILED
+[ci/rust ]   | 
+[ci/rust ]   | failures:
+[ci/rust ]   | 
+[ci/rust ]   | ---- a::two stdout ----
+[ci/rust ]   | 
+[ci/rust ]   | thread 'a::two' (7) panicked at src/a.rs:3:5:
+[ci/rust ]   | accepted
+[ci/rust ]   | note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+[ci/rust ]   | 
+[ci/rust ]   | test result: [31mFAILED[m. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+[ci/rust ]   | 
+[ci/rust ]   | error: test failed, to rerun pass `--lib`
+[ci/web-2]   ⚙  Summary - ## sum
+| a | b |
+[ci/rust ]   ❌  Failure - Main cargo test --workspace [10.638993ms]
+[ci/web-2] ⭐ Run Complete job
+[ci/web-2] Cleaning up container for job web
+[ci/rust ] exit status 101
+[ci/rust ] ⭐ Run Complete job
+[ci/rust ]   ✅  Success - Complete job
+[ci/rust ] 🏁  Job failed
+[ci/web-2]   ✅  Success - Complete job
+[ci/web-2] 🏁  Job succeeded
+[ci/web-1]   ❗  ::error file=a.ts,line=2::boom
+[ci/web-1]   | done
+[ci/web-1]   ✅  Success - Main lint [7.563537ms]
+[ci/web-1]   ⚙  Summary - ## sum
+| a | b |
+[ci/web-1] ⭐ Run Complete job
+[ci/web-1] Cleaning up container for job web
+[ci/web-1]   ✅  Success - Complete job
+[ci/web-1] 🏁  Job succeeded
+Error: Job 'rust' failed

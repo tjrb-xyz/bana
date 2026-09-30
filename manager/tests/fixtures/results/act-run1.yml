@@ -1,0 +1,92 @@
+name: ci
+on: workflow_dispatch
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: summary one
+        run: |
+          echo "## node job" >> "$GITHUB_STEP_SUMMARY"
+          echo "| a | b |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 1 | 2 |" >> "$GITHUB_STEP_SUMMARY"
+      - name: summary two
+        run: echo "second step summary" >> "$GITHUB_STEP_SUMMARY"
+      - name: annotations
+        run: |
+          echo "::group::A group"
+          echo "inside group"
+          echo "::endgroup::"
+          echo "::notice title=Heads up::a notice"
+          echo "::warning file=demo.test.mjs,line=3::a warning"
+          echo "::error file=demo.test.mjs,line=4,col=31::accepted"
+          echo "::debug::a debug line"
+      - name: node tests
+        id: tests
+        run: node --test --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=junit-node.xml demo.test.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-node
+          path: junit-node.xml
+  py:
+    runs-on: ubuntu-latest
+    steps:
+      - name: unittest
+        run: |
+          cat > t.py <<'EOF'
+          import unittest
+          class T(unittest.TestCase):
+              def test_a(self): pass
+              @unittest.skip("slow")
+              def test_b(self): pass
+          EOF
+          python3 -m unittest -v t 2>&1
+          echo "multi"; echo "line"; printf 'no newline at end'
+  matrix:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x64, arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - run: mkdir -p out && echo "bin for ${{ matrix.target }}" > out/app-${{ matrix.target }}.txt && echo "${{ matrix.target }}" > out/same-name.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.target }}
+          path: out/
+  host:
+    runs-on: host
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo test
+        working-directory: crate
+        run: cargo test --workspace --no-fail-fast
+      - name: nextest
+        if: always()
+        working-directory: crate
+        run: cargo nextest run --profile ci --workspace
+      - name: summary from host mode
+        if: always()
+        run: echo "host summary" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-cargo
+          path: crate/target/nextest/ci/junit.xml
+  consume:
+    needs: [node, matrix]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: got
+      - run: find got -type f | sort && cat got/pkg-x64/same-name.txt
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          path: merged
+          merge-multiple: true
+      - run: find merged -type f | sort

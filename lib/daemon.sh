@@ -25,7 +25,9 @@
 # bana.conf's daemon.* keys say which pushes run (`bana settings` lists them). They and
 # the rest of the settings are read at install: run install again after changing them.
 # The daemon runs a snapshot of bana in ~/.bana/<prefix>/daemon, and builds in its own
-# clone, ~/.bana/<prefix>/src: your checkout stays yours.
+# clone, ~/.bana/<prefix>/src: your checkout stays yours. Only Fix with Claude on a failed
+# build (the page, 🧱) writes there: a bana/fix-<sha7> branch and its worktree under
+# ~/.bana/<prefix>/fix, in the checkout install ran in.
 
 daemon_usage() { awk '/^#   bana daemon/, /^#   bana daemon poke/ { sub(/^# ?/, ""); print }' "$bana_root/lib/daemon.sh" >&2; exit 2; }
 
@@ -251,9 +253,10 @@ d_path() {
   echo "$p"
 }
 
-# daemon/settings: only the keys the daemon takes (another is an error there).
-d_write_settings() { # PORT TRAY PATH GH
-  local port=$1 tray=$2 path=$3 gh=$4 tiers k v login p
+# daemon/settings: only the keys the daemon takes (another is an error there). ROOT is this
+# checkout: the page's Fix with Claude makes its worktrees and branches in it.
+d_write_settings() { # PORT TRAY PATH GH ROOT
+  local port=$1 tray=$2 path=$3 gh=$4 root=$5 tiers k v login p b=''
   tiers=$(words "$(conf tiers "quick nightly release")" | tr -s ' ' | sed 's/^ //; s/ $//')
   for k in daemon.tier daemon.tag_tier; do
     v=$(daemon_conf "$k")
@@ -265,6 +268,11 @@ d_write_settings() { # PORT TRAY PATH GH
   case $(daemon_conf daemon.supersede) in queued | running) ;; *) die "daemon.supersede: queued or running" ;; esac
   case $(daemon_conf daemon.token) in gh | none) ;; *) die "daemon.token: gh or none" ;; esac
   login=$(gh api user --jq .login 2>/dev/null || true)
+  # The bana commit the snapshot is of (a fix's brief names it), unless bana is a copy
+  # inside another repository.
+  if [[ $(git -C "$bana_root" rev-parse --show-toplevel 2>/dev/null) == "$(cd "$bana_root" && pwd -P)" ]]; then
+    b=$(git -C "$bana_root" rev-parse HEAD 2>/dev/null) || b=''
+  fi
   mkdir -p "$d_snap"
   {
     echo "# Written by bana daemon install ($(date '+%Y-%m-%d %H:%M')); run it again to change this."
@@ -292,6 +300,8 @@ d_write_settings() { # PORT TRAY PATH GH
       echo "$k = $p"
     done
     echo "script = $d_snap/bin/bana"
+    echo "checkout = $root"
+    [[ -z $b ]] || echo "bana_commit = $b"
   } >"$d_settings.new.$$"
   mv -f "$d_settings.new.$$" "$d_settings"
 }
@@ -476,7 +486,7 @@ d_prepare() { # PORT TRAY
   d_snapshot "$bin"
   d_clone "$root" "$gh"
   path=$(d_path)
-  d_write_settings "$1" "$2" "$path" "$gh"
+  d_write_settings "$1" "$2" "$path" "$gh" "$root"
   echo "  settings: $d_settings"
 }
 

@@ -1,0 +1,31 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.01s
+────────────
+ Nextest run ID b7646b50-fbcb-4ace-9b56-45bb963da60a with nextest profile: ci
+    Starting 5 tests across 2 binaries (1 test skipped)
+        PASS [   0.008s] (1/5) demo::facts fact_one
+        PASS [   0.005s] (2/5) demo::facts fact_two
+        FAIL [   0.008s] (3/5) demo tests::accepted
+  stdout ───
+
+    running 1 test
+    test tests::accepted ... FAILED
+
+    failures:
+
+    failures:
+        tests::accepted
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'tests::accepted' (5893) panicked at src/lib.rs:12:45:
+    accepted
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        PASS [   0.006s] (4/5) demo tests::adds
+        PASS [   0.007s] (5/5) demo::facts real::raw_file_end_stops_with_done
+────────────
+     Summary [   0.015s] 5 tests run: 4 passed, 1 failed, 1 skipped
+        FAIL [   0.008s] (3/5) demo tests::accepted
+error: test run failed

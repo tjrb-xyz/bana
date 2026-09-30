@@ -19,6 +19,7 @@ ln -s "${BASH_UNDER_TEST:-$(command -v bash)}" "$T/path/bash"
 [[ -z ${AWK:-} ]] || ln -s "$(command -v "$AWK")" "$T/path/awk"
 export PATH=$T/path:$here/stand-ins:$PATH
 echo "bash: $(bash -c 'echo $BASH_VERSION'), awk: $(awk --version 2>&1 | head -1)"
+real_home=$HOME # each test's world has a HOME of its own; cargo's registry is in this one
 
 tar czf "$T/runner.tar.gz" -C "$here/fixtures/runner" .
 export FAKE_TARBALL=$T/runner.tar.gz BANA_RUNNER_VERSION=2.999.0
@@ -208,12 +209,16 @@ cd "$src"
 fresh
 mkdir -p .github/workflows && echo 'on: workflow_dispatch' >.github/workflows/ci.yml
 lock=$HOME/.bana/act.lock
+act_started() { # waits until the stand-in act has written its pid
+  local i=0
+  while [[ ! -s $FAKE_STATE/act.pid ]] && ((i++ < 100)); do sleep 0.1; done
+}
 FAKE_ACT_SLEEP=30 bash "$bana" ci >/dev/null 2>&1 &
 running=$!
-i=0
-while [[ ! -s $FAKE_STATE/act.pid ]] && ((i++ < 100)); do sleep 0.1; done
-check "lock: act holds it, with bana ci's pid (exec keeps it)" same "$(sed -n 1p "$lock/owner")" "$running"
-check "lock: that pid is act's" same "$(cat "$FAKE_STATE/act.pid")" "$running"
+act_started
+act_pid=$(cat "$FAKE_STATE/act.pid")
+check "lock: bana ci holds it while act runs, with its own pid" same "$(sed -n 1p "$lock/owner")" "$running"
+check "lock: act runs under it (its output goes through tee)" same "$(ps -o ppid= -p "$act_pid" | tr -d ' ')" "$running"
 check "lock: its label" same "$(sed -n 3p "$lock/owner")" "bana ci quick (wid)"
 bash "$bana" ci nightly >"$T/out" 2>&1 || true
 check "lock: another bana ci is refused" has "$T/out" "act is busy here: bana ci quick (wid)"
@@ -221,13 +226,24 @@ check "lock: another bana ci is refused" has "$T/out" "act is busy here: bana ci
 BANA_ACT_LOCKED=1 bash "$bana" ci >/dev/null
 check "lock: BANA_ACT_LOCKED=1 (the daemon has it) runs anyway" has "$FAKE_LOG" "act workflow_dispatch"
 check "lock: and leaves it as it was" same "$(sed -n 1p "$lock/owner")" "$running"
+kill "$act_pid"
+wait "$running" 2>/dev/null || true
+check "lock: act ended, bana ci frees it" test ! -e "$lock"
+# ci.log = no: bana ci execs act, whose pid then holds the lock.
+rm -f "$FAKE_STATE/act.pid"
+BANA_CI_LOG=no FAKE_ACT_SLEEP=30 bash "$bana" ci >/dev/null 2>&1 &
+running=$!
+act_started
+check "lock: with ci.log = no, act holds it, with bana ci's pid (exec keeps it)" same "$(sed -n 1p "$lock/owner")" "$running"
+check "lock: that pid is act's" same "$(cat "$FAKE_STATE/act.pid")" "$running"
 kill "$running"
 wait "$running" 2>/dev/null || true
 : >"$FAKE_LOG"
 bash "$bana" ci >/dev/null
 check "lock: act gone, the next bana ci takes it over" has "$FAKE_LOG" "act workflow_dispatch"
-check "lock: as its own" same "$(sed -n 1p "$lock/owner")" "$(cat "$FAKE_STATE/act.pid")"
+check "lock: and frees it once act ends" test ! -e "$lock"
 # The daemon's: a live owner; then the same pid with another start time (reused).
+mkdir -p "$lock"
 sleep 30 &
 sleeper=$!
 printf '%s\n' "$sleeper" "$(LC_ALL=C ps -o lstart= -p "$sleeper" | awk '{ $1 = $1; print }')" "build 7 of wid" >"$lock/owner"
@@ -239,12 +255,295 @@ bash "$bana" ci >/dev/null
 check "lock: a pid that started at another time is someone else's: taken over" has "$FAKE_LOG" "act workflow_dispatch"
 kill "$sleeper"
 wait "$sleeper" 2>/dev/null || true
-# An act that cannot start: its pid is gone, so its lock is stale.
+# An act that cannot start: bana ci frees the lock, and an exec'd one's pid is gone (stale).
 mkdir -p "$T/w/badact" && printf '#!/nonexistent/interpreter\n' >"$T/w/badact/act" && chmod +x "$T/w/badact/act"
 PATH=$T/w/badact:$PATH bash "$bana" ci >/dev/null 2>&1 || true
+PATH=$T/w/badact:$PATH BANA_CI_LOG=no bash "$bana" ci >/dev/null 2>&1 || true
 : >"$FAKE_LOG"
 bash "$bana" ci >/dev/null
 check "lock: an act that never started holds nothing" has "$FAKE_LOG" "act workflow_dispatch"
+
+# ---- bana ci keeps act's output, for bana fix -------------------------------------------------
+fresh
+mkdir -p .github/workflows && echo 'on: workflow_dispatch' >.github/workflows/ci.yml
+git add .github && git -c user.name=t -c user.email=t@t commit -q -m one
+echo 'on: push' >.github/workflows/ci.yml && echo new >new.txt
+ci=$HOME/.bana/wid/ci
+env_of() { sed -n "s/^$1=//p" "$ci/last.env"; }
+FAKE_ACT_OUT='[ci/rust] ⭐ Run Main cargo test' FAKE_ACT_EXIT=1 bash "$bana" ci -j rust >"$T/out" 2>"$T/err" && st=0 || st=$?
+check "log: bana ci exits with act's status (1)" same "$st" 1
+check "log: act's output on the terminal" has "$T/out" "[ci/rust] ⭐ Run Main cargo test"
+check "log: and in ci/last.log" has "$ci/last.log" "[ci/rust] ⭐ Run Main cargo test"
+check "log: with act's stderr" has "$ci/last.log" "Error: Job 'rust' failed"
+check "log: under their names once act ended" test ! -e "$ci/last.log.part" -a ! -e "$ci/last.env.part"
+check "log: the first line names the network" has "$T/out" "(linux/amd64, network bridge)"
+check "log: a failure points to bana fix" has "$T/out" "bana fix: hand this failure to Claude Code on a fix branch"
+check "log: and to the log" has "$T/out" "act's output: $ci/last.log"
+check "log: last.env has every field, in order" same "$(cut -d= -f1 "$ci/last.env" | tr '\n' ' ')" \
+  "sha ref dirty tier job event network act bana started ended exit "
+check "log: last.env: the commit" same "$(env_of sha)" "$(git rev-parse HEAD)"
+check "log: last.env: its ref" same "$(env_of ref)" "$(git symbolic-ref HEAD)"
+check "log: last.env: the changed files, untracked too" same "$(env_of dirty)" ".github/workflows/ci.yml new.txt"
+check "log: last.env: the tier and the job" same "$(env_of tier) $(env_of job)" "quick rust"
+check "log: last.env: no event" same "$(env_of event)" ""
+check "log: last.env: the network" same "$(env_of network)" "bridge"
+check "log: last.env: act's version" same "$(env_of act)" "0.2.89"
+check "log: last.env: bana's commit" same "$(env_of bana)" "$(git -C "$here/.." rev-parse HEAD)"
+check "log: last.env: when it started and ended" \
+  bash -c "[[ '$(env_of started)' =~ ^[0-9]+$ ]] && (( $(env_of ended) >= $(env_of started) ))"
+check "log: last.env: act's exit status" same "$(env_of exit)" "1"
+check "log: the lock is gone after the run" test ! -e "$HOME/.bana/act.lock"
+bash "$bana" settings >"$T/out"
+check "log: ci.log is a setting, yes by default" has "$T/out" "ci.log = yes"
+echo '{}' >event.json
+FAKE_ACT_OUT='all green' bash "$bana" ci nightly --event event.json -- --network host >"$T/out" 2>&1 && st=0 || st=$?
+check "log: exit 0 is kept" same "$st" 0
+check "log: a second bana ci starts, and its log replaces the last" same "$(cat "$ci/last.log")" "all green"
+check "log: no bana fix after a pass" lacks "$T/out" "bana fix"
+check "log: act's own --network wins, in the first line" has "$T/out" "network host)"
+check "log: and in last.env" same "$(env_of network)" "host"
+check "log: last.env: the event file, the tier, no job" same "$(env_of event) $(env_of tier) $(env_of job)" \
+  "$(pwd -P)/event.json nightly "
+cp "$ci/last.env" "$T/last.env"
+: >"$FAKE_LOG"
+bash "$bana" ci -n >/dev/null
+check "log: a dry run leaves the last run's log" same "$(cat "$ci/last.log")" "all green"
+check "log: and its last.env" same "$(cat "$ci/last.env")" "$(cat "$T/last.env")"
+rm -rf "$ci"
+BANA_CI_LOG=no bash "$bana" ci >/dev/null &
+p=$!
+wait "$p"
+check "log: ci.log = no execs act" same "$(cat "$FAKE_STATE/act.pid")" "$p"
+check "log: and keeps nothing" test ! -e "$ci"
+: >"$FAKE_LOG"
+BANA_ACT_LOCKED=1 FAKE_ACT_OUT='{"msg":"x"}' FAKE_ACT_EXIT=1 bash "$bana" ci >"$T/out" 2>"$T/err" &
+p=$!
+wait "$p" && st=0 || st=$?
+check "log: the daemon's bana ci (BANA_ACT_LOCKED=1) execs act" same "$(cat "$FAKE_STATE/act.pid")" "$p"
+check "log: with act's status" same "$st" 1
+check "log: its stdout is bana's first line, then act's own" same "$(sed 1d "$T/out")" '{"msg":"x"}'
+check "log: act's stderr stays apart" has "$T/err" "Error: Job 'rust' failed"
+check "log: no bana fix there" lacks "$T/out" "bana fix"
+check "log: and nothing kept" test ! -e "$ci"
+check "log: nor act's version asked" lacks "$FAKE_LOG" "act --version"
+# Ctrl-C: SIGINT to the process group. The command runs in a group of its own, with SIGINT
+# back at its default (a background job here ignores it), and gets the SIGINT once act has
+# started talking (so tee has started too).
+own_group=(python3 -c 'import os, signal, sys
+os.setpgid(0, 0)
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+os.execvp(sys.argv[1], sys.argv[1:])')
+interrupt() { # PID
+  local i=0
+  while ! grep -qs 'act: started' "$ci/last.log.part" && ((i++ < 100)); do sleep 0.1; done
+  kill -INT -- "-$1"
+}
+FAKE_ACT_INT=1 FAKE_ACT_OUT='act: started' "${own_group[@]}" bash "$bana" ci >"$T/out" 2>&1 &
+p=$!
+interrupt "$p"
+wait "$p" && st=0 || st=$?
+check "log: Ctrl-C: act's last words are in last.log (tee -i)" has "$ci/last.log" "act: interrupted, its containers removed"
+check "log: Ctrl-C: after the rest of act's output" has "$ci/last.log" "act: started"
+check "log: Ctrl-C: act's status" same "$st" 1
+check "log: Ctrl-C: last.env too" same "$(env_of exit)" "1"
+check "log: Ctrl-C: no bana fix after it" lacks "$T/out" "bana fix"
+check "log: Ctrl-C: the lock is gone" test ! -e "$HOME/.bana/act.lock"
+# An act the SIGINT kills: bash 3.2 would die with it, but for bana ci's trap.
+rm -rf "$ci"
+FAKE_ACT_SLEEP=30 FAKE_ACT_OUT='act: started' "${own_group[@]}" bash "$bana" ci >"$T/out" 2>&1 &
+p=$!
+interrupt "$p"
+wait "$p" && st=0 || st=$?
+check "log: Ctrl-C killing act: bana ci still ends the log" has "$ci/last.log" "act: started"
+check "log: Ctrl-C killing act: its status" same "$st $(env_of exit)" "130 130"
+
+# ---- bana fix: a failure handed to Claude Code, on a branch of its own -----------------------------
+# bana fix runs bana-manager (fix prepare makes the worktree, the brief and the prompt): the one
+# BANA_TEST_MANAGER names, else one the real cargo builds here. Claude Code is the stand-in, which
+# only records its arguments and where it ran.
+fresh
+fix_bm=${BANA_TEST_MANAGER:-}
+if [[ -z $fix_bm ]] && cargo=$(PATH=${PATH#"$T/path:$here/stand-ins:"} command -v cargo); then
+  fix_bm=$here/../manager/target/debug/bana-manager
+  HOME=$real_home "$cargo" build -q --locked --manifest-path "$here/../manager/Cargo.toml" || fix_bm=$T/unbuilt
+fi
+if [[ -z $fix_bm ]]; then
+  echo "skip bana fix: no cargo here to build bana-manager (BANA_TEST_MANAGER names a built one)"
+else
+  check "fix: bana-manager, built for these tests" test -x "$fix_bm"
+fi
+if [[ -x ${fix_bm:-} ]]; then
+  mkdir -p .github/workflows && echo 'on: workflow_dispatch' >.github/workflows/ci.yml
+  echo one >lib.rs
+  git add -A && git -c user.name=t -c user.email=t@t commit -q -m one
+  git clone -q --bare . "$T/w/origin.git" && git remote set-url origin "$T/w/origin.git"
+  br=$(git symbolic-ref HEAD) one=$(git rev-parse HEAD)
+  x1=${one:0:7} d=$HOME/.bana/wid
+  mkdir -p "$d/daemon" && dp=$(cd "$d" && pwd -P)
+  paste=$here/../manager/tests/fixtures/results/dsper-paste.txt
+  bana_self=$(cd "$here/.." && pwd)/bin/bana
+  commit() { echo "$1" >>lib.rs && git -c user.name=t -c user.email=t@t commit -qam "$1" && git rev-parse HEAD; }
+  claude_arg() { # N: the stand-in's Nth argument
+    local a i=0
+    while IFS= read -r -d '' a; do
+      i=$((i + 1))
+      [[ $i != "$1" ]] || { printf '%s' "$a"; return; }
+    done <"$FAKE_STATE/claude.args"
+  }
+  claude_argc() { tr -cd '\000' <"$FAKE_STATE/claude.args" | wc -c | tr -d ' '; }
+
+  CARGO_TARGET_DIR=$T/w/none bash "$bana" fix --log "$paste" >"$T/out" 2>&1 || true
+  check "fix: without bana-manager, says how to get it" has "$T/out" "bana fix needs bana-manager: bana daemon install"
+  # shellcheck disable=SC2016 # the old binary expands these when it runs
+  printf '#!/bin/sh\necho "old bana-manager $*" >>"$FAKE_LOG"\nexit 2\n' >"$d/daemon/bana-manager"
+  chmod +x "$d/daemon/bana-manager"
+  CARGO_TARGET_DIR=$T/w/none bash "$bana" fix --log "$paste" >"$T/out" 2>&1 || true
+  check "fix: a daemon snapshot from before bana fix does not do" has "$T/out" "bana fix needs bana-manager: bana daemon install"
+  cp "$fix_bm" "$d/daemon/bana-manager"
+  bash "$bana" fix >"$T/out" 2>&1 || true
+  check "fix: nothing failed, nothing to fix" has "$T/out" "Nothing here failed: no failed bana ci, and no failed daemon build of"
+
+  # A pasted log (the owner's dsper run): the fix starts at HEAD.
+  bash "$bana" fix --log "$paste" >"$T/out" 2>&1 || true
+  wt=$dp/fix/$x1
+  check "fix --log: bana/fix-<sha7> at HEAD" same "$(git rev-parse -q --verify "refs/heads/bana/fix-$x1" || true)" "$one"
+  check "fix --log: a worktree in ~/.bana/<prefix>/fix, on it" same "$(git -C "$wt" symbolic-ref HEAD 2>/dev/null || true)" "refs/heads/bana/fix-$x1"
+  check "fix --log: your checkout stays on its branch" same "$(git symbolic-ref HEAD)" "$br"
+  check "fix --log: the worktree denies git push to Claude" has "$wt/.claude/settings.local.json" '"Bash(git push:*)"'
+  check "fix --log: and git status there stays clean" same "$(git -C "$wt" status --porcelain 2>&1)" ""
+  check "fix --log: Claude Code runs in the worktree" same "$(cat "$FAKE_STATE/claude.cwd")" "$wt"
+  check "fix --log: named after the fix (-n)" same "$(claude_arg 1) $(claude_arg 2)" "-n bana fix $x1"
+  check "fix --log: the prompt is its first message" same "$(claude_arg 3)" "$(cat "$d/fix/$x1.d/prompt.txt")"
+  check "fix --log: and nothing else" same "$(claude_argc)" 3
+  check "fix --log: the prompt names the owner's failing test" has "$d/fix/$x1.d/prompt.txt" \
+    "real_c3_the_engine_accepts_only_its_token_and_no_origin panicked at crates/dsper-engine/tests/facts.rs:457:18"
+  check "fix --log: and how to read the brief, with this bana" has "$d/fix/$x1.d/prompt.txt" "$bana_self fix brief $x1"
+  check "fix --log: the brief says which Claude Code" has "$d/fix/$x1.d/brief.md" "- Claude Code: 2.1.284 (Claude Code)"
+  bash "$bana" fix --log - <"$paste" >"$T/out" 2>&1 || true
+  check "fix --log -: pasted on stdin, at the same commit: its fix goes on" has "$T/out" "Fix $x1 goes on: bana/fix-$x1"
+  (cd "$wt" && bash "$bana" fix brief) >"$T/out" 2>&1 || true
+  check "fix brief: in a fix's worktree, its brief" same "$(head -1 "$T/out")" "# bana fix $x1"
+
+  # A failed bana ci: the fix is at the commit it ran, not at HEAD.
+  two=$(commit two) && x2=${two:0:7}
+  FAKE_ACT_OUT=$(cat "$paste") FAKE_ACT_EXIT=1 bash "$bana" ci -j rust >/dev/null 2>&1 || true
+  three=$(commit three) && x3=${three:0:7}
+  bash "$bana" fix >"$T/out" 2>&1 || true
+  check "fix: by default the newest failure, here the last bana ci" has "$T/out" "The newest failure here is the last bana ci (bana fix last)"
+  check "fix: at the commit it ran (last.env's sha)" same "$(git rev-parse -q --verify "refs/heads/bana/fix-$x2" || true)" "$two"
+  check "fix: Claude Code in that fix's worktree" same "$(cat "$FAKE_STATE/claude.cwd")" "$dp/fix/$x2"
+  check "fix: its brief says how the hand run ran" has "$d/fix/$x2.d/brief.md" "- Jobs asked for: -j rust"
+  bash "$bana" fix last >"$T/out" 2>&1 || true
+  check "fix last: the last bana ci's fix goes on" has "$T/out" "Fix $x2 goes on"
+
+  # Daemon builds, read from their build.json as the daemon writes it (at HEAD, commit three).
+  daemon_build() { # ID STATE REF ENDED
+    mkdir -p "$d/builds/$1"
+    cp "$here/../manager/tests/fixtures/results/dsper-paste.jsonl" "$d/builds/$1/act.jsonl"
+    cat >"$d/builds/$1/build.json" <<JSON
+{
+  "id": $1,
+  "trigger": "push",
+  "ref": "$3",
+  "sha": "$three",
+  "tier": "quick",
+  "attempt": 1,
+  "queued_at": 1790000000,
+  "before": null,
+  "state": "$2",
+  "reason": null,
+  "started_at": 1790000000,
+  "ended_at": $4,
+  "jobs": [
+    {
+      "key": "rust",
+      "id": "rust",
+      "state": "success"
+    }
+  ]
+}
+JSON
+  }
+  now=$(date +%s)
+  daemon_build 42 failure "$br" $((now - 1000))
+  bash "$bana" fix >"$T/out" 2>&1 || true
+  check "fix: a failed daemon build older than the hand run: the hand run" has "$T/out" "(bana fix last)"
+  daemon_build 42 failure "$br" $((now + 1000))
+  daemon_build 43 failure refs/heads/other $((now + 2000))
+  daemon_build 44 error "$br" $((now + 3000))
+  bash "$bana" fix >"$T/out" 2>&1 || true
+  check "fix: a newer failed daemon build of this branch (not another's, nor one in error)" has "$T/out" \
+    "The newest failure here is daemon build 42 of ${br#refs/heads/} (bana fix 42)"
+  check "fix: at the build's commit" same "$(cat "$FAKE_STATE/claude.cwd")" "$dp/fix/$x3"
+  check "fix: its brief names the build" has "$d/fix/$x3.d/brief.md" "- Run: daemon build 42 (push)"
+  (cd "$dp/fix/$x3" && bash "$bana" fix 42) >"$T/out" 2>&1 || true
+  check "fix 42: from a fix's worktree, its fix goes on" has "$T/out" "Fix $x3 goes on"
+  check "fix 42: in your checkout, not in that worktree" has "$d/fix/$x3.d/fix.json" "\"checkout\": \"$(pwd -P)\""
+  bash "$bana" fix 44 >"$T/out" 2>&1 || true
+  check "fix 44: a build that ended in error has no fix" has "$T/out" "build 44 did not fail"
+
+  # --open: Claude Code's link, to open (a Mac) or xdg-open.
+  : >"$FAKE_LOG"
+  rm -f "$FAKE_STATE/claude.args"
+  FAKE_OS=Darwin bash "$bana" fix 42 --open >"$T/out" 2>&1 || true
+  link=$(sed -n 's/^open //p' "$FAKE_LOG")
+  check "fix --open: on a Mac, open with Claude Code's claude-cli:// link" same "${link%%\?*}" "claude-cli://open"
+  check "fix --open: the link opens the worktree, with the prompt" same "$(python3 -c 'import sys, urllib.parse as u
+q = u.parse_qs(u.urlsplit(sys.argv[1]).query)
+print(q["cwd"][0], q["q"][0] == open(sys.argv[2], encoding="utf-8").read())' "$link" "$d/fix/$x3.d/prompt.txt")" "$dp/fix/$x3 True"
+  check "fix --open: and starts no Claude Code here" test ! -e "$FAKE_STATE/claude.args"
+  check "fix --open: says what comes" has "$T/out" "Claude Code opens in a new terminal"
+  : >"$FAKE_LOG"
+  bash "$bana" fix 42 --open >/dev/null 2>&1 || true
+  check "fix --open: elsewhere, xdg-open" has "$FAKE_LOG" "xdg-open claude-cli://open?cwd="
+  noclaude=$(IFS=:; for p in $PATH; do [[ -x $p/claude ]] || printf '%s:' "$p"; done)
+  PATH=${noclaude%:} bash "$bana" fix 42 >"$T/out" 2>&1 || true
+  check "fix: no Claude Code on PATH: where the fix is" has "$T/out" "worktree: $dp/fix/$x3"
+  check "fix: and its prompt" has "$T/out" "prompt:   $d/fix/$x3.d/prompt.txt"
+
+  bash "$bana" fix list >"$T/out" 2>&1 || true
+  check "fix list: the paste's fix" has "$T/out" "$x1  bana/fix-$x1: no commits yet (a pasted log, on ${br#refs/heads/})"
+  check "fix list: the hand run's" has "$T/out" "$x2  bana/fix-$x2: no commits yet (bana ci here, on ${br#refs/heads/})"
+  check "fix list: the daemon build's" has "$T/out" "$x3  bana/fix-$x3: no commits yet (daemon build 42, on ${br#refs/heads/})"
+
+  # push goes to origin (a local bare one here); --pr asks gh for a pull request.
+  bash "$bana" fix push "$x1" >"$T/out" 2>&1 || true
+  check "fix push: nothing to push without a commit" has "$T/out" "bana/fix-$x1 has no commits on $x1 yet"
+  { echo fixed >>"$wt/lib.rs" && git -C "$wt" -c user.name=t -c user.email=t@t commit -qam fixed; } || true
+  : >"$FAKE_LOG"
+  (cd "$wt" && bash "$bana" fix push --pr) >"$T/out" 2>&1 || true
+  check "fix push: in a fix's worktree, its branch goes to origin" \
+    same "$(git -C "$T/w/origin.git" rev-parse -q --verify "refs/heads/bana/fix-$x1" || true)" "$(git -C "$wt" rev-parse HEAD)"
+  check "fix push --pr: a pull request against the branch that failed" has "$FAKE_LOG" \
+    "gh pr create --fill --base ${br#refs/heads/} --head bana/fix-$x1 --repo acme/widget"
+
+  # drop: the worktree goes, never with changes unless --force; the branch while it has no commits.
+  echo more >>"$wt/lib.rs" || true
+  bash "$bana" fix drop "$x1" >"$T/out" 2>&1 || true
+  check "fix drop: refuses a worktree with changes not committed" has "$T/out" "has changes not committed"
+  check "fix drop: and keeps it" test -d "$wt"
+  git -C "$wt" checkout -q -- lib.rs || true
+  bash "$bana" fix drop "$x1" >"$T/out" 2>&1 || true
+  check "fix drop: the worktree goes" test ! -e "$wt"
+  git worktree list >"$T/out"
+  check "fix drop: git forgets it" lacks "$T/out" "$wt"
+  check "fix drop: a branch with commits stays" same "$(git rev-parse -q --verify "refs/heads/bana/fix-$x1" || true)" \
+    "$(git -C "$T/w/origin.git" rev-parse "refs/heads/bana/fix-$x1")"
+  bash "$bana" fix list >"$T/out" 2>&1 || true
+  check "fix drop: and so does its fix" has "$T/out" "$x1  bana/fix-$x1: 1 commit, worktree removed"
+  bash "$bana" fix drop "$x1" --delete-branch >/dev/null 2>&1 || true
+  check "fix drop --delete-branch: the branch goes too" same "$(git rev-parse -q --verify "refs/heads/bana/fix-$x1" || true)" ""
+  check "fix drop --delete-branch: and the fix" test ! -e "$d/fix/$x1.d"
+  bash "$bana" fix drop "$x2" >/dev/null 2>&1 || true
+  check "fix drop: a branch without commits goes with its worktree" same "$(git rev-parse -q --verify "refs/heads/bana/fix-$x2" || true)" ""
+  check "fix drop: and so does its fix" test ! -e "$d/fix/$x2" -a ! -e "$d/fix/$x2.d"
+  echo new >"$dp/fix/$x3/new.txt" || true
+  bash "$bana" fix drop >/dev/null 2>&1 || true
+  check "fix drop: an untracked file is a change too (the newest fix, by default)" test -e "$dp/fix/$x3/new.txt"
+  bash "$bana" fix drop "$x3" --force >/dev/null 2>&1 || true
+  check "fix drop --force: the worktree goes with its changes" test ! -e "$dp/fix/$x3"
+  check "fix: your checkout's own files stay as they were" same "$(git status --porcelain)" ""
+fi
 
 # ---- USB audio --------------------------------------------------------------------
 fresh
@@ -474,6 +773,8 @@ docker = $here/stand-ins/docker
 bash = $T/path/bash
 caffeinate = $here/stand-ins/caffeinate
 script = $d/daemon/bin/bana
+checkout = $(git rev-parse --show-toplevel)
+bana_commit = $(git -C "$bana_root" rev-parse HEAD)
 EOF
 check "daemon: settings, resolved (bana.conf's path first, absolute programs)" same "$(grep -v '^#' "$d/daemon/settings")" "$(cat "$T/want")"
 p=$HOME/Library/LaunchAgents/xyz.tjrb.bana.wid.plist

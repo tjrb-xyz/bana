@@ -4,7 +4,10 @@
 # labels match, so Macs, Linux PCs and VMs share the work. README.md has the details.
 #
 # On this machine, when you want it (act, in OrbStack's Docker; nothing stays running):
-#   bana ci [TIER] [-j JOB] [--x64] [--list] [--event FILE]   the workflow's jobs here (bana ci --help)
+#   bana ci [TIER] [-j JOB] [--x64] [--list] [--event FILE]   the workflow's jobs here (bana ci --help);
+#                            act's output stays in ~/.bana/<prefix>/ci/last.log, for bana fix
+#   bana fix [BUILD | last | --log FILE|-] [--open]   a failed run to Claude Code, on a branch
+#                            of its own in a worktree (bana fix help: brief, list, push, drop)
 # CI on push, on this machine (a daemon runs each push through act and posts commit statuses):
 #   bana daemon install [--port N] [--no-tray] [--no-open] [--now]   start it (bana daemon help)
 #   bana daemon uninstall [--purge] | run [--build] | status | log | open | poke
@@ -181,7 +184,7 @@ settings() {
   echo "# bana $BANA_VERSION at $bana_root"
   echo "# bana.conf: ${conf_file:-none}"
   for k in repo prefix labels vm vm_x64 linux_user packages.linux path hook.mac hook.linux \
-    runner_version workflow tiers tier_input act.image act.network act.args act.docker_config keep keep_max_gb \
+    runner_version workflow tiers tier_input act.image act.network act.args act.docker_config ci.log keep keep_max_gb \
     daemon.branches daemon.tags daemon.tier daemon.tag_tier daemon.poll daemon.timeout \
     daemon.supersede daemon.token; do
     case $k in
@@ -195,6 +198,7 @@ settings() {
     act.docker_config)
       # shellcheck disable=SC2088 # as bana.conf would say it
       v=$(conf act.docker_config "~/.bana/docker") ;;
+    ci.log) v=$(conf ci.log yes) ;;
     keep_max_gb) v=$(conf keep_max_gb 0) ;;
     daemon.*) v=$(daemon_conf "$k") ;;
     *) v=$(conf "$k") ;;
@@ -736,6 +740,17 @@ relabel() {
   say "Labels are up to date."
 }
 
+# bana-manager for its SUBCOMMAND: the daemon's snapshot, else this bana's own release build.
+# One older than the subcommand (its usage lacks it) does not count.
+bm() { # SUBCOMMAND
+  local b
+  for b in "$home/daemon/bana-manager" "${CARGO_TARGET_DIR:-$bana_root/manager/target}/release/bana-manager"; do
+    [[ -x $b ]] || continue
+    if grep -q "bana-manager $1 " <<<"$("$b" "$1" --usage </dev/null 2>&1)"; then echo "$b"; return; fi
+  done
+  die "bana $1 needs bana-manager: bana daemon install"
+}
+
 manager() {
   need_repo
   local bin=$bana_root/manager/target/release/bana-manager port='' a h
@@ -803,6 +818,11 @@ ci)
   # shellcheck source=SCRIPTDIR/../lib/act.sh
   source "$bana_root/lib/act.sh"
   act_main "$@"
+  ;;
+fix)
+  # shellcheck source=SCRIPTDIR/../lib/fix.sh
+  source "$bana_root/lib/fix.sh"
+  fix_main "$@"
   ;;
 tart)
   # shellcheck source=SCRIPTDIR/../lib/tart.sh

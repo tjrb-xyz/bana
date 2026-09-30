@@ -14,6 +14,8 @@
 #   Linux jobs (<prefix>-linux, ubuntu-*) run in containers from bana.conf's act.image; on a
 #   Mac, macOS jobs (<prefix>-macos) run on the Mac itself, with its CoreAudio and USB devices.
 #   One act runs at a time on this machine: bana ci refuses while another one runs.
+#   A run keeps act's output in ~/.bana/<prefix>/ci/last.log, and what ran in last.env, for
+#   bana fix (bana.conf: ci.log = no runs act as before, which keeps its colours in containers).
 #   bana.conf's act.args go to act too (e.g. --reuse to keep containers, and their builds).
 #   Anything after -- goes to act, and wins over act.args.
 
@@ -36,9 +38,10 @@ act_started() { LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | awk '{ $1 = $1; pri
 # One act at a time on this machine, for bana ci and the daemon's builds: act names its
 # containers without a run id (a second run removes the first one's), and its artifact
 # server's port is fixed. The lock is ~/.bana/act.lock, a directory whose owner file has
-# three lines: a pid, when that pid started, and a label. bana ci's pid becomes act's
-# (exec), so the lock holds while act runs. Once the pid is gone, or is another process
-# (another start time), the lock is stale and the next taker removes it.
+# three lines: a pid, when that pid started, and a label. bana ci holds it until act ends,
+# then frees it; where bana ci execs act, its pid becomes act's, so the lock holds while act
+# runs. Once the pid is gone, or is another process (another start time), the lock is stale
+# and the next taker removes it.
 act_lock() { # LABEL
   local lock=$base_home/act.lock owner pid start tries=0
   mkdir -p "$base_home"
@@ -55,7 +58,8 @@ act_lock() { # LABEL
     # Stale: it goes, unless someone took it over meanwhile.
     [[ $(cat "$lock/owner" 2>/dev/null || true) != "$owner" ]] || rm -rf "$lock"
   done
-  # Until act starts; if it cannot start, its pid is gone and the lock stale anyway.
+  # Until act ends, or starts through exec; if it cannot start, its pid is gone and the lock
+  # stale anyway.
   trap 'rm -rf "$base_home/act.lock"' EXIT
   printf '%s\n' "$$" "$(act_started $$)" "$1" >"$lock/owner.$$"
   mv "$lock/owner.$$" "$lock/owner"
@@ -63,7 +67,7 @@ act_lock() { # LABEL
 
 act_main() {
   local tier='' x64='' list='' dry='' event='' secrets='' locked jobs=() pass=() args=() extra=()
-  local wf root here tiers image arch i o dc
+  local wf root here tiers image arch net i o dc all=()
   while (($#)); do
     case $1 in
     -j | --job) jobs=(-j "${2:?-j JOB}"); shift ;;
@@ -116,7 +120,8 @@ act_main() {
   # Each job gets a localhost of its own, as on GitHub, where each job has its own machine:
   # act's default (host) gives all of a run's Linux jobs the Docker host's, so the servers
   # of jobs running side by side answer each other (act.network = host for that).
-  args+=(--network "$(conf act.network bridge)")
+  net=$(conf act.network bridge)
+  args+=(--network "$net")
 
   # act reads its files relative to -C: relative paths stay relative to where bana ci runs.
   here=$(pwd -P)
@@ -158,6 +163,50 @@ act_main() {
   export DOCKER_CONFIG=$dc
   # The commit's own act options; those after -- come later, so they win.
   read -r -a extra <<<"$(conf act.args)" || true
-  say "act: ${tier:-the workflow} from $(basename "$wf"), Linux jobs in $image ($arch)$([[ $os == Darwin ]] && echo ", macOS jobs on this Mac")"
-  exec act workflow_dispatch "${args[@]}" ${extra[@]+"${extra[@]}"} ${jobs[@]+"${jobs[@]}"} ${pass[@]+"${pass[@]}"}
+  # They may name another network: act takes the last.
+  all=(${extra[@]+"${extra[@]}"} ${pass[@]+"${pass[@]}"})
+  for ((i = 0; i < ${#all[@]}; i++)); do
+    case ${all[i]} in --network) net=${all[i + 1]:-$net} ;; --network=*) net=${all[i]#*=} ;; esac
+  done
+  say "act: ${tier:-the workflow} from $(basename "$wf"), Linux jobs in $image ($arch, network $net)$([[ $os == Darwin ]] && echo ", macOS jobs on this Mac")"
+  args=(workflow_dispatch "${args[@]}" ${extra[@]+"${extra[@]}"} ${jobs[@]+"${jobs[@]}"} ${pass[@]+"${pass[@]}"})
+  # The daemon reads act's output itself, and a dry run leaves the last run's log.
+  [[ $locked != 1 && -z $dry && $(conf ci.log yes) != no ]] || exec act "${args[@]}"
+  act_logged "${args[@]}"
+}
+
+# A run by hand keeps act's output, and what ran, for bana fix: in ~/.bana/<prefix>/ci,
+# last.log and last.env. last.env's lines are KEY=VALUE (the rest of the line): sha, ref,
+# dirty (the changed files, as git status names them, space-separated), tier, job, event (its
+# file), network, act and bana (their versions), started and ended (Unix seconds), and exit
+# (act's). Both take their names when act ends (.part until then). act's output goes through
+# tee, so bash stays, holding the lock, until act ends; its EXIT trap then frees the lock.
+# Uses act_main's locals.
+act_logged() { # ACT-ARGUMENT...
+  local dir=$home/ci sha ref dirty v b='' started status stopped=''
+  mkdir -p "$dir"
+  sha=$(git -C "$root" rev-parse -q --verify HEAD 2>/dev/null) || true
+  ref=$(git -C "$root" symbolic-ref -q HEAD 2>/dev/null) || true
+  dirty=$(git -C "$root" status --porcelain 2>/dev/null |
+    awk '{ p = substr($0, 4); i = index(p, " -> "); if (i) p = substr(p, i + 4); printf "%s%s", s, p; s = " " }') || true
+  v=$(act --version 2>/dev/null | awk 'NR == 1 { print $NF }') || true
+  # bana's own commit, unless it is a copy inside another repository.
+  if [[ $(git -C "$bana_root" rev-parse --show-toplevel 2>/dev/null) == "$(cd "$bana_root" && pwd -P)" ]]; then
+    b=$(git -C "$bana_root" rev-parse HEAD 2>/dev/null) || true
+  fi
+  started=$(date +%s)
+  # Ctrl-C reaches act, which stops its jobs and ends; tee -i and bash (trapping it) wait
+  # for that, so the log ends as act's output does.
+  trap 'stopped=1' INT
+  if act "$@" 2>&1 | tee -i "$dir/last.log.part"; then status=0; else status=${PIPESTATUS[0]}; fi
+  trap - INT
+  printf '%s\n' "sha=$sha" "ref=$ref" "dirty=$dirty" "tier=$tier" "job=${jobs[1]:-}" "event=$event" \
+    "network=$net" "act=$v" "bana=$b" "started=$started" "ended=$(date +%s)" "exit=$status" >"$dir/last.env.part"
+  mv -f "$dir/last.log.part" "$dir/last.log"
+  mv -f "$dir/last.env.part" "$dir/last.env"
+  if ((status)) && [[ -z $stopped ]]; then
+    echo "act's output: $dir/last.log"
+    say "bana fix: hand this failure to Claude Code on a fix branch"
+  fi
+  exit "$status"
 }

@@ -3,11 +3,13 @@
 //! GitHub CLI, with arguments checked here first.
 //!
 //! In daemon mode ([`daemon_router`]) the same page and pool routes, plus the
-//! daemon's: its summary, the builds and their logs, and what the page's
-//! buttons do. Those call [`Daemon`]'s methods, with numeric ids, refs among
-//! the heads fetched and tiers from the settings.
+//! daemon's: its summary, the builds and their logs, what the page's buttons
+//! do, and the fixes Fix with Claude makes. Those call [`Daemon`]'s methods,
+//! with numeric ids, refs among the heads fetched, tiers from the settings
+//! and fixes by their commit's hex digits.
 
 use crate::daemon::Daemon;
+use crate::fix;
 use crate::guard::{err, guarded, health, Access};
 use crate::{
     attach_jobs, parse_local, parse_pool, parse_runs, runs_to_detail, valid_ref, valid_runner,
@@ -523,6 +525,9 @@ fn local_routes(d: Daemon) -> Router {
         .route("/builds/{id}/log", get(build_log))
         .route("/builds/{id}/cancel", post(cancel_build))
         .route("/builds/{id}/rerun", post(rerun))
+        .route("/builds/{id}/fix", post(fix_build))
+        .route("/fixes", get(fixes))
+        .route("/fixes/{fix}", get(fix_state))
         .route("/daemon", post(set_daemon))
         .route("/daemon/poll", post(poll))
         .route("/queue/clear", post(clear_queue))
@@ -636,6 +641,41 @@ async fn rerun(State(d): D, Path(id): Path<u64>) -> Response {
         Ok(new) => Json(json!({ "build": new })).into_response(),
         Err(e) => err(StatusCode::CONFLICT, e),
     }
+}
+
+/// Fix with Claude: the fix for a failed build, made or gone on with, as
+/// `bana-manager fix prepare` prints it: {fix, worktree, branch, link,
+/// command, dir, reused}. 404 for no such build, 409 for one that did not
+/// fail (it passed, was cancelled, timed out, could not start, or runs).
+async fn fix_build(State(d): D, Path(id): Path<u64>) -> Response {
+    match d.fix(id).await {
+        Ok(made) => Json(made).into_response(),
+        Err(e) => fix_error(e),
+    }
+}
+
+async fn fixes(State(d): D) -> Json<Value> {
+    Json(json!({ "fixes": d.fixes() }))
+}
+
+/// One fix, by its sha7 (4 to 64 hex digits of its commit).
+async fn fix_state(State(d): D, Path(name): Path<String>) -> Response {
+    if !(4..=64).contains(&name.len()) || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return err(StatusCode::BAD_REQUEST, "fix: its commit's hex digits");
+    }
+    match d.fix_state(&name).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => fix_error(e),
+    }
+}
+
+fn fix_error(e: fix::Error) -> Response {
+    let code = match &e {
+        fix::Error::Missing(_) => StatusCode::NOT_FOUND,
+        fix::Error::NotFailed(_) => StatusCode::CONFLICT,
+        fix::Error::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    err(code, e.to_string())
 }
 
 #[derive(Deserialize)]
@@ -1027,6 +1067,9 @@ esac"#,
             ("POST", "/ci/v1/builds"),
             ("POST", "/ci/v1/builds/1/cancel"),
             ("POST", "/ci/v1/builds/1/rerun"),
+            ("POST", "/ci/v1/builds/1/fix"),
+            ("GET", "/ci/v1/fixes"),
+            ("GET", "/ci/v1/fixes/abcd123"),
             ("POST", "/ci/v1/daemon"),
             ("POST", "/ci/v1/daemon/poll"),
             ("POST", "/ci/v1/queue/clear"),
@@ -1247,6 +1290,128 @@ esac"#,
         )
         .await;
         assert_eq!(code, 409, "not finished: {v}");
+        p.remove();
+    }
+
+    /// `%XX` back to bytes, as Claude Code's handler reads the link.
+    fn unescape(s: &str) -> String {
+        let (b, mut out, mut i) = (s.as_bytes(), Vec::new(), 0);
+        while i < b.len() {
+            if b[i] == b'%' {
+                out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap());
+                i += 3;
+            } else {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    #[tokio::test]
+    async fn fix_with_claude_on_a_failed_build() {
+        let p = Project::new("srv-fix");
+        let extra = format!("checkout = {}\n", p.checkout().display());
+        let d = start_daemon(&p, &extra).await;
+        let m = Manager::new(Tools::from_settings(d.settings()), "t".into());
+        let access = Arc::new(Access::loopback(TOKEN, 8470, &["/ci/v1/"]));
+        let app = daemon_router(m, d.clone(), access);
+        let mut shas = Vec::new();
+        for (id, fixture) in [(1, "pass"), (2, "fail"), (3, "syntax")] {
+            shas.push(p.commit(fixture, fixture));
+            p.push("main");
+            call(&app, "POST", "/ci/v1/daemon/poll", None, true).await;
+            built(&d, id).await;
+        }
+        let (sha, sha7) = (&shas[1], &shas[1][..7]);
+        let (_, l) = call(&app, "GET", "/ci/v1/local", None, true).await;
+        assert_eq!(l["failed"], 2, "{l}");
+
+        let (code, v) = call(&app, "POST", "/ci/v1/builds/2/fix", None, true).await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(
+            (&v["fix"], &v["branch"], &v["reused"]),
+            (
+                &json!(sha7),
+                &json!(format!("bana/fix-{sha7}")),
+                &json!(false)
+            )
+        );
+        let wt = v["worktree"].as_str().unwrap();
+        let prompt =
+            std::fs::read_to_string(PathBuf::from(v["dir"].as_str().unwrap()).join("prompt.txt"))
+                .unwrap();
+        // The link opens Claude Code in the worktree with the prompt typed.
+        let link = v["link"].as_str().unwrap();
+        let query = link.strip_prefix("claude-cli://open?").unwrap();
+        let (cwd, q) = query.split_once('&').unwrap();
+        assert_eq!(unescape(cwd.strip_prefix("cwd=").unwrap()), wt);
+        assert_eq!(unescape(q.strip_prefix("q=").unwrap()), prompt);
+        assert!(prompt.contains("lint › cargo clippy"), "{prompt}");
+        assert!(
+            v["command"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("cd '{wt}' && claude -n 'bana fix {sha7}' ")),
+            "{v}"
+        );
+        let (code, again) = call(&app, "POST", "/ci/v1/builds/2/fix", None, true).await;
+        assert_eq!(code, 200, "{again}");
+        assert_eq!(
+            (&again["fix"], &again["worktree"], &again["reused"]),
+            (&v["fix"], &v["worktree"], &json!(true)),
+            "a second click goes on with the fix"
+        );
+
+        // Only a failed build has one.
+        for (path, code, why) in [
+            ("/ci/v1/builds/1/fix", 409, "build 1 passed"),
+            (
+                "/ci/v1/builds/3/fix",
+                409,
+                "build 3 did not fail: could not start",
+            ),
+            ("/ci/v1/builds/99/fix", 404, "no build 99"),
+        ] {
+            let (c, e) = call(&app, "POST", path, None, true).await;
+            assert_eq!(c, code, "{path}: {e}");
+            assert!(e["error"].as_str().unwrap().starts_with(why), "{path}: {e}");
+        }
+        assert_eq!(
+            call(&app, "POST", "/ci/v1/builds/x/fix", None, true)
+                .await
+                .0,
+            400
+        );
+
+        let (code, all) = call(&app, "GET", "/ci/v1/fixes", None, true).await;
+        assert_eq!(code, 200, "{all}");
+        let f = &all["fixes"][0];
+        assert_eq!(
+            (&f["fix"], &f["build"], &f["sha"], &f["jobs"]),
+            (&json!(sha7), &json!(2), &json!(sha), &json!(["lint"])),
+            "{all}"
+        );
+        for name in [sha7, sha.as_str()] {
+            let (code, one) = call(&app, "GET", &format!("/ci/v1/fixes/{name}"), None, true).await;
+            assert_eq!(code, 200, "{name}: {one}");
+            assert_eq!((&one["fix"], &one["ahead"]), (&json!(sha7), &json!(0)));
+            assert_eq!(one["link"], again["link"]);
+            assert!(
+                one["brief"].as_str().unwrap().contains("cargo clippy"),
+                "{one}"
+            );
+        }
+        let other = if sha.starts_with("ffff") {
+            "0000"
+        } else {
+            "ffff"
+        };
+        for (name, code) in [(other, 404), ("xyz1", 400), ("..%2Fx", 400), ("abc", 400)] {
+            let (c, e) = call(&app, "GET", &format!("/ci/v1/fixes/{name}"), None, true).await;
+            assert_eq!(c, code, "{name}: {e}");
+        }
+        d.shutdown().await;
         p.remove();
     }
 }

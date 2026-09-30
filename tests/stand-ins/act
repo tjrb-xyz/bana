@@ -1,8 +1,18 @@
 #!/bin/sh
 # Stand-in act: records how bana calls it, and its pid and environment in $FAKE_STATE;
-# FAKE_ACT_SLEEP=N keeps it running N seconds (as the same pid).
+# FAKE_ACT_SLEEP=N keeps it running N seconds (as the same pid). It prints FAKE_ACT_OUT, and
+# exits with FAKE_ACT_EXIT, saying so on stderr as act does. With FAKE_ACT_INT=1 (trapped
+# before FAKE_ACT_OUT), a SIGINT ends it as it ends act: a last line a moment later (tee must
+# still be there to take it), then exit 1.
 echo "act $*" >>"$FAKE_LOG"
 [ "$1" != --version ] || { echo "act version 0.2.89"; exit 0; }
 echo "$$" >"$FAKE_STATE/act.pid"
 env >"$FAKE_STATE/act.env"
-[ -z "${FAKE_ACT_SLEEP:-}" ] || exec sleep "$FAKE_ACT_SLEEP"
+[ -z "${FAKE_ACT_INT:-}" ] || trap 'sleep 0.2; echo "act: interrupted, its containers removed"; exit 1' INT
+[ -z "${FAKE_ACT_OUT:-}" ] || printf '%s\n' "$FAKE_ACT_OUT"
+if [ -n "${FAKE_ACT_INT:-}" ]; then
+  sleep "${FAKE_ACT_SLEEP:-30}"
+elif [ -n "${FAKE_ACT_SLEEP:-}" ]; then
+  exec sleep "$FAKE_ACT_SLEEP"
+fi
+[ "${FAKE_ACT_EXIT:-0}" = 0 ] || { echo "Error: Job 'rust' failed" >&2; exit "$FAKE_ACT_EXIT"; }

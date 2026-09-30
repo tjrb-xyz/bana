@@ -1,0 +1,9 @@
+#!/bin/sh
+# Stand-in Claude Code: it never runs a prompt. It logs its arguments and where it ran, and
+# keeps them for the tests in $FAKE_STATE: claude.cwd, and claude.args (each argument ends
+# with a NUL). --version answers as Claude Code does.
+printf 'claude %s (in %s)\n' "$*" "$(pwd -P)" >>"$FAKE_LOG"
+[ "${1:-}" != --version ] || { echo "2.1.284 (Claude Code)"; exit 0; }
+pwd -P >"$FAKE_STATE/claude.cwd"
+: >"$FAKE_STATE/claude.args"
+for a in "$@"; do printf '%s\0' "$a" >>"$FAKE_STATE/claude.args"; done

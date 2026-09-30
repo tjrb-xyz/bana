@@ -830,6 +830,9 @@ pub struct Summary {
     pub queue: Vec<QueuedView>,
     /// The newest finished build.
     pub last: Option<BuildView>,
+    /// The newest build that failed, unless one since passed (builds that
+    /// ended in error are passed over): the menu bar's "Fix #N with Claude…".
+    pub failed: Option<u64>,
 }
 
 /// The daemon's view of GitHub and of this machine.
@@ -914,6 +917,9 @@ pub struct TrayView {
     pub paused: bool,
     /// The build a left click opens: the running one, else the latest.
     pub open_build: Option<u64>,
+    /// `Fix #41 with Claude…`, and its build, while the last build failed.
+    pub fix_line: Option<String>,
+    pub fix_build: Option<u64>,
 }
 
 pub fn tray_view(s: &Summary) -> TrayView {
@@ -1013,6 +1019,8 @@ pub fn tray_view(s: &Summary) -> TrayView {
         cancel_enabled: s.running.is_some(),
         paused: w.paused,
         open_build: s.running.as_ref().or(s.last.as_ref()).map(|b| b.id),
+        fix_line: s.failed.map(|id| format!("Fix #{id} with Claude…")),
+        fix_build: s.failed,
     }
 }
 
@@ -1975,12 +1983,17 @@ mod tests {
             ),
             (
                 "idle after a failure",
-                |s| s.last = Some(build(3, BuildState::Failure, Some(0))),
+                |s| (s.last, s.failed) = (Some(build(3, BuildState::Failure, Some(0))), Some(3)),
                 "🧱 !",
             ),
             (
                 "idle after an error",
                 |s| s.last = Some(build(3, BuildState::Error, Some(0))),
+                "🧱 !",
+            ),
+            (
+                "idle after an error that followed a failure",
+                |s| (s.last, s.failed) = (Some(build(4, BuildState::Error, Some(0))), Some(3)),
                 "🧱 !",
             ),
             ("paused", |s| s.watcher.paused = true, "🧱 paused"),
@@ -2018,6 +2031,14 @@ mod tests {
                 },
                 "🧱 1h02m +2",
             ),
+            (
+                "building after a failure",
+                |s| {
+                    s.running = Some(build(4, BuildState::Running, None));
+                    (s.last, s.failed) = (Some(build(3, BuildState::Failure, Some(0))), Some(3));
+                },
+                "🧱 0m",
+            ),
         ];
         for (name, tweak, title) in rows {
             let mut s = summary();
@@ -2026,6 +2047,9 @@ mod tests {
             assert_eq!(v.title, title, "{name}");
             assert_eq!(v.cancel_enabled, s.running.is_some(), "{name}");
             assert_eq!(v.paused, s.watcher.paused, "{name}");
+            // Fix with Claude: offered for the summary's newest failed build.
+            let fix = s.failed.map(|id| (format!("Fix #{id} with Claude…"), id));
+            assert_eq!(v.fix_line.zip(v.fix_build), fix, "{name}");
         }
 
         // The words, building and idle.
@@ -2074,8 +2098,8 @@ mod tests {
 
         let v = tray_view(&summary());
         assert_eq!(
-            (v.title.as_str(), v.last_line, v.open_build),
-            (BRICK, None, None)
+            (v.title.as_str(), v.last_line, v.open_build, v.fix_line),
+            (BRICK, None, None, None)
         );
         assert_eq!(v.tooltip, "bana: dsper idle");
         let mut s = summary();
@@ -2105,6 +2129,8 @@ mod tests {
         assert_eq!(v["running"]["ref"], "main");
         assert_eq!(v["running"]["state"], "running");
         assert_eq!(v["watcher"]["docker"], true);
-        assert!(v["last"].is_null());
+        assert!(v["last"].is_null() && v["failed"].is_null());
+        s.failed = Some(3);
+        assert_eq!(serde_json::to_value(&s).unwrap()["failed"], 3);
     }
 }

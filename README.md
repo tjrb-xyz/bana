@@ -121,6 +121,9 @@ The run uses your working tree, uncommitted changes included, and the workflow's
 `tier_input` in bana.conf). Artifacts land in `~/.bana/act/artifacts`. With the GitHub CLI signed in, jobs get
 its token as `GITHUB_TOKEN`.
 
+act's output also goes to `~/.bana/<prefix>/ci/last.log`, and what ran to `last.env` (commit, changed files,
+tier, job, network, versions, exit status), for `bana fix`, which a failed run points to. `ci.log = no` skips it.
+
 Limits worth knowing:
 - act uses your working tree only for a checkout step without `ref:` (or with `ref:` equal to the current ref).
   A checkout with any other `ref:` clones from GitHub instead.
@@ -131,6 +134,35 @@ Limits worth knowing:
   directory under act's cache (`~/.cache/act/<random>/hostexecutor`), leaving out gitignored files such as
   `target/`, so they build from scratch. act deletes the copy after the job (after a failed one only with
   `-- --rm`). bana's `keep-builds` does nothing under `bana ci`.
+
+## Fix a failure with Claude Code
+
+`bana fix` hands a failed run to [Claude Code](https://claude.com/claude-code), on a branch of its own:
+
+```sh
+bana fix                     # the newest failure here: the last bana ci, or the daemon's last failed build of this branch
+bana fix 41                  # daemon build 41
+bana fix last                # the last bana ci here
+pbpaste | bana fix --log -   # act's output from elsewhere (or --log FILE); the fix starts at HEAD
+bana fix --open              # in a new terminal, through Claude Code's claude-cli:// link
+```
+
+It makes `bana/fix-<sha7>` at the failing commit, as a git worktree of your checkout in
+`~/.bana/<prefix>/fix/<sha7>`, writes a brief of what failed and how it ran (the failing tests with their file
+and line, cargo's rerun command, each failed step's last lines, and what was bana's or act's rather than the
+project's), and starts Claude Code there with a prompt that says so. Your working tree and branches stay as they
+are, and a commit on the fix branch shows up in your checkout at once. Claude works with your own Claude Code
+settings plus one rule: no `git push`. Pushing is yours:
+
+```sh
+bana fix list                              # the fixes: branch, commits, worktree
+bana fix brief [FIX]                       # what failed, where and how it ran
+bana fix push [FIX] [--pr]                 # push the branch (the daemon builds it); --pr opens a pull request
+bana fix drop [FIX] [--force] [--delete-branch]   # remove the worktree; the branch stays while it has commits
+```
+
+It needs bana-manager: the daemon's (`bana daemon install`), or a `cargo build --release` in bana's `manager/`.
+[docs/FIX.md](docs/FIX.md) has the rest.
 
 ## bana up: a runner pool (optional)
 
@@ -189,6 +221,7 @@ Every key can be overridden by `BANA_<KEY>` in the environment (`plan.path.rust`
 | `act.network` | `bridge` | the Docker network of Linux jobs: `bridge` gives each job a localhost of its own, as on GitHub; `host` (act's default) shares the Docker host's between all of them |
 | `act.args` | | more act options for `bana ci` and the daemon's builds (`--reuse`) |
 | `act.docker_config` | `~/.bana/docker` | the Docker config act pulls with: bana's own, without your logins, so macOS never asks for your Keychain password; `~/.docker` for private images |
+| `ci.log` | `yes` | `bana ci` keeps act's output in `~/.bana/<prefix>/ci/last.log` for `bana fix`, through a pipe, so Linux jobs print without colours; `no` gives act your terminal, and keeps nothing |
 | `daemon.*` | | which pushes the daemon builds, and how ([docs/DAEMON.md](docs/DAEMON.md#settings)) |
 | `keep`, `keep_max_gb` | , `0` | what `keep-builds` keeps (git clean `-e` patterns), and the size that starts one over |
 | `plan.*` | | how `plan` picks jobs ([Tiers and plan](#tiers-and-plan)) |
@@ -331,6 +364,7 @@ Moving a machine over: `scripts/ci-runner.sh down` with the old script (it remov
 
 ```sh
 bana ci [TIER] [-j JOB] [--x64] [--list] [--event FILE] [-- ACT-OPTIONS]
+bana fix [BUILD | last | --log FILE|-] [--open]   # and brief, list, push, drop: docs/FIX.md
 bana daemon install [--port N] [--no-tray] [--no-open] [--now]
 bana daemon status|log|open|poke|run|uninstall   # docs/DAEMON.md
 bana up [--linux N] [--x64 N] [--no-mac] [--dedicated] [--label L] [--no-usb] [--token T]

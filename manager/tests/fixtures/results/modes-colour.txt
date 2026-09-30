@@ -1,0 +1,50 @@
+time="2026-09-29T10:02:27Z" level=info msg="Using docker host 'unix:///var/run/docker.sock', and daemon socket 'unix:///var/run/docker.sock'"
+[33m[ci/rust ] [0m⭐ Run Set up job
+[35m[ci/web-2] [0m⭐ Run Set up job
+[32m[ci/web-1] [0m⭐ Run Set up job
+[32m[ci/web-1] [0m  ✅  Success - Set up job
+[32m[ci/web-1] [0m🧪  Matrix: map[os:a]
+[32m[ci/web-1] [0m⭐ Run Main lint
+[33m[ci/rust ] [0m  ✅  Success - Set up job
+[32m[ci/web-1] [0m  ❗  ::error file=a.ts,line=2::boom
+[32m|[0m done
+[32m[ci/web-1] [0m  ✅  Success - Main lint [5.545388ms]
+[32m[ci/web-1] [0m  ⚙  Summary - ## sum
+| a | b |
+[32m[ci/web-1] [0m⭐ Run Complete job
+[32m[ci/web-1] [0mCleaning up container for job web
+[33m[ci/rust ] [0m⭐ Run Main cargo test --workspace
+[32m[ci/web-1] [0m  ✅  Success - Complete job
+[32m[ci/web-1] [0m🏁  Job succeeded
+[35m[ci/web-2] [0m  ✅  Success - Set up job
+[35m[ci/web-2] [0m🧪  Matrix: map[os:b]
+[35m[ci/web-2] [0m⭐ Run Main lint
+[33m|[0m test a::one ... ok
+[33m|[0m test a::two ... FAILED
+[33m|[0m 
+[33m|[0m failures:
+[33m|[0m 
+[33m|[0m ---- a::two stdout ----
+[33m|[0m 
+[33m|[0m thread 'a::two' (7) panicked at src/a.rs:3:5:
+[33m|[0m accepted
+[33m|[0m note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+[33m|[0m 
+[33m|[0m test result: [31mFAILED[m. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+[33m|[0m 
+[33m|[0m error: test failed, to rerun pass `--lib`
+[33m[ci/rust ] [0m  ❌  Failure - Main cargo test --workspace [5.152765ms]
+[33m[ci/rust ] [0mexit status 101
+[33m[ci/rust ] [0m⭐ Run Complete job
+[33m[ci/rust ] [0m  ✅  Success - Complete job
+[33m[ci/rust ] [0m🏁  Job failed
+[35m[ci/web-2] [0m  ❗  ::error file=a.ts,line=2::boom
+[35m|[0m done
+[35m[ci/web-2] [0m  ✅  Success - Main lint [3.695007ms]
+[35m[ci/web-2] [0m  ⚙  Summary - ## sum
+| a | b |
+[35m[ci/web-2] [0m⭐ Run Complete job
+[35m[ci/web-2] [0mCleaning up container for job web
+[35m[ci/web-2] [0m  ✅  Success - Complete job
+[35m[ci/web-2] [0m🏁  Job succeeded
+Error: Job 'rust' failed
