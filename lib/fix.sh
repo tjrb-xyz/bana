@@ -436,6 +436,10 @@ fix_drop() { # [FIX] [--force] [--delete-branch]
 }
 
 fix_main() {
+  # One spelling of bana's home for every path Claude Code's rules and bana-manager see:
+  # on a Mac, /var is /private/var, and the worktree's path comes back resolved.
+  mkdir -p "$home"
+  home=$(cd "$home" && pwd -P)
   case ${1:-} in
   brief) shift; fix_brief "$@" ;;
   list) shift; (($# == 0)) || fix_usage; fix_list ;;
