@@ -11,7 +11,7 @@
 #   BANA_E2E_DOCKER=0        no Docker: every job on the host (act's host mode), as on a
 #                            Mac without OrbStack; docker is a stub that says it runs
 #   BANA_E2E_IMAGE=IMAGE     the Linux jobs' image (default: catthehacker/ubuntu:act-24.04
-#                            when Docker has it, else buildpack-deps:bookworm-scm, pulled)
+#                            when Docker has it, else pulled from ghcr.io)
 #   BANA_E2E_PORT=N          the daemon's port (default 18470)
 #   BANA_E2E_KEEP=1          keep the scratch directory
 #
@@ -54,8 +54,10 @@ fi
 image=${BANA_E2E_IMAGE:-}
 if [[ $docker_mode == 1 && -z $image ]]; then
   image=catthehacker/ubuntu:act-24.04
-  # Small, with git and bash: the builds run with --pull=false, so it is pulled here.
-  docker image inspect "$image" >/dev/null 2>&1 || image=buildpack-deps:bookworm-scm
+  # act's Ubuntu image: the jobs use node actions (upload-artifact), so the image needs node.
+  # The builds run with --pull=false, so it is pulled here, from ghcr.io when Docker lacks it
+  # (Docker Hub limits anonymous pulls).
+  docker image inspect "$image" >/dev/null 2>&1 || image=ghcr.io/catthehacker/ubuntu:act-24.04
 fi
 if [[ $docker_mode == 1 ]] && ! docker image inspect "$image" >/dev/null 2>&1; then
   docker pull -q "$image" >/dev/null

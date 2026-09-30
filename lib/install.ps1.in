@@ -191,9 +191,12 @@ try {
   $got = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $tmp $asset)).Hash.ToLowerInvariant()
   if ($got -ne $want) { Die "${asset}: sha256 $got, but the release says $want" }
 
-  # Expand-Archive refuses entries outside the directory; the zip must hold one directory.
+  # .NET's ZipFile, not Expand-Archive: that one lives in a script module, which a Restricted
+  # execution policy will not load even under irm | iex. ZipFile refuses entries outside the
+  # directory; the zip must hold one directory.
   $x = Join-Path $tmp 'x'
-  Expand-Archive -LiteralPath (Join-Path $tmp $asset) -DestinationPath $x
+  Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+  [System.IO.Compression.ZipFile]::ExtractToDirectory((Join-Path $tmp $asset), $x)
   $top = @(Get-ChildItem -LiteralPath $x -Force)
   if ($top.Count -ne 1 -or -not $top[0].PSIsContainer) { Die "$asset should hold one directory, and has: $(($top | ForEach-Object { $_.Name }) -join ' ')" }
   $src = $top[0].FullName

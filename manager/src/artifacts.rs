@@ -154,10 +154,8 @@ fn unzip(opts: &[&str], zip: &Path, into: Option<&Path>) -> Result<String, Strin
 pub fn platform(name: &str) -> Option<String> {
     let (stem, oses): (&str, &[&str]) = if let Some(s) = name.strip_suffix(".tar.gz") {
         (s, &["linux", "macos"])
-    } else if let Some(s) = name.strip_suffix(".zip") {
-        (s, &["windows"])
     } else {
-        return None;
+        (name.strip_suffix(".zip")?, &["windows"])
     };
     oses.iter().find_map(|os| {
         ["x64", "arm64"].iter().find_map(|arch| {
