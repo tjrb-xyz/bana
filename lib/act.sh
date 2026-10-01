@@ -258,10 +258,8 @@ act_logged() { # ACT-ARGUMENT...
   dirty=$(git -C "$root" -c core.quotePath=false status --porcelain 2>/dev/null |
     awk '{ p = substr($0, 4); i = index(p, " -> "); if (i) p = substr(p, i + 4); printf "%s%s", s, p; s = " " }') || true
   v=$(act --version 2>/dev/null | awk 'NR == 1 { print $NF }') || true
-  # bana's own commit, unless it is a copy inside another repository.
-  if [[ $(git -C "$bana_root" rev-parse --show-toplevel 2>/dev/null) == "$(cd "$bana_root" && pwd -P)" ]]; then
-    b=$(git -C "$bana_root" rev-parse HEAD 2>/dev/null) || true
-  fi
+  # bana's own commit (a checkout's or a release's; none for a copy).
+  b=$(bana_commit)
   started=$(date +%s)
   # Ctrl-C reaches act, which stops its jobs and ends; tee -i and bash (trapping it) wait
   # for that, so the log ends as act's output does.
@@ -286,7 +284,7 @@ act_logged() { # ACT-ARGUMENT...
 # (none is built for it): last.report.md, and its table on the terminal.
 act_report() { # DIR
   local b m='' opts=()
-  for b in "$machine_dir/bana-manager" "${CARGO_TARGET_DIR:-$bana_root/manager/target}/release/bana-manager"; do
+  for b in "$bana_root/bin/bana-manager" "$machine_dir/bana-manager" "${CARGO_TARGET_DIR:-$bana_root/manager/target}/release/bana-manager"; do
     if bm_has "$b" report; then m=$b; break; fi
   done
   [[ -n $m ]] || return 0

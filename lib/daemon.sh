@@ -257,11 +257,21 @@ d_doctor_project() { # ROOT GH UNMAPPED SPLIT
 
 # ---- install -----------------------------------------------------------------------------
 
-# bana-manager, built from this checkout (BANA_DAEMON_BIN: a given one).
+# bana-manager: BANA_DAEMON_BIN (a given one), else a release's own (of this very version),
+# else built from this checkout.
 d_build() {
+  local b=$bana_root/bin/bana-manager v
   if [[ -n ${BANA_DAEMON_BIN:-} ]]; then
     [[ -x $BANA_DAEMON_BIN ]] || die "BANA_DAEMON_BIN: no program $BANA_DAEMON_BIN"
     echo "$BANA_DAEMON_BIN"
+    return
+  fi
+  if [[ -x $b ]]; then
+    if [[ $(bana_kind) == release ]]; then
+      v=$("$b" version 2>/dev/null) || v=
+      [[ $v == "$BANA_VERSION" ]] || die "$b is not bana $BANA_VERSION's bana-manager (it says '$v'): install this release again (its install.sh --force)"
+    fi
+    echo "$b"
     return
   fi
   command -v cargo >/dev/null || die "cargo is needed to build the daemon: https://rustup.rs"
@@ -340,13 +350,11 @@ d_write_keys() { # FILE
 
 # daemon.d/settings: the machine's keys (another is an error there).
 d_write_machine() { # PORT TRAY GH
-  local k prog login b=''
+  local k prog login b
   login=$(gh api user --jq .login 2>/dev/null || true)
-  # The bana commit the snapshot is of (a fix's brief names it), unless bana is a copy
-  # inside another repository.
-  if [[ $(git -C "$bana_root" rev-parse --show-toplevel 2>/dev/null) == "$(cd "$bana_root" && pwd -P)" ]]; then
-    b=$(git -C "$bana_root" rev-parse HEAD 2>/dev/null) || b=''
-  fi
+  # The bana commit the snapshot is of (a fix's brief names it): a checkout's or a
+  # release's; none for a copy inside another repository.
+  b=$(bana_commit)
   {
     echo "# Written by bana daemon install ($(date '+%Y-%m-%d %H:%M')); run it again to change this."
     echo "port = $1"

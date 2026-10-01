@@ -56,6 +56,7 @@
 #   bana keep-builds         on a self-hosted runner: a clean checkout that keeps build caches
 #   bana apt PACKAGE...      installs the Debian packages that are missing
 #   bana settings            the settings in effect, and where they came from
+#   bana version             this bana (a release's, or a checkout's commit), and the daemon's if other
 #
 # Settings come from bana.conf (or .github/bana.conf) in your repository, or in the
 # checkout BANA_PROJECT_ROOT names; any key can be overridden by BANA_<KEY> in the
@@ -63,6 +64,7 @@
 set -euo pipefail
 
 BANA_VERSION=0.1.0
+BANA_COMMIT= # a release's commit (.github/release.sh pack writes it); a checkout's is git's
 
 say() { printf '\033[1m%s\033[0m\n' "$*"; }
 warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
@@ -76,6 +78,9 @@ while [[ -L $self ]]; do
   case $link in /*) self=$link ;; *) self=$(dirname "$self")/$link ;; esac
 done
 bana_root=$(cd "$(dirname "$self")/.." && pwd)
+# A release (PREFIX/current/bin/bana): its version's own directory, so a bana that runs
+# while an upgrade moves current keeps its own lib/.
+[[ ! -f $bana_root/../receipt ]] || bana_root=$(cd "$bana_root" && pwd -P)
 self=$bana_root/bin/$(basename "$self")
 
 os=$(uname -s)
@@ -162,6 +167,32 @@ repo_from_git() {
 }
 
 base_home=${BANA_HOME:-$HOME/.bana}
+
+# How this bana came: release (bana's installer, PREFIX/receipt), submodule (of a project),
+# legacy (the old install.sh's checkout, ~/.bana/src), dev (another checkout of bana) or
+# copy (anything else: the daemon's snapshot, a copy inside a project).
+bana_kind() {
+  local top
+  if grep -qx 'name=bana' "$bana_root/../receipt" 2>/dev/null; then echo release; return; fi
+  top=$(git -C "$bana_root" rev-parse --show-toplevel 2>/dev/null) || top=
+  if [[ -z $top || $top != "$(cd "$bana_root" && pwd -P)" ]]; then
+    echo copy
+  elif [[ -n $(git -C "$bana_root" rev-parse --show-superproject-working-tree 2>/dev/null) ]]; then
+    echo submodule
+  elif [[ $top == "$(cd "$base_home/src" 2>/dev/null && pwd -P)" ]]; then
+    echo legacy
+  else
+    echo dev
+  fi
+}
+# bana's own commit: a checkout's HEAD, else the release's (none for a copy).
+bana_commit() {
+  if [[ $(git -C "$bana_root" rev-parse --show-toplevel 2>/dev/null) == "$(cd "$bana_root" && pwd -P)" ]]; then
+    git -C "$bana_root" rev-parse HEAD 2>/dev/null || true
+  else
+    echo "$BANA_COMMIT"
+  fi
+}
 # Where bana keeps a project's files (its runners, the daemon's clone, builds and state),
 # and the daemon's own (its snapshot and settings: no prefix has a dot).
 project_home() { echo "$base_home/$1"; } # PREFIX
@@ -221,6 +252,22 @@ daemon_conf() { # KEY
   daemon.token) conf "$1" gh ;;
   *) conf "$1" ;;
   esac
+}
+
+# bana version: this bana, and the daemon's when that differs.
+bana_version() {
+  local c h v
+  case $(bana_kind) in
+  release) echo "bana $BANA_VERSION (release v$BANA_VERSION)" ;;
+  copy) c=$BANA_COMMIT; echo "bana $BANA_VERSION${c:+ (commit ${c:0:7})}" ;;
+  *) c=$(bana_commit); echo "bana $BANA_VERSION${c:+ (checkout ${c:0:7})}" ;;
+  esac
+  [[ -f $machine_dir/settings ]] || return 0
+  # shellcheck source=SCRIPTDIR/../lib/daemon.sh
+  source "$bana_root/lib/daemon.sh"
+  h=$(d_health "$(d_port)") && d_is_ours "$h" || return 0
+  v=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' <<<"$h")
+  [[ -z $v || $v == "$BANA_VERSION" ]] || echo "the daemon runs $v: bana daemon install"
 }
 
 settings() {
@@ -800,12 +847,12 @@ relabel() {
   say "Labels are up to date."
 }
 
-# bana-manager for its SUBCOMMAND: the daemon's snapshot, else this bana's own release build,
-# which cargo builds (or brings up to date) when neither has it, as for bana manager. One
-# older than the subcommand (its usage lacks it) does not count.
+# bana-manager for its SUBCOMMAND: a release's own, else the daemon's snapshot, else this
+# checkout's release build, which cargo builds (or brings up to date) when none has it, as
+# for bana manager. One older than the subcommand (its usage lacks it) does not count.
 bm() { # SUBCOMMAND
   local b built=${CARGO_TARGET_DIR:-$bana_root/manager/target}/release/bana-manager
-  for b in "$machine_dir/bana-manager" "$built"; do
+  for b in "$bana_root/bin/bana-manager" "$machine_dir/bana-manager" "$built"; do
     if bm_has "$b" "$1"; then echo "$b"; return; fi
   done
   command -v cargo >/dev/null ||
@@ -832,8 +879,12 @@ manager() {
     return 0
   fi
   need_repo
-  command -v cargo >/dev/null || [[ -x $bin ]] || die "cargo is needed to build the manager: https://rustup.rs"
-  if command -v cargo >/dev/null; then
+  # A release's own, prebuilt; a checkout's, which cargo builds.
+  if [[ -x $bana_root/bin/bana-manager ]]; then
+    bin=$bana_root/bin/bana-manager
+  elif ! command -v cargo >/dev/null; then
+    [[ -x $bin ]] || die "cargo is needed to build the manager: https://rustup.rs"
+  else
     say "Building the manager (the first time takes a minute)"
     cargo build -q --release --locked --manifest-path "$bana_root/manager/Cargo.toml"
   fi
@@ -975,7 +1026,7 @@ changed | plan | keep-builds)
   ci_main "$cmd" "$@"
   ;;
 apt) apt_missing "$@" ;;
-version | --version) echo "bana $BANA_VERSION" ;;
+version | --version) bana_version ;;
 # Used by the commands above, inside a Linux machine:
 linux-one) # K: the K-th Linux runner of a Mac's Linux machine
   [[ $(id -u) == 0 ]] && die "run as a normal user"

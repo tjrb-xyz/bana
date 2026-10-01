@@ -69,6 +69,10 @@
 //! bana's MCP server for Claude Code, on stdin and stdout (bana_manager::mcp):
 //! the fix loop's tools, in the fix worktree it runs in. `--config` prints the
 //! --mcp-config JSON that starts it instead.
+//!
+//!   bana-manager version
+//!
+//! prints its version (bana's), as a release's bin/bana checks it.
 
 use bana_manager::actlog::{Status, StatusState};
 use bana_manager::daemon::{post_status, Machine, MACHINE_DIR};
@@ -85,7 +89,7 @@ use tokio::sync::Notify;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: bana-manager --script PATH --repo OWNER/REPO [--port N] [--workflow FILE] [--tiers A,B] [--tier-input NAME] [--gh PATH] [--token T]\n       bana-manager daemon --home DIR [--no-tray]\n       bana-manager results (--json FILE | --text FILE|-)\n       bana-manager report (--build DIR | --text FILE|- [--env FILE]) [--conf FILE] [--repo OWNER/REPO] [--machine NAME] [--json]\n       bana-manager fix prepare --dir DIR --checkout DIR (--build N | --run | --log FILE|- [--sha S] [--ref R] [--tier T]) [--repo OWNER/REPO] [--workflow FILE] [--bana CMD] [--recheck] [--headless]\n       bana-manager fix brief --dir DIR [FIX]\n       bana-manager fix status --dir DIR [FIX]\n       bana-manager fix gate --dir DIR\n       bana-manager fix push --dir DIR FIX\n       bana-manager fix drop --dir DIR FIX [--force] [--delete-branch]\n       bana-manager fix result FILE\n       bana-manager mcp --dir DIR [--config]"
+        "usage: bana-manager --script PATH --repo OWNER/REPO [--port N] [--workflow FILE] [--tiers A,B] [--tier-input NAME] [--gh PATH] [--token T]\n       bana-manager daemon --home DIR [--no-tray]\n       bana-manager results (--json FILE | --text FILE|-)\n       bana-manager report (--build DIR | --text FILE|- [--env FILE]) [--conf FILE] [--repo OWNER/REPO] [--machine NAME] [--json]\n       bana-manager fix prepare --dir DIR --checkout DIR (--build N | --run | --log FILE|- [--sha S] [--ref R] [--tier T]) [--repo OWNER/REPO] [--workflow FILE] [--bana CMD] [--recheck] [--headless]\n       bana-manager fix brief --dir DIR [FIX]\n       bana-manager fix status --dir DIR [FIX]\n       bana-manager fix gate --dir DIR\n       bana-manager fix push --dir DIR FIX\n       bana-manager fix drop --dir DIR FIX [--force] [--delete-branch]\n       bana-manager fix result FILE\n       bana-manager mcp --dir DIR [--config]\n       bana-manager version"
     );
     std::process::exit(2)
 }
@@ -143,6 +147,10 @@ fn fail(msg: &str) -> ! {
 
 fn main() {
     let mut args = std::env::args().skip(1).peekable();
+    if args.peek().is_some_and(|a| a == "version") {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if args.peek().is_some_and(|a| a == "results") {
         args.next();
         results(args);

@@ -1,9 +1,12 @@
 #!/bin/sh
 # Stand-in launchd: remembers what was bootstrapped. FAKE_BOOTOUT_SLOW=N: a service booted
-# out stays loaded for N more prints (the daemon still stops).
+# out stays loaded for N more prints (the daemon still stops). Each start counts in
+# $FAKE_STATE/pid (the fake health's pid).
 echo "launchctl $*" >>"$FAKE_LOG"
 case $1 in
-bootstrap) touch "$FAKE_STATE/launchd-$(basename "$3" .plist)" ;;
+bootstrap)
+  touch "$FAKE_STATE/launchd-$(basename "$3" .plist)"
+  echo $(($(cat "$FAKE_STATE/pid" 2>/dev/null || echo 1) + 1)) >"$FAKE_STATE/pid" ;;
 bootout)
   if [ -n "${FAKE_BOOTOUT_SLOW:-}" ] && [ -e "$FAKE_STATE/launchd-${2##*/}" ]; then
     echo "$FAKE_BOOTOUT_SLOW" >"$FAKE_STATE/stopping-${2##*/}"

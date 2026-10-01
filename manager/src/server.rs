@@ -536,10 +536,12 @@ fn pool_routes(m: Arc<Manager>) -> Router {
 type R = State<Arc<Registry>>;
 
 /// Open: `bana` looks for it, and a daemon starting asks it.
+/// Its version and pid tell `bana daemon install` that the new daemon runs.
 async fn daemon_health(State(r): R) -> Json<Value> {
     let m = r.machine();
     Json(
         json!({"ok": true, "service": "ci", "api": 1, "daemon": true, "global": true,
+        "version": env!("CARGO_PKG_VERSION"), "pid": std::process::id(),
         "port": m.port, "machine": m.machine, "projects": r.prefixes()}),
     )
 }
@@ -1790,6 +1792,17 @@ esac"#,
         .await;
         assert_eq!(code, 409, "{v}");
         assert_eq!(put(json!({"notes": "late", "rev": 2})).await.0, 409);
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test]
+    async fn health_reports_version_and_pid() {
+        let (p, d, app) = daemon_app("srv-health").await;
+        let (code, h) = call(&app, "GET", "/ci/v1/health", None, false).await;
+        assert_eq!(code, 200, "{h}");
+        assert_eq!(h["version"], env!("CARGO_PKG_VERSION"), "{h}");
+        assert_eq!(h["pid"], std::process::id(), "{h}");
         d.shutdown().await;
         p.remove();
     }

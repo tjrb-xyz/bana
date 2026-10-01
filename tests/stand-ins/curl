@@ -1,7 +1,9 @@
 #!/bin/bash
 # Stand-in curl: serves the fake runner tarball for any download (-o FILE), and plays the
 # daemon on 127.0.0.1. Its health answers once launchd or systemd runs it (FAKE_HEALTH:
-# this answer instead), naming the projects added ($HOME/.bana/*/daemon/settings); a daemon
+# this answer instead), naming the projects added ($HOME/.bana/*/daemon/settings), its version
+# (FAKE_VERSION, else the snapshot's BANA_VERSION), its pid (a count of the starts; see
+# launchctl and systemctl) and FAKE_LATEST as the newest release, if set; a daemon
 # of before (one a project, xyz.tjrb.bana.<prefix> or bana-<prefix>.service) answers when
 # that one runs. /ci/v1/projects is $FAKE_STATE/projects.json (then projects.next, if any),
 # else a line a project added, from its files; …/local is $FAKE_STATE/local.json (then
@@ -24,7 +26,9 @@ http://127.0.0.1:*/ci/v1/health)
   if [[ -n ${FAKE_HEALTH:-} ]]; then echo "$FAKE_HEALTH"; exit 0; fi
   if [[ -e $FAKE_STATE/launchd-xyz.tjrb.bana || -e $FAKE_STATE/systemd-bana.service ]]; then
     p=$(added | sed 's/.*/"&"/' | paste -s -d, -)
-    printf '{"ok":true,"service":"ci","api":1,"daemon":true,"global":true,"port":8470,"machine":"mbp","projects":[%s]}\n' "$p"
+    v=${FAKE_VERSION:-$(sed -n 's/^BANA_VERSION=//p' "${BANA_HOME:-$HOME/.bana}/daemon.d/bin/bana" 2>/dev/null)}
+    printf '{"ok":true,"service":"ci","api":1,"daemon":true,"global":true,"version":"%s","pid":%s,%s"port":8470,"machine":"mbp","projects":[%s]}\n' \
+      "$v" "$(cat "$FAKE_STATE/pid" 2>/dev/null || echo 1)" "${FAKE_LATEST:+\"latest\":\"$FAKE_LATEST\",}" "$p"
     exit 0
   fi
   for f in "$FAKE_STATE"/launchd-xyz.tjrb.bana.* "$FAKE_STATE"/systemd-bana-*.service; do
