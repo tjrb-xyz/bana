@@ -1912,6 +1912,10 @@ impl Daemon {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
+        // And its pid dies: act.lock, if still the daemon's (act's only once
+        // act() has read act's start time), is stale to the next start. This
+        // process lives on, so it would be held for good: it goes here.
+        self.0.release_lock(&[std::process::id()]);
     }
 
     /// The registry's runner: the next build here, once its gates are open;
