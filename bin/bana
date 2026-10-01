@@ -3,9 +3,17 @@
 # Each machine runs `bana up` once; GitHub gives each job to a free runner whose
 # labels match, so Macs, Linux PCs and VMs share the work. README.md has the details.
 #
-# Making bana the project's CI:
-#   bana init [--check] [--diff] [--workflow F]   map its runners to this machine and to a pool,
-#                            and propose bana.conf and workflow changes (bana init --help)
+# CI on push, on this machine (one daemon builds every push of each project added, through
+# act, and posts commit statuses):
+#   bana daemon install [--port N] [--no-tray] [--no-open] [--now]   start it, once a machine
+#                            (bana daemon help)
+#   bana daemon uninstall [--purge] | run [--build] | status | log | open | poke [PROJECT]
+#   bana add [--check] [--diff] [--workflow F] [--no-hook] [--no-claude]   in a project's checkout:
+#                            map its runners to this machine and to a pool, propose bana.conf and
+#                            workflow changes, and add the project to the daemon (bana add --help)
+#   bana list                the projects added here, and what each does
+#   bana remove [PROJECT] [--purge]   the project's CI here goes (--purge: its builds too)
+#   bana pause|resume [PROJECT]   hold the builds of its pushes, or build them again
 # On this machine, when you want it (act, in OrbStack's Docker; nothing stays running):
 #   bana ci [TIER] [-j JOB] [--x64] [--list] [--event FILE]   the workflow's jobs here (bana ci --help);
 #                            act's output stays in ~/.bana/<prefix>/ci/last.log, for bana fix
@@ -19,11 +27,7 @@
 #   bana install [BUILD | --from FILE|DIR]   a daemon build's files on this machine, through that
 #                            installer (the project's hook may ask, and use sudo)
 #   bana mcp                 bana's tools for Claude Code in a fix (an MCP server on stdin and
-#                            stdout); bana daemon install registers it with Claude Code here
-# CI on push, on this machine (a daemon runs each push through act and posts commit statuses):
-#   bana daemon install [--port N] [--no-tray] [--no-open] [--now] [--no-claude]   start it
-#                            (bana daemon help)
-#   bana daemon uninstall [--purge] | run [--build] | status | log | open | poke
+#                            stdout); bana add registers it with Claude Code here
 # A runner pool, if you want GitHub to run the jobs on your machines (they must stay awake):
 #   bana up [options]        join the pool
 #       on a Mac:   a macOS runner (in your login session: real CoreAudio, real USB
@@ -44,7 +48,7 @@
 #   bana usb                 the USB audio devices here, and the labels they give
 #   bana relabel             update this machine's runner labels (after plugging a device in)
 #   bana manager [--port N]  the dev manager: a page that shows and drives all this
-#                            (the daemon's page instead, when this project's daemon runs)
+#                            (the daemon's page instead, when the daemon runs)
 #   bana tart up|status|log|shell|down   a Linux VM in Tart on a Mac (bana tart help)
 # In workflows (and by hand):
 #   bana changed BEFORE [BRANCH]   files changed since BEFORE, else since BRANCH ('*': unknown)
@@ -106,9 +110,6 @@ find_config() {
   done
   true
 }
-conf_file=$(find_config)
-conf_dir=
-[[ -z $conf_file ]] || conf_dir=$(cd "$(dirname "$conf_file")" && pwd)
 
 # `key = value` lines; '#' starts a comment line. Prints the value, or fails.
 conf_lookup() {
@@ -160,23 +161,53 @@ repo_from_git() {
   esac
 }
 
-repo=$(conf repo)
-[[ -n $repo ]] || repo=$(repo_from_git)
-prefix=$(conf prefix "$(printf '%s' "${repo##*/}" | lower | tr -c 'a-z0-9-\n' '-')")
-[[ -n $prefix ]] || prefix=bana
-[[ $prefix =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "prefix: lowercase letters, digits and '-', not '$prefix'"
 base_home=${BANA_HOME:-$HOME/.bana}
-home=$base_home/$prefix
+# Where bana keeps a project's files (its runners, the daemon's clone, builds and state),
+# and the daemon's own (its snapshot and settings: no prefix has a dot).
+project_home() { echo "$base_home/$1"; } # PREFIX
+machine_dir=$base_home/daemon.d
+
+# The project: its bana.conf, repository and prefix, and its files' home. bana add reads
+# them again once it has written bana.conf.
+load_project() {
+  conf_file=$(find_config)
+  conf_dir=
+  [[ -z $conf_file ]] || conf_dir=$(cd "$(dirname "$conf_file")" && pwd)
+  repo=$(conf repo)
+  [[ -n $repo ]] || repo=$(repo_from_git)
+  prefix=$(conf prefix "$(printf '%s' "${repo##*/}" | lower | tr -c 'a-z0-9-\n' '-')")
+  [[ -n $prefix ]] || prefix=bana
+  [[ $prefix =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "prefix: lowercase letters, digits and '-', not '$prefix'"
+  home=$(project_home "$prefix")
+}
+load_project
 vm=$(conf vm bana)          # the Linux machine on a Mac (its own CPU); shared by projects
 vm_x64=$(conf vm_x64 bana-x64) # the x86_64 one (OrbStack only)
 linux_user=$(conf linux_user bana) # who runners run as on a Linux machine entered as root
+
+# PROJECT, a project bana add added (bana list), in place of this checkout's. LEFT: or one
+# removed whose files are left (bana remove PROJECT --purge).
+pick_project() { # PREFIX [LEFT]
+  local f
+  f=$(project_home "$1")/daemon/settings
+  [[ $1 =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "No project $1 (bana list)"
+  [[ -f $f ]] || { [[ -n ${2:-} ]] && project_left "$1"; } || die "No project $1 (bana list)"
+  prefix=$1 home=$(project_home "$1") picked=1 repo=''
+  [[ ! -f $f ]] || repo=$(awk '/^repo *=/ { sub(/^repo *= */, ""); print; exit }' "$f")
+}
+# The files bana remove leaves (its clone, builds, fixes and state) are there.
+project_left() { # PREFIX
+  local d
+  for d in src builds fix releases act-cache state.json; do [[ ! -e $(project_home "$1")/$d ]] || return 0; done
+  return 1
+}
 
 need_repo() {
   [[ -n $repo ]] || die "Which repository? Set repo = owner/name in bana.conf (no bana.conf found${conf_file:+; using $conf_file})"
   [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "repo: owner/name, not '$repo'"
 }
 
-# A daemon.* setting, with its default (`bana daemon install` writes them for the daemon).
+# A daemon.* setting, with its default (`bana add` writes them for the daemon).
 daemon_conf() { # KEY
   local t=()
   read -r -a t <<<"$(words "$(conf tiers "quick nightly release")")" || true
@@ -774,7 +805,7 @@ relabel() {
 # older than the subcommand (its usage lacks it) does not count.
 bm() { # SUBCOMMAND
   local b built=${CARGO_TARGET_DIR:-$bana_root/manager/target}/release/bana-manager
-  for b in "$home/daemon/bana-manager" "$built"; do
+  for b in "$machine_dir/bana-manager" "$built"; do
     if bm_has "$b" "$1"; then echo "$b"; return; fi
   done
   command -v cargo >/dev/null ||
@@ -788,19 +819,19 @@ bm() { # SUBCOMMAND
 bm_has() { [[ -x $1 ]] && grep -q "bana-manager $2 " <<<"$("$1" "$2" --usage </dev/null 2>&1)"; } # BINARY SUBCOMMAND
 
 manager() {
-  need_repo
-  local bin=$bana_root/manager/target/release/bana-manager port='' a h
-  # This project's daemon serves the same page (and more): open that one instead.
+  local bin=$bana_root/manager/target/release/bana-manager port='' a h p=''
+  # The daemon serves the same page (and more): open that one instead, at this project.
   # shellcheck source=SCRIPTDIR/../lib/daemon.sh
   source "$bana_root/lib/daemon.sh"
   for a in "$@"; do [[ $port == next ]] && port=$a; [[ $a == --port ]] && port=next; done
   [[ -n $port && $port != next ]] || port=$(d_port)
-  if h=$(d_health "$port"); then
-    d_is_ours "$h" || die "Another project's bana daemon serves port $port: pass --port"
-    say "$repo's daemon serves the page: $(d_url "$port")"
-    if [[ $os == Darwin ]]; then open "$(d_url "$port")" || true; fi
+  if h=$(d_health "$port") && d_is_ours "$h"; then
+    ! d_added || p="p=$prefix"
+    say "The bana daemon serves the page: $(d_url "$port" "$p")"
+    if [[ $os == Darwin ]]; then open "$(d_url "$port" "$p")" || true; fi
     return 0
   fi
+  need_repo
   command -v cargo >/dev/null || [[ -x $bin ]] || die "cargo is needed to build the manager: https://rustup.rs"
   if command -v cargo >/dev/null; then
     say "Building the manager (the first time takes a minute)"
@@ -895,10 +926,23 @@ ci)
   source "$bana_root/lib/act.sh"
   act_main "$@"
   ;;
-init)
-  # shellcheck source=SCRIPTDIR/../lib/init.sh
-  source "$bana_root/lib/init.sh"
-  init_main "$@"
+add)
+  # shellcheck source=SCRIPTDIR/../lib/daemon.sh
+  source "$bana_root/lib/daemon.sh"
+  # shellcheck source=SCRIPTDIR/../lib/add.sh
+  source "$bana_root/lib/add.sh"
+  add_main "$@"
+  ;;
+init) printf '\033[31m%s\033[0m\n' "bana init is now bana add" >&2; exit 2 ;;
+list | remove | pause | resume)
+  [[ $cmd == list || -z ${1:-} || $1 == -* ]] || { pick_project "$1" "$([[ $cmd == remove && $* == *--purge* ]] && echo 1)"; shift; }
+  # shellcheck source=SCRIPTDIR/../lib/daemon.sh
+  source "$bana_root/lib/daemon.sh"
+  case $cmd in
+  list) (($# == 0)) || project_usage; daemon_list ;;
+  remove) daemon_remove "$@" ;;
+  *) daemon_pause "$cmd" "$@" ;;
+  esac
   ;;
 report) report "$@" ;;
 installer | install)

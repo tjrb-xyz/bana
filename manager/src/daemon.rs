@@ -6088,7 +6088,7 @@ exec git \"$@\"
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(d.summary().running.is_none() && p.read("pid.1").is_empty());
         assert_eq!(
-            actlog::tray_view(&d.summary()).title,
+            actlog::tray_view(&[d.summary()], &[]).title,
             format!("{} paused", actlog::BRICK)
         );
 
@@ -6316,7 +6316,9 @@ exec git \"$@\"
             3,
             "bana, bana/plan, bana/rust"
         );
-        assert!(actlog::tray_view(&d.summary()).title.ends_with("!gh"));
+        assert!(actlog::tray_view(&[d.summary()], &[])
+            .title
+            .ends_with("!gh"));
 
         // GitHub is back, but refuses a loopback link: the statuses go without one.
         p.set("gh-down", false);
@@ -6858,7 +6860,7 @@ exec git \"$@\"
         assert_eq!(finished(&d, 2).await.build.state, BuildState::Failure);
         assert_eq!(d.summary().failed, Some(2));
         assert_eq!(
-            actlog::tray_view(&d.summary()).fix_line.as_deref(),
+            actlog::project_view(&d.summary()).fix_line.as_deref(),
             Some("Fix #2 with Claude…")
         );
         // The owner goes on working: the fix is at the failing commit anyway.
@@ -6997,7 +6999,7 @@ exec git \"$@\"
             Err(fix::Error::NotFailed(why)) => assert!(why.contains("a round of fix"), "{why}"),
             other => panic!("{other:?}"),
         }
-        assert_eq!(actlog::tray_view(&d.summary()).fix_line, None);
+        assert_eq!(actlog::project_view(&d.summary()).fix_line, None);
 
         // A daemon installed before fixes names no checkout.
         let e = fix::Prepare::for_daemon(&p.settings(""), fix::Source::Build(2)).unwrap_err();
@@ -7567,7 +7569,7 @@ exec git \"$@\"
         assert_eq!((r.build, r.reason), (id, None));
         let ask = d.summary().release.unwrap();
         assert_eq!((ask.tag.as_str(), ask.state.as_str()), ("v0.1.0", "asking"));
-        assert_eq!(actlog::tray_view(&d.summary()).title, "🧱 v0.1.0?");
+        assert_eq!(actlog::tray_view(&[d.summary()], &[]).title, "🧱 v0.1.0?");
         // Nothing was written on GitHub: one list, for the previous release.
         assert_eq!(
             p.read("gh-release.log"),
@@ -7728,7 +7730,7 @@ exec git \"$@\"
             (State::Failed, Some(why.as_str()))
         );
         assert_eq!(lines(), 1, "the list only");
-        assert_eq!(actlog::tray_view(&d.summary()).title, "🧱 v0.1.0?");
+        assert_eq!(actlog::tray_view(&[d.summary()], &[]).title, "🧱 v0.1.0?");
         std::fs::write(&sh, &original).unwrap();
 
         // The tag moved on origin since the build.
@@ -7775,7 +7777,10 @@ exec git \"$@\"
         p.set("gh-fail-at", false);
         std::fs::write(p.flag("gh-slow"), "3").unwrap();
         d.publish_release("v0.1.0", 1).unwrap();
-        assert_eq!(actlog::tray_view(&d.summary()).title, "🧱 publishing");
+        assert_eq!(
+            actlog::tray_view(&[d.summary()], &[]).title,
+            "🧱 publishing"
+        );
         let second = d.publish_release("v0.1.0", 1);
         assert!(
             matches!(&second, Err(release::Error::Refused(m)) if m.contains("one publish at a time")),
@@ -7910,7 +7915,7 @@ exec git \"$@\"
         );
         assert_eq!(d.summary().release.map(|r| r.state), Some("blocked".into()));
         assert_eq!(
-            actlog::tray_view(&d.summary()).title,
+            actlog::tray_view(&[d.summary()], &[]).title,
             actlog::BRICK,
             "bana does not ask"
         );

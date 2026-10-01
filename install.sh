@@ -38,4 +38,4 @@ mkdir -p "$bin"
 ln -sf "$src/bin/bana" "$bin/bana"
 echo "bana $(git -C "$src" describe --always --tags) is $bin/bana"
 case ":$PATH:" in *":$bin:"*) ;; *) echo "Add $bin to your PATH (e.g. in ~/.zshrc: export PATH=\$HOME/.local/bin:\$PATH)" ;; esac
-echo "Next, in your project's checkout: bana daemon install (README: CI on push)"
+echo "Next: bana daemon install, once, then bana add in each project's checkout (README: CI on push)"

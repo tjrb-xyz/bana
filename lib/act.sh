@@ -286,7 +286,7 @@ act_logged() { # ACT-ARGUMENT...
 # (none is built for it): last.report.md, and its table on the terminal.
 act_report() { # DIR
   local b m='' opts=()
-  for b in "$home/daemon/bana-manager" "${CARGO_TARGET_DIR:-$bana_root/manager/target}/release/bana-manager"; do
+  for b in "$machine_dir/bana-manager" "${CARGO_TARGET_DIR:-$bana_root/manager/target}/release/bana-manager"; do
     if bm_has "$b" report; then m=$b; break; fi
   done
   [[ -n $m ]] || return 0
@@ -319,6 +319,6 @@ act_unmapped() { # LOG
       for l in $labels; do
         case $keys in *" $(lower <<<"$l") "*) known=1 ;; esac
       done
-      [[ -n $known ]] || warn "not run here: $job (runs-on: $labels): see bana init"
+      [[ -n $known ]] || warn "not run here: $job (runs-on: $labels): see bana add"
     done
 }

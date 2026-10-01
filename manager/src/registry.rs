@@ -149,6 +149,14 @@ impl Registry {
             .collect()
     }
 
+    /// The projects that could not start (or start again now), and why.
+    pub fn errors(&self) -> Vec<(String, String)> {
+        locked(&self.entries)
+            .iter()
+            .filter_map(|(p, e)| Some((p.clone(), e.daemon.as_ref().err()?.clone())))
+            .collect()
+    }
+
     pub fn daemon(&self, prefix: &str) -> Option<Daemon> {
         locked(&self.entries)
             .get(prefix)?
@@ -593,6 +601,12 @@ echo "end $BANA_BUILD" >>"$ctl/order"
         assert!(c["error"].as_str().unwrap().contains("no clone"), "{c}");
         assert_eq!((&c["repo"], &c["paused"]), (&json!("o/c"), &json!(true)));
         assert!(r.daemon("sc").is_none());
+        let errors = r.errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].0 == "sc" && errors[0].1.contains("no clone"),
+            "{errors:?}"
+        );
         assert!(matches!(r.routes("sc"), Some(Err(_))) && r.routes("sd").is_none());
         assert_eq!(row(&rows, &pb.prefix)["error"], Value::Null);
 

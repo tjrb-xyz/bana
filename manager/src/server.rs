@@ -1216,6 +1216,35 @@ mod tests {
 
     const TOKEN: &str = "ci0123456789abcdef0123456789abcd";
 
+    /// The page asks the project it shows (`#p=`), and every link it writes
+    /// keeps it: none goes to a bare `#build=` or `#release=`.
+    #[test]
+    fn the_page_asks_and_links_the_project_it_shows() {
+        let page = include_str!("page.html");
+        let script = &page[page.find("<script>").unwrap()..];
+        assert!(script.contains(r#""/ci/v1/p/" + encodeURIComponent(project)"#));
+        assert!(script.contains(r#"get("p")"#));
+        assert!(
+            script.contains(r#"h.set("p", project)"#),
+            "Publish keeps it"
+        );
+        assert!(
+            script.contains(r#"fetch("/ci/v1/projects""#),
+            "the picker's rows"
+        );
+        for bare in [
+            r##""#build="##,
+            r##"href="#build"##,
+            r##"href="#release"##,
+            r#"hash = "build="#,
+        ] {
+            assert!(!script.contains(bare), "{bare}");
+        }
+        assert!(page.contains("Pause automatic builds") && !page.contains("Pause new builds"));
+        assert!(page.contains("No projects yet: run bana add in a project's checkout."));
+        assert!(page.contains("Run bana add in its checkout, or bana remove"));
+    }
+
     /// A manager over stand-in programs: a `bana` that reports one busy runner
     /// and a USB audio device, and a GitHub CLI that is not signed in, or one
     /// that echoes what it was asked (`gh_echo`).

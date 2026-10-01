@@ -1,45 +1,92 @@
 # CI on push: bana daemon
 
-`bana daemon install` makes a machine a project's CI. A daemon fetches the repository every 30 seconds (and at
-once after a push from your checkout, through a git hook install adds; `--no-hook` leaves it out), runs each
-eligible push through `bana ci` (act, in OrbStack's Docker) and posts commit statuses to GitHub with the GitHub
-CLI. On a Mac it is a LaunchAgent in your login session, with 🧱 in the menu bar; on Linux it is a systemd user
-service with no menu bar. It builds in its own clone, `~/.bana/<prefix>/src`, so your checkout stays yours.
+One daemon a machine is the CI of every project you add to it. `bana daemon install` starts it, once, anywhere;
+`bana add`, in a project's checkout, adds the project. The daemon fetches each repository every 30 seconds (and
+at once after a push from a checkout, through a git hook `bana add` adds), runs each eligible push through
+`bana ci` (act, in OrbStack's Docker), one build at a time on the machine, and posts commit statuses to GitHub
+with the GitHub CLI. On a Mac it is a LaunchAgent in your login session, with 🧱 in the menu bar; on Linux it is
+a systemd user service with no menu bar. It builds each project in its own clone, `~/.bana/<prefix>/src`, so
+your checkout stays yours.
 
 The [README](../README.md#ci-on-push-bana-daemon) has the short version. This page has the rest.
 
 ## Install
 
 What it needs: act (`brew install act`), Docker (OrbStack, running), the GitHub CLI signed in with the `repo`
-scope (`gh auth login`), and cargo (rustup), which builds the daemon the first time. In the project's checkout:
+scope (`gh auth login`), and cargo (rustup), which builds the daemon the first time. Anywhere, once a machine:
 
 ```sh
-bana daemon install             # check, build, clone, start; on a Mac it opens the page
+bana daemon install             # check, build, start; on a Mac it opens the page
 bana daemon install --port 8471 # another port (the default is 8470, or the one installed)
 bana daemon install --no-tray   # on a Mac: no menu bar item (a Mac mini nobody looks at)
 bana daemon install --no-open   # don't open the page afterwards
 bana daemon install --now       # restart at once, even while a build runs
-bana daemon install --no-claude # don't register bana's tools with Claude Code (below)
 ```
 
-Install first checks the machine and the workflow (the doctor): act, Docker, gh and its token's scope, that git
-can read the repository through gh, and the workflow's `workflow_dispatch` trigger. It warns about what would go
-wrong in the workflow ([What the workflow needs](#what-the-workflow-needs)), and about pool runners on this
-machine, since with both every push would run twice. Then it builds `bana-manager`, puts a snapshot of bana in
-`~/.bana/<prefix>/daemon`, clones the repository into `~/.bana/<prefix>/src` and writes the daemon's settings
-from bana.conf.
+Install first checks the machine (the doctor): act, Docker, unzip and sha256, gh and its token's scope, and
+whether gh can publish releases. Then it builds `bana-manager`, puts a snapshot of bana in `~/.bana/daemon.d`,
+writes the machine's settings there, and starts the daemon: the LaunchAgent `xyz.tjrb.bana` on a Mac, the user
+unit `bana.service` on Linux. It lists the projects it serves (none, the first time).
 
-When Claude Code (`claude`) is on the PATH, install also registers bana's MCP server with it, in this checkout
-at local scope (private to you; the fix worktrees see it too): `claude mcp remove -s local bana`, then `claude
-mcp add -s local bana -- ~/.bana/<prefix>/daemon/bana-manager mcp --dir ~/.bana/<prefix>`. Those are the tools
-Claude uses in a fix ([FIX.md](FIX.md)). Install prints how to undo it; uninstall removes it.
+Run install again to take a newer bana, or another port. If a build is running, install waits for it to end;
+with `--now` it restarts at once and the build runs again. The push hooks read the port when they run, so a new
+port needs nothing else.
 
-The settings are read at install, so run install again after changing bana.conf's `daemon.*` keys, or to take a
-newer bana. If a build is running, install waits for it to end; with `--now` it restarts at once and the build
-runs again.
+## Projects
 
-The first start only records the branches and tags as they are. Nothing is built until the next push, or until
-you use *Run now*.
+```sh
+bana add [--check] [--diff] [--workflow F] [--no-hook] [--no-claude]   # in its checkout
+bana list                        # the projects added here
+bana pause [PROJECT]             # hold its automatic builds
+bana resume [PROJECT]            # build what waited
+bana remove [PROJECT] [--purge]  # its CI here goes
+```
+
+PROJECT is a prefix `bana list` shows, by default the checkout's.
+
+**`bana add`** first says where each of the workflow's jobs runs here and proposes bana.conf and workflow changes
+([README](../README.md#bana-add-bana-as-the-projects-ci)), written only if you say so on a terminal. Then it
+checks what the daemon needs of the project: that git can read the repository through gh, the workflow's
+`workflow_dispatch` trigger, and what would go wrong in the workflow
+([What the workflow needs](#what-the-workflow-needs)), and pool runners on this machine, since with both every
+push would run twice. It writes the project's settings, `~/.bana/<prefix>/daemon/settings`, from bana.conf (that
+file is the project being added: the daemon serves every project that has one), clones the repository into
+`~/.bana/<prefix>/src`, adds the push hook (`--no-hook` leaves it out) and registers bana's tools with Claude
+Code (below). If the daemon runs, it starts the project at once and prints its page; otherwise the next
+`bana daemon install` does. A prefix another repository has here already is refused: set another in bana.conf.
+
+The settings are read at `bana add`, so run it again after changing bana.conf's `daemon.*` keys. When they
+changed, the daemon starts the project again; a build it was running ends interrupted and runs again once.
+
+When Claude Code (`claude`) is on the PATH, `bana add` registers bana's MCP server with it, in this checkout at
+local scope (private to you; the fix worktrees see it too): `claude mcp remove -s local bana`, then `claude mcp
+add -s local bana -- ~/.bana/daemon.d/bana-manager mcp --dir ~/.bana/<prefix>`. Those are the tools Claude uses
+in a fix ([FIX.md](FIX.md)). `--no-claude` leaves it out; `bana remove` removes it.
+
+The first start of a project only records its branches and tags as they are. Nothing is built until the next
+push, or until you use *Run now*.
+
+**`bana list`** has a line a project: PROJECT, REPO, STATE (`active`, `paused`, or `error: …` for a project the
+daemon cannot start, such as one with no clone), QUEUE, LAST (the last build and how it ended), CHECKOUT and
+FILES, where its clone, builds, fixes and releases are (`~/.bana/<prefix>`). While the daemon is down it reads
+the files instead, and STATE is `down` (or `down, paused`).
+
+**`bana pause`** holds the project's automatic builds: its pushes, and the retries of builds a restart cut
+short. The daemon still fetches, and the pushes queue (a newer push still replaces a queued one of its branch);
+*Run now*, *Re-run*, a fix's rounds and *Publish* still work. A tag's build is a push, so it waits too. A
+running build finishes. **`bana resume`** builds what waited. Both work while the daemon is down: the pause is
+the file `~/.bana/<prefix>/daemon/paused`, which the daemon reads when it starts, and *Pause automatic builds*
+on the page and in 🧱 is the same file.
+
+**`bana remove`** takes the project's settings and pause away; the daemon cancels its running build (`project
+removed`) and drops it. Then it removes the push hook and Claude Code's registration in the checkout the
+settings name (from any directory: `bana remove wid`). Its clone, builds, fixes and releases stay in
+`~/.bana/<prefix>`, so `bana add` again goes on from them; `--purge` removes those too (also later:
+`bana remove wid --purge` after a `bana remove wid`). Neither touches the project's pool runners (`bana up`) or
+your `vars`.
+
+**`bana daemon uninstall`** stops the daemon and removes `~/.bana/daemon.d` and the LaunchAgent or unit. The
+projects stay added: their pushes wait for the next install. `--purge` runs `bana remove --purge` for each first.
 
 ## On GitHub
 
@@ -53,7 +100,7 @@ A build at another tier than pushes run (a nightly by hand, a tag) posts `bana <
 instead, so it never overwrites a push's result. A queued build posts nothing, so a push replaced while it waited
 shows no status at all.
 
-Each status's *Details* link is `http://127.0.0.1:<port>/#build=<id>`: it opens the build on the page, and works
+Each status's *Details* link is `http://127.0.0.1:<port>/#p=<prefix>&build=<id>`: it opens the build on the page, and works
 only on the machine that ran it, which is why the descriptions name the machine. If GitHub refuses that link, the
 daemon posts without one from then on. Statuses that cannot be posted (offline, gh signed out) are tried again,
 at most five minutes apart.
@@ -63,34 +110,42 @@ yet.
 
 ## The menu bar
 
-🧱, then what the daemon is doing:
+🧱, then what the daemon is doing. With more than one project, the title names the project it is about: the
+one building (`🧱 wid 4m +3`, every project's queue counted), else the one that most needs you (a release to
+publish, then one that cannot start, a failure, a wait, a pause), else `🧱 +3` for what is queued.
 
 | Title | |
 |---|---|
 | `🧱` | idle |
 | `🧱 4m`, `🧱 4m +2` | building for 4 minutes of awake time, with 2 builds queued |
 | `🧱 !` | idle, and the last build failed |
-| `🧱 paused` | new builds are paused |
+| `🧱 paused` | automatic builds are paused |
 | `🧱 no Docker` | builds wait for Docker (start OrbStack) |
 | `🧱 busy` | builds wait for your `bana ci` |
 | `🧱 publishing` | a release is being published |
 | `🧱 v0.1.0?` | v0.1.0's build passed with its files: publish it? ([Releases](#releases)) |
 | `🧱 !gh` | statuses are not being posted; the tooltip says why |
 
-A left click opens the page on the running build, else the latest one. A right click shows the menu: what it is
-doing, the last result (it opens that build), *Publish v0.1.0…* while bana asks (it opens the page on the
-release, where you read the notes first), *Fix #41 with Claude…* while the last build failed
-([FIX.md](FIX.md)), *Open bana*, *Cancel build*, *Pause new builds* and *Quit bana*. Quit stops local CI until
-your next login or `bana daemon install`.
+A left click opens the page on the running build, else the latest one. A right click shows the menu: what the
+machine is doing (`bana: building wid #12`, `bana: 2 queued`, `bana: idle`, and how many projects cannot
+start), *Open bana*, a submenu for each project, and *Quit bana*. A project's submenu is labelled with what it
+does, and has the last result (it opens that build), *Publish v0.1.0…* while bana asks (it opens the page on
+the release, where you read the notes first), *Fix #41 with Claude…* while its last build failed
+([FIX.md](FIX.md)), *Open*, *Cancel #12* while it builds, and *Pause automatic builds*. A project the daemon
+cannot start shows why, and what to run. Quit stops local CI until your next login or `bana daemon install`.
 
 ## The page
 
-`bana daemon open`, or the menu bar, opens it at `http://127.0.0.1:8470/`. Its *Local CI* section has:
+`bana daemon open [PROJECT]`, or the menu bar, opens it at `http://127.0.0.1:8470/`. With two projects or
+more, its header has a picker, each with its state and queue; the address says which project it shows
+(`#p=<prefix>`), and without one it shows the project building, else the first. Its *Local CI* section has, for
+that project:
 
-- a line with the repository, when it last fetched, and whatever is holding builds back;
-- the release bana asks about, or `#release=<tag>` ([Releases](#releases));
-- *Pause new builds* (fetching goes on, and a running build finishes), *Check now* (fetch at once) and
-  *Clear queue* (drops a backlog after a long time away);
+- a line with the repository, when it last fetched, and whatever is holding builds back (`after wid #12`: another
+  project's build runs first);
+- the release bana asks about, or `#p=<prefix>&release=<tag>` ([Releases](#releases));
+- *Pause automatic builds* ([Projects](#projects)), *Check now* (fetch at once) and *Clear queue* (drops a
+  backlog after a long time away);
 - *Run now*: a branch or tag at a tier, at the front of the queue. That is how a nightly runs;
 - the queue, each build with *Remove*;
 - the build: its jobs, the live log of the one you pick (a failed step opens by itself), *Cancel* and *Re-run*
@@ -103,8 +158,9 @@ your next login or `bana daemon install`.
 - the history (the last 100 builds, each with its tests' share, `tests 95%`, and its files, `4 files`), and the
   pushes not built.
 
-The runner pool's sections follow, under *Runner pool (optional)*. `bana manager` opens this page too while the
-project's daemon runs.
+The runner pool's sections follow, under *Runner pool (optional)*, for the project shown. `bana manager` opens
+this page too while the daemon runs. With no project yet the page says to run `bana add`; a project the daemon
+cannot start shows why.
 
 The page takes the token from the address the first time (the menu bar and `bana daemon open` pass it) and keeps
 it in the browser's local storage, so GitHub's *Details* links open builds directly after that. It serves
@@ -123,7 +179,7 @@ A push runs when:
 4. that commit has not been built at that tier already, so the same commit on a new branch, or pushed again, does
    not run twice (*Re-run* does). A tag always runs, even on a commit built already: its build is the release.
 
-The rules come from the install, never from the pushed commit, so a branch cannot widen them. Pull requests from
+The rules come from `bana add`, never from the pushed commit, so a branch cannot widen them. Pull requests from
 forks never reach the daemon: it fetches only branches and tags.
 
 Branch pushes run `daemon.tier` (the first of `tiers`), tags `daemon.tag_tier` (the last). A branch keeps at most
@@ -139,10 +195,13 @@ default branch.
 
 ## One build at a time
 
-The daemon runs one build at a time, and act runs a build's jobs in parallel as it does under `bana ci`. The lock
-`~/.bana/act.lock` is shared with `bana ci`: while the daemon builds, `bana ci` says `act is busy here` and stops;
-while your `bana ci` runs, the queue waits (`🧱 busy`). Builds also wait while paused, and while Docker does not
-answer (OrbStack not started yet after login).
+The daemon runs one build at a time on the machine, whatever its project, and act runs a build's jobs in
+parallel as it does under `bana ci`. The projects take turns: after a build of one, the next project with a
+queue goes first, so a long queue in one project delays another by one build at most. Meanwhile another
+project's queue says `after wid #12`. The lock `~/.bana/act.lock` is shared with `bana ci`: while the daemon
+builds, `bana ci` says `act is busy here` and stops; while your `bana ci` runs, the queue waits (`🧱 busy`).
+Builds also wait while Docker does not answer (OrbStack not started yet after login), and a paused project's
+pushes wait.
 
 A build that takes longer than `daemon.timeout` (120 minutes of awake time) is cancelled. A cancel sends act a
 SIGINT, so its cleanup and `always()` steps run; a second one after 60 s, and after 30 s more act and everything
@@ -163,7 +222,7 @@ never ran needs it). act's own settings (`act.*`) come from the failing commit's
 saves as the build's `round.conf`, not from the snapshot. The history shows them as `fix d4b5174 · round 2 · job`.
 A round cut short by a restart runs again once, like any build.
 
-A fix gets `fix.rounds` rounds, one at a time, and none while the daemon is paused. Round 0, the failed jobs at
+A fix gets `fix.rounds` rounds, one at a time; a pause does not hold them. Round 0, the failed jobs at
 the failing commit, runs when a fix is made or registered: from the page or 🧱, or `bana fix` while the daemon
 runs. When a fix's builds leave the history (pruned, or its fix dropped), its refs in the daemon's clone go too. The daemon touches your checkout only when you click:
 *Fix with Claude* (the worktree), *Keep*, *Push* and *Discard*.
@@ -172,7 +231,8 @@ runs. When a fix's builds leave the history (pruned, or its fix dropped), its re
 
 When a build ends, the daemon writes `results.jsonl` and `report.md` beside its log: the report of
 [README.md](../README.md#the-ci-report), with the standards (`report.*`) of the built commit's bana.conf. The
-page's *Report* tab, `bana report N`, `GET /ci/v1/builds/N/report` and the MCP server's `ci_report` show it.
+page's *Report* tab, `bana report N`, `GET /ci/v1/p/<prefix>/builds/N/report` and the MCP server's `ci_report`
+show it.
 The statuses stay as they were.
 
 The report is made from `results.jsonl` alone, one JSON object per line, `schema` 1. A builder other than act
@@ -219,7 +279,7 @@ go, so each file is kept once. The build's `dist` lists each file with its size,
 release's (in `SHA256SUMS`: `release.files` and the installer), or its problem. The CI report's *Artifacts*
 section lists what each upload gave. A problem never changes the build's result or its statuses.
 
-`GET /ci/v1/builds/<id>/files/<name>` serves a listed file, and nothing else. Install one on this machine with
+`GET /ci/v1/p/<prefix>/builds/<id>/files/<name>` serves a listed file, and nothing else. Install one on this machine with
 `bana install <id>` (or `sh <dist>/install.sh --from <dist>`), in a terminal: the project's hook may ask, and
 use sudo. The page does not install anything itself.
 
@@ -281,7 +341,7 @@ publishes.
 
 ### Notes with Claude
 
-In the checkout where `bana daemon install` registered bana's MCP server, ask Claude Code: *write the release
+In the checkout where `bana add` registered bana's MCP server, ask Claude Code: *write the release
 notes for v0.1.0*. The server's instructions tell it how: read the release, then its pull requests, write for
 the project's users one line per pull request ending `(#N)`, grouped by theme, never invent changes, and leave
 Tested and Install to bana.
@@ -316,17 +376,18 @@ you run as you can.
 
 ### The API
 
-The page and the MCP server use these, on loopback behind the token like the rest of `/ci/v1/`:
+The page and the MCP server use these, on loopback behind the token like the rest of a project's routes,
+`/ci/v1/p/<prefix>/` ([The daemon's API](#the-daemons-api)):
 
 | | |
 |---|---|
-| `GET /ci/v1/releases` | the releases, the newest first |
-| `GET /ci/v1/releases/<tag>` | one release: its state, build, previous release, files, not built, changes, title (and the default one), notes, their check, Tested |
-| `PUT /ci/v1/releases/<tag>/notes` | `{notes, title?, rev, source?}` (`you` or `claude`): the new rev and the check; 409 for another rev, or once it publishes |
-| `POST /ci/v1/releases/<tag>/publish` | `{rev}`: 202, and the publish runs; 409 unless bana asks (or it failed, or was dismissed), the rev is the notes' now, and no other publish runs |
-| `POST /ci/v1/releases/<tag>/dismiss` | *Not now* |
+| `GET …/releases` | the releases, the newest first |
+| `GET …/releases/<tag>` | one release: its state, build, previous release, files, not built, changes, title (and the default one), notes, their check, Tested |
+| `PUT …/releases/<tag>/notes` | `{notes, title?, rev, source?}` (`you` or `claude`): the new rev and the check; 409 for another rev, or once it publishes |
+| `POST …/releases/<tag>/publish` | `{rev}`: 202, and the publish runs; 409 unless bana asks (or it failed, or was dismissed), the rev is the notes' now, and no other publish runs |
+| `POST …/releases/<tag>/dismiss` | *Not now* |
 
-`GET /ci/v1/local`'s `release` is the one the menu bar and `bana daemon status` show.
+`GET …/local`'s `release` is the one the menu bar and `bana daemon status` show.
 
 ## Sleep, wake and restarts
 
@@ -338,28 +399,31 @@ The first fetch after the Mac wakes comes within one poll (`daemon.poll`, 30 sec
 moved meanwhile and queues one build each, for its newest commit.
 
 A build the daemon did not finish (a crash, a reboot, a logout) is ended at the next start and run again once, if
-its commit is still its branch's head (a tag's, or one started by hand, always). `bana daemon uninstall` stops a
-running build and does not run it again.
+its commit is still its branch's head (a tag's, or one started by hand, always). With one build at a time, a
+crash cuts short one build at most. `bana daemon uninstall` stops a running build and does not run it again.
+While a project is paused, such a retry of a push waits for `bana resume`, and so does one of a *Run now* or a
+*Re-run* (a retry no longer knows what started it); a fix round's retry runs.
 
 ## What the workflow needs
 
 The daemon runs the workflow as `workflow_dispatch`, with an event shaped like the push (`github.ref`,
-`github.sha`, `github.event.before`, and the tier in `inputs`). The doctor warns about each of these:
+`github.sha`, `github.event.before`, and the tier in `inputs`). `bana add` warns about each of these:
 
 - **`on:` keeps only `workflow_dispatch`, or pushes are gated.** With `push` too and no runner pool, GitHub
   queues self-hosted jobs that no runner takes. With only `workflow_dispatch`, GitHub runs nothing itself on a
   push. A `push` is fine too when the root jobs run only
   `if: (github.event_name != 'push' && github.event_name != 'schedule') || vars.<PREFIX>_CI_AUTO != 'false'`
-  (bana init's gate; `vars.<PREFIX>_CI_AUTO != 'false' || github.event_name == 'workflow_dispatch'` does too,
-  for a workflow with no other trigger) and that variable is `false` on GitHub. A workflow without `workflow_dispatch` cannot be installed.
+  (bana add's gate; `vars.<PREFIX>_CI_AUTO != 'false' || github.event_name == 'workflow_dispatch'` does too,
+  for a workflow with no other trigger) and that variable is `false` on GitHub. A workflow without
+  `workflow_dispatch` cannot be added.
 - **No checkout `ref:`.** act builds the pushed commit only for a checkout without `ref:`; with one it clones
   from GitHub instead.
 - **`runner.environment == 'self-hosted'` gates need `|| env.ACT == 'true'`.** act never sets
   `runner.environment`, so such a step is skipped under the daemon.
   `$RUNNER_ENVIRONMENT` in a script is empty for the same reason.
-- **Every job has a place.** The doctor runs `bana init --check`: a job whose runs-on label has no place here
-  is not run, and the build still passes. Run `bana init` before install; the `act.platform.*` keys it writes
-  come through `bana ci`, so each build takes them from the commit it builds.
+- **Every job has a place.** `bana add`'s report says where each job runs: a job whose runs-on label has no
+  place here is not run, and the build still passes. The `act.platform.*` keys it writes come through
+  `bana ci`, so each build takes them from the commit it builds.
 
 act ignores `on.push.branches`, `paths` and `concurrency`: the daemon's own rules and its one-build-at-a-time
 replace them. act enforces only a step's `timeout-minutes`; `daemon.timeout` guards the build.
@@ -375,7 +439,7 @@ A job can tell it runs under the daemon by `BANA_DAEMON=1` (and under any act by
 
 ## Settings
 
-In bana.conf, read at install (`bana settings` shows them):
+In bana.conf, read at `bana add` (`bana settings` shows them):
 
 | Key | Default | What |
 |---|---|---|
@@ -392,8 +456,12 @@ In bana.conf, read at install (`bana settings` shows them):
 
 `act.args` (act options for `bana ci` and the daemon's builds, such as `--reuse`), `act.image` and `act.network` are read from
 the commit being built, like the workflow. `repo`, `prefix`, `workflow`, `tiers`, `tier_input` and `path` are
-taken at install; `path` goes first on the daemon's PATH. Install also records the checkout it runs in, where
-*Fix with Claude* makes its branches and worktrees, and bana's commit, which a fix's brief names.
+taken at `bana add`; `path` goes first on the project's PATH. `bana add` also records the checkout it runs in,
+where *Fix with Claude* makes its branches and worktrees.
+
+The machine's settings, in `~/.bana/daemon.d/settings`, are written at `bana daemon install`: the port, the
+machine's name, whether there is a menu bar, the PATH and the programs (gh, git, docker, bash) found then, and
+bana's commit, which a fix's brief names. A project's settings never change them.
 
 ## Trust
 
@@ -436,33 +504,63 @@ Logs stay on the machine.
 
 | | |
 |---|---|
-| `~/.bana/<prefix>/daemon/` | the snapshot: `bana-manager`, bana, and `settings` |
+| `~/.bana/daemon.d/` | the machine's: the snapshot (`bana-manager`, `bin/bana`, `lib/`), `settings`, and `daemon.lock` (one daemon a machine) |
+| `~/.bana/<prefix>/daemon/settings` | the project's settings, from bana.conf: while it is there, the project is added |
+| `~/.bana/<prefix>/daemon/paused` | there while the project is paused |
 | `~/.bana/<prefix>/src/` | the daemon's clone |
 | `~/.bana/<prefix>/builds/<id>/` | each build: `build.json`, `act.jsonl` (act's log), `event.json`, `results.jsonl` and `report.md` (the CI report), `artifacts/` (act's), `dist/` (a green build's files and installer) |
 | `~/.bana/<prefix>/act-cache/` | act's actions, and the macOS jobs' copies while they run |
 | `~/.bana/<prefix>/releases/` | each release: `<tag>.json`, `<tag>.log` (what gh said when it was published) and `<tag>.notes.md` (what went on GitHub) |
 | `~/.bana/<prefix>/fix/` | *Fix with Claude* and `bana fix`: each fix's worktree, and beside it `<sha7>.d/` with its brief and `rounds.json` ([FIX.md](FIX.md)) |
-| `~/.bana/<prefix>/state.json` | paused, the queue, the heads seen, each branch's last green commit |
+| `~/.bana/<prefix>/state.json` | the queue, the heads seen, each branch's last green commit |
 | `~/.bana/<prefix>/vars` | optional, yours: `KEY=value` lines for `vars.*` |
 | `~/.bana/act.lock` | the lock shared with `bana ci` |
-| `~/Library/Logs/bana/<prefix>.log` | the daemon's log on a Mac (`journalctl --user -u bana-<prefix>` on Linux) |
+| `~/Library/Logs/bana/bana.log` | the daemon's log on a Mac (`journalctl --user -u bana` on Linux) |
 
 The last 100 builds are kept, and their artifacts and files for 7 days, but for the newest files of each branch
 and tier ([above](#a-builds-files)), and a release's build while bana asks about it, and for 7 days after it was
 published or dismissed. A fix's rounds are kept apart, until the fix is discarded or 14 days after
 its last round.
 
+## The daemon's API
+
+On loopback, behind the token in `~/.bana/manager-token` but for the health:
+
+| | |
+|---|---|
+| `GET /ci/v1/health` | `{daemon, global: true, port, machine, projects}` |
+| `GET /ci/v1/projects` | a line a project: `{prefix, repo, checkout, paused, error, queue, running, last}` |
+| `POST /ci/v1/projects` | read the projects' settings again (`bana add`, `remove`, `pause` and `resume` send it): start the new ones, start the changed ones again, drop the removed ones; the same answer |
+| `/ci/v1/p/<prefix>/…` | the project's routes: `local`, `builds…`, `fixes…`, `releases…`, `daemon` (`{paused}`), `daemon/poll`, `queue/clear`, and the runner pool's. 404 for a project not added, 503 for one the daemon cannot start |
+
+The push hook posts `/ci/v1/p/<prefix>/daemon/poll`, with the port from `~/.bana/daemon.d/settings`.
+
+## From a daemon a project
+
+bana had one daemon a project before: the LaunchAgent `xyz.tjrb.bana.<prefix>` or the unit
+`bana-<prefix>.service`, each on its own port. `bana daemon install` moves them to the one daemon: it waits for
+each one's running build (not with `--now`), stops it and removes its LaunchAgent or unit and its snapshot,
+keeps only the project's keys in its settings, and puts its push hook and Claude Code's registration in its
+checkout again. Its clone, builds, fixes, releases and state stay, and a pause carries over. The port is the old
+daemon's when there was one, else 8470.
+
+Old links do not follow: the statuses already on GitHub, and bookmarks, point at the old ports, or at
+`#build=<id>` with no project. On the daemon's port such a link opens the project building, else the
+first.
+
 ## Commands
 
 ```sh
-bana daemon install [--port N] [--no-tray] [--no-open] [--now] [--no-claude]
-bana daemon status             # whether it runs, what it builds, what waits
+bana daemon install [--port N] [--no-tray] [--no-open] [--now]
+bana daemon status             # whether it runs, and what each project builds and waits for
 bana daemon log                # its log, followed
-bana daemon open               # the page
-bana daemon poke               # fetch now, rather than at the next poll
+bana daemon open [PROJECT]     # the page
+bana daemon poke [PROJECT]     # fetch now, rather than at the next poll (every project, outside a checkout)
 bana daemon run [--build]      # in the foreground, for debugging (--build: from this checkout first)
-bana daemon uninstall [--purge] # stop and remove it; --purge also its clone, builds and state
+bana daemon uninstall [--purge] # stop and remove it; the projects stay (--purge: bana remove --purge each)
+bana add | list | remove | pause | resume   # the projects (above)
 ```
 
-Run them in the project's checkout. On Linux the daemon runs while you are logged in; on a machine you don't log
-in to, `sudo loginctl enable-linger $USER` keeps it running.
+`bana daemon` runs anywhere; `open` and `poke` take this checkout's project by default. On Linux the daemon runs
+while you are logged in; on a machine you don't log in to, `sudo loginctl enable-linger $USER` keeps it
+running.

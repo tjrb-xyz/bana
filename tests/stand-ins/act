@@ -4,7 +4,7 @@
 # exits with FAKE_ACT_EXIT, saying so on stderr as act does. With FAKE_ACT_INT=1 (trapped
 # before FAKE_ACT_OUT), a SIGINT ends it as it ends act: a last line a moment later (tee must
 # still be there to take it), then exit 1.
-# bana init's dry runs (-n -j JOB, maybe --matrix K:V): a skip line for each label in
+# bana add's dry runs (-n -j JOB, maybe --matrix K:V): a skip line for each label in
 # $FAKE_STATE/labels/JOB (JOB@K:V for an entry); with -v, $FAKE_STATE/matrix/JOB as act's
 # matrix line.
 echo "act $*" >>"$FAKE_LOG"
