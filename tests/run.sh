@@ -1766,6 +1766,118 @@ check "prebuilt: without a receipt, a copy (as current/)" same "$(head -1 "$T/ou
 bash "$T/w/b/bana" daemon uninstall >/dev/null 2>&1 || true
 unset FAKE_CARGO_FAIL BANA_DAEMON_STEP
 
+# ---- handover: install stages daemon.d.new, swaps, confirms the new daemon, else goes back ------
+fresh
+daemon_world
+m=$HOME/.bana/daemon.d
+export FAKE_OS=Darwin FAKE_ARCH=arm64 FAKE_HOST=MBP
+health_pid() { curl -fsS http://127.0.0.1:8470/ci/v1/health | sed -n 's/.*"pid":\([0-9]*\).*/\1/p'; }
+# A copy of bana (T), with a lib file of its own.
+copy_bana() { # DIR
+  rm -rf "$1" && mkdir -p "$1/bin" "$1/lib"
+  cp "$bana" "$1/bin/" && cp "$here"/../lib/*.sh "$here"/../lib/install.*.in "$1/lib/"
+}
+(cd "$HOME" && bash "$bana" daemon install --no-open) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "handover: a first install has no snapshot before" test ! -e "$m.prev" -a ! -e "$m.new"
+cp -R "$m" "$T/first"
+pid=$(health_pid)
+: >"$FAKE_LOG"
+(cd "$HOME" && bash "$bana" daemon install --no-open) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "handover: the snapshot before is daemon.d.prev, as it was" diff -r "$T/first" "$m.prev"
+check "handover: the new daemon is another process" test "$(health_pid)" != "$pid"
+check "handover: and says it runs" has "$T/out" "The daemon runs. Its page:"
+check "handover: no setting names the staged snapshot" lacks "$m/settings" "daemon.d.new"
+check "handover: nothing staged is left" test ! -e "$m.new"
+copy_bana "$T/w/t"
+echo 'echo zz' >"$T/w/t/lib/zz.sh"
+(cd "$HOME" && bash "$T/w/t/bin/bana" daemon install --no-open) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "handover: a lib file of that bana" test -e "$m/lib/zz.sh"
+(cd "$HOME" && bash "$bana" daemon install --no-open) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "handover: is gone with a bana without it" test ! -e "$m/lib/zz.sh"
+
+# A build runs: daemon.d stays as it is until it ends, and a build queued in the gap ends too.
+row() { printf '[\n{"prefix":"wid","running":%s}\n]\n' "$1"; } # RUNNING
+row '{"id":7,"ref":"main"}' >"$FAKE_STATE/projects.json"
+row null >"$FAKE_STATE/projects.next"
+row '{"id":8,"ref":"feat/x"}' >"$FAKE_STATE/projects.next2"
+row null >"$FAKE_STATE/projects.next3"
+echo '# changed' >>"$T/w/t/lib/daemon.sh"
+cksum <"$m/lib/daemon.sh" >"$T/old"
+: >"$FAKE_LOG"
+(cd "$HOME" && FAKE_SEEN=$m/lib/daemon.sh bash "$T/w/t/bin/bana" daemon install --no-open) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+rm -f "$FAKE_STATE/projects.json"
+check "handover: waits for the build" has "$T/out" "wid's build #7 (main) runs: restarting the daemon when it ends"
+check "handover: and for one that started as it ended" has "$T/out" "wid's build #8 (feat/x) runs: restarting the daemon when it ends"
+check "handover: asked until both ended" test ! -e "$FAKE_STATE/projects.next" -a ! -e "$FAKE_STATE/projects.next3"
+check "handover: daemon.d unchanged while they ran (5 asks), then restarted" \
+  same "$(awk '/^launchctl bootstrap/ { exit } /^seen / { print }' "$FAKE_LOG" | sort | uniq -c | tr -s ' ')" " 5 seen $(cat "$T/old")"
+check "handover: then the new snapshot" cmp -s "$T/w/t/lib/daemon.sh" "$m/lib/daemon.sh"
+row '{"id":9,"ref":"main"}' >"$FAKE_STATE/projects.json"
+(cd "$HOME" && bash "$bana" daemon install --now --no-open) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "handover: --now does not wait" lacks "$T/out" "runs: restarting"
+(cd "$HOME" && BANA_UPGRADE_NOW=1 bash "$bana" daemon install --no-open) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+rm -f "$FAKE_STATE/projects.json"
+check "handover: nor with BANA_UPGRADE_NOW (an upgrade's)" lacks "$T/out" "runs: restarting"
+
+# The new daemon answers as another bana: the one before runs again.
+cp -R "$m" "$T/before"
+: >"$FAKE_LOG"
+(cd "$HOME" && FAKE_VERSION=0.0.0 bash "$bana" daemon install --no-open) >"$T/out" 2>&1 && st=0 || st=$?
+check "handover: a new daemon of another version fails the install" same "$st" 1
+check "handover: says what it answered" has "$T/out" "bana $V's daemon answered as bana 0.0.0: starting bana 0.0.0's again"
+check "handover: and that the one before runs, with both versions" has "$T/out" \
+  "bana $V's daemon did not come up; the daemon is back on 0.0.0. Its log: bana daemon log, files in ~/.bana/daemon.d.bad"
+check "handover: daemon.d is the one before again" diff -r "$T/before" "$m"
+check "handover: the new one is daemon.d.bad" cmp -s "$bana" "$m.bad/bin/bana"
+check "handover: started twice" same "$(grep -c 'launchctl bootstrap' "$FAKE_LOG")" 2
+check "handover: nothing staged is left" test ! -e "$m.new" -a ! -e "$m.prev"
+
+# Neither comes up: both are kept, and it says what to run.
+rm -f "$FAKE_STATE/launchd-xyz.tjrb.bana"
+(cd "$HOME" && FAKE_VERSION=0.0.0 bash "$bana" daemon install --no-open) >"$T/out" 2>&1 && st=0 || st=$?
+check "handover: neither comes up: fails" same "$st" 1
+check "handover: says so" has "$T/out" "bana $V's daemon did not come up, and bana $V's did not either (answered as bana 0.0.0). Both are kept:"
+check "handover: both are kept" test -e "$m/bin/bana" -a -e "$m.bad/bin/bana"
+check "handover: how to start the one before" has "$T/out" \
+  "  launchctl bootout gui/1000/xyz.tjrb.bana; launchctl bootstrap gui/1000 $HOME/Library/LaunchAgents/xyz.tjrb.bana.plist"
+check "handover: how to try the new one" has "$T/out" "  mv $m $m.prev && mv $m.bad $m && launchctl bootout"
+
+# --no-tray stays; --tray brings the menu bar back.
+(cd "$HOME" && bash "$bana" daemon install --no-tray --no-open) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+(cd "$HOME" && bash "$bana" daemon install --no-open) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "handover: --no-tray is kept" bash -c "grep -qx 'tray = no' '$m/settings' && grep -q -- '--no-tray' '$HOME/Library/LaunchAgents/xyz.tjrb.bana.plist'"
+(cd "$HOME" && bash "$bana" daemon install --tray --no-open) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "handover: --tray: the menu bar again" grep -qx 'tray = yes' "$m/settings"
+
+# The push hook while daemon.d is away (between the two renames).
+bash "$bana" add </dev/null >/dev/null 2>&1 || true
+hook=$(git rev-parse --git-path hooks)/reference-transaction
+mv "$m" "$T/away"
+st=0
+printf 'abc def refs/remotes/origin/main\n' | sh "$hook" committed >"$T/out" 2>&1 || st=$?
+mv "$T/away" "$m"
+check "handover: the push hook without daemon.d: exits 0, quietly" same "$st $(cat "$T/out")" "0 "
+
+mkdir -p "$m.new" "$m.prev" "$m.bad"
+bash "$bana" daemon uninstall >/dev/null 2>&1
+check "handover: uninstall removes the staged, before and bad snapshots" test ! -e "$m.new" -a ! -e "$m.prev" -a ! -e "$m.bad" -a ! -e "$m"
+unset FAKE_OS FAKE_ARCH FAKE_HOST
+
+# Linux: systemd restarts it, as another process.
+fresh
+daemon_world
+m=$HOME/.bana/daemon.d
+(cd "$HOME" && bash "$bana" daemon install) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+pid=$(health_pid)
+(cd "$HOME" && bash "$bana" daemon install) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "handover (Linux): another process" test "$(health_pid)" != "$pid"
+check "handover (Linux): the snapshot before is kept" test -e "$m.prev/bin/bana"
+: >"$FAKE_LOG"
+(cd "$HOME" && FAKE_VERSION=0.0.0 bash "$bana" daemon install) >"$T/out" 2>&1 || true
+check "handover (Linux): back on the one before" has "$T/out" "the daemon is back on 0.0.0"
+check "handover (Linux): restarted twice" same "$(grep -c 'systemctl --user restart bana.service' "$FAKE_LOG")" 2
+unset BANA_DAEMON_BIN BANA_DAEMON_STEP
+
 # ---- Tart --------------------------------------------------------------------------------------
 fresh
 export FAKE_OS=Darwin FAKE_ARCH=arm64 FAKE_HOST=mbp

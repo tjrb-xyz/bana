@@ -645,7 +645,7 @@ d_olds() {
 # fixes, releases and state stay as they are.
 d_migrate() { # NOW
   local p f dir s port h flat id checkout r said mpath reload=''
-  mpath=$(d_setting path) || mpath=
+  mpath=$(d_setting path "$d_dir.new/settings") || mpath= # the one about to run
   while IFS=$'\t' read -r p f <&3; do
     [[ -n $p ]] || continue
     dir=$(project_home "$p") s=$(d_project "$p")

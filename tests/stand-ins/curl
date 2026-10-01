@@ -7,7 +7,7 @@
 # of before (one a project, xyz.tjrb.bana.<prefix> or bana-<prefix>.service) answers when
 # that one runs. /ci/v1/projects is $FAKE_STATE/projects.json (then projects.next, then
 # projects.next2 and on, if any), else a line a project added, from its files (FAKE_SEEN: a
-# file whose cksum each answer adds to $FAKE_STATE/seen); …/local is $FAKE_STATE/local.json (then
+# file whose cksum each answer logs, as seen CKSUM); …/local is $FAKE_STATE/local.json (then
 # local.next, if any); a fix registered (…/fixes) has its round 0 queued, a fix dropped
 # (…/forget) had two round builds, and what comes on stdin (-H @-: the token) goes to
 # $FAKE_STATE/curl.stdin.
@@ -40,7 +40,7 @@ http://127.0.0.1:*/ci/v1/health)
   done
   exit 7 ;;
 http://127.0.0.1:*/ci/v1/projects)
-  [[ -z ${FAKE_SEEN:-} ]] || cksum <"$FAKE_SEEN" >>"$FAKE_STATE/seen"
+  [[ -z ${FAKE_SEEN:-} ]] || echo "seen $(cksum <"$FAKE_SEEN")" >>"$FAKE_LOG"
   if [[ -e $FAKE_STATE/projects.json ]]; then
     cat "$FAKE_STATE/projects.json"
     for f in "$FAKE_STATE"/projects.next*; do
