@@ -27,6 +27,8 @@ if [ -d "$FAKE_STATE/labels" ]; then
     exit 0
   fi
 fi
+# bana ci's fetch of the actions (a dry run, one job at a time): nothing more.
+case " $* " in *" -n --concurrent-jobs 1 "*) exit 0 ;; esac
 echo "$$" >"$FAKE_STATE/act.pid"
 env >"$FAKE_STATE/act.env"
 [ -z "${FAKE_ACT_INT:-}" ] || trap 'sleep 0.2; echo "act: interrupted, its containers removed"; exit 1' INT
@@ -35,5 +37,12 @@ if [ -n "${FAKE_ACT_INT:-}" ]; then
   sleep "${FAKE_ACT_SLEEP:-30}"
 elif [ -n "${FAKE_ACT_SLEEP:-}" ]; then
   exec sleep "$FAKE_ACT_SLEEP"
+fi
+# FAKE_ACT_LATE=1: once $FAKE_STATE/late exists, a line on each output, then act.survived.
+if [ -n "${FAKE_ACT_LATE:-}" ]; then
+  while [ ! -e "$FAKE_STATE/late" ]; do sleep 0.05; done
+  echo '{"msg":"late"}'
+  echo "late" >&2
+  echo ok >"$FAKE_STATE/act.survived"
 fi
 [ "${FAKE_ACT_EXIT:-0}" = 0 ] || { echo "Error: Job 'rust' failed" >&2; exit "$FAKE_ACT_EXIT"; }

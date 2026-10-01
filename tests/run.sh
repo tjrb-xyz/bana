@@ -307,9 +307,14 @@ check "daemon round: BANA_ROUND_CONF does not reach act's jobs" lacks "$FAKE_STA
 : >"$FAKE_LOG"
 BANA_ROUND_CONF=$T/w/round.conf BANA_PROJECT_ROOT=$src BANA_ACT_LOCKED=1 bash "$bana" ci quick --event event.json -- --json >/dev/null
 check "daemon round: a failing commit without bana.conf: act's defaults" lacks "$FAKE_LOG" "--reuse"
+: >"$FAKE_LOG"
+BANA_ROUND_CONF=$T/w/round.conf BANA_PROJECT_ROOT=$src BANA_ACT_LOCKED=1 bash "$bana" ci quick --event event.json -- --json --action-offline-mode >/dev/null
+check "daemon round without a token (offline): no fetch of the actions first" lacks "$FAKE_LOG" "--concurrent-jobs"
 mv "$T/w/bana.conf.was" "$src/.github/bana.conf"
 : >"$FAKE_LOG"
 BANA_PROJECT_ROOT=$src BANA_ACT_LOCKED=1 bash "$bana" ci quick --event event.json -- --secret-file secrets --json >/dev/null
+check "daemon ci: the actions first, one job at a time, a dry run" same "$(grep -c -- '-n --concurrent-jobs 1$' "$FAKE_LOG")" 1
+check "daemon ci: then the run, which fetches none" grep -q -- '--json --action-offline-mode$' "$FAKE_LOG"
 check "daemon ci: BANA_PROJECT_ROOT does not reach act's jobs" lacks "$FAKE_STATE/act.env" "BANA_PROJECT_ROOT="
 check "daemon ci: nor BANA_ACT_LOCKED" lacks "$FAKE_STATE/act.env" "BANA_ACT_LOCKED="
 check "daemon ci: BANA_ACT_LOCKED=1 leaves the lock to the daemon" test ! -e "$HOME/.bana/act.lock"
@@ -345,6 +350,21 @@ check "lock: and leaves it as it was" same "$(sed -n 1p "$lock/owner")" "$runnin
 kill "$act_pid"
 wait "$running" 2>/dev/null || true
 check "lock: act ended, bana ci frees it" test ! -e "$lock"
+# The daemon's bana ci: if the daemon dies (its pipes close), act runs on, still as bana ci's pid.
+rm -f "$FAKE_STATE/act.pid" "$FAKE_STATE/late" "$FAKE_STATE/act.survived"
+mkfifo "$T/w/daemon.out"
+cat "$T/w/daemon.out" >/dev/null &
+reader=$!
+FAKE_ACT_LATE=1 BANA_ACT_LOCKED=1 bash "$bana" ci >"$T/w/daemon.out" 2>&1 &
+ci=$!
+for _ in $(seq 100); do [[ -s $FAKE_STATE/act.pid ]] && break; sleep 0.05; done
+kill "$reader"
+wait "$reader" 2>/dev/null || true
+touch "$FAKE_STATE/late"
+wait "$ci" && st=0 || st=$?
+check "daemon ci: act runs on when the daemon's pipes close" same "$st $(cat "$FAKE_STATE/act.survived" 2>/dev/null)" "0 ok"
+check "daemon ci: as bana ci's pid (it execs act)" same "$(cat "$FAKE_STATE/act.pid")" "$ci"
+rm -f "$T/w/daemon.out" "$FAKE_STATE/late"
 # ci.log = no: bana ci execs act, whose pid then holds the lock.
 rm -f "$FAKE_STATE/act.pid"
 BANA_CI_LOG=no FAKE_ACT_SLEEP=30 bash "$bana" ci >/dev/null 2>&1 &
