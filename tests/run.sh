@@ -1147,7 +1147,7 @@ YML
 two_world() {
   git init -q "$T/w/two" && git -C "$T/w/two" remote add origin git@github.com:acme/two.git
   mkdir -p "$T/w/two/.github/workflows"
-  printf 'on:\n  workflow_dispatch:\n' >"$T/w/two/.github/workflows/ci.yml"
+  printf 'on:\n  workflow_dispatch:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n' >"$T/w/two/.github/workflows/ci.yml"
   git -C "$T/w/two" add -A && git -C "$T/w/two" -c user.name=t -c user.email=t@t commit -q -m one
   git clone -q --bare "$T/w/two" "$T/w/two.git"
   git config --global url."file://$T/w/two.git".insteadOf https://github.com/acme/two.git
@@ -1628,7 +1628,7 @@ check "doctor: pool runners here" has "$T/out" "This machine has runners in acme
 check "doctor: then no separate push warning" lacks "$T/out" "a push trigger"
 bash "$bana" remove --purge >/dev/null
 rm -rf "$d/runners"
-echo 'on: push' >.github/workflows/ci.yml
+printf 'on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: make\n' >.github/workflows/ci.yml
 bash "$bana" add </dev/null >"$T/out" 2>&1 || true
 check "doctor: no workflow_dispatch, nothing added" has "$T/out" "ci.yml has no workflow_dispatch trigger"
 check "doctor: and nothing added" test ! -e "$d/daemon/settings" -a ! -e "$d/src"

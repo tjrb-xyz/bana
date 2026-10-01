@@ -267,7 +267,7 @@ add_workflow() { # [NAME]
   [[ -n $n ]] || { n=$(conf workflow) && i_why="bana.conf's workflow"; }
   if [[ -z $n ]]; then
     for f in "$d"/*.yml "$d"/*.yaml; do [[ -f $f ]] && grep -q '^jobs:' "$f" && c+=("${f##*/}"); done
-    ((${#c[@]})) || die "No workflow in $d"
+    ((${#c[@]})) || die "No workflow with jobs in $d"
     if [[ -f $d/ci.yml ]]; then
       n=ci.yml i_why="bana's default"
       ((${#c[@]} == 1)) || i_why="$i_why; bana add --workflow FILE for another: $(printf '%s\n' "${c[@]}" | grep -vx ci.yml | tr '\n' ' ' | sed 's/ $//')"
