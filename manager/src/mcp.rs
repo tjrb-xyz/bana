@@ -1,5 +1,5 @@
 //! bana's MCP server: `bana-manager mcp --dir ~/.bana/<prefix>`, which Claude
-//! Code starts in a fix's worktree (`bana daemon install` registers it in the
+//! Code starts in a fix's worktree (`bana add` registers it in the
 //! owner's checkout; `bana fix` passes it with --mcp-config where that does
 //! not reach).
 //!
@@ -113,12 +113,15 @@ fn write_line(out: &Out, v: &Value) -> std::io::Result<()> {
 pub struct Link {
     pub port: u16,
     pub token_file: PathBuf,
+    /// Where the project's routes are: `/ci/v1/p/<prefix>`.
+    pub base: String,
 }
 
 impl Link {
-    /// From `<dir>/daemon/settings`: `port` (8470 by default), and the token
-    /// in bana's home (`home`, else the directory above `dir`: bana's is
-    /// `<home>/<prefix>`).
+    /// From the project's settings ([`fix::daemon_settings`]): `port` (8470
+    /// by default), the token in bana's home (`home`, else the directory
+    /// above `dir`: bana's is `<home>/<prefix>`), and its prefix (else the
+    /// directory's name).
     pub fn for_dir(dir: &Path) -> Self {
         let kv = fix::daemon_settings(dir);
         let home = kv
@@ -127,9 +130,16 @@ impl Link {
             .map(PathBuf::from)
             .or_else(|| dir.parent().map(Path::to_path_buf))
             .unwrap_or_else(|| dir.to_path_buf());
+        let prefix = kv
+            .get("prefix")
+            .filter(|p| !p.is_empty())
+            .cloned()
+            .or_else(|| dir.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_default();
         Self {
             port: kv.get("port").and_then(|p| p.parse().ok()).unwrap_or(8470),
             token_file: home.join("manager-token"),
+            base: format!("/ci/v1/p/{prefix}"),
         }
     }
 
@@ -143,6 +153,11 @@ impl Link {
         secs: u64,
     ) -> Result<(u16, Value), String> {
         let token = std::fs::read_to_string(&self.token_file).unwrap_or_default();
+        // The project's routes are under its base; the health is the daemon's.
+        let path = match path.strip_prefix("/ci/v1/") {
+            Some(rest) if rest != "health" => format!("{}/{rest}", self.base),
+            _ => path.to_string(),
+        };
         let addr = std::net::SocketAddr::from(([127, 0, 0, 1], self.port));
         let mut c = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3))
             .map_err(|e| format!("{addr}: {e}"))?;
@@ -958,7 +973,7 @@ impl Server {
         let src = self.dir.join("src");
         if !src.join(".git").exists() {
             return Err(Fail::Tool(format!(
-                "the daemon's clone {} is missing: bana daemon install makes it",
+                "the daemon's clone {} is missing: bana add makes it",
                 src.display()
             )));
         }
@@ -1309,7 +1324,7 @@ impl Server {
             .unwrap_or_default();
         let Some((owner, name)) = repo.split_once('/').filter(|_| crate::valid_repo(&repo)) else {
             return Err(Fail::Tool(
-                "the bana daemon's settings name no repository: bana daemon install".into(),
+                "the bana daemon's settings name no repository: bana add".into(),
             ));
         };
         let o = self.gh(&[
@@ -1425,16 +1440,20 @@ impl Server {
 /// release_context's answer from the daemon's release view: the build's
 /// essentials and at most [`OTHER_MAX`] other changes.
 fn context(mut v: Value) -> Value {
-    let page = v["page_url"]
-        .as_str()
-        .and_then(|u| u.split('#').next())
-        .unwrap_or("")
-        .to_string();
+    let url = v["page_url"].as_str().unwrap_or("");
+    let (page, hash) = url.split_once('#').unwrap_or((url, ""));
+    // The page's project, as the release's link names it.
+    let project = hash
+        .split('&')
+        .find(|kv| kv.starts_with("p="))
+        .map(|p| format!("{p}&"))
+        .unwrap_or_default();
+    let link = format!("{page}#{project}build=");
     let b = &v["build"];
     if b.is_object() {
         v["build"] = json!({
             "id": b["id"], "state": b["state"], "tier": b["tier"], "ref": b["ref"],
-            "ended_at": b["ended_at"], "page_url": format!("{page}#build={}", b["id"]),
+            "ended_at": b["ended_at"], "page_url": format!("{link}{}", b["id"]),
         });
     }
     if let Some(files) = v["files"].as_array_mut() {
@@ -1721,7 +1740,8 @@ mod tests {
     use super::*;
     use crate::daemon::tests::{finished, start, Project};
     use crate::guard::Access;
-    use crate::server::{daemon_router, Manager, Tools};
+    use crate::registry::Registry;
+    use crate::server::daemon_router;
     use std::sync::Arc;
 
     const TOKEN: &str = "mcp0123456789abcdef0123456789abc";
@@ -1774,8 +1794,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let access = Arc::new(Access::loopback(TOKEN, port, &["/ci/v1/"]));
-        let m = Manager::new(Tools::from_settings(d.settings()), "t".into());
-        let app = daemon_router(m, d.clone(), access);
+        let app = daemon_router(Registry::of(vec![d.clone()]), access);
         let http = tokio::spawn(async move { axum::serve(listener, app).await });
         let dir = d.settings().dir.clone();
         let token_file = dir.join("token");
@@ -1784,7 +1803,12 @@ mod tests {
 
         let (dir2, wt2, sha72) = (dir.clone(), wt.clone(), sha7.clone());
         let hold = p.flag("hold");
-        let link = Link { port, token_file };
+        let base = "/ci/v1/p/p".to_string();
+        let link = Link {
+            port,
+            token_file,
+            base,
+        };
         let round1 = tokio::task::spawn_blocking(move || {
             let (dir, wt, sha7) = (dir2, wt2, sha72);
             let hello = json!({"jsonrpc": "2.0", "id": 0, "method": "initialize",
@@ -2058,14 +2082,21 @@ FAKE_LOG='CTL/gh-mcp.log' FAKE_PRS='CTL/prs' exec 'STANDIN' \"$@\"
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let access = Arc::new(Access::loopback(TOKEN, port, &["/ci/v1/"]));
-        let m = Manager::new(Tools::from_settings(d.settings()), "t".into());
-        let app = daemon_router(m, d.clone(), access);
+        let app = daemon_router(Registry::of(vec![d.clone()]), access);
         let http = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
         let token_file = d.settings().dir.join("token");
         std::fs::write(&token_file, format!("{TOKEN}\n")).unwrap();
-        (Link { port, token_file }, http)
+        let base = "/ci/v1/p/p".to_string();
+        (
+            Link {
+                port,
+                token_file,
+                base,
+            },
+            http,
+        )
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2086,6 +2117,7 @@ FAKE_LOG='CTL/gh-mcp.log' FAKE_PRS='CTL/prs' exec 'STANDIN' \"$@\"
         until("v0.1.0 asked about", || asking("v0.1.0")).await;
         let (link, http) = serve_api(&d).await;
         let dir = d.settings().dir.clone();
+        let prefix = d.settings().prefix.clone();
         let ctl = p.flag("");
         let gh = p.flag("gh-mcp");
         std::fs::write(
@@ -2098,11 +2130,10 @@ FAKE_LOG='CTL/gh-mcp.log' FAKE_PRS='CTL/prs' exec 'STANDIN' \"$@\"
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::create_dir_all(dir.join("daemon")).unwrap();
-        std::fs::write(
-            dir.join("daemon/settings"),
-            format!("repo = o/r\ngh = {}\n", gh.display()),
-        )
-        .unwrap();
+        std::fs::write(dir.join("daemon/settings"), "repo = o/r\n").unwrap();
+        let machine = dir.parent().unwrap().join("daemon.d");
+        std::fs::create_dir_all(&machine).unwrap();
+        std::fs::write(machine.join("settings"), format!("gh = {}\n", gh.display())).unwrap();
         let prs = p.flag("prs");
         std::fs::create_dir_all(&prs).unwrap();
         let body = "b".repeat(2500);
@@ -2164,7 +2195,7 @@ FAKE_LOG='CTL/gh-mcp.log' FAKE_PRS='CTL/prs' exec 'STANDIN' \"$@\"
             let id = c["build"]["id"].as_u64().unwrap();
             assert_eq!(
                 c["build"]["page_url"],
-                json!(format!("http://127.0.0.1:8470/#build={id}"))
+                json!(format!("http://127.0.0.1:8470/#p={prefix}&build={id}"))
             );
             assert!(c["files"].to_string().contains("\"SHA256SUMS\""), "{c}");
             assert!(c.get("dir").is_none());
@@ -2234,7 +2265,8 @@ FAKE_LOG='CTL/gh-mcp.log' FAKE_PRS='CTL/prs' exec 'STANDIN' \"$@\"
             let w = ok(&w);
             assert_eq!((&w["rev"], &w["missing_prs"]), (&json!(2), &json!([3])), "{w}");
             assert!(w["next"].as_str().unwrap().contains("without #3"), "{w}");
-            assert_eq!(w["page_url"], "http://127.0.0.1:8470/#release=v0.1.0");
+            let page = format!("http://127.0.0.1:8470/#p={prefix}&release=v0.1.0");
+            assert_eq!(w["page_url"], json!(page));
             let c = call(&mut s, 9, "release_context", json!({"tag": "v0.1.0"}));
             let n = &ok(&c)["notes"];
             assert_eq!((&n["rev"], &n["source"], &n["text"]), (&json!(2), &json!("claude"), &json!("- Adds A (#1)\n")));
@@ -2330,14 +2362,14 @@ FAKE_LOG='CTL/gh-mcp.log' FAKE_PRS='CTL/prs' exec 'STANDIN' \"$@\"
             .map(|i| json!({"sha": format!("{i}"), "subject": "s"}))
             .collect();
         let v = context(
-            json!({"tag": "v1", "state": "asking", "page_url": "http://127.0.0.1:9/#release=v1",
+            json!({"tag": "v1", "state": "asking", "page_url": "http://127.0.0.1:9/#p=x&release=v1",
             "build": {"id": 4, "state": "success", "tier": "release", "jobs": []}, "dir": "/x",
             "files": [{"name": "a.deb", "bytes": 3, "platform": null, "release": true}],
             "changes": {"prs": [], "other": other, "more": 5}, "notes": {"rev": 2}}),
         );
         assert_eq!(v["changes"]["other"].as_array().unwrap().len(), 300);
         assert_eq!(v["changes"]["more"], 155);
-        assert_eq!(v["build"]["page_url"], "http://127.0.0.1:9/#build=4");
+        assert_eq!(v["build"]["page_url"], "http://127.0.0.1:9/#p=x&build=4");
         assert!(v["build"].get("jobs").is_none() && v.get("dir").is_none());
         assert_eq!(
             v["files"],
@@ -2427,6 +2459,7 @@ FAKE_LOG='CTL/gh-mcp.log' FAKE_PRS='CTL/prs' exec 'STANDIN' \"$@\"
         s.daemon = Link {
             port,
             token_file: root.join("none"),
+            base: "/ci/v1/p/x".into(),
         };
         s.poll = 0;
         let buf = Buf::default();
@@ -2515,6 +2548,7 @@ FAKE_LOG='CTL/gh-mcp.log' FAKE_PRS='CTL/prs' exec 'STANDIN' \"$@\"
         s.daemon = Link {
             port,
             token_file: root.join("none"),
+            base: "/ci/v1/p/x".into(),
         };
         s.poll = 0;
         s.pause = Duration::from_millis(10);
@@ -2600,19 +2634,44 @@ FAKE_LOG='CTL/gh-mcp.log' FAKE_PRS='CTL/prs' exec 'STANDIN' \"$@\"
         std::fs::create_dir_all(dir.join("daemon")).unwrap();
         let l = Link::for_dir(&dir);
         assert_eq!(
-            (l.port, l.token_file.clone()),
-            (8470, root.join("home/manager-token"))
+            (l.port, l.token_file.clone(), l.base.as_str()),
+            (8470, root.join("home/manager-token"), "/ci/v1/p/wid")
         );
+        // The machine's port and home; an older bana's in the project's
+        // file are left out.
+        std::fs::create_dir_all(root.join("home/daemon.d")).unwrap();
         std::fs::write(
-            dir.join("daemon/settings"),
-            "port = 8471\nhome = /elsewhere\n",
+            root.join("home/daemon.d/settings"),
+            "port = 8472\nhome = /elsewhere\n",
         )
         .unwrap();
+        std::fs::write(dir.join("daemon/settings"), "prefix = wid\nport = 8471\n").unwrap();
         let l = Link::for_dir(&dir);
         assert_eq!(
-            (l.port, l.token_file),
-            (8471, PathBuf::from("/elsewhere/manager-token"))
+            (l.port, l.token_file.clone()),
+            (8472, PathBuf::from("/elsewhere/manager-token"))
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_link_calls_the_projects_routes_but_the_health() {
+        let (port, got) = fake_daemon(vec![json!({"daemon": true}), json!({"ok": true})]);
+        let l = Link {
+            port,
+            token_file: PathBuf::from("/none"),
+            base: "/ci/v1/p/x".into(),
+        };
+        assert!(l.up());
+        assert_eq!(
+            l.call("GET", "/ci/v1/builds?limit=1", None, 5).unwrap().0,
+            200
+        );
+        let got = got.lock().unwrap().clone();
+        assert!(got[0].starts_with("GET /ci/v1/health "), "{got:?}");
+        assert!(
+            got[1].starts_with("GET /ci/v1/p/x/builds?limit=1 "),
+            "{got:?}"
+        );
     }
 }

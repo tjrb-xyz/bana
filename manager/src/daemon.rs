@@ -1,11 +1,12 @@
-//! The daemon: bana's CI on push, on this machine. `bana-manager daemon --dir
-//! ~/.bana/<prefix>` fetches the project's own clone, queues the pushes the
-//! rules take ([`crate::watch`]), runs each through `bana ci` (act), one build
-//! at a time, folds act's log into the build ([`crate::actlog`]) and posts the
-//! commit statuses that say so through the GitHub CLI.
+//! The daemon: bana's CI on push, on this machine. A project's [`Daemon`]
+//! (in `~/.bana/<prefix>`) fetches the project's own clone, queues the pushes
+//! the rules take ([`crate::watch`]), runs each through `bana ci` (act), one
+//! build at a time, folds act's log into the build ([`crate::actlog`]) and
+//! posts the commit statuses that say so through the GitHub CLI.
 //!
 //! Three tasks share one state: the watcher (fetch, list the heads, decide),
-//! the runner (the gates, then one build) and the poster (statuses, in order,
+//! the runner (the gates, then one build; the registry's, for all the
+//! projects, under `bana-manager daemon`) and the poster (statuses, in order,
 //! the newest state per context). The page and the menu bar call [`Daemon`]'s
 //! methods and read its [`Summary`] from a watch channel.
 //!
@@ -32,8 +33,15 @@
 //! since Claude's code runs in them. They are kept apart from the 100 builds,
 //! until their fix goes or 14 days after its last round.
 //!
+//! One daemon serves every project on the machine ([`crate::registry`]):
+//! each project added is one [`Daemon`], in `~/.bana/<prefix>`, and one
+//! runner runs their builds, one at a time.
+//!
 //! Under the directory:
-//! - `daemon/settings`: written by `bana daemon install` (below);
+//! - `daemon/settings`: written by `bana add` (below); while it is there, the
+//!   project is added;
+//! - `daemon/paused`: there while the owner has paused the project's
+//!   automatic builds (pushes);
 //! - `src/`: the clone builds check out, with `refs/bana/green/*` pins;
 //! - `state.json`: paused, the next id, the heads last seen, each ref's last
 //!   green head, the queue (ids), whether GitHub takes our target_url, and the
@@ -54,8 +62,13 @@
 //!
 //! JSON goes to a temporary file, is synced, then renamed over the old one.
 //!
-//! The settings file has `key = value` lines; `#` starts a comment. A key not
-//! below is an error.
+//! The settings are `key = value` lines; `#` starts a comment. A key not
+//! below is an error. A project runs with the machine's file,
+//! `~/.bana/daemon.d/settings` (`bana daemon install` writes it), then its
+//! own, whose machine keys (port to bana_commit, but path) are left out
+//! ([`settings_text`]).
+//!
+//! The project's:
 //!
 //!   repo              owner/repo (required)
 //!   prefix            bana.conf's prefix (required)
@@ -72,6 +85,12 @@
 //!   daemon.token      gh (the jobs' GITHUB_TOKEN is gh's), or none (empty)
 //!   fix.rounds        5: rounds a fix may run after round 0 (More rounds adds as many)
 //!   fix.token         none (rounds get an empty token and act's offline mode), or gh
+//!   checkout          the owner's checkout (absolute), where Fix with Claude
+//!                     makes its worktrees and branches (none: it cannot)
+//!   path              PATH for its builds, when bana.conf sets one
+//!
+//! The machine's:
+//!
 //!   port              8470: the page's port, which target_url links to
 //!   host              this machine's name in descriptions (hostname -s)
 //!   login             the GitHub user the daemon runs for (the event's sender)
@@ -79,10 +98,14 @@
 //!   tray              yes or no: the menu bar (yes on macOS)
 //!   home              bana's home, where act.lock is (${BANA_HOME:-$HOME/.bana})
 //!   git gh docker caffeinate bash   the programs (default: found on path)
-//!   script            the bin/bana builds run (daemon/bin/bana)
-//!   checkout          the owner's checkout (absolute), where Fix with Claude
-//!                     makes its worktrees and branches (none: it cannot)
+//!   script            the bin/bana builds run (daemon.d/bin/bana)
 //!   bana_commit       the bana commit the snapshot is of, for a fix's brief
+//!   retry recheck grace publish_timeout   seconds (`500ms`: milliseconds):
+//!                     the first wait after a failed post (5), how often a held
+//!                     queue looks again (10), between SIGTERM and SIGKILL (5),
+//!                     and for `gh release create` (1800)
+//!   ladder ladder_short   the cancel ladder's two waits (60 30; 20 10 when
+//!                     the daemon stops)
 
 use crate::actlog::{
     self, Build, BuildState, BuildView, Event, Report, Status, StatusState, Summary, Watcher,
@@ -132,10 +155,12 @@ const LOG_PAGE: u64 = 256 * 1024;
 pub const LABEL: &str = "xyz.tjrb.bana";
 /// Why a build stopped when the daemon did. The next start retries it once.
 pub const INTERRUPTED: &str = "interrupted (bana restarted)";
-/// Why the queue waits while the owner has paused the daemon.
+/// Why the queue waits while the owner has paused the project's automatic
+/// builds (and nothing else is queued).
 pub const PAUSED: &str = "paused";
 
-const KEYS: &[&str] = &[
+/// The project's keys, in `<prefix>/daemon/settings` (`bana add`).
+pub const PROJECT_KEYS: &[&str] = &[
     "repo",
     "prefix",
     "workflow",
@@ -151,6 +176,12 @@ const KEYS: &[&str] = &[
     "daemon.token",
     "fix.rounds",
     "fix.token",
+    "checkout",
+    "path",
+];
+
+/// The machine's keys, in `daemon.d/settings` (`bana daemon install`).
+pub const MACHINE_KEYS: &[&str] = &[
     "port",
     "host",
     "login",
@@ -163,9 +194,47 @@ const KEYS: &[&str] = &[
     "caffeinate",
     "bash",
     "script",
-    "checkout",
     "bana_commit",
+    "retry",
+    "recheck",
+    "ladder",
+    "ladder_short",
+    "grace",
+    "publish_timeout",
 ];
+
+/// Where the one daemon keeps its files, under bana's home: its settings,
+/// its snapshot (`bana-manager`, `bin/`, `lib/`) and its daemon.lock. The dot
+/// keeps it apart from the projects' prefixes.
+pub const MACHINE_DIR: &str = "daemon.d";
+
+/// The settings project `prefix` in `home` runs with: the machine's
+/// (`daemon.d/settings`, none when missing), then the project's own without
+/// the machine's keys (an older bana wrote them there), so its keys win.
+pub fn settings_text(home: &Path, prefix: &str) -> Result<String, String> {
+    let file = home.join(prefix).join("daemon/settings");
+    let own = std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let machine =
+        std::fs::read_to_string(home.join(MACHINE_DIR).join("settings")).unwrap_or_default();
+    Ok(merge_settings(&machine, &own))
+}
+
+/// `machine`'s lines, then `project`'s but those with a machine-only key.
+pub fn merge_settings(machine: &str, project: &str) -> String {
+    let mut text = machine.to_string();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    for line in project.lines() {
+        let key = line.split_once('=').map(|(k, _)| k.trim());
+        if key.is_some_and(|k| MACHINE_KEYS.contains(&k) && !PROJECT_KEYS.contains(&k)) {
+            continue;
+        }
+        text.push_str(line);
+        text.push('\n');
+    }
+    text
+}
 
 /// The jobs' GITHUB_TOKEN (`daemon.token`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,31 +341,22 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// `<dir>/daemon/settings`, with the daemon's own environment.
-    pub fn load(dir: &Path) -> Result<Self, String> {
-        let file = dir.join("daemon/settings");
-        let text =
-            std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
-        Self::parse(&text, dir, std::env::vars().collect())
+    /// Project `prefix` in `home` (`~/.bana`): its settings on the machine's
+    /// ([`settings_text`]), with the daemon's own environment.
+    pub fn load(home: &Path, prefix: &str) -> Result<Self, String> {
+        let text = settings_text(home, prefix)?;
+        let s = Self::parse(&text, &home.join(prefix), std::env::vars().collect())?;
+        if s.prefix != prefix {
+            return Err(format!(
+                "settings: prefix = {}, but the project is {prefix}",
+                s.prefix
+            ));
+        }
+        Ok(s)
     }
 
     pub fn parse(text: &str, dir: &Path, env: BTreeMap<String, String>) -> Result<Self, String> {
-        let mut kv: BTreeMap<&str, &str> = BTreeMap::new();
-        for (n, line) in text.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let at = |what: String| format!("settings, line {}: {what}", n + 1);
-            let (k, v) = line
-                .split_once('=')
-                .ok_or_else(|| at("not key = value".into()))?;
-            let k = KEYS
-                .iter()
-                .find(|x| **x == k.trim())
-                .ok_or_else(|| at(format!("unknown key {}", k.trim())))?;
-            kv.insert(*k, v.trim());
-        }
+        let kv = pairs(text)?;
         let get = |k: &str| kv.get(k).copied();
         let or = |k: &str, d: &str| get(k).unwrap_or(d).to_string();
         let bad = |k: &str, what: &str| format!("settings: {k} = {what}");
@@ -359,25 +419,26 @@ impl Settings {
             "none" => JobToken::Empty,
             _ => return Err(bad("fix.token", "gh or none")),
         };
-        let port = match get("port").unwrap_or("8470").parse::<u16>() {
-            Ok(p) if p > 0 => p,
-            _ => return Err(bad("port", "a port number")),
+        let Machine {
+            port,
+            machine,
+            tray,
+            home,
+            home_set,
+            recheck,
+        } = Machine::from(&kv, &env)?;
+        let wait = |k: &str, d: u64| {
+            get(k)
+                .map_or(Some(Duration::from_secs(d)), duration)
+                .ok_or_else(|| bad(k, "seconds, or milliseconds with ms"))
         };
-        let tray = match get("tray").unwrap_or(if cfg!(target_os = "macos") {
-            "yes"
-        } else {
-            "no"
-        }) {
-            "yes" | "true" | "1" => true,
-            "no" | "false" | "0" => false,
-            _ => return Err(bad("tray", "yes or no")),
+        let ladder = |k: &str, d: [u64; 2]| {
+            let v: Vec<Duration> = match get(k) {
+                Some(v) => v.split_whitespace().filter_map(duration).collect(),
+                None => d.iter().map(|s| Duration::from_secs(*s)).collect(),
+            };
+            <[Duration; 2]>::try_from(v).map_err(|_| bad(k, "two waits, in seconds"))
         };
-        let home_set = get("home").is_some() || env.contains_key("BANA_HOME");
-        let home = get("home")
-            .map(PathBuf::from)
-            .or_else(|| env.get("BANA_HOME").map(PathBuf::from))
-            .or_else(|| env.get("HOME").map(|h| Path::new(h).join(".bana")))
-            .ok_or_else(|| bad("home", "a directory (no HOME here)"))?;
         let checkout = get("checkout").filter(|c| !c.is_empty()).map(PathBuf::from);
         if checkout.as_ref().is_some_and(|c| !c.is_absolute()) {
             return Err(bad("checkout", "an absolute path"));
@@ -402,7 +463,7 @@ impl Settings {
             fix_rounds,
             fix_token,
             port,
-            machine: get("host").map(String::from).unwrap_or_else(machine_name),
+            machine,
             login: or("login", ""),
             path: get("path")
                 .map(String::from)
@@ -416,18 +477,21 @@ impl Settings {
             docker: or("docker", "docker"),
             caffeinate: or("caffeinate", "caffeinate"),
             bash: or("bash", "bash"),
-            script: get("script")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| dir.join("daemon/bin/bana")),
+            script: get("script").map(PathBuf::from).unwrap_or_else(|| {
+                dir.parent()
+                    .unwrap_or(dir)
+                    .join(MACHINE_DIR)
+                    .join("bin/bana")
+            }),
             checkout,
             bana_commit: bana_commit.map(String::from),
             env,
-            retry: Duration::from_secs(5),
-            recheck: Duration::from_secs(10),
-            ladder: [Duration::from_secs(60), Duration::from_secs(30)],
-            ladder_short: [Duration::from_secs(20), Duration::from_secs(10)],
-            grace: Duration::from_secs(5),
-            publish_timeout: Duration::from_secs(30 * 60),
+            retry: wait("retry", 5)?,
+            recheck,
+            ladder: ladder("ladder", [60, 30])?,
+            ladder_short: ladder("ladder_short", [20, 10])?,
+            grace: wait("grace", 5)?,
+            publish_timeout: wait("publish_timeout", 30 * 60)?,
         })
     }
 
@@ -511,6 +575,104 @@ fn seconds(s: &str, unit: u64) -> Option<Duration> {
         .map(|n| Duration::from_secs(n * unit))
 }
 
+/// `30` (seconds), or `500ms`.
+fn duration(s: &str) -> Option<Duration> {
+    match s.trim().strip_suffix("ms") {
+        Some(ms) => ms
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .map(Duration::from_millis),
+        None => seconds(s, 1),
+    }
+}
+
+/// The settings' `key = value` lines, the last of a key winning.
+fn pairs(text: &str) -> Result<BTreeMap<&'static str, &str>, String> {
+    let mut kv = BTreeMap::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let at = |what: String| format!("settings, line {}: {what}", n + 1);
+        let (k, v) = line
+            .split_once('=')
+            .ok_or_else(|| at("not key = value".into()))?;
+        let k = PROJECT_KEYS
+            .iter()
+            .chain(MACHINE_KEYS)
+            .find(|x| **x == k.trim())
+            .ok_or_else(|| at(format!("unknown key {}", k.trim())))?;
+        kv.insert(*k, v.trim());
+    }
+    Ok(kv)
+}
+
+/// What the one daemon needs before any project: `daemon.d/settings`.
+#[derive(Debug, Clone)]
+pub struct Machine {
+    pub port: u16,
+    pub machine: String,
+    pub tray: bool,
+    /// bana's home: act.lock and the token are here.
+    pub home: PathBuf,
+    pub home_set: bool,
+    /// How often a held queue looks again.
+    pub recheck: Duration,
+}
+
+impl Machine {
+    /// `<home>/daemon.d/settings` (none: the defaults), with the daemon's
+    /// own environment.
+    pub fn load(home: &Path) -> Result<Self, String> {
+        let file = home.join(MACHINE_DIR).join("settings");
+        let text = match std::fs::read_to_string(&file) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("{}: {e}", file.display())),
+        };
+        let kv = pairs(&text).map_err(|e| format!("{}: {e}", file.display()))?;
+        Self::from(&kv, &std::env::vars().collect())
+    }
+
+    fn from(kv: &BTreeMap<&str, &str>, env: &BTreeMap<String, String>) -> Result<Self, String> {
+        let get = |k: &str| kv.get(k).copied();
+        let bad = |k: &str, what: &str| format!("settings: {k} = {what}");
+        let port = match get("port").unwrap_or("8470").parse::<u16>() {
+            Ok(p) if p > 0 => p,
+            _ => return Err(bad("port", "a port number")),
+        };
+        let tray = match get("tray").unwrap_or(if cfg!(target_os = "macos") {
+            "yes"
+        } else {
+            "no"
+        }) {
+            "yes" | "true" | "1" => true,
+            "no" | "false" | "0" => false,
+            _ => return Err(bad("tray", "yes or no")),
+        };
+        let home_set = get("home").is_some() || env.contains_key("BANA_HOME");
+        let home = get("home")
+            .map(PathBuf::from)
+            .or_else(|| env.get("BANA_HOME").map(PathBuf::from))
+            .or_else(|| env.get("HOME").map(|h| Path::new(h).join(".bana")))
+            .ok_or_else(|| bad("home", "a directory (no HOME here)"))?;
+        let recheck = match get("recheck") {
+            Some(r) => duration(r).ok_or_else(|| bad("recheck", "seconds"))?,
+            None => Duration::from_secs(10),
+        };
+        Ok(Self {
+            port,
+            machine: get("host").map(String::from).unwrap_or_else(machine_name),
+            tray,
+            home,
+            home_set,
+            recheck,
+        })
+    }
+}
+
 /// This machine's short name, as descriptions say it (`mbp`).
 pub fn machine_name() -> String {
     std::process::Command::new("hostname")
@@ -527,6 +689,9 @@ pub fn machine_name() -> String {
 #[serde(default)]
 pub struct State {
     pub version: u32,
+    /// The owner paused automatic builds: `daemon/paused` says so, and this
+    /// mirrors it. Never written here; an older bana's is moved there.
+    #[serde(skip_serializing)]
     pub paused: bool,
     pub next_id: u64,
     /// The heads last seen.
@@ -692,7 +857,14 @@ struct Shared {
     inner: Mutex<Inner>,
     summary: tokio::sync::watch::Sender<Summary>,
     poll: Notify,
-    run: Notify,
+    /// Wakes the runner: this daemon's own, or the registry's, which all
+    /// the projects share.
+    run: Arc<Notify>,
+    /// Counts the summaries published, the registry's across its projects
+    /// (the menu bar follows it).
+    changed: tokio::sync::watch::Sender<u64>,
+    /// The first fetch waits this long (the registry staggers its projects').
+    first_poll: Duration,
     post: Notify,
     post_now: Notify,
     /// Counts the changes to rounds.json files: a round's long poll waits on it.
@@ -711,12 +883,36 @@ pub struct Daemon(Arc<Shared>);
 
 impl Daemon {
     /// Reads state.json and the builds, then starts the watcher, the runner and
-    /// the poster. The clone (`src`) must exist: `bana daemon install` makes it.
+    /// the poster. The clone (`src`) must exist: `bana add` makes it.
     pub async fn start(settings: Settings) -> Result<Self, String> {
+        let d = Self::start_in(
+            settings,
+            Arc::new(Notify::new()),
+            tokio::sync::watch::Sender::new(0),
+            Duration::ZERO,
+        )
+        .await?;
+        let runner = tokio::spawn(d.0.clone().runner());
+        d.0.tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(runner);
+        Ok(d)
+    }
+
+    /// As [`Self::start`], but with no runner of its own: the registry's
+    /// runs its builds ([`Self::next_build`]), and `run` wakes it. `changed`
+    /// counts its summaries; its first fetch waits `first_poll`.
+    pub async fn start_in(
+        settings: Settings,
+        run: Arc<Notify>,
+        changed: tokio::sync::watch::Sender<u64>,
+        first_poll: Duration,
+    ) -> Result<Self, String> {
         let dir = settings.dir.clone();
         if !dir.join("src/.git").exists() {
             return Err(format!(
-                "no clone at {}: run bana daemon install",
+                "no clone at {}: run bana add in the project's checkout",
                 dir.join("src").display()
             ));
         }
@@ -728,6 +924,14 @@ impl Daemon {
             Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("state.json: {e}"))?,
             Err(_) => State::default(),
         };
+        // The pause is daemon/paused's; an older bana kept it in state.json.
+        let flag = dir.join("daemon/paused");
+        if state.paused && !flag.exists() {
+            if let Err(e) = std::fs::write(&flag, "") {
+                eprintln!("bana daemon: {}: {e}", flag.display());
+            }
+        }
+        state.paused = flag.exists();
         let mut records = BTreeMap::new();
         for e in std::fs::read_dir(dir.join("builds"))
             .into_iter()
@@ -785,7 +989,9 @@ impl Daemon {
             }),
             summary,
             poll: Notify::new(),
-            run: Notify::new(),
+            run,
+            changed,
+            first_poll,
             post: Notify::new(),
             post_now: Notify::new(),
             rounds: tokio::sync::watch::Sender::new(0),
@@ -802,7 +1008,6 @@ impl Daemon {
         shared.post.notify_one();
         let tasks = vec![
             tokio::spawn(shared.clone().watcher()),
-            tokio::spawn(shared.clone().runner()),
             tokio::spawn(shared.clone().poster()),
             tokio::spawn(shared.clone().seeder()),
         ];
@@ -817,6 +1022,11 @@ impl Daemon {
     /// The summary as it changes (the menu bar).
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Summary> {
         self.0.summary.subscribe()
+    }
+
+    /// The summary last published (`GET /ci/v1/projects`).
+    pub fn published(&self) -> Summary {
+        self.0.summary.borrow().clone()
     }
 
     /// The summary now (`GET /ci/v1/local`).
@@ -1067,14 +1277,47 @@ impl Daemon {
         }
     }
 
-    /// Pause or resume starting builds; fetching goes on.
+    /// Pause or resume automatic builds (pushes, and their retries): they
+    /// queue, and wait. Fetching goes on, and Run now, reruns and a fix's
+    /// rounds still build. `daemon/paused` says so, for `bana pause`.
     pub fn set_paused(&self, paused: bool) {
+        let flag = self.0.paused_flag();
+        // The file and the state change together: a scan's read is not between.
         let mut inner = self.0.lock();
+        let written = if paused {
+            flag.parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|_| std::fs::write(&flag, ""))
+        } else {
+            std::fs::remove_file(&flag).or_else(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(e),
+            })
+        };
+        if let Err(e) = written {
+            eprintln!("bana daemon: {}: {e}", flag.display());
+        }
         inner.state.paused = paused;
-        self.0.save_state(&inner.state);
         self.0.publish(&inner);
         drop(inner);
         self.0.run.notify_one();
+    }
+
+    /// Reads `daemon/paused` again: `bana pause` and `bana resume` change it.
+    pub fn reload_paused(&self) {
+        let mut inner = self.0.lock();
+        let paused = self.0.paused_flag().exists();
+        if inner.state.paused != paused {
+            inner.state.paused = paused;
+            self.0.publish(&inner);
+            drop(inner);
+            self.0.run.notify_one();
+        }
+    }
+
+    /// Whether the owner paused automatic builds.
+    pub fn paused(&self) -> bool {
+        self.0.lock().state.paused
     }
 
     /// Fetch now, and try posting again now.
@@ -1185,7 +1428,7 @@ impl Daemon {
                 "install": files.iter().any(|f| f.name == "install.sh")
                     .then(|| format!("bana install {}", r.build)),
                 "dir": self.0.build_dir(r.build).join("dist"),
-                "page_url": format!("http://127.0.0.1:{}/#release={}", s.port, r.tag),
+                "page_url": format!("http://127.0.0.1:{}/#p={}&release={}", s.port, s.prefix, r.tag),
             });
             (v, r.build)
         };
@@ -1221,7 +1464,8 @@ impl Daemon {
         self.0.publish(inner);
         Ok(json!({"tag": tag, "rev": rev, "missing_prs": check.missing,
             "outside_range": check.outside_range, "duplicated": check.duplicated,
-            "page_url": format!("http://127.0.0.1:{}/#release={tag}", self.0.settings.port)}))
+            "page_url": format!("http://127.0.0.1:{}/#p={}&release={tag}",
+                self.0.settings.port, self.0.settings.prefix)}))
     }
 
     /// Not now: bana stops asking about release `tag`.
@@ -1478,7 +1722,7 @@ impl Daemon {
         let mut rs = rounds::load(&path)
             .map_err(RoundError::Failed)?
             .unwrap_or_else(|| Rounds::new(s.settings.fix_rounds));
-        match rs.ask(&tree, &want, repeat, inner.state.paused) {
+        match rs.ask(&tree, &want, repeat, false) {
             Err(r) => Err(RoundError::Refused {
                 why: r.why,
                 running: r.running,
@@ -1514,11 +1758,10 @@ impl Daemon {
             return Err(RoundError::Bad("tree: a snapshot's full tree".into()));
         }
         let want = wanted(&f, jobs)?;
-        let paused = s.lock().state.paused;
         let rs = rounds::load(&rounds::path(&s.settings.dir, &f.fix))
             .map_err(RoundError::Failed)?
             .unwrap_or_else(|| Rounds::new(s.settings.fix_rounds));
-        match rs.ask(tree, &want, repeat, paused) {
+        match rs.ask(tree, &want, repeat, false) {
             Err(r) => Err(RoundError::Refused {
                 why: r.why,
                 running: r.running,
@@ -1533,9 +1776,8 @@ impl Daemon {
     }
 
     /// One round: its builds, and once it ended, what failed in the brief's
-    /// shape. It waits up to `wait` for the round to end (a long poll), but
-    /// not for a round the paused daemon holds back (`waiting` says why a
-    /// queued round waits).
+    /// shape. It waits up to `wait` for the round to end (a long poll);
+    /// `waiting` says why a queued round waits.
     pub async fn round(&self, name: &str, n: u32, wait: Duration) -> Result<Value, RoundError> {
         let fix = self.find_fix(name)?.fix;
         let path = rounds::path(&self.0.settings.dir, &fix);
@@ -1550,8 +1792,7 @@ impl Daemon {
                 .get(n)
                 .cloned()
                 .ok_or_else(|| RoundError::Missing(format!("fix {fix} has no round {n}")))?;
-            let held = self.0.round_waits(&round).as_deref() == Some(PAUSED);
-            if round.state.finished() || held || tokio::time::Instant::now() >= deadline {
+            if round.state.finished() || tokio::time::Instant::now() >= deadline {
                 return Ok(self.0.round_view(&fix, &rs, &round).await);
             }
             let _ = tokio::time::timeout_at(deadline, changed.changed()).await;
@@ -1671,20 +1912,92 @@ impl Daemon {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
+        // And its pid dies: act.lock, if still the daemon's (act's only once
+        // act() has read act's start time), is stale to the next start. This
+        // process lives on, so it would be held for good: it goes here.
+        self.0.release_lock(&[std::process::id()]);
     }
 
+    /// The registry's runner: the next build here, once its gates are open;
+    /// it is now the running one ([`Shared::next_build`]).
+    pub(crate) async fn next_build(&self) -> Option<(u64, mpsc::UnboundedReceiver<String>)> {
+        self.0.next_build().await
+    }
+
+    /// The registry's runner: runs build `id` ([`Self::next_build`]'s) to its end.
+    pub(crate) async fn run_build(&self, id: u64, cancel: mpsc::UnboundedReceiver<String>) {
+        self.0.run_build(id, cancel).await
+    }
+
+    /// The registry's runner runs another project's build (`why`: `after
+    /// <prefix> #N`): a queue here that could start says it waits for it.
+    pub(crate) fn hold_for(&self, why: &str) {
+        let mut inner = self.0.lock();
+        if inner.running.is_none() && next_up(&inner).is_some() {
+            inner.waiting = Some(why.to_string());
+            self.0.publish(&inner);
+        }
+    }
+
+    /// The build that runs now, if any: its id and ref.
+    pub fn running(&self) -> Option<(u64, String)> {
+        let inner = self.0.lock();
+        let id = inner.running.as_ref()?.id;
+        let r = inner.records.get(&id)?;
+        Some((id, watch::short_ref(&r.request.git_ref).to_string()))
+    }
+
+    /// Whether `other` is this same daemon (not one started again).
+    pub fn same(&self, other: &Daemon) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Stops: a running build ends (and runs again once at the next start),
+    /// waiting two minutes at most for it, as the process exits after.
     pub async fn shutdown(&self) {
+        self.stop(Some(Duration::from_secs(120)), INTERRUPTED).await
+    }
+
+    /// Stops, and waits for the running build to end however long its
+    /// checkout takes: a daemon started again in this process only then
+    /// takes its daemon.lock, state.json and builds.
+    pub async fn stop_fully(&self) {
+        self.stop(None, INTERRUPTED).await
+    }
+
+    /// Stops for good, as [`Daemon::stop_fully`], but a running build ends
+    /// with `why`: under the same lock as the stop, so a build the runner
+    /// starts meanwhile gets it too.
+    pub async fn stop_with(&self, why: &str) {
+        self.stop(None, why).await
+    }
+
+    async fn stop(&self, most: Option<Duration>, why: &str) {
         {
             let mut inner = self.0.lock();
             inner.stopping = true;
             if let Some(r) = &inner.running {
-                let _ = r.cancel.send(INTERRUPTED.into());
+                let _ = r.cancel.send(why.into());
             }
         }
         let _ = self.0.stop.send(true);
         let tasks = std::mem::take(&mut *self.0.tasks.lock().unwrap_or_else(|e| e.into_inner()));
         for t in tasks {
             let _ = tokio::time::timeout(Duration::from_secs(120), t).await;
+        }
+        // The registry's runner ends the build it runs here (the short ladder),
+        // and a publish ends on its own (publish_timeout): a daemon started
+        // again in this process would otherwise mark it interrupted under it.
+        let since = Instant::now();
+        let busy = |inner: &Inner| {
+            inner.running.is_some()
+                || inner
+                    .releases
+                    .values()
+                    .any(|r| r.state == release::State::Publishing)
+        };
+        while busy(&self.0.lock()) && most.is_none_or(|m| since.elapsed() < m) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         self.0
             .claimed
@@ -1705,6 +2018,11 @@ impl Shared {
 
     fn build_dir(&self, id: u64) -> PathBuf {
         self.settings.dir.join("builds").join(id.to_string())
+    }
+
+    /// `daemon/paused`: there while the owner has paused automatic builds.
+    fn paused_flag(&self) -> PathBuf {
+        self.settings.dir.join("daemon/paused")
     }
 
     fn lock_dir(&self) -> PathBuf {
@@ -1812,6 +2130,7 @@ impl Shared {
             }),
         };
         self.summary.send_replace(summary);
+        self.changed.send_modify(|n| *n = n.wrapping_add(1));
     }
 
     /// Queues a build: at the back, or at the front (after the other builds
@@ -2671,20 +2990,11 @@ impl Shared {
 
     /// Why a round that has not started waits, when nothing runs ahead of
     /// it: the paused daemon, Docker, or the owner's `bana ci` (its lock).
-    fn round_waits(&self, r: &Round) -> Option<String> {
-        let inner = self.lock();
-        self.round_waiting(&inner, r)
-    }
-
     fn round_waiting(&self, inner: &Inner, r: &Round) -> Option<String> {
-        if r.state != BuildState::Queued {
-            None
-        } else if inner.state.paused {
-            Some(PAUSED.into())
-        } else if inner.running.is_some() {
+        // A pause holds pushes only: never a round.
+        if r.state != BuildState::Queued || inner.running.is_some() {
             None
         } else {
-            // Not an older "paused": the daemon was resumed since.
             inner.waiting.clone().filter(|w| w != PAUSED)
         }
     }
@@ -2803,7 +3113,8 @@ impl Shared {
     // ---- the watcher -----------------------------------------------------------
 
     async fn watcher(self: Arc<Self>) {
-        let mut tick = tokio::time::interval(self.settings.poll);
+        let first = tokio::time::Instant::now() + self.first_poll;
+        let mut tick = tokio::time::interval_at(first, self.settings.poll);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut stop = self.stop.subscribe();
         loop {
@@ -3008,8 +3319,9 @@ impl Shared {
         self.publish(&inner);
     }
 
-    /// The next build, once its gates are open (not paused, Docker up, the lock
-    /// ours): it is now the running one, and the lock is held for it.
+    /// The next build, once its gates are open (not a push while paused,
+    /// Docker up, the lock ours): it is now the running one, and the lock is
+    /// held for it. The registry's runner calls it for each project in turn.
     async fn next_build(&self) -> Option<(u64, mpsc::UnboundedReceiver<String>)> {
         let id = {
             let mut inner = self.lock();
@@ -3032,19 +3344,20 @@ impl Shared {
             if !done.is_empty() {
                 self.save_state(&inner.state);
             }
-            let Some(&id) = inner.state.queue.first() else {
+            if inner.state.queue.is_empty() {
                 (inner.waiting, inner.watcher.lock_holder) = (None, None);
                 self.publish(&inner);
                 return None;
-            };
+            }
             if inner.stopping {
                 return None;
             }
-            if inner.state.paused {
+            // Paused: the pushes wait, the rest may pass them.
+            let Some(id) = next_up(&inner) else {
                 inner.waiting = Some(PAUSED.into());
                 self.publish(&inner);
                 return None;
-            }
+            };
             id
         };
         let docker = self
@@ -3074,15 +3387,15 @@ impl Shared {
         let mut inner = self.lock();
         inner.watcher.lock_holder = None;
         inner.waiting = None;
-        // It may have been cancelled, or the daemon paused, meanwhile.
-        if inner.state.queue.first() != Some(&id) || inner.state.paused || inner.stopping {
+        // It may have been cancelled, or the project paused, meanwhile.
+        if next_up(&inner) != Some(id) || inner.stopping {
             drop(inner);
             self.release_lock(&[std::process::id()]);
             self.run.notify_one();
             return None;
         }
         let (tx, rx) = mpsc::unbounded_channel();
-        inner.state.queue.remove(0);
+        inner.state.queue.retain(|q| *q != id);
         inner.running = Some(Running {
             id,
             since: Instant::now(),
@@ -3382,7 +3695,7 @@ impl Shared {
             let old = rec.build.clone();
             rec.build = Build::new(&list, now());
             if let Ok(reason) = cancel.try_recv() {
-                if inner.stopping {
+                if inner.stopping && reason == INTERRUPTED {
                     // The daemon stops before act ran: it is queued again as it was.
                     rec.build = Build::default();
                     self.save(rec);
@@ -3390,7 +3703,8 @@ impl Shared {
                     self.save_state(&inner.state);
                     return;
                 }
-                // Cancelled while it was being checked out: nothing ran, nothing is posted.
+                // Cancelled while it was being checked out (or its project
+                // removed): nothing ran, nothing is posted.
                 rec.build.finish(None, Some(&reason), now());
                 self.save(rec);
                 return;
@@ -3994,7 +4308,9 @@ impl Shared {
                     let rec = inner.records.get(id)?;
                     let p = rec.statuses.get(context)?.clone();
                     let url = inner.state.target_url_ok.then(|| {
-                        let mut u = format!("http://127.0.0.1:{}/#build={id}", self.settings.port);
+                        let s = &self.settings;
+                        let mut u =
+                            format!("http://127.0.0.1:{}/#p={}&build={id}", s.port, s.prefix);
                         if let Some(key) = context
                             .strip_prefix(&rec.context_prefix)
                             .and_then(|k| k.strip_prefix('/'))
@@ -4430,7 +4746,10 @@ async fn claim(dir: &Path) -> Result<std::fs::File, String> {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    Err(format!("another bana daemon runs in {}", dir.display()))
+    Err(format!(
+        "another bana daemon runs in {} (an older bana's? bana daemon install stops it)",
+        dir.display()
+    ))
 }
 
 /// A build interrupted by a restart runs again when nothing moved on: its
@@ -4441,6 +4760,17 @@ fn retry_eligible(r: &Request, heads: &Heads) -> bool {
         && (matches!(r.trigger, Trigger::Manual | Trigger::Rerun | Trigger::Fix)
             || watch::is_tag(&r.git_ref)
             || heads.get(&r.git_ref) == Some(&r.sha))
+}
+
+/// The queued build to start next: the first, or while the owner has paused
+/// automatic builds, the first that is not a push (or a push's retry).
+fn next_up(inner: &Inner) -> Option<u64> {
+    inner.state.queue.iter().copied().find(|id| {
+        !inner.state.paused
+            || inner.records.get(id).is_some_and(|r| {
+                r.request.is_fix() || matches!(r.request.trigger, Trigger::Manual | Trigger::Rerun)
+            })
+    })
 }
 
 /// A full commit or tree id: 40 or 64 hex digits.
@@ -4628,7 +4958,7 @@ pub(crate) mod tests {
     use super::*;
     use std::process::Command as Std;
 
-    const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/act");
+    pub(crate) const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/act");
     /// tests/stand-ins/gh, whose release store the daemon's gh uses.
     const STANDIN_GH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/stand-ins/gh");
 
@@ -4745,11 +5075,11 @@ exec git \"$@\"
     /// one (`<dir>/src`), and the stand-ins.
     pub(crate) struct Project {
         /// Its own, so one test's sweep never meets another's builds.
-        prefix: String,
-        root: PathBuf,
-        ctl: PathBuf,
-        work: PathBuf,
-        dir: PathBuf,
+        pub(crate) prefix: String,
+        pub(crate) root: PathBuf,
+        pub(crate) ctl: PathBuf,
+        pub(crate) work: PathBuf,
+        pub(crate) dir: PathBuf,
     }
 
     fn git(cwd: &Path, args: &[&str]) -> String {
@@ -4774,6 +5104,16 @@ exec git \"$@\"
 
     impl Project {
         pub(crate) fn new(name: &str) -> Self {
+            Self::make(name, None)
+        }
+
+        /// One of the projects in `home`, in `<home>/<prefix>` as bana adds
+        /// them (its settings are the test's to write).
+        pub(crate) fn new_in(name: &str, home: &Path) -> Self {
+            Self::make(name, Some(home))
+        }
+
+        fn make(name: &str, home: Option<&Path>) -> Self {
             let root =
                 std::env::temp_dir().join(format!("bana-daemon-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
@@ -4791,9 +5131,13 @@ exec git \"$@\"
             }
             git(&root, &["init", "-q", "--bare", "-b", "main", "origin.git"]);
             git(&root, &["clone", "-q", "origin.git", "work"]);
-            let dir = root.join("home/p");
+            let prefix = format!("{name}{}", std::process::id());
+            let dir = match home {
+                Some(h) => h.join(&prefix),
+                None => root.join("home/p"),
+            };
             let p = Self {
-                prefix: format!("{name}{}", std::process::id()),
+                prefix,
                 work: root.join("work"),
                 root,
                 ctl,
@@ -4932,7 +5276,7 @@ exec git \"$@\"
         panic!("waited 30 s for {what}");
     }
 
-    async fn poll(d: &Daemon) {
+    pub(crate) async fn poll(d: &Daemon) {
         let n = d.0.lock().polls;
         d.poll_now();
         until("a poll", || d.0.lock().polls > n).await;
@@ -5021,8 +5365,33 @@ exec git \"$@\"
             (s.path.as_str(), s.git.as_str(), s.gh.as_str()),
             ("/usr/bin", "git", "gh")
         );
-        assert_eq!(s.script, Path::new("/x/wid/daemon/bin/bana"));
+        assert_eq!(s.script, Path::new("/x/daemon.d/bin/bana"));
         assert!(s.checkout.is_none() && s.bana_commit.is_none(), "{s:?}");
+        assert_eq!(
+            (s.retry, s.recheck, s.grace, s.publish_timeout),
+            (
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                Duration::from_secs(5),
+                Duration::from_secs(1800)
+            )
+        );
+        assert_eq!(
+            (s.ladder, s.ladder_short),
+            (
+                [Duration::from_secs(60), Duration::from_secs(30)],
+                [Duration::from_secs(20), Duration::from_secs(10)]
+            )
+        );
+        let text = "repo = o/r\nprefix = wid\nrecheck = 50ms\nladder = 1 500ms\n";
+        let s = Settings::parse(text, dir, env.clone()).unwrap();
+        assert_eq!(
+            (s.recheck, s.ladder),
+            (
+                Duration::from_millis(50),
+                [Duration::from_secs(1), Duration::from_millis(500)]
+            )
+        );
 
         // What Fix with Claude needs, as install writes it.
         let text =
@@ -5104,10 +5473,67 @@ exec git \"$@\"
                 "repo = o/r\nprefix = w\nbana_commit = b1df\n",
                 "bana_commit",
             ),
+            ("repo = o/r\nprefix = w\nladder = 60\n", "ladder"),
+            ("repo = o/r\nprefix = w\ngrace = 0\n", "grace"),
         ] {
             let e = Settings::parse(text, dir, env.clone()).unwrap_err();
             assert!(e.contains(why), "{text:?}: {e}");
         }
+    }
+
+    #[test]
+    fn a_project_runs_with_the_machines_settings_and_its_own() {
+        let home = std::env::temp_dir().join(format!("bana-daemon-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let put = |file: &str, text: &str| {
+            let path = home.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        // A lone project file (no machine's yet) is read as it is.
+        put(
+            "wid/daemon/settings",
+            "repo = o/r\nprefix = wid\nport = 8471\nhost = old\n",
+        );
+        let s = Settings::load(&home, "wid").unwrap();
+        assert_eq!((s.repo.as_str(), s.port), ("o/r", 8470), "{s:?}");
+        assert_eq!(s.script, home.join("daemon.d/bin/bana"));
+        // The machine's keys are the machine's: an older bana's in the
+        // project's file are left out, but its path wins.
+        put(
+            "daemon.d/settings",
+            "port = 8472\nhost = mbp\npath = /usr/bin\nscript = /s/bana\n",
+        );
+        put(
+            "wid/daemon/settings",
+            "repo = o/r\nprefix = wid\nport = 8471\nhost = old\ndaemon.poll = 7\n",
+        );
+        let s = Settings::load(&home, "wid").unwrap();
+        assert_eq!(
+            (s.port, s.machine.as_str(), s.path.as_str(), s.poll),
+            (8472, "mbp", "/usr/bin", Duration::from_secs(7))
+        );
+        assert_eq!(s.script, Path::new("/s/bana"));
+        put(
+            "wid/daemon/settings",
+            "repo = o/r\nprefix = wid\npath = /opt/bin:/usr/bin\n",
+        );
+        let s = Settings::load(&home, "wid").unwrap();
+        assert_eq!(s.path, "/opt/bin:/usr/bin");
+        let m = Machine::load(&home).unwrap();
+        assert_eq!((m.port, m.machine.as_str()), (8472, "mbp"));
+        // fix and the MCP read the same.
+        let kv = fix::daemon_settings(&home.join("wid"));
+        assert_eq!(
+            (kv["port"].as_str(), kv["path"].as_str()),
+            ("8472", "/opt/bin:/usr/bin")
+        );
+        // The directory is the project: its prefix must say so.
+        put("other/daemon/settings", "repo = o/r\nprefix = wid\n");
+        let e = Settings::load(&home, "other").unwrap_err();
+        assert!(e.contains("the project is other"), "{e}");
+        assert!(Settings::load(&home, "none").is_err());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -5217,7 +5643,8 @@ exec git \"$@\"
             ),
             ("bana", "pending", "running on t (quick)")
         );
-        assert_eq!(first.url.as_deref(), Some("http://127.0.0.1:8470/#build=1"));
+        let page = format!("http://127.0.0.1:8470/#p={}&build=1", p.prefix);
+        assert_eq!(first.url.as_deref(), Some(page.as_str()));
         let last = posts.last().unwrap();
         assert_eq!(
             (last.context.as_str(), last.state.as_str()),
@@ -5233,7 +5660,7 @@ exec git \"$@\"
                 states[..states.len() - 1].iter().all(|s| *s == "pending"),
                 "{states:?}"
             );
-            let url = format!("http://127.0.0.1:8470/#build=1&job={job}");
+            let url = format!("{page}&job={job}");
             assert_eq!(mine[0].url.as_deref(), Some(url.as_str()));
         }
 
@@ -5681,7 +6108,7 @@ exec git \"$@\"
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(d.summary().running.is_none() && p.read("pid.1").is_empty());
         assert_eq!(
-            actlog::tray_view(&d.summary()).title,
+            actlog::tray_view(&[d.summary()], &[]).title,
             format!("{} paused", actlog::BRICK)
         );
 
@@ -5726,6 +6153,67 @@ exec git \"$@\"
         assert_eq!(finished(&d, 1).await.build.state, BuildState::Success);
         assert!(d.summary().watcher.lock_holder.is_none());
         assert!(!p.lock().exists());
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pause_holds_pushes_and_tags_but_not_what_the_owner_asks_for() {
+        let p = Project::new("pause");
+        let s = p.settings("daemon.tags = v*\n");
+        let d = start_with(s.clone()).await;
+        p.commit("pass", "side");
+        p.push("side");
+        poll(&d).await;
+        assert_eq!(finished(&d, 1).await.build.state, BuildState::Success);
+
+        // Paused: a push and a tag queue, and wait.
+        let flag = p.dir.join("daemon/paused");
+        d.set_paused(true);
+        assert!(d.paused() && flag.exists());
+        p.commit("pass", "a");
+        p.push("main");
+        p.tag("v1.0.0");
+        poll(&d).await;
+        let pushes: Vec<u64> = d.summary().queue.iter().map(|q| q.id).collect();
+        assert_eq!(pushes.len(), 2, "{:?}", d.summary().queue);
+        until("paused", || waiting(&d).as_deref() == Some(PAUSED)).await;
+        // Run now and a rerun pass them.
+        let manual = d.run_now("side", "nightly").unwrap();
+        assert_eq!(finished(&d, manual).await.build.state, BuildState::Success);
+        let rerun = d.rerun(1).unwrap();
+        assert_eq!(finished(&d, rerun).await.build.state, BuildState::Success);
+        let queue: Vec<u64> = d.summary().queue.iter().map(|q| q.id).collect();
+        assert_eq!(queue, pushes, "the push and the tag still wait");
+        assert_eq!(waiting(&d).as_deref(), Some(PAUSED));
+        assert!(p.read(&format!("pid.{}", pushes[0])).is_empty());
+
+        // bana resume takes the file away; the rescan reads it.
+        std::fs::remove_file(&flag).unwrap();
+        d.reload_paused();
+        assert!(!d.paused());
+        for id in &pushes {
+            assert_eq!(finished(&d, *id).await.build.state, BuildState::Success);
+        }
+        d.shutdown().await;
+
+        // An older bana kept the pause in state.json: it moves to the file.
+        let file = p.dir.join("state.json");
+        let mut state: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert!(state.get("paused").is_none(), "{state}");
+        state["paused"] = json!(true);
+        write_json(&file, &state).unwrap();
+        let d = start_with(s.clone()).await;
+        assert!(d.paused() && flag.exists());
+        let state: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert!(state.get("paused").is_none(), "{state}");
+        d.set_paused(false);
+        assert!(!flag.exists() && !d.paused());
+        // bana pause while the daemon is down.
+        d.shutdown().await;
+        std::fs::write(&flag, "").unwrap();
+        let d = start_with(s).await;
+        assert!(d.paused());
         d.shutdown().await;
         p.remove();
     }
@@ -5848,7 +6336,9 @@ exec git \"$@\"
             3,
             "bana, bana/plan, bana/rust"
         );
-        assert!(actlog::tray_view(&d.summary()).title.ends_with("!gh"));
+        assert!(actlog::tray_view(&[d.summary()], &[])
+            .title
+            .ends_with("!gh"));
 
         // GitHub is back, but refuses a loopback link: the statuses go without one.
         p.set("gh-down", false);
@@ -6315,8 +6805,9 @@ exec git \"$@\"
         d.crash();
         let file = p.dir.join("state.json");
         let mut state: State = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-        (state.queue, state.paused) = (vec![], false);
+        state.queue = vec![];
         write_json(&file, &state).unwrap();
+        std::fs::remove_file(p.dir.join("daemon/paused")).unwrap();
         // GitHub refuses build 1's statuses for good; the ones after still go.
         std::fs::write(p.ctl.join("gh-422"), &a).unwrap();
         let d = start_with(s.clone()).await;
@@ -6389,7 +6880,7 @@ exec git \"$@\"
         assert_eq!(finished(&d, 2).await.build.state, BuildState::Failure);
         assert_eq!(d.summary().failed, Some(2));
         assert_eq!(
-            actlog::tray_view(&d.summary()).fix_line.as_deref(),
+            actlog::project_view(&d.summary()).fix_line.as_deref(),
             Some("Fix #2 with Claude…")
         );
         // The owner goes on working: the fix is at the failing commit anyway.
@@ -6528,11 +7019,11 @@ exec git \"$@\"
             Err(fix::Error::NotFailed(why)) => assert!(why.contains("a round of fix"), "{why}"),
             other => panic!("{other:?}"),
         }
-        assert_eq!(actlog::tray_view(&d.summary()).fix_line, None);
+        assert_eq!(actlog::project_view(&d.summary()).fix_line, None);
 
         // A daemon installed before fixes names no checkout.
         let e = fix::Prepare::for_daemon(&p.settings(""), fix::Source::Build(2)).unwrap_err();
-        assert!(e.to_string().contains("bana daemon install again"), "{e}");
+        assert!(e.to_string().contains("bana add in it again"), "{e}");
         d.shutdown().await;
         p.remove();
     }
@@ -6749,7 +7240,7 @@ exec git \"$@\"
             ["quick", "-j", "web"]
         );
 
-        // Rounds run out, and the owner gives more; none while paused.
+        // Rounds run out, and the owner gives more; a pause holds pushes only.
         let other = snapshot(&p, &wt, sha7, "fail");
         let (why, running) = refused(d.ask_round(sha7, &other, None, false).await);
         assert!(
@@ -6763,33 +7254,11 @@ exec git \"$@\"
             (&json!(4), &json!(2))
         );
         d.set_paused(true);
-        let (why, _) = refused(d.ask_round(sha7, &other, None, false).await);
-        assert!(why.contains("paused"), "{why}");
-        d.set_paused(false);
-        // Queued behind a held build, then paused: the long poll says so at
-        // once rather than wait.
-        p.set("hold", true);
         p.commit("pass", "h");
         p.push("fourth");
         poll(&d).await;
-        let held = *d.0.lock().records.keys().last().unwrap();
-        until("the held build", || {
-            !p.read(&format!("pid.{held}")).is_empty()
-        })
-        .await;
+        let push = *d.0.lock().records.keys().last().unwrap();
         let r3 = d.ask_round(sha7, &other, None, false).await.unwrap();
-        let n3 = r3["round"].as_u64().unwrap() as u32;
-        d.set_paused(true);
-        let t = std::time::Instant::now();
-        let v = d.round(sha7, n3, Duration::from_secs(30)).await.unwrap();
-        assert_eq!(
-            (&v["state"], &v["waiting"]),
-            (&json!("queued"), &json!(PAUSED)),
-            "{v}"
-        );
-        assert!(t.elapsed() < Duration::from_secs(5));
-        d.set_paused(false);
-        p.set("hold", false);
         let v = d.round(
             sha7,
             r3["round"].as_u64().unwrap() as u32,
@@ -6797,6 +7266,10 @@ exec git \"$@\"
         );
         let v = v.await.unwrap();
         assert_eq!(v["state"], "failure", "{v}");
+        assert_eq!(d.summary().queue[0].id, push, "the push waits");
+        assert_eq!(d.summary().queue[0].waiting.as_deref(), Some(PAUSED));
+        d.set_paused(false);
+        assert_eq!(finished(&d, push).await.build.state, BuildState::Success);
         assert_eq!(d.fix_state(sha7).await.unwrap()["rounds_left"], 1);
         let on_disk = rounds::load(&rounds::path(&p.dir, sha7)).unwrap().unwrap();
         assert_eq!(
@@ -7116,7 +7589,7 @@ exec git \"$@\"
         assert_eq!((r.build, r.reason), (id, None));
         let ask = d.summary().release.unwrap();
         assert_eq!((ask.tag.as_str(), ask.state.as_str()), ("v0.1.0", "asking"));
-        assert_eq!(actlog::tray_view(&d.summary()).title, "🧱 v0.1.0?");
+        assert_eq!(actlog::tray_view(&[d.summary()], &[]).title, "🧱 v0.1.0?");
         // Nothing was written on GitHub: one list, for the previous release.
         assert_eq!(
             p.read("gh-release.log"),
@@ -7277,7 +7750,7 @@ exec git \"$@\"
             (State::Failed, Some(why.as_str()))
         );
         assert_eq!(lines(), 1, "the list only");
-        assert_eq!(actlog::tray_view(&d.summary()).title, "🧱 v0.1.0?");
+        assert_eq!(actlog::tray_view(&[d.summary()], &[]).title, "🧱 v0.1.0?");
         std::fs::write(&sh, &original).unwrap();
 
         // The tag moved on origin since the build.
@@ -7324,7 +7797,10 @@ exec git \"$@\"
         p.set("gh-fail-at", false);
         std::fs::write(p.flag("gh-slow"), "3").unwrap();
         d.publish_release("v0.1.0", 1).unwrap();
-        assert_eq!(actlog::tray_view(&d.summary()).title, "🧱 publishing");
+        assert_eq!(
+            actlog::tray_view(&[d.summary()], &[]).title,
+            "🧱 publishing"
+        );
         let second = d.publish_release("v0.1.0", 1);
         assert!(
             matches!(&second, Err(release::Error::Refused(m)) if m.contains("one publish at a time")),
@@ -7459,7 +7935,7 @@ exec git \"$@\"
         );
         assert_eq!(d.summary().release.map(|r| r.state), Some("blocked".into()));
         assert_eq!(
-            actlog::tray_view(&d.summary()).title,
+            actlog::tray_view(&[d.summary()], &[]).title,
             actlog::BRICK,
             "bana does not ask"
         );
@@ -7554,7 +8030,21 @@ exec git \"$@\"
             (r.state, r.reason.as_deref()),
             (State::Failed, Some(release::INTERRUPTED))
         );
-        d.shutdown().await;
+
+        // A daemon stopped for a restart in this process waits for a publish
+        // to end: the new one would mark it interrupted while it runs.
+        d.0.lock().releases.get_mut("v0.4.0").unwrap().state = State::Publishing;
+        let stopping = tokio::spawn({
+            let d = d.clone();
+            async move { d.stop_fully().await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!stopping.is_finished(), "it waits for the publish");
+        d.0.lock().releases.get_mut("v0.4.0").unwrap().state = State::Published;
+        tokio::time::timeout(Duration::from_secs(5), stopping)
+            .await
+            .expect("it stops once the publish ended")
+            .unwrap();
         p.remove();
     }
 }

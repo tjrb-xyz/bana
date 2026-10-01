@@ -384,16 +384,18 @@ fn a_fixs_tools_answer_from_its_files_without_the_daemon() {
             &wt.to_string_lossy(),
         ],
     );
-    // Nothing listens on the settings' port.
+    // Nothing listens on the machine's port.
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
         .unwrap()
         .port();
+    std::fs::create_dir_all(root.join("home/daemon.d")).unwrap();
     std::fs::write(
-        dir.join("daemon/settings"),
-        format!("port = {port}\nfix.rounds = 3\n"),
+        root.join("home/daemon.d/settings"),
+        format!("port = {port}\n"),
     )
     .unwrap();
+    std::fs::write(dir.join("daemon/settings"), "fix.rounds = 3\n").unwrap();
     let state = dir.join(format!("fix/{sha7}.d"));
     std::fs::create_dir_all(&state).unwrap();
     let fix = json!({"version": 1, "fix": sha7, "origin": "log", "sha": sha, "ref": "refs/heads/main",
@@ -491,16 +493,18 @@ fn the_release_tools_ask_github_with_gh_and_bana_for_the_rest() {
     .unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // Nothing listens on the settings' port.
+    // Nothing listens on the machine's port.
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
         .unwrap()
         .port();
+    std::fs::create_dir_all(root.join("home/daemon.d")).unwrap();
     std::fs::write(
-        dir.join("daemon/settings"),
-        format!("port = {port}\nrepo = o/r\ngh = {}\n", gh.display()),
+        root.join("home/daemon.d/settings"),
+        format!("port = {port}\ngh = {}\n", gh.display()),
     )
     .unwrap();
+    std::fs::write(dir.join("daemon/settings"), "repo = o/r\n").unwrap();
     let replies = session(
         &dir,
         &root,

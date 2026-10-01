@@ -3,13 +3,14 @@
 bana runs a project's GitHub Actions workflow on your own machines, for CI that is too long, too big or too
 hardware-bound for GitHub's runners. It is small on purpose, and it works in three ways:
 
-- **`bana daemon`: CI on push, on your Mac.** A daemon fetches the repository, runs the workflow with
-  [act](https://github.com/nektos/act) for each eligible push, and posts commit statuses to GitHub. 🧱 in the
-  menu bar shows what it is doing, and a click opens its page with the build's live log. It keeps nothing
-  awake while idle, and a push made while the Mac sleeps builds when it wakes.
+- **`bana daemon`: CI on push, on your Mac.** One daemon a machine serves every project you add with
+  `bana add`: it fetches each repository, runs the workflow with [act](https://github.com/nektos/act) for each
+  eligible push, one build at a time, and posts commit statuses to GitHub. 🧱 in the menu bar shows what it is
+  doing, and a click opens its page with the build's live log. It keeps nothing awake while idle, and a push
+  made while the Mac sleeps builds when it wakes.
 - **`bana ci`: the same, by hand.** It runs the jobs with act in OrbStack's Docker: Linux jobs in containers,
   and on a Mac the macOS jobs on the Mac itself, with its real CoreAudio and USB devices. Nothing stays running.
-  Use it before you push, and before you install the daemon.
+  Use it before you push, and before you add the project to the daemon.
 - **`bana up`: a runner pool, if you want it.** Your machines register as self-hosted runners and GitHub gives
   them the jobs from each push. That needs them awake and online, so it is opt-in, and `bana down` undoes it.
   A project uses the daemon or the pool, not both.
@@ -20,30 +21,41 @@ Ubuntu. It was extracted from its first user, a project kept here as [the worked
 
 ## CI on push: bana daemon
 
-In the project's checkout, with act, OrbStack (running), the GitHub CLI signed in and Rust (cargo builds the
-daemon the first time):
+With act, OrbStack (running), the GitHub CLI signed in and Rust (cargo builds the daemon the first time):
 
 ```sh
 brew install act gh yq           # and OrbStack, for Docker
 gh auth login
-bana init                        # where each job runs here; bana.conf and workflow changes, if you say y
+bana daemon install              # once a machine, anywhere: check, build, start; on a Mac it opens the page
+cd ~/src/myproj                  # then in each project's checkout:
+bana add                         # where each job runs here; bana.conf and workflow changes, if you say y; CI here
 git add .github && git commit -m "bana as CI"   # the daemon builds commits, with their bana.conf
 bana ci                          # once by hand: the workflow works under act
-bana daemon install              # check, build, start; on a Mac it opens the page
 git push                         # builds on this Mac
 ```
 
-Install checks the machine and warns about what in the workflow would go wrong under the daemon
-([below](#what-the-workflow-needs)). It builds in its own clone, `~/.bana/<prefix>/src`, never in your
-checkout. It starts from the branches as they are: the next push builds. Its settings (bana.conf's `daemon.*`
-keys) are read at install, so run it again after changing them.
+Install checks the machine and starts the one daemon; run it again to take a newer bana. `bana add` checks the
+project and warns about what in the workflow would go wrong under the daemon
+([below](#what-the-workflow-needs)), then adds it: the daemon builds it in its own clone,
+`~/.bana/<prefix>/src`, never in your checkout, and starts from the branches as they are: the next push builds.
+Its settings (bana.conf's `daemon.*` keys) are read at `bana add`, so run it again after changing them.
+
+```sh
+bana list                        # the projects added here: state, queue, last build, checkout, files
+bana pause [PROJECT]             # no automatic builds of its pushes; Run now, fixes and releases still work
+bana resume [PROJECT]            # the pushes that waited build
+bana remove [PROJECT] [--purge]  # its CI here goes; --purge also its clone, builds and state
+```
+
+PROJECT is a prefix `bana list` shows, by default the checkout's. A project's files (its clone, builds, fixes
+and releases) are in `~/.bana/<prefix>/`, which `bana list` shows.
 
 **How a push reaches it.** The daemon fetches every 30 seconds; that is one small git request, and it catches up
-by itself after the Mac sleeps. A push from your checkout arrives at once: install adds a git hook there
+by itself after the Mac sleeps. A push from your checkout arrives at once: `bana add` adds a git hook there
 (`reference-transaction`) that, when a push goes through, asks the daemon to fetch now. A push from elsewhere (a
 merge on GitHub, another machine) waits for the next fetch. No webhook is needed, so nothing on your Mac is
-reachable from the internet and no GitHub Actions minutes are spent. `--no-hook` leaves the hook out, and a
-hook of your own by that name is left alone.
+reachable from the internet and no GitHub Actions minutes are spent. `bana add --no-hook` leaves the hook out,
+and a hook of your own by that name is left alone.
 
 **On GitHub** each build posts the statuses `bana` for the build and `bana/<job>` for each job that starts:
 `running on mbp (quick)`, then `passed on mbp in 12m · 5 jobs` or `rust failed at "cargo clippy" · 3m40s on
@@ -52,12 +64,15 @@ page, at `http://127.0.0.1:8470/`, so it works only on the machine that ran it.
 
 **In the menu bar**, 🧱 alone is idle; `🧱 4m +2` is building for 4 minutes with 2 queued; `🧱 !` means the
 last build failed; `🧱 paused`, `🧱 no Docker` (start OrbStack), `🧱 busy` (waiting for your `bana ci`) and
-`🧱 !gh` (statuses not posted) say why builds wait; `🧱 v0.1.0?` asks whether to publish a release. A left click opens the page; a right click has *Cancel build*,
-*Pause new builds* and *Quit bana*, which stops local CI until the next login.
+`🧱 !gh` (statuses not posted) say why builds wait; `🧱 v0.1.0?` asks whether to publish a release. With more
+than one project the title names the one it is about (`🧱 wid 4m +2`). A left click opens the page; a right
+click has a submenu for each project (*Cancel #N*, *Fix #N with Claude…*, *Publish v0.1.0…*, *Pause automatic
+builds*) and *Quit bana*, which stops local CI until the next login.
 
-**The page**, *Local CI*, has the queue, the running build with its jobs and live log, and the history. *Run now*
-builds a branch at any tier, which is how a nightly runs. *Pause new builds* lets the running build finish;
-*Cancel* stops one; *Re-run* builds the same commit again.
+**The page**, *Local CI*, has a project picker (with two or more projects), the queue, the running build with
+its jobs and live log, and the history. *Run now* builds a branch at any tier, which is how a nightly runs.
+*Pause automatic builds* holds the pushes (the running build finishes, and Run now still builds); *Cancel* stops
+one; *Re-run* builds the same commit again.
 
 **Which pushes run:** branches matching `daemon.branches` (all but `dependabot/*` and `renovate/*`), tags
 matching `daemon.tags` (none by default), and not a head commit with `[skip ci]` or another of GitHub's skip
@@ -73,8 +88,9 @@ in a terminal, where the project's hook can ask. They are kept a week, and the n
 while the branch is there, so the latest nightly of main can always be installed. A failed build's uploads stay
 as act left them, for a week; a problem with the files never changes a build's result.
 
-**One build at a time.** The daemon and `bana ci` share a lock: while the daemon builds, `bana ci` stops with
-*act is busy here*, and while your `bana ci` runs, the daemon's builds wait.
+**One build at a time.** The daemon builds one project's build at a time, each project in turn; another
+project's queue says *after wid #12*. The daemon and `bana ci` share a lock: while the daemon builds, `bana ci`
+stops with *act is busy here*, and while your `bana ci` runs, the daemon's builds wait.
 
 **Sleep.** Nothing keeps the Mac awake while idle. While act runs, `caffeinate` stops idle sleep; closing the lid
 still sleeps the Mac, and the build pauses until it wakes. After a wake the next fetch comes within 30 seconds
@@ -86,21 +102,21 @@ keys and Keychain in reach. Use the daemon only on a private repository, where w
 get the GitHub CLI's token as `GITHUB_TOKEN` (`daemon.token = none`: an empty one).
 
 ```sh
-bana daemon status               # whether it runs, what it builds, what waits
-bana daemon log                  # its log (~/Library/Logs/bana/<prefix>.log on a Mac)
-bana daemon open                 # the page
-bana daemon poke                 # fetch now
-bana daemon uninstall [--purge]  # stop it; --purge also removes its clone and builds
+bana daemon status               # whether it runs, and what each project builds and waits for
+bana daemon log                  # its log (~/Library/Logs/bana/bana.log on a Mac)
+bana daemon open [PROJECT]       # the page
+bana daemon poke [PROJECT]       # fetch now (every project, outside a checkout)
+bana daemon uninstall [--purge]  # stop it; the projects stay added (--purge: bana remove --purge each)
 ```
 
 [docs/DAEMON.md](docs/DAEMON.md) has the rest: every setting, how cancels and timeouts work, the files it keeps,
-running it on Linux, and the trust boundary in full.
+running it on Linux, moving from the daemon a project of before, and the trust boundary in full.
 
 ### What the workflow needs
 
 The daemon runs the workflow as `workflow_dispatch`, with an event shaped like the push (`github.ref`,
-`github.sha`, `github.event.before` and the tier input as a push would have them). Install warns about each of
-these, and `bana init` proposes the changes:
+`github.sha`, `github.event.before` and the tier input as a push would have them). `bana add` warns about each
+of these, and proposes the changes:
 
 - GitHub itself runs nothing on a push: `on:` keeps only `workflow_dispatch`, or its root jobs are gated on a
   variable, `if: (github.event_name != 'push' && github.event_name != 'schedule') || vars.<PREFIX>_CI_AUTO != 'false'`,
@@ -136,8 +152,8 @@ bana ci -- --reuse               # anything after -- goes to act; --reuse keeps 
 
 A job takes the first of its labels that has a place, as act does. `act.platform.<label>` (lowercase) in
 bana.conf is `linux` (a container from `act.image`), `mac` (the Mac itself; elsewhere not run), `skip [reason]`
-(not run) or an image of its own; `bana init` asks and writes these. `self-hosted` and a label with `=` cannot
-be keys. After a run, bana names the jobs that had no place: *not run here: JOB (runs-on: ...): see bana init*.
+(not run) or an image of its own; `bana add` asks and writes these. `self-hosted` and a label with `=` cannot
+be keys. After a run, bana names the jobs that had no place: *not run here: JOB (runs-on: ...): see bana add*.
 
 The run uses your working tree, uncommitted changes included, and the workflow's tier input (`tiers`,
 `tier_input` in bana.conf). Artifacts land in `~/.bana/act/artifacts/1/<name>/<name>.zip` (upload-artifact@v4:
@@ -180,8 +196,8 @@ and line, cargo's rerun command, each failed step's last lines, and what was ban
 project's), and starts Claude Code there with a prompt that says so. Your working tree and branches stay as they
 are, and a commit on the fix branch shows up in your checkout at once.
 
-With the daemon, Claude tests through bana's tools (an MCP server that `bana daemon install` registers with
-Claude Code in your checkout; `--no-claude` leaves it out). `run_jobs` snapshots the worktree and has the daemon
+With the daemon, Claude tests through bana's tools (an MCP server that `bana add` registers with Claude Code
+in your checkout; `--no-claude` leaves it out). `run_jobs` snapshots the worktree and has the daemon
 run the failed jobs on it under act, the way CI ran them, at the front of its queue and without posting
 statuses. A fix gets `fix.rounds` (5) such rounds, one at a time, plus round 0: the failed jobs again at the
 unchanged commit, to tell a real failure from an environmental one. When a round is green, `commit_fix` (which
@@ -302,8 +318,7 @@ bana daemon open                 # the Release card: files, Tested, the notes; P
 
 While it builds, bana writes notes from git: every commit on the first-parent line since the previous release,
 as a pull request (a merge or a squash, `Title (#12)`) or as another change. You edit them on the page, or ask
-Claude Code in the checkout, where `bana daemon install` registered bana's tools: *write the release notes for
-v0.1.0*. Claude reads the release and the pull requests, writes notes for the project's users and saves them
+Claude Code in the checkout, where `bana add` registered bana's tools: *write the release notes for v0.1.0*. Claude reads the release and the pull requests, writes notes for the project's users and saves them
 for you to review; it cannot publish.
 
 *Publish v0.1.0* checks the files against `SHA256SUMS`, that the tag is still the commit built and that the
@@ -342,16 +357,18 @@ Jobs wait in GitHub's queue while no runner is online, so leave the pool (`bana 
 On a Mac, OrbStack's command line (`orb`) makes and runs the Linux machines. Without OrbStack, bana uses Lima
 for the arm64 machine and makes no x86_64 one. A [Tart VM](#more-machines) is an optional extra.
 
-## bana init: bana as the project's CI
+## bana add: bana as the project's CI
 
 ```sh
-bana init                        # the report, then what it proposes, asked about on a terminal
-bana init --check                # the report only; exit 1 when a job would have no place here
-bana init --diff | git apply     # only the workflow changes, as a patch
-bana init --workflow test.yml    # another workflow in .github/workflows
+bana add                         # the report, what it proposes (asked about on a terminal), then CI here
+bana add --check                 # the report only, nothing added; exit 1 when a job would have no place here
+bana add --diff | git apply      # only the workflow changes, as a patch
+bana add --workflow test.yml     # another workflow in .github/workflows
+bana add --no-hook --no-claude   # no push hook; bana's tools not registered with Claude Code
 ```
 
-In the project's checkout, `bana init` has act evaluate every job's `runs-on` (matrix entries one by one) and
+(`bana add` was `bana init`, which now says so and stops.) In the project's checkout, `bana add` has act
+evaluate every job's `runs-on` (matrix entries one by one) and
 says where each would run: here, under `bana ci` and the daemon, and in a pool of `bana up` runners. The
 workflow is bana.conf's `workflow`, else `ci.yml`, else the only one with `workflow_dispatch`. A job whose
 `runs-on` or matrix reads `needs.` is decided at run time. A label
@@ -360,18 +377,25 @@ bana does not know is asked about on a terminal (`linux`, `mac`, `skip` or an im
 line: a matrix whose entries go to different places here, a step that needs systemd, a CPU a container cannot give, `$RUNNER_ENVIRONMENT`
 in a script, a checkout `ref:`.
 
-It then proposes `.github/bana.conf` (a new file, or an appended `# bana init DATE` block of the keys it lacks)
+It then proposes `.github/bana.conf` (a new file, or an appended `# bana add DATE` block of the keys it lacks)
 and a patch to the workflow: `workflow_dispatch:` in `on:`, the `env.ACT` and `RUNNER_ENVIRONMENT` gates, the
 `vars.<PREFIX>_CI_AUTO` gate on pushes and nightlies of root jobs (and of jobs that run after skipped needs,
 `always()`), and `runs-on`
 a variable can move to a pool, `${{ fromJSON(vars.<PREFIX>_RUNNER_LINUX || '["self-hosted","<prefix>-linux"]') }}`.
 It writes bana.conf and runs `git apply` only after you say y, and never on a workflow with uncommitted changes.
 No branch, no commit: review with `git diff`. A second run asks only about what is new. It needs act, and
-mikefarah's yq (else the one in `act.image`, through Docker).
+mikefarah's yq (else the one in `act.image`, through Docker); without them it only warns, and goes on.
+
+Then, even off a terminal, it adds the project to the daemon here: it checks what the daemon needs of it (git
+reads the repository through gh, `workflow_dispatch`, no pool runners here), writes its settings to
+`~/.bana/<prefix>/daemon/settings`, clones it into `~/.bana/<prefix>/src`, adds the push hook and registers
+bana's MCP server with Claude Code in this checkout. If the daemon runs, it starts the project at once and
+prints its page; otherwise `bana daemon install` starts it. A prefix another repository has here already is
+refused. `bana remove` undoes it all but the clone and builds (`--purge`: those too).
 
 ## Adopt bana in a project
 
-`bana init` does steps 2 to 4 for you, or shows what they are.
+`bana add` does steps 2 to 4 for you, or shows what they are.
 
 **1. Add bana.** Pin it as a git submodule, so each checkout of your project has the bana it was tested with:
 
@@ -409,7 +433,7 @@ Every key can be overridden by `BANA_<KEY>` in the environment (`plan.path.rust`
 | `act.image` | `catthehacker/ubuntu:act-24.04` | the image `bana ci` runs Linux jobs in |
 | `act.network` | `bridge` | the Docker network of Linux jobs: `bridge` gives each job a localhost of its own, as on GitHub; `host` (act's default) shares the Docker host's between all of them |
 | `act.args` | | more act options for `bana ci` and the daemon's builds (`--reuse`) |
-| `act.platform.<label>` | see [bana ci](#bana-ci-the-workflow-on-this-machine) | where `bana ci` and the daemon run jobs with this runs-on label: `linux`, `mac`, `skip [reason]` or an image (`bana init` writes these) |
+| `act.platform.<label>` | see [bana ci](#bana-ci-the-workflow-on-this-machine) | where `bana ci` and the daemon run jobs with this runs-on label: `linux`, `mac`, `skip [reason]` or an image (`bana add` writes these) |
 | `act.docker_config` | `~/.bana/docker` | the Docker config act pulls with: bana's own, without your logins, so macOS never asks for your Keychain password; `~/.docker` for private images |
 | `ci.log` | `yes` | `bana ci` keeps act's output in `~/.bana/<prefix>/ci/last.log` for `bana fix`, through a pipe, so Linux jobs print without colours; `no` gives act your terminal, and keeps nothing |
 | `daemon.*` | | which pushes the daemon builds, and how ([docs/DAEMON.md](docs/DAEMON.md#settings)) |
@@ -446,8 +470,9 @@ workflow, take `runs-on` from a variable, as the worked example does:
     runs-on: ${{ fromJSON(vars.MYPROJ_RUNNER_LINUX || '["self-hosted","myproj-linux"]') }}
 ```
 
-**4. Run it:** `tools/bana/bin/bana ci` in the project's checkout, then `tools/bana/bin/bana daemon install` for CI
-on push. For a pool instead, `tools/bana/bin/bana up` on each machine ([Commands](#commands)).
+**4. Run it:** `tools/bana/bin/bana ci` in the project's checkout. For CI on push, `bana daemon install` once a
+machine, then `tools/bana/bin/bana add` in the checkout. For a pool instead, `tools/bana/bin/bana up` on each
+machine ([Commands](#commands)).
 
 ### Reusable workflow pieces
 
@@ -492,7 +517,7 @@ When the changes cannot be told (a new branch with no common history), every pat
 
 `example` is bana's first user: a Rust and web project with a macOS audio driver, Linux services and packages
 for several CPUs. [examples/example](examples/example) has its `.github/bana.conf` and the two hooks beside it,
-and `ci.yml`, its workflow trimmed to where the jobs run (`bana init`'s tests run on it). The mac hook installs
+and `ci.yml`, its workflow trimmed to where the jobs run (`bana add`'s tests run on it). The mac hook installs
 Homebrew's SCons, ragel and CMake and the project's audio driver, and checks for rustup. The linux hook installs
 rustup and checks that sudo does not ask. Its `plan.*` keys are its path rules. Its `daemon.*` keys build every
 branch but the bots', at `quick`, and `v*` tags at `release`, which it publishes from the daemon's page. Its `report.*` keys are its CI report's standards: toolchain,
@@ -500,7 +525,7 @@ rust, engine (the `real_*` tests), web, macos, streaming, sdk, linux_service and
 make its installer per-user, with `install-hook.sh` (shipped in each archive) asking before it installs the Mac's
 audio devices with sudo.
 
-On a Mac, `bana init --check` finds a place for every job of it, and still exits 1: `package`'s matrix splits
+On a Mac, `bana add --check` finds a place for every job of it, and still exits 1: `package`'s matrix splits
 over machines (the Linux targets in containers, `osx-arm64` on the Mac itself), and act runs every Linux
 container at one CPU, so a run there builds only the arm64 targets. Its notes also name `background-linux`,
 which needs systemd that act's containers do not have, and a `$RUNNER_ENVIRONMENT` check in a script.
@@ -540,9 +565,10 @@ brew install act gh yq                       # and OrbStack, running; rustup is 
 gh auth login
 curl -fsSL -H "Authorization: token $(gh auth token)" \
   https://raw.githubusercontent.com/tjrb-xyz/bana/main/install.sh | sh   # bana on the PATH
-bana init --check                            # every job has a place; exits 1 for package's SPLIT matrix
+bana add --check                             # every job has a place; exits 1 for package's SPLIT matrix
 bana ci nightly                              # every job once, by hand; fix what fails
-bana daemon install                          # its warnings name what is left in ci.yml
+bana daemon install                          # once on the MacBook
+bana add                                     # its warnings name what is left in ci.yml
 gh variable set EXAMPLE_CI_AUTO --body false # GitHub queues nothing for a pool not there
 git push                                     # 🧱 4m in the menu bar, then bana on the commit
 ```
@@ -563,8 +589,8 @@ gh release download v0.1.0-rc1 -R tjrb-xyz/example -p install.sh -O - | sh   # o
 ### A runner pool for the example instead
 
 If the example goes back to a pool (`bana up` on each machine), `EXAMPLE_CI_AUTO` goes (`gh variable delete
-EXAMPLE_CI_AUTO`) and so does the daemon (`bana daemon uninstall`): the two must not both take its pushes. The
-workflow stays as it is. Its jobs run on
+EXAMPLE_CI_AUTO`) and so does its CI on the daemon (`bana remove example`): the two must not both take its
+pushes. The workflow stays as it is. Its jobs run on
 
 ```yaml
     runs-on: ${{ fromJSON(vars.EXAMPLE_RUNNER_LINUX || '["self-hosted","example-linux"]') }}
@@ -583,8 +609,12 @@ bana report [BUILD | last | --log FILE|-] [--json]   # the CI report, per standa
 bana installer DIST (--tag T | --label L)   # the project's install.sh, install.ps1 and SHA256SUMS
 bana install [BUILD | --from FILE|DIR]     # a daemon build's files, on this machine
 bana mcp             # bana's tools for Claude Code, by hand (an MCP server on stdio)
-bana daemon install [--port N] [--no-tray] [--no-open] [--now] [--no-claude]
+bana daemon install [--port N] [--no-tray] [--no-open] [--now]   # once a machine
 bana daemon status|log|open|poke|run|uninstall   # docs/DAEMON.md
+bana add [--check] [--diff] [--workflow F] [--no-hook] [--no-claude]   # a project's CI on the daemon here
+bana list            # the projects added here
+bana remove [PROJECT] [--purge]   # a project's CI here goes
+bana pause|resume [PROJECT]       # hold its automatic builds, or build them again
 bana up [--linux N] [--x64 N] [--no-mac] [--dedicated] [--label L] [--no-usb] [--token T]
 bana status          # this machine's runners and USB audio devices, and the pool
 bana usb             # the USB audio devices here, and the labels they give
@@ -595,7 +625,8 @@ bana manager         # the page, at http://127.0.0.1:8470/#token=… (the daemon
 bana settings        # the settings in effect
 ```
 
-Run them from the project's checkout: that is where bana finds bana.conf. `bana up` again is safe: registered
+Run them from the project's checkout: that is where bana finds bana.conf. `bana daemon`, `bana list`, and
+`remove`, `pause` and `resume` given a PROJECT run anywhere. `bana up` again is safe: registered
 runners stay, and their labels are brought up to date.
 
 **Tokens.** With the GitHub CLI signed in as a repository admin (`gh auth login`) nothing else is needed.
@@ -604,7 +635,7 @@ Otherwise pass `--token`: *Settings → Actions → Runners → New self-hosted 
 
 ## The manager
 
-The manager is the pool's page. While the project's daemon runs, `bana manager` opens the daemon's page, which
+The manager is the pool's page. While the daemon runs, `bana manager` opens the daemon's page, which
 has the same sections under *Runner pool (optional)*. Otherwise it builds the manager with cargo (a minute the
 first time) and starts a page on `http://127.0.0.1:8470`:
 
@@ -662,7 +693,8 @@ quarantined download). `.github/workflows/test.yml` runs them on Ubuntu and on
 macOS (stock bash 3.2), plus shellcheck and the manager's tests. On a private repository the macOS job's
 minutes count ten times. `.github/workflows/installer.yml` runs install.ps1 on Windows (PowerShell 5.1 and 7:
 the junction, the user PATH, Unblock-File, the hook under a Restricted policy), only when the installer changes.
-`BANA_E2E=1 tests/e2e-daemon.sh` runs the daemon with real act: its last push uploads an archive per CPU, and the
-green build's installer installs one under a scratch home.
+`BANA_E2E=1 tests/e2e-daemon.sh` runs the daemon with real act: a push uploads an archive per CPU, and the
+green build's installer installs one under a scratch home; then a second project is added while it runs, paused,
+resumed, and outlives the removal of the first.
 
 License: GPL-3.0-only.

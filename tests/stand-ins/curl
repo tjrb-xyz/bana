@@ -1,16 +1,32 @@
 #!/bin/bash
-# Stand-in curl: serves the fake runner tarball for any download (-o FILE), and plays a
-# daemon on 127.0.0.1: its health answers once launchd or systemd runs it (FAKE_HEALTH:
-# this answer instead), /ci/v1/local is $FAKE_STATE/local.json (then local.next, if
-# any), a fix registered (/ci/v1/fixes) has its round 0 queued, a fix dropped (…/forget)
-# had two round builds, and what comes on stdin
-# (-H @-: the token) goes to $FAKE_STATE/curl.stdin.
+# Stand-in curl: serves the fake runner tarball for any download (-o FILE), and plays the
+# daemon on 127.0.0.1. Its health answers once launchd or systemd runs it (FAKE_HEALTH:
+# this answer instead), naming the projects added ($HOME/.bana/*/daemon/settings); a daemon
+# of before (one a project, xyz.tjrb.bana.<prefix> or bana-<prefix>.service) answers when
+# that one runs. /ci/v1/projects is $FAKE_STATE/projects.json (then projects.next, if any),
+# else a line a project added, from its files; …/local is $FAKE_STATE/local.json (then
+# local.next, if any); a fix registered (…/fixes) has its round 0 queued, a fix dropped
+# (…/forget) had two round builds, and what comes on stdin (-H @-: the token) goes to
+# $FAKE_STATE/curl.stdin.
 echo "curl $*" >>"$FAKE_LOG"
 url=${*: -1}
 for a in "$@"; do [[ $a == @- ]] && cat >"$FAKE_STATE/curl.stdin"; done
+added() { # the prefixes added
+  local f p
+  for f in "${BANA_HOME:-$HOME/.bana}"/*/daemon/settings; do
+    [[ -f $f ]] || continue
+    p=${f%/daemon/settings}
+    echo "${p##*/}"
+  done
+}
 case $url in
 http://127.0.0.1:*/ci/v1/health)
   if [[ -n ${FAKE_HEALTH:-} ]]; then echo "$FAKE_HEALTH"; exit 0; fi
+  if [[ -e $FAKE_STATE/launchd-xyz.tjrb.bana || -e $FAKE_STATE/systemd-bana.service ]]; then
+    p=$(added | sed 's/.*/"&"/' | paste -s -d, -)
+    printf '{"ok":true,"service":"ci","api":1,"daemon":true,"global":true,"port":8470,"machine":"mbp","projects":[%s]}\n' "$p"
+    exit 0
+  fi
   for f in "$FAKE_STATE"/launchd-xyz.tjrb.bana.* "$FAKE_STATE"/systemd-bana-*.service; do
     [[ -e $f ]] || continue
     p=${f##*/} p=${p#launchd-xyz.tjrb.bana.} p=${p#systemd-bana-} p=${p%.service}
@@ -18,13 +34,30 @@ http://127.0.0.1:*/ci/v1/health)
     exit 0
   done
   exit 7 ;;
-http://127.0.0.1:*/ci/v1/local)
+http://127.0.0.1:*/ci/v1/projects)
+  if [[ -e $FAKE_STATE/projects.json ]]; then
+    cat "$FAKE_STATE/projects.json"
+    [[ ! -e $FAKE_STATE/projects.next ]] || mv "$FAKE_STATE/projects.next" "$FAKE_STATE/projects.json"
+    exit 0
+  fi
+  s=''
+  for p in $(added); do
+    [[ -n $s ]] || echo "["
+    f=${BANA_HOME:-$HOME/.bana}/$p/daemon
+    printf '%s{"checkout":"%s","error":null,"last":null,"paused":%s,"prefix":"%s","queue":0,"repo":"%s","running":null}' "$s" \
+      "$(sed -n 's/^checkout *= *//p' "$f/settings")" "$([[ -e $f/paused ]] && echo true || echo false)" "$p" \
+      "$(sed -n 's/^repo *= *//p' "$f/settings")"
+    s=$',\n'
+  done
+  if [[ -n $s ]]; then printf '\n]\n'; else echo "[]"; fi
+  exit 0 ;;
+http://127.0.0.1:*/ci/v1/local | http://127.0.0.1:*/ci/v1/p/*/local)
   cat "$FAKE_STATE/local.json" 2>/dev/null || exit 22
   [[ ! -e $FAKE_STATE/local.next ]] || mv "$FAKE_STATE/local.next" "$FAKE_STATE/local.json"
   exit 0 ;;
-http://127.0.0.1:*/ci/v1/daemon/poll) echo '{"ok":true}'; exit 0 ;;
-http://127.0.0.1:*/ci/v1/fixes) echo '{"fix":"","recheck":0,"rounds":{}}'; exit 0 ;;
-http://127.0.0.1:*/ci/v1/fixes/*/forget) echo '{"fix":"","builds":2}'; exit 0 ;;
+http://127.0.0.1:*/ci/v1/p/*/daemon/poll) echo '{"ok":true}'; exit 0 ;;
+http://127.0.0.1:*/ci/v1/p/*/fixes) echo '{"fix":"","recheck":0,"rounds":{}}'; exit 0 ;;
+http://127.0.0.1:*/ci/v1/p/*/fixes/*/forget) echo '{"fix":"","builds":2}'; exit 0 ;;
 http://127.0.0.1:*) exit 7 ;;
 esac
 while (($#)); do

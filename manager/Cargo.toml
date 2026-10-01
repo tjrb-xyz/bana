@@ -18,6 +18,8 @@ libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "process", "io-util", "time", "sync", "signal"] }
+# The daemon hands each project's requests to its own routes.
+tower = { version = "0.5", features = ["util"] }
 
 # The menu bar (tray.rs). macOS only: Linux builds need no GTK.
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -25,7 +27,6 @@ tao = "0.37.1"
 tray-icon = "0.24.2"
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 
 [profile.release]

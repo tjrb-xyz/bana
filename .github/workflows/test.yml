@@ -53,12 +53,13 @@ jobs:
       - run: cargo test --locked
 
   # The daemon end to end: real act and Docker, pushes to a local origin, statuses
-  # through the gh stand-in, a cancel from the API, kill -9 and a restart, and the fix
-  # loop with the test as Claude Code (bana's MCP server over stdio).
+  # through the gh stand-in, a cancel from the API, kill -9 and a restart, the fix
+  # loop with the test as Claude Code (bana's MCP server over stdio), and a second
+  # project: one build at a time, bana pause and resume, bana remove.
   e2e:
     if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: act ${{ env.ACT_VERSION }}
@@ -77,7 +78,7 @@ jobs:
   macos-daemon:
     if: github.event_name != 'workflow_dispatch'
     runs-on: macos-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - name: cargo clippy (with the tray)
@@ -91,7 +92,7 @@ jobs:
         if: ${{ !cancelled() }}
         working-directory: manager
         run: cargo build --locked && echo "BANA_DAEMON_BIN=$PWD/target/debug/bana-manager" >>"$GITHUB_ENV"
-      - name: bana daemon install, as a LaunchAgent, in a temporary home
+      - name: bana daemon install, as a LaunchAgent, in a temporary home; then bana add
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
@@ -117,21 +118,28 @@ jobs:
           printf 'on:\n  workflow_dispatch:\njobs:\n  a:\n    runs-on: [self-hosted, wid-macos]\n    steps:\n      - run: "true"\n' >.github/workflows/ci.yml
           git add -A && git commit -q -m one && git push -q origin HEAD:main
 
-          bash "$bana" daemon install --no-tray --no-open
-          plist=$HOME/Library/LaunchAgents/xyz.tjrb.bana.wid.plist
+          # Once a machine, anywhere: the one daemon, with no project yet.
+          (cd "$T" && bash "$bana" daemon install --no-tray --no-open)
+          plist=$HOME/Library/LaunchAgents/xyz.tjrb.bana.plist
           plutil -lint "$plist"
-          launchctl print "gui/$(id -u)/xyz.tjrb.bana.wid" | tee "$T/print" | head -n 40
+          launchctl print "gui/$(id -u)/xyz.tjrb.bana" | tee "$T/print" | head -n 40
           grep -q 'state = running' "$T/print"
+          # Then the project, in its checkout: the daemon starts it without a restart.
+          bash "$bana" add </dev/null
           curl -fsS --noproxy '*' http://127.0.0.1:8470/ci/v1/health | tee "$T/health"
           echo
-          grep -q '"prefix":"wid"' "$T/health"
+          grep -q '"global":true' "$T/health"
+          grep -q '"projects":\["wid"\]' "$T/health"
+          bash "$bana" list | tee "$T/list"
+          grep -q '^wid  *acme/wid  *active' "$T/list"
           bash "$bana" daemon status
           bash "$bana" daemon uninstall --purge
-          if launchctl print "gui/$(id -u)/xyz.tjrb.bana.wid" >/dev/null 2>&1; then
+          if launchctl print "gui/$(id -u)/xyz.tjrb.bana" >/dev/null 2>&1; then
             echo "still loaded after uninstall" >&2
             exit 1
           fi
           test ! -e "$plist"
+          test ! -e "$HOME/.bana/wid/daemon"
       - name: act ${{ env.ACT_VERSION }}
         if: ${{ !cancelled() }}
         run: |
