@@ -399,17 +399,22 @@ impl Registry {
         }
     }
 
-    /// Whether a newer bana is out: after [`upgrade::FIRST`], then every
-    /// [`upgrade::EVERY`]. A failure is one line in the log.
+    /// Whether a newer bana is out: after [`upgrade::FIRST`], then once
+    /// [`upgrade::due`], looked at every [`upgrade::TICK`]. A failure is one
+    /// line in the log, and is asked again at the next tick.
     async fn upgrade_check(self: Arc<Self>) {
         let mut stop = self.stop.subscribe();
         let mut wait = upgrade::FIRST;
+        let mut last = None;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {}
                 _ = stop.changed() => return,
             }
-            wait = upgrade::EVERY;
+            wait = upgrade::TICK;
+            if !upgrade::due(last, std::time::SystemTime::now()) {
+                continue;
+            }
             let env = std::env::var("BANA_RELEASES").ok();
             let Some(releases) = upgrade::releases(env.as_deref()) else {
                 return;
@@ -419,8 +424,9 @@ impl Registry {
             }
             let found =
                 upgrade::check(&releases, &self.machine.path, env!("CARGO_PKG_VERSION")).await;
-            if let Err(e) = &found {
-                eprintln!("bana daemon: is a newer bana out? {e}");
+            match &found {
+                Ok(_) => last = Some(std::time::SystemTime::now()),
+                Err(e) => eprintln!("bana daemon: is a newer bana out? {e}"),
             }
             self.found_latest(&found);
         }

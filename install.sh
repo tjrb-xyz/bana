@@ -93,6 +93,10 @@ got=$(sha256 "$tmp/install.sh")
 # The commands where the release has them, else in ~/.local/bin.
 prefix=${XDG_DATA_HOME:-$HOME/.local/share}/bana
 b=$(sed -n 's/^bin=//p' "$prefix/receipt" 2>/dev/null | head -1)
+# This script's link of before is always in ~/.local/bin: the release's command takes its place.
+if [ -z "$b" ] && [ -L "$bin/bana" ]; then
+  case $(readlink "$bin/bana") in "$src"/*) b=$bin ;; esac
+fi
 bin=${b:-${XDG_BIN_HOME:-$bin}}
 rm -f "$home/.upgrade-from"
 st=0

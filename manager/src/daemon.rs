@@ -691,10 +691,16 @@ pub fn machine_name() -> String {
         .unwrap_or_else(|| "this machine".into())
 }
 
+/// state.json's version: a change to it comes with a new one. A daemon
+/// refuses a state.json of a newer bana (a downgrade) rather than drop what
+/// it does not know.
+pub const STATE_VERSION: u32 = 1;
+
 /// state.json.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct State {
+    /// [`STATE_VERSION`] when written.
     pub version: u32,
     /// The owner paused automatic builds: `daemon/paused` says so, and this
     /// mirrors it. Never written here; an older bana's is moved there.
@@ -718,7 +724,7 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: STATE_VERSION,
             paused: false,
             next_id: 1,
             heads: Heads::new(),
@@ -931,6 +937,12 @@ impl Daemon {
             Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("state.json: {e}"))?,
             Err(_) => State::default(),
         };
+        if state.version > STATE_VERSION {
+            return Err(format!(
+                "state.json is a newer bana's (version {}, this bana reads {STATE_VERSION}): bana upgrade",
+                state.version
+            ));
+        }
         // The pause is daemon/paused's; an older bana kept it in state.json.
         let flag = dir.join("daemon/paused");
         if state.paused && !flag.exists() {
@@ -6204,8 +6216,24 @@ exec git \"$@\"
         }
         d.shutdown().await;
 
-        // An older bana kept the pause in state.json: it moves to the file.
+        // A newer bana's state.json is refused, and left as it is.
         let file = p.dir.join("state.json");
+        let kept = std::fs::read(&file).unwrap();
+        let mut newer: Value = serde_json::from_slice(&kept).unwrap();
+        assert_eq!(newer["version"], json!(STATE_VERSION));
+        newer["version"] = json!(STATE_VERSION + 1);
+        newer["later"] = json!("a newer bana's");
+        write_json(&file, &newer).unwrap();
+        let newer = std::fs::read(&file).unwrap();
+        let e = Daemon::start(s.clone()).await.err().unwrap();
+        assert!(
+            e.contains("state.json is a newer bana's") && e.ends_with("bana upgrade"),
+            "{e}"
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), newer);
+        std::fs::write(&file, &kept).unwrap();
+
+        // An older bana kept the pause in state.json: it moves to the file.
         let mut state: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         assert!(state.get("paused").is_none(), "{state}");
         state["paused"] = json!(true);

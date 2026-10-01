@@ -19,6 +19,9 @@ concurrency:
   cancel-in-progress: false
 env:
   MACOSX_DEPLOYMENT_TARGET: '11.0'
+  # Where the release goes: its install.sh downloads from there (release.sh dist), and publish
+  # creates it there. One value for both.
+  BANA_RELEASE_REPO: ${{ github.repository }}
 jobs:
   # The version: the tag's (or the one asked for), bin/bana's and the manager's, all one.
   check:
@@ -28,9 +31,10 @@ jobs:
       v: ${{ steps.v.outputs.v }}
       prerelease: ${{ steps.v.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          persist-credentials: false
       - id: v
         name: .github/release.sh check
         env:
@@ -38,6 +42,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = push ]; then V=${GITHUB_REF_NAME#v}; else V=$ASKED; fi
+          [ -n "$V" ] || { echo "::error::no version: the input version, X.Y.Z"; exit 1; }
           .github/release.sh check "$V"
           if [ "$GITHUB_EVENT_NAME" = push ] && ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
             echo "::error::$GITHUB_REF_NAME is not a commit on main"
@@ -77,7 +82,9 @@ jobs:
       PLAT: ${{ matrix.plat }}
       B: manager/target/${{ matrix.target }}/release/bana-manager
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - run: rustup target add "$T"
       - run: cargo build --release --locked --target "$T" --manifest-path manager/Cargo.toml
       - name: statically linked
@@ -109,7 +116,7 @@ jobs:
           fi
           test "$got" = "$V" || { echo "::error::bana-manager version says '$got', not $V"; exit 1; }
       - run: .github/release.sh pack "$B" "$V" "$PLAT" dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bana-${{ matrix.plat }}
           path: dist/bana-v${{ needs.check.outputs.v }}-${{ matrix.plat }}.tar.gz
@@ -125,15 +132,17 @@ jobs:
     env:
       V: ${{ needs.check.outputs.v }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: bana-*
           merge-multiple: true
           path: dist
       - run: .github/release.sh dist dist "$V"
       - run: cd dist && sha256sum -c SHA256SUMS
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bana-v${{ needs.check.outputs.v }}-dist
           path: dist
@@ -152,7 +161,7 @@ jobs:
     env:
       V: ${{ needs.check.outputs.v }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: bana-v${{ needs.check.outputs.v }}-dist
           path: dist
@@ -182,22 +191,29 @@ jobs:
     permissions:
       contents: write
     env:
-      GH_TOKEN: ${{ github.token }}
       TAG: ${{ github.ref_name }}
       V: ${{ needs.check.outputs.v }}
       PRE: ${{ needs.check.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: bana-v${{ needs.check.outputs.v }}-dist
           path: dist
       - name: gh release create --draft, checked, then published
+        # The token for gh, in this step only.
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          R=$GITHUB_REPOSITORY
+          R=$BANA_RELEASE_REPO
+          if ! grep -qx "REPO='$R'" dist/install.sh; then
+            echo "::error::dist/install.sh does not download from $R: nothing changed"
+            exit 1
+          fi
           if gh release view "$TAG" -R "$R" >/dev/null 2>&1; then
             echo "::error::$TAG has a release already: nothing changed"
             exit 1

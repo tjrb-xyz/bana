@@ -149,7 +149,8 @@ unpack() {
   [ "$(printf '%s\n' "$top" | wc -l | tr -d ' ')" = 1 ] ||
     die "$asset should hold one directory, and has: $(printf '%s\n' "$top" | tr '\n' ' ')"
   mkdir "$2"
-  tar -xzf "$1" -C "$2"
+  # As the one who installs, not the owner the archive names (root keeps those otherwise).
+  tar -x --no-same-owner -zf "$1" -C "$2"
   src=$2/$top
   [ -d "$src" ] || die "$asset should hold one directory, and $top is not one"
   [ ! -L "$src" ] || die "$asset should hold one directory, and $top is a link"

@@ -1,5 +1,6 @@
 //! Whether a newer bana is out: two minutes after the daemon starts, then
-//! once a day, `curl` asks `<releases>/latest` where it redirects, with the
+//! once a day (by the clock, asked each hour: a Mac's sleep does not count
+//! towards a monotonic wait; a failure asks again an hour later), `curl` asks `<releases>/latest` where it redirects, with the
 //! settings' PATH. The tag after `/tag/` is kept in memory while it is newer
 //! than this bana ([`crate::registry::Registry::latest`]): the health, the
 //! page, the menu bar, `bana list` and `bana daemon status` say so. A failure
@@ -13,7 +14,7 @@ use std::cmp::Ordering;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::process::Command;
 
 /// bana's releases.
@@ -22,6 +23,14 @@ pub const RELEASES: &str = "https://github.com/tjrb-xyz/bana/releases";
 pub const FIRST: Duration = Duration::from_secs(120);
 /// Then once a day.
 pub const EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+/// How often it looks whether a day has passed (or asks again after a failure).
+pub const TICK: Duration = Duration::from_secs(60 * 60);
+
+/// A check is due at `now`: none succeeded yet, or the last, at `last`, is a
+/// day old (or the clock went back before it).
+pub fn due(last: Option<SystemTime>, now: SystemTime) -> bool {
+    last.is_none_or(|l| !matches!(now.duration_since(l), Ok(d) if d < EVERY))
+}
 /// Its file in bana's home turns the check off.
 pub const OFF: &str = ".no-upgrade-check";
 
@@ -101,6 +110,18 @@ pub fn remember(known: &Mutex<Option<String>>, found: &Result<Option<String>, St
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn due_once_a_day_by_the_clock() {
+        let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert!(due(None, t));
+        assert!(!due(Some(t), t + EVERY - TICK));
+        assert!(due(Some(t), t + EVERY));
+        // A Mac that slept through the night: the clock moved on.
+        assert!(due(Some(t), t + EVERY * 3));
+        // The clock went back.
+        assert!(due(Some(t), t - TICK));
+    }
 
     #[test]
     fn tag_from_redirect_accepts_and_rejects() {

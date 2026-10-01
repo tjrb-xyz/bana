@@ -74,7 +74,7 @@ stage=''
 trap '[[ -z $stage ]] || rm -rf "$stage"' EXIT
 
 pack() { # MANAGER VERSION PLAT OUT
-  local mgr=${1:-} v=${2:-} plat=${3:-} out=${4:-} sha d f
+  local mgr=${1:-} v=${2:-} plat=${3:-} out=${4:-} sha d f own
   [[ -n $out ]] || usage
   valid "$v" || die "pack: X.Y.Z (X.Y.Z-pre for a prerelease), not '$v'"
   [[ " $plats " == *" $plat "* ]] || die "pack: PLAT is one of $plats, not '$plat'"
@@ -95,8 +95,10 @@ pack() { # MANAGER VERSION PLAT OUT
   mkdir -p "$out"
   f=$out/bana-v$v-$plat.tar.gz
   (cd "$stage" && find "bana-v$v" -type f | LC_ALL=C sort) >"$stage/list"
-  # COPYFILE_DISABLE: no ._ files from a Mac's tar.
-  COPYFILE_DISABLE=1 tar -C "$stage" -czf "$f.part" -T "$stage/list"
+  # Owned by root (0:0), not the build's user: a root install's files are root's, whatever
+  # the tar. COPYFILE_DISABLE: no ._ files from a Mac's tar.
+  if tar --version 2>/dev/null | grep -q 'GNU tar'; then own=(--owner=0 --group=0 --numeric-owner); else own=(--uid 0 --gid 0); fi
+  COPYFILE_DISABLE=1 tar "${own[@]}" -C "$stage" -czf "$f.part" -T "$stage/list"
   mv "$f.part" "$f"
   rm -rf "$stage"
   stage=''

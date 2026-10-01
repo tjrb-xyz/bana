@@ -417,20 +417,24 @@ While a project is paused, such a retry of a push waits for `bana resume`, and s
 4. It waits up to a minute for the daemon to answer its health as this bana's version, from a new process.
 5. If it does not, `daemon.d` becomes `daemon.d.bad` (its files, for `bana daemon log`), `daemon.d.prev` becomes
    `daemon.d` again, and the daemon before restarts; install fails, naming both versions. If that one does not
-   come up either, both stay as they are and install prints the commands to start either.
+   come up either, both stay as they are and install prints the commands to start either. Install stopped
+   meanwhile (Ctrl-C, kill, the terminal closed) does the same.
+
+One install runs at a time: another one meanwhile is refused (`~/.bana/daemon.d.lock` has its pid).
 
 One `daemon.d.prev` is kept. The settings are written by the new bana and go back with the snapshot, so a
 release writes only the settings keys its own `bana-manager` reads. A change to `state.json` comes with a new
-`version` in it, which the new daemon upgrades itself.
+`version` in it, which the new daemon upgrades itself; an older daemon refuses a newer `state.json` (that project
+does not run, and its log says `bana upgrade`) rather than drop what it does not know.
 
 `bana upgrade` runs the newest release's install.sh, once its sha256 matches the release's SHA256SUMS. Its hook
 runs the steps above from the new files first: if the new daemon does not come up, the install stops and bana
 stays as it was. With `--now`, the daemon restarts at once. `bana upgrade vX.Y.Z` takes that release; an older
 one is a downgrade, which asks (`--yes`). The installer keeps the release before, so going back is quick.
 
-**The release check.** Two minutes after it starts, then once a day, the daemon asks
-`https://github.com/tjrb-xyz/bana/releases/latest` where it redirects (curl, with the settings' `path`); no API,
-no token. When that release is newer than the daemon's bana, the health says `"latest"`, and the page, the menu
+**The release check.** Two minutes after it starts, then once a day (by the clock, so a Mac's sleep counts; a
+failure asks again an hour later), the daemon asks `https://github.com/tjrb-xyz/bana/releases/latest` where it
+redirects (curl, with the settings' `path`); no API, no token. When that release is newer than the daemon's bana, the health says `"latest"`, and the page, the menu
 bar (*bana vX.Y.Z is out…*), `bana list`, `bana daemon status` and the fix tools' status say so. Nothing is
 installed by itself. To turn it off: `touch ~/.bana/.no-upgrade-check`.
 

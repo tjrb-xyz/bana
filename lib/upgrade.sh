@@ -137,6 +137,13 @@ upgrade_main() {
   if [[ $kind == release ]]; then
     prefix=$(dirname "$bana_root")
     bindir=$(sed -n 's/^bin=//p' "$prefix/receipt" | head -1)
+    # The prefix as the installer's link names it: bana_root is the physical path, another
+    # one when HOME is reached through a link (the installer would not know its link).
+    l=$(readlink "$bindir/bana" 2>/dev/null) || l=''
+    l=${l%/current/bin/bana}
+    if [[ -n $l && $l != "$prefix" && -d $l && $(cd "$l" && pwd -P) == "$(cd "$prefix" && pwd -P)" ]]; then
+      prefix=$l
+    fi
   else
     prefix=${XDG_DATA_HOME:-$HOME/.local/share}/bana
     if l=$(command -v bana) && [[ -L $l ]]; then

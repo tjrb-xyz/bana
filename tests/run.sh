@@ -1850,6 +1850,60 @@ check "handover: --no-tray is kept" bash -c "grep -qx 'tray = no' '$m/settings' 
 (cd "$HOME" && bash "$bana" daemon install --tray --no-open) >"$T/out" 2>&1 || { cat "$T/out"; false; }
 check "handover: --tray: the menu bar again" grep -qx 'tray = yes' "$m/settings"
 
+# The new daemon cannot start (launchctl bootstrap fails): the one before runs again.
+cp -R "$m" "$T/before-start"
+: >"$FAKE_LOG"
+touch "$FAKE_STATE/start-fail"
+(cd "$HOME" && bash "$bana" daemon install --no-open) >"$T/out" 2>&1 && st=0 || st=$?
+check "handover: a new daemon that cannot start fails the install" same "$st" 1
+check "handover: says launchctl could not start it" has "$T/out" "launchctl could not start $HOME/Library/LaunchAgents/xyz.tjrb.bana.plist"
+check "handover: then that it did not answer" has "$T/out" "bana $V's daemon did not answer: starting bana $V's again"
+check "handover: and that the one before runs" has "$T/out" "the daemon is back on $V"
+check "handover: with no unbound variable" lacks "$T/out" "unbound"
+check "handover: daemon.d is the one before again" diff -r "$T/before-start" "$m"
+check "handover: the new one is daemon.d.bad" test -e "$m.bad/bin/bana" -a ! -e "$m.prev"
+check "handover: started again after the failed start" same "$(grep -c '^launchctl bootstrap' "$FAKE_LOG")" 2
+
+# Stopped while it waits for the new daemon (Ctrl-C, kill, the terminal closed): the one
+# before runs again. The new one answers as another version, so it waits.
+for sig in TERM HUP; do
+  rm -rf "$T/before-sig" && cp -R "$m" "$T/before-sig"
+  : >"$FAKE_LOG"
+  (cd "$HOME" && FAKE_VERSION=0.0.0 BANA_DAEMON_STEP=1 exec bash "$bana" daemon install --no-open) >"$T/out" 2>&1 &
+  bp=$!
+  for ((k = 0; k < 300; k++)); do grep -q '^launchctl bootstrap' "$FAKE_LOG" && break; sleep 0.1; done
+  kill -"$sig" "$bp"
+  wait "$bp" && st=0 || st=$?
+  check "handover: $sig while it waits: fails" same "$st" 1
+  check "handover: $sig: daemon.d is the one before again" diff -r "$T/before-sig" "$m"
+  check "handover: $sig: the new one is daemon.d.bad" test -e "$m.bad/bin/bana" -a ! -e "$m.prev"
+  check "handover: $sig: the one before started again" same "$(grep -c '^launchctl bootstrap' "$FAKE_LOG")" 2
+done
+# Ctrl-C: a job in the background ignores SIGINT, so python3 gives it back.
+(cd "$HOME" && FAKE_VERSION=0.0.0 BANA_DAEMON_STEP=1 exec python3 -c \
+  'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvp("bash", sys.argv[1:])' \
+  bash "$bana" daemon install --no-open) >"$T/out" 2>&1 &
+bp=$!
+for ((k = 0; k < 300; k++)); do grep -q 'Waiting for the daemon' "$T/out" && break; sleep 0.1; done
+kill -INT "$bp"
+wait "$bp" || true
+check "handover: INT: says it was stopped, and starts the one before" has "$T/out" \
+  "bana $V's daemon install was stopped: starting bana 0.0.0's again"
+check "handover: INT: the one before runs" has "$T/out" "the daemon is back on 0.0.0"
+
+# One install at a time; a lock whose process is gone is taken over.
+sleep 60 &
+sp=$!
+mkdir "$m.lock" && echo "$sp" >"$m.lock/pid"
+(cd "$HOME" && bash "$bana" daemon install --no-open) >"$T/out" 2>&1 && st=0 || st=$?
+check "handover: another install runs: refused" same "$st" 1
+check "handover: says so" has "$T/out" "Another bana daemon install runs (pid $sp): try again once it ends"
+check "handover: and its lock stays" test -e "$m.lock/pid"
+kill "$sp"
+wait "$sp" 2>/dev/null || true
+(cd "$HOME" && bash "$bana" daemon install --no-open) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "handover: a stale lock is taken over, and goes" test ! -e "$m.lock"
+
 # The push hook while daemon.d is away (between the two renames).
 bash "$bana" add </dev/null >/dev/null 2>&1 || true
 hook=$(git rev-parse --git-path hooks)/reference-transaction
@@ -1877,6 +1931,13 @@ check "handover (Linux): the snapshot before is kept" test -e "$m.prev/bin/bana"
 (cd "$HOME" && FAKE_VERSION=0.0.0 bash "$bana" daemon install) >"$T/out" 2>&1 || true
 check "handover (Linux): back on the one before" has "$T/out" "the daemon is back on 0.0.0"
 check "handover (Linux): restarted twice" same "$(grep -c 'systemctl --user restart bana.service' "$FAKE_LOG")" 2
+rm -rf "$T/before-start" && cp -R "$m" "$T/before-start"
+touch "$FAKE_STATE/start-fail"
+(cd "$HOME" && bash "$bana" daemon install) >"$T/out" 2>&1 && st=0 || st=$?
+check "handover (Linux): a new daemon that cannot start fails the install" same "$st" 1
+check "handover (Linux): systemd could not start it, and the one before runs" has "$T/out" "the daemon is back on $V"
+check "handover (Linux): with no unbound variable" lacks "$T/out" "unbound"
+check "handover (Linux): daemon.d is the one before again" diff -r "$T/before-start" "$m"
 unset BANA_DAEMON_BIN BANA_DAEMON_STEP
 
 # ---- package: bana's release files, from .github/release.sh pack and dist -----------------------
@@ -1911,6 +1972,8 @@ want=$( (cd "$here/.." && { printf '%s\n' bin/bana bin/bana-manager LICENSE READ
 for p in linux-x64 linux-arm64 macos-x64 macos-arm64; do
   check "package: $p holds bana-v$V/, with bana's files and nothing else" same "$(tar -tzf "$T/dist/bana-v$V-$p.tar.gz" | LC_ALL=C sort)" "$want"
 done
+check "package: its files are root's (0:0), not the build's user's" \
+  same "$(tar --numeric-owner -tvzf "$T/dist/bana-v$V-linux-x64.tar.gz" | awk '{ print $2 }' | sort -u)" "0/0"
 tar -xzOf "$T/dist/bana-v$V-linux-x64.tar.gz" "bana-v$V/bin/bana" >"$T/w/bana.packed"
 check "package: bin/bana has the commit stamped" has "$T/w/bana.packed" "BANA_COMMIT=$sha #"
 check "package: and only that line differs from bana's" same "$(diff "$bana" "$T/w/bana.packed" | grep -c '^[<>]')" 2
@@ -1919,6 +1982,11 @@ check "package: install.sh is bana's, for v$V" bash -c "grep -qx \"NAME='bana'\"
 check "package: notes.md says how to install" has "$T/dist/notes.md" \
   "curl -fsSL https://github.com/tjrb-xyz/bana/releases/latest/download/install.sh | sh"
 check "package: notes.md names the platforms" has "$T/dist/notes.md" "Platforms: linux-arm64, linux-x64, macos-arm64, macos-x64."
+rm -rf "$T/w/dr" && mkdir -p "$T/w/dr" && cp "$T/dist"/*.tar.gz "$T/w/dr/"
+BANA_RELEASE_REPO=acme/bana bash "$release_sh" dist "$T/w/dr" "$V" >/dev/null 2>&1 || true
+check "package: BANA_RELEASE_REPO names the repository its install.sh downloads from" \
+  bash -c "grep -qx \"REPO='acme/bana'\" '$T/w/dr/install.sh' && grep -qF 'https://github.com/acme/bana/releases/latest/download/install.sh' '$T/w/dr/notes.md'"
+rm -rf "$T/w/dr"
 check "package: pack refuses another version than bin/bana's" bash -c "! GITHUB_SHA=$sha bash '$release_sh' pack '$T/manager' 9.9.9 linux-x64 '$T/w/x' 2>'$T/out'"
 check "package: and says so" has "$T/out" "pack: bin/bana is bana $V, not 9.9.9"
 check "package: pack refuses an unknown platform" bash -c "! GITHUB_SHA=$sha bash '$release_sh' pack '$T/manager' $V linux-riscv '$T/w/x' 2>/dev/null"
@@ -1979,6 +2047,14 @@ check "hook: current stays" same "$(readlink "$p/current")" "v$V"
 check "hook: 9.9.9 is not installed" test ! -e "$p/v9.9.9"
 check "hook: the daemon's files are the ones before" diff -r "$T/before" "$m"
 rm -rf "$T/before"
+# A bana command that is not the installer's (it would stay): the install stops before the daemon moves.
+mv "$b/bana" "$T/w/bana.link" && cp "$bana" "$b/bana"
+inst "$T/dist9" && st=0 || st=$?
+check "hook: a command not the installer's stops the install" same "$st" 1
+check "hook: and says so" has "$T/out" "$b/bana is not this installer's: remove it, or install with --bin-dir DIR"
+check "hook: before the daemon moves" lacks "$T/out" "Waiting for the daemon"
+check "hook: current stays" same "$(readlink "$p/current")" "v$V"
+rm -f "$b/bana" && mv "$T/w/bana.link" "$b/bana"
 pid=$(health_pid)
 : >"$FAKE_LOG"
 check "hook: upgrade to 9.9.9, with the daemon" inst "$T/dist9"
@@ -2121,6 +2197,18 @@ rm "$FAKE_RELEASES/down"
 echo v8.0.1 >"$FAKE_RELEASES/latest"
 (cd "$HOME" && "$m/bin/bana" daemon uninstall && sh "$p/v8.0.0/install.sh" --uninstall --prefix "$p" --yes) >/dev/null 2>&1 || true
 
+# HOME through a link: the upgrade names the prefix as the installer's links do.
+rm -rf "$p" "$b/bana"
+ln -s "$HOME" "$T/w/hl"
+(cd "$T/w/hl" && HOME=$T/w/hl sh "$FAKE_RELEASES/download/v8.0.0/install.sh" --from "$FAKE_RELEASES/download/v8.0.0" --yes &&
+  HOME=$T/w/hl "$T/w/hl/.local/bin/bana" upgrade) >"$T/out" 2>&1 && st=0 || st=$?
+check "upgrade: HOME through a link" same "$st" 0
+check "upgrade: the command is the installer's still" lacks "$T/out" "left alone"
+check "upgrade: and in the receipt, by the link's path" has "$p/receipt" "link=$T/w/hl/.local/bin/bana"
+(cd "$T/w/hl" && HOME=$T/w/hl sh "$d1/install.sh" --uninstall --yes) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "upgrade: so --uninstall removes it" test ! -e "$b/bana" -a ! -L "$b/bana"
+rm -f "$T/w/hl"
+
 # The old install.sh's checkout (~/.bana/src, its link in ~/.local/bin): the hook moves the
 # daemon to the release, then the link; a failure after puts the link back.
 fresh
@@ -2209,6 +2297,11 @@ root_install && st=0 || st=$?
 check "root-install: no release yet: the git checkout" bash -c "test $st = 0 && test -d '$s/.git' && test \"\$(readlink '$b/bana')\" = '$s/bin/bana'"
 check "root-install: and says so" has "$T/out" "No bana release yet: a git checkout in $s instead"
 mv "$T/latest" "$FAKE_RELEASES/latest"
+# XDG_BIN_HOME elsewhere: the old checkout's link (always in ~/.local/bin) becomes the release's.
+rm -rf "$p" && legacy_src
+XDG_BIN_HOME=$T/w/xb root_install && st=0 || st=$?
+check "root-install: XDG_BIN_HOME elsewhere: the old link is the release's" \
+  bash -c "test $st = 0 && test \"\$(readlink '$b/bana')\" = '$p/current/bin/bana' && test ! -e '$T/w/xb/bana'"
 
 # ---- notice: a newer bana is out (the daemon's health says), and a daemon on another bana ------
 fresh

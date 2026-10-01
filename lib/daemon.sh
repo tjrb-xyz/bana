@@ -711,16 +711,40 @@ d_stage() { # PORT TRAY
   echo "  settings: $d_settings"
 }
 
+# One install at a time: two would share daemon.d.new. The lock has its pid; one whose
+# process is gone is stale.
+d_lock() {
+  local lock=$d_dir.lock pid tries=0
+  mkdir -p "$base_home"
+  until mkdir "$lock" 2>/dev/null; do
+    tries=$((tries + 1))
+    ((tries < 5)) || die "Cannot take $lock"
+    # No pid yet: its taker may be writing it.
+    pid=$(cat "$lock/pid" 2>/dev/null) || { sleep 1; pid=$(cat "$lock/pid" 2>/dev/null || true); }
+    if [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      die "Another bana daemon install runs (pid $pid): try again once it ends"
+    fi
+    # Stale: it goes, unless someone took it over meanwhile.
+    [[ $(cat "$lock/pid" 2>/dev/null || true) != "$pid" ]] || rm -rf "$lock"
+  done
+  trap 'rm -rf "$d_dir.lock"' EXIT
+  echo "$$" >"$lock/pid.$$"
+  mv "$lock/pid.$$" "$lock/pid"
+}
+
 # daemon.d.new becomes daemon.d, by two renames: the one before is daemon.d.prev (a
-# daemon still running keeps its files).
+# daemon still running keeps its files). No Ctrl-C between the two: the caller says
+# what one does after.
 d_swap() {
   rm -rf "$d_dir.prev"
+  trap '' INT TERM HUP
   [[ ! -d $d_dir ]] || mv "$d_dir" "$d_dir.prev"
   mv "$d_dir.new" "$d_dir"
 }
 
 # Waits for the daemon on PORT to answer as bana VERSION, from a process other than
-# NOT-PID (if given). d_last: the last answer of the one daemon.
+# NOT-PID (if given). d_last: the last answer of the one daemon ('' when none did).
+d_last=''
 d_confirm() { # PORT VERSION [NOT-PID]
   local k h
   d_last=''
@@ -776,6 +800,7 @@ daemon_install() {
     ((n != 1)) || port=$old
   fi
   if ! [[ $port =~ ^[0-9]+$ ]] || ((port < 1 || port > 65535)); then die "--port: a port number, not '$port'"; fi
+  d_lock
   # The port must be free, or this daemon's, or a daemon's of before (it stops).
   if h=$(curl -fsS --noproxy '*' --max-time 3 "http://127.0.0.1:$port/ci/v1/health" 2>/dev/null); then
     if ! grep -Eq '"daemon": *true' <<<"$h" || { ! d_is_ours "$h" && [[ -z $olds ]]; }; then
@@ -794,8 +819,18 @@ daemon_install() {
     was=$name
   fi
   d_swap
+  # Stopped (Ctrl-C, the terminal closed) before the new daemon answers: the one before again.
+  if [[ -d $d_dir.prev ]]; then
+    for k in INT TERM HUP; do
+      # shellcheck disable=SC2064 # the values now
+      trap "d_interrupted $k $(printf '%q ' "$port" "$was" "${was:-$name}")" "$k"
+    done
+  else
+    trap - INT TERM HUP
+  fi
   say "Waiting for the daemon on port $port"
   if d_restart && d_confirm "$port" "$BANA_VERSION" "$pid"; then
+    trap - INT TERM HUP
     if [[ -n ${was:-$name} && ${was:-$name} != "$BANA_VERSION" ]]; then
       say "The daemon runs bana $BANA_VERSION (was ${was:-$name}). Its page: $(d_url "$port")"
     else
@@ -810,15 +845,24 @@ daemon_install() {
   if [[ $os == Darwin && -n $open ]]; then open "$(d_url "$port")" || true; fi
 }
 
+# Install was stopped by SIGNAL after the swap: the one before runs again (with no
+# terminal to say so after a HUP).
+d_interrupted() { # SIGNAL PORT WAS NAME
+  [[ $1 != HUP ]] || exec >/dev/null 2>&1
+  d_rollback "$2" "$3" "$4" "install was stopped"
+}
+
 # The new snapshot's daemon did not come up as this bana (SAID): the one before
 # (daemon.d.prev, bana NAME, whose health says WAS) runs again, and the new one stays in
 # daemon.d.bad for its log.
 d_rollback() { # PORT WAS NAME SAID
-  local bad start
-  bad=$(d_health_pid "$d_last")
+  local bad='' start
+  [[ -z $d_last ]] || bad=$(d_health_pid "$d_last")
+  trap '' INT TERM HUP
   rm -rf "$d_dir.bad"
   mv "$d_dir" "$d_dir.bad"
   mv "$d_dir.prev" "$d_dir"
+  trap - INT TERM HUP
   warn "bana $BANA_VERSION's daemon $4: starting bana $3's again"
   if d_restart && d_confirm "$1" "$2" "$bad"; then
     die "bana $BANA_VERSION's daemon did not come up; the daemon is back on $3. Its log: bana daemon log, files in $(d_tilde "$d_dir.bad")"
