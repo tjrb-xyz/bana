@@ -103,7 +103,7 @@ download() { # ASSET DIR
     gh release download "$TAG" -R "$REPO" -p "$1" -D "$2" --clobber
   elif command -v curl >/dev/null 2>&1; then
     curl -fL --proto '=https' --tlsv1.2 --progress-bar -o "$2/$1" "$url/$1" ||
-      die "could not download $url/$1 ($REPO may be private: install the GitHub CLI and run 'gh auth login')"
+      die "could not download $url/$1 (a private repository needs gh: gh auth login)"
   else
     die "need the GitHub CLI (gh) or curl to download"
   fi
@@ -149,7 +149,8 @@ unpack() {
   [ "$(printf '%s\n' "$top" | wc -l | tr -d ' ')" = 1 ] ||
     die "$asset should hold one directory, and has: $(printf '%s\n' "$top" | tr '\n' ' ')"
   mkdir "$2"
-  tar -xzf "$1" -C "$2"
+  # As the one who installs, not the owner the archive names (root keeps those otherwise).
+  tar -x --no-same-owner -zf "$1" -C "$2"
   src=$2/$top
   [ -d "$src" ] || die "$asset should hold one directory, and $top is not one"
   [ ! -L "$src" ] || die "$asset should hold one directory, and $top is a link"

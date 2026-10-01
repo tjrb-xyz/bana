@@ -194,7 +194,8 @@ installer_main() {
       if ((local_)); then
         echo "#   sh install.sh --from DIR (DIR: this build's files; bana install on the daemon's machine)"
       else
-        echo "#   gh release download $tag -R $repo -p install.sh -O - | sh"
+        echo "#   curl -fsSL https://github.com/$repo/releases/download/$tag/install.sh | sh"
+        echo "#   gh release download $tag -R $repo -p install.sh -O - | sh   (a private repository)"
       fi
       installer_let NAME "$name"
       installer_let REPO "$repo"

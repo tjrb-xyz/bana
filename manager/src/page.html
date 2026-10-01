@@ -94,6 +94,7 @@ code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px
     <span class="muted" id="updated"></span>
   </header>
   <p class="error" id="fatal" hidden></p>
+  <p id="upgrade" hidden>bana <a id="upgrade-link" href="#" target="_blank" rel="noopener"></a> is out (this daemon runs <span id="upgrade-runs"></span>): run <code>bana upgrade</code></p>
 
   <section id="ci" hidden>
     <h2>Local CI</h2>
@@ -282,6 +283,15 @@ const noToken = () => daemon
 const $ = (id) => document.getElementById(id);
 const chip = (l) => `<span class="chip${/^usb-/.test(l) ? " hw" : ""}">${esc(l)}</span>`;
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+// A newer bana (the health's or a summary's "latest"): one line under the header.
+let runs = "";
+function showLatest(o) {
+  $("upgrade").hidden = !o.latest;
+  if (!o.latest) return;
+  $("upgrade-link").textContent = o.latest;
+  $("upgrade-link").href = o.latest_url;
+  $("upgrade-runs").textContent = runs;
+}
 function show(id, text) { const el = $(id); el.hidden = !text; el.textContent = text || ""; }
 
 const apiBase = () => daemon ? "/ci/v1/p/" + encodeURIComponent(project) : "/ci/v1";
@@ -1100,6 +1110,7 @@ async function refreshLocal() {
     show("project-error", "");
     const l = await api("GET", "/local");
     local = l;
+    showLatest(l);
     const sig = JSON.stringify([l.running && [l.running.id, l.running.state], l.last && l.last.id, l.queue.map((q) => q.id), l.watcher.unposted]);
     if (sig !== lastSig || Date.now() - buildsAt > 30000) {
       builds = (await api("GET", "/builds?limit=100")).builds;
@@ -1200,6 +1211,8 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden && da
   let h = {};
   try { h = await (await fetch("/ci/v1/health")).json(); } catch (e) {}
   daemon = h.daemon === true;
+  runs = h.version || "";
+  showLatest(h);
   if (daemon) {
     $("ci").hidden = false;
     $("pool-box").open = false;

@@ -27,6 +27,7 @@ pub mod server;
 pub mod sweep;
 #[cfg(target_os = "macos")]
 pub mod tray;
+pub mod upgrade;
 pub mod watch;
 
 use serde::Serialize;

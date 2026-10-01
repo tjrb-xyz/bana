@@ -21,7 +21,8 @@ Ubuntu. It was extracted from its first user, a project kept here as [the worked
 
 ## CI on push: bana daemon
 
-With act, OrbStack (running), the GitHub CLI signed in and Rust (cargo builds the daemon the first time):
+With act, OrbStack (running) and the GitHub CLI signed in (and Rust in a git checkout of bana, where cargo builds
+the daemon the first time; a release has it built):
 
 ```sh
 brew install act gh yq           # and OrbStack, for Docker
@@ -34,7 +35,7 @@ bana ci                          # once by hand: the workflow works under act
 git push                         # builds on this Mac
 ```
 
-Install checks the machine and starts the one daemon; run it again to take a newer bana. `bana add` checks the
+Install checks the machine and starts the one daemon; `bana upgrade` takes a newer bana, the daemon first. `bana add` checks the
 project and warns about what in the workflow would go wrong under the daemon
 ([below](#what-the-workflow-needs)), then adds it: the daemon builds it in its own clone,
 `~/.bana/<prefix>/src`, never in your checkout, and starts from the branches as they are: the next push builds.
@@ -331,9 +332,10 @@ published without your click: not from the menu bar, not by Claude.
 People install a release with its installer, from GitHub:
 
 ```sh
-gh release download v0.1.0 -R OWNER/REPO -p install.sh -O - | sh            # macOS, Linux (private repositories too)
-curl -fsSL https://github.com/OWNER/REPO/releases/download/v0.1.0/install.sh | sh   # a public repository
-gh release download v0.1.0 -R OWNER/REPO -p install.ps1 -O - | Out-String | iex    # Windows
+curl -fsSL https://github.com/OWNER/REPO/releases/download/v0.1.0/install.sh | sh   # macOS, Linux
+gh release download v0.1.0 -R OWNER/REPO -p install.sh -O - | sh            # a private repository
+irm https://github.com/OWNER/REPO/releases/download/v0.1.0/install.ps1 | iex       # Windows
+gh release download v0.1.0 -R OWNER/REPO -p install.ps1 -O - | Out-String | iex    # Windows, a private repository
 ```
 
 [docs/DAEMON.md](docs/DAEMON.md#releases) has the rest: how the previous release is found, the checks before a
@@ -404,15 +406,17 @@ git submodule add https://github.com/tjrb-xyz/bana tools/bana
 git -C tools/bana checkout <commit or tag>
 ```
 
-Or install it per machine, with a checkout in `~/.bana/src` and `bana` on your PATH (run it again to update;
-`sh -s -- REF` pins a tag or commit):
+Or install it per machine: a release in `~/.local/share/bana`, `bana` on your PATH in `~/.local/bin`, and
+`bana upgrade` to update (it checks the release's install.sh against its SHA256SUMS, and moves the daemon first):
 
 ```sh
-curl -fsSL -H "Authorization: token $(gh auth token)" \
-  https://raw.githubusercontent.com/tjrb-xyz/bana/main/install.sh | sh
+curl -fsSL https://github.com/tjrb-xyz/bana/releases/latest/download/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/tjrb-xyz/bana/main/install.sh | sh -s -- --git   # a git checkout instead
 ```
 
-The header is there because bana is private; with gh signed in, the script also fetches bana through gh.
+The second, bana's own install.sh, takes the newest release too (`sh -s -- vX.Y.Z`: that one), and a git checkout in
+`~/.bana/src` with `--git [REF]` or while there is no release yet. A bana it installed in `~/.bana/src` before the
+releases moves to them with `bana upgrade`; `~/.bana/src` stays until you remove it.
 
 **2. Write `.github/bana.conf`** (or `bana.conf` at the root). `key = value` lines; `#` starts a comment line.
 Every key can be overridden by `BANA_<KEY>` in the environment (`plan.path.rust` is `BANA_PLAN_PATH_RUST`).
@@ -491,11 +495,8 @@ Two composite actions, for workflows that want them:
     # a job output: ${{ fromJSON(steps.plan.outputs.json).rust }}
 ```
 
-bana is a private repository, so its actions work in other repositories only after bana's
-**Settings → Actions → General → Access** allows repositories owned by `tjrb-xyz`. Then no token is needed.
 Without actions, run the same commands in a step: `tools/bana/bin/bana changed "$BEFORE" "$BRANCH" |
-tools/bana/bin/bana plan "$TIER" >> "$GITHUB_OUTPUT"`. That needs the submodule checked out in the job, which a
-private submodule does not allow with the default token.
+tools/bana/bin/bana plan "$TIER" >> "$GITHUB_OUTPUT"`. That needs the submodule checked out in the job.
 
 ### Tiers and plan
 
@@ -563,8 +564,7 @@ On the MacBook, in the example's checkout:
 ```sh
 brew install act gh yq                       # and OrbStack, running; rustup is there already
 gh auth login
-curl -fsSL -H "Authorization: token $(gh auth token)" \
-  https://raw.githubusercontent.com/tjrb-xyz/bana/main/install.sh | sh   # bana on the PATH
+curl -fsSL https://github.com/tjrb-xyz/bana/releases/latest/download/install.sh | sh   # bana on the PATH
 bana add --check                             # every job has a place; exits 1 for package's SPLIT matrix
 bana ci nightly                              # every job once, by hand; fix what fails
 bana daemon install                          # once on the MacBook
@@ -609,7 +609,7 @@ bana report [BUILD | last | --log FILE|-] [--json]   # the CI report, per standa
 bana installer DIST (--tag T | --label L)   # the project's install.sh, install.ps1 and SHA256SUMS
 bana install [BUILD | --from FILE|DIR]     # a daemon build's files, on this machine
 bana mcp             # bana's tools for Claude Code, by hand (an MCP server on stdio)
-bana daemon install [--port N] [--no-tray] [--no-open] [--now]   # once a machine
+bana daemon install [--port N] [--no-tray | --tray] [--no-open] [--now]   # once a machine
 bana daemon status|log|open|poke|run|uninstall   # docs/DAEMON.md
 bana add [--check] [--diff] [--workflow F] [--no-hook] [--no-claude]   # a project's CI on the daemon here
 bana list            # the projects added here
@@ -623,6 +623,8 @@ bana start|stop NAME # one runner
 bana down            # this machine's runners leave the pool
 bana manager         # the page, at http://127.0.0.1:8470/#token=… (the daemon's, when it runs)
 bana settings        # the settings in effect
+bana version         # this bana (a release's, or a checkout's commit), and the daemon's if other
+bana upgrade [vX.Y.Z] [--check] [--now] [--yes]   # the newest release, the daemon first (a downgrade asks)
 ```
 
 Run them from the project's checkout: that is where bana finds bana.conf. `bana daemon`, `bana list`, and
@@ -636,8 +638,8 @@ Otherwise pass `--token`: *Settings → Actions → Runners → New self-hosted 
 ## The manager
 
 The manager is the pool's page. While the daemon runs, `bana manager` opens the daemon's page, which
-has the same sections under *Runner pool (optional)*. Otherwise it builds the manager with cargo (a minute the
-first time) and starts a page on `http://127.0.0.1:8470`:
+has the same sections under *Runner pool (optional)*. Otherwise it starts the release's manager (in a git
+checkout of bana, cargo builds it: a minute the first time) and a page on `http://127.0.0.1:8470`:
 
 - **this machine's runners**: *waiting for a job* (the listener runs), *running a job* (a worker runs too) or
   *stopped*, with Start and Stop; and its USB audio devices with their labels;
@@ -690,11 +692,20 @@ own devices reach only its macOS runner.
 bash, bash 3.2) through every stage of example's hook, `tests/install-ps1.sh` runs install.ps1 on pwsh, and
 `tests/install-real.sh` runs install.sh on the machine's own tools (on a Mac: sysctl, BSD tar, /sbin/sha256sum and a
 quarantined download). `.github/workflows/test.yml` runs them on Ubuntu and on
-macOS (stock bash 3.2), plus shellcheck and the manager's tests. On a private repository the macOS job's
-minutes count ten times. `.github/workflows/installer.yml` runs install.ps1 on Windows (PowerShell 5.1 and 7:
+macOS (stock bash 3.2), plus shellcheck and the manager's tests. `.github/workflows/installer.yml` runs install.ps1 on Windows (PowerShell 5.1 and 7:
 the junction, the user PATH, Unblock-File, the hook under a Restricted policy), only when the installer changes.
 `BANA_E2E=1 tests/e2e-daemon.sh` runs the daemon with real act: a push uploads an archive per CPU, and the
 green build's installer installs one under a scratch home; then a second project is added while it runs, paused,
 resumed, and outlives the removal of the first.
+
+## Releasing bana
+
+1. `.github/release.sh bump X.Y.Z` sets the version in bin/bana and the manager; a pull request, merged.
+2. *Actions → release → Run workflow* with `X.Y.Z`: a dry run. It runs the tests, builds bana-manager for
+   linux-x64, linux-arm64, macos-arm64 and macos-x64, packs them, installs the release on Linux and a Mac, and
+   leaves the files as the artifact `bana-vX.Y.Z-dist`. It never publishes.
+3. `git tag vX.Y.Z && git push origin vX.Y.Z` (a commit on main) runs the same and publishes, through the
+   `release` environment (*Settings → Environments* can require a reviewer). A `-` makes a prerelease.
+4. A bad release: `gh release delete vX.Y.Z`, and people go back with `bana upgrade vPREV`.
 
 License: GPL-3.0-only.

@@ -974,6 +974,22 @@ pub struct TrayView {
     /// What a left click (and Open bana) opens: the project whose build
     /// runs, else the first, and its build.
     pub open: Option<(String, Option<u64>)>,
+    /// `bana v0.2.0 is out…`, while a newer bana is: it opens the release.
+    pub latest_line: Option<String>,
+    pub latest: Option<String>,
+}
+
+impl TrayView {
+    /// A newer bana is out (`v0.2.0`): the machine's line says so, and the
+    /// menu has an item for it.
+    pub fn with_latest(mut self, latest: Option<&str>) -> Self {
+        if let Some(l) = latest {
+            self.status_line += &format!(" · {l} is out");
+            self.latest_line = Some(format!("bana {l} is out…"));
+            self.latest = Some(l.to_string());
+        }
+        self
+    }
 }
 
 /// One project's submenu.
@@ -1073,6 +1089,8 @@ pub fn tray_view(all: &[Summary], errors: &[(String, String)]) -> TrayView {
         status_line,
         projects,
         open,
+        latest_line: None,
+        latest: None,
     }
 }
 
@@ -2495,6 +2513,17 @@ mod tests {
             (only.title.as_str(), only.open),
             ("🧱 !", Some(("c".into(), None)))
         );
+    }
+
+    #[test]
+    fn tray_view_machine_line_shows_newer() {
+        let v = tray_view(&[summary()], &[]);
+        assert_eq!(v.clone().with_latest(None), v, "none out: as it was");
+        let n = v.with_latest(Some("v0.2.0"));
+        assert_eq!(n.status_line, "bana: idle · v0.2.0 is out");
+        assert_eq!(n.latest_line.as_deref(), Some("bana v0.2.0 is out…"));
+        assert_eq!(n.latest.as_deref(), Some("v0.2.0"));
+        assert_eq!(n.title, BRICK, "the title stays");
     }
 
     #[test]

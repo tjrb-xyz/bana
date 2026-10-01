@@ -6,7 +6,8 @@
 //! - left click: opens the page on the running build (else the first
 //!   project's latest);
 //! - right click: the menu: the machine's line, Open bana, one submenu per
-//!   project, Quit bana. A project's submenu (`app: building main 1a2b3c4`)
+//!   project, bana vX is out… while a newer bana is (it opens the release),
+//!   Quit bana. A project's submenu (`app: building main 1a2b3c4`)
 //!   has its last result, Publish vX… while bana asks to publish a release,
 //!   Fix #N with Claude… while its last build failed, Open, Cancel #N while
 //!   a build runs, and Pause automatic builds. A project that cannot start
@@ -29,6 +30,7 @@
 
 use crate::actlog::{cut, menu_action, menu_id, tray_view, ProjectView, Summary, BRICK};
 use crate::registry::Registry;
+use crate::upgrade;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -94,6 +96,8 @@ struct Items {
     quit: MenuItem,
     /// After the projects' submenus, while there are any.
     gap: PredefinedMenuItem,
+    /// `bana v0.2.0 is out…`, before Quit while a newer bana is.
+    latest: MenuItem,
 }
 
 /// One project's submenu and its items, each in it while it applies.
@@ -202,6 +206,8 @@ struct Shown {
     /// What a left click opens: a project, and its build.
     open: Option<(String, Option<u64>)>,
     projects: BTreeMap<String, ShownProject>,
+    /// The newer bana the menu has an item for.
+    latest: Option<String>,
 }
 
 fn menu() -> (Menu, Items) {
@@ -216,6 +222,7 @@ fn menu() -> (Menu, Items) {
         open,
         quit,
         gap: PredefinedMenuItem::separator(),
+        latest: MenuItem::new("", true, None),
     };
     (menu, it)
 }
@@ -230,7 +237,7 @@ fn show(tray: &TrayIcon, it: &Items, s: &mut Shown) {
         .iter()
         .map(|(_, d)| d.published())
         .collect();
-    let v = tray_view(&all, &s.registry.errors());
+    let v = tray_view(&all, &s.registry.errors()).with_latest(s.registry.latest().as_deref());
     tray.set_title(Some(&v.title));
     let _ = tray.set_tooltip(Some(&v.tooltip));
     it.status.set_text(&v.status_line);
@@ -254,10 +261,32 @@ fn show(tray: &TrayIcon, it: &Items, s: &mut Shown) {
             let _ = it.menu.insert(&it.gap, PROJECTS_AT + v.projects.len());
         }
     }
+    match (&v.latest_line, s.latest.is_some()) {
+        (Some(l), shown) => {
+            it.latest.set_text(l);
+            if !shown {
+                let _ = it.menu.insert(&it.latest, it.menu.items().len() - 1);
+            }
+        }
+        (None, true) => {
+            let _ = it.menu.remove(&it.latest);
+        }
+        (None, false) => {}
+    }
+    s.latest = v.latest;
     for pv in v.projects {
         if let Some(p) = s.projects.get_mut(&pv.prefix) {
             p.show(pv);
         }
+    }
+}
+
+/// The release page of the newer bana.
+fn open_latest(s: &Shown) {
+    let env = std::env::var("BANA_RELEASES").ok();
+    let releases = upgrade::releases(env.as_deref()).unwrap_or_else(|| upgrade::RELEASES.into());
+    if let Some(tag) = &s.latest {
+        open(&format!("{releases}/tag/{tag}"));
     }
 }
 
@@ -414,6 +443,7 @@ pub fn run(quit: Arc<Notify>, start: impl FnOnce(Tray)) -> ! {
                     rt,
                     open: None,
                     projects: BTreeMap::new(),
+                    latest: None,
                 });
                 true
             }
@@ -444,6 +474,8 @@ pub fn run(quit: Arc<Notify>, start: impl FnOnce(Tray)) -> ! {
                 } else if let Some(s) = &shown {
                     if e.id == it.open.id() {
                         open_shown(s);
+                    } else if e.id == it.latest.id() {
+                        open_latest(s);
                     } else if let Some((p, a)) = menu_action(e.id.as_ref()) {
                         act(s, p, a);
                     }

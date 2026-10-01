@@ -16,6 +16,7 @@ use crate::fix;
 use crate::guard::{err, guarded, health, Access};
 use crate::registry::Registry;
 use crate::release;
+use crate::upgrade;
 use crate::{
     attach_jobs, parse_local, parse_pool, parse_runs, runs_to_detail, valid_ref, valid_runner,
     valid_tier, Local, PoolRunner, RunView,
@@ -503,6 +504,7 @@ pub fn daemon_router(r: Arc<Registry>, access: Arc<Access>) -> Router {
     let api = Router::new()
         .route("/health", get(daemon_health))
         .route("/projects", get(projects).post(rescan))
+        .route("/p/{prefix}/local", get(project_local))
         .route("/p/{prefix}/{*rest}", any(forward))
         .with_state(r);
     guarded(
@@ -536,12 +538,26 @@ fn pool_routes(m: Arc<Manager>) -> Router {
 type R = State<Arc<Registry>>;
 
 /// Open: `bana` looks for it, and a daemon starting asks it.
+/// Its version and pid tell `bana daemon install` that the new daemon runs.
+/// "latest": a newer bana's tag, when one is out.
 async fn daemon_health(State(r): R) -> Json<Value> {
     let m = r.machine();
-    Json(
-        json!({"ok": true, "service": "ci", "api": 1, "daemon": true, "global": true,
-        "port": m.port, "machine": m.machine, "projects": r.prefixes()}),
-    )
+    let mut h = json!({"ok": true, "service": "ci", "api": 1, "daemon": true, "global": true,
+        "version": env!("CARGO_PKG_VERSION"), "pid": std::process::id(),
+        "port": m.port, "machine": m.machine, "projects": r.prefixes()});
+    latest(&r, &mut h);
+    Json(h)
+}
+
+/// A newer bana's tag, and its release page, when one is out.
+fn latest(r: &Registry, v: &mut Value) {
+    if let Some(l) = r.latest() {
+        let env = std::env::var("BANA_RELEASES").ok();
+        let releases =
+            upgrade::releases(env.as_deref()).unwrap_or_else(|| upgrade::RELEASES.into());
+        v["latest_url"] = json!(format!("{releases}/tag/{l}"));
+        v["latest"] = json!(l);
+    }
 }
 
 /// The projects as JSON, one a line: the shell reads it with sed.
@@ -601,6 +617,20 @@ async fn forward(State(r): R, req: axum::extract::Request) -> Response {
         Ok(res) => res,
         Err(e) => match e {},
     }
+}
+
+/// A project's summary ([`local`]), with a newer bana's tag when one is out.
+async fn project_local(
+    State(r): R,
+    Path(prefix): Path<String>,
+    req: axum::extract::Request,
+) -> Response {
+    let Some(d) = r.daemon(&prefix) else {
+        return forward(State(r), req).await;
+    };
+    let mut v = local_view(&d);
+    latest(&r, &mut v);
+    Json(v).into_response()
 }
 
 type D = State<Daemon>;
@@ -731,12 +761,16 @@ async fn project_health(State(d): D) -> Json<Value> {
 
 /// The summary, and what Run now may offer: the refs fetched and the tiers.
 async fn local(State(d): D) -> Json<Value> {
+    Json(local_view(&d))
+}
+
+fn local_view(d: &Daemon) -> Value {
     let mut v = json!(d.summary());
     v["refs"] = json!(d.heads().keys().collect::<Vec<_>>());
     v["tiers"] = json!(d.settings().tiers);
     v["skipped"] = json!(d.skipped().iter().rev().take(20).collect::<Vec<_>>());
     v["port"] = json!(d.settings().port);
-    Json(v)
+    v
 }
 
 #[derive(Deserialize)]
@@ -1790,6 +1824,47 @@ esac"#,
         .await;
         assert_eq!(code, 409, "{v}");
         assert_eq!(put(json!({"notes": "late", "rev": 2})).await.0, 409);
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test]
+    async fn health_reports_version_and_pid() {
+        let (p, d, app) = daemon_app("srv-health").await;
+        let (code, h) = call(&app, "GET", "/ci/v1/health", None, false).await;
+        assert_eq!(code, 200, "{h}");
+        assert_eq!(h["version"], env!("CARGO_PKG_VERSION"), "{h}");
+        assert_eq!(h["pid"], std::process::id(), "{h}");
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test]
+    async fn health_has_latest_when_set() {
+        let p = Project::new("srv-latest");
+        let d = start_daemon(&p, "").await;
+        let r = Registry::of(vec![d.clone()]);
+        let access = Arc::new(Access::loopback(TOKEN, 8470, &["/ci/v1/"]));
+        let app = daemon_router(r.clone(), access);
+        let (_, h) = call(&app, "GET", "/ci/v1/health", None, false).await;
+        assert!(h.get("latest").is_none(), "{h}");
+        let (_, l) = call(&app, "GET", "/ci/v1/p/p/local", None, true).await;
+        assert!(l.get("latest").is_none() && l["tiers"].is_array(), "{l}");
+        r.found_latest(&Ok(Some("v9.9.9".into())));
+        let (_, h) = call(&app, "GET", "/ci/v1/health", None, false).await;
+        assert_eq!(h["latest"], "v9.9.9", "{h}");
+        assert!(
+            h["latest_url"].as_str().unwrap().ends_with("/tag/v9.9.9"),
+            "{h}"
+        );
+        let (code, l) = call(&app, "GET", "/ci/v1/p/p/local", None, true).await;
+        assert_eq!((code, &l["latest"]), (200, &json!("v9.9.9")), "{l}");
+        assert!(l["tiers"].is_array(), "the summary still: {l}");
+        r.found_latest(&Err("offline".into()));
+        let (_, h) = call(&app, "GET", "/ci/v1/health", None, false).await;
+        assert_eq!(h["latest"], "v9.9.9", "a failed check keeps it: {h}");
+        let (code, _) = call(&app, "GET", "/ci/v1/p/nope/local", None, true).await;
+        assert_eq!(code, 404);
         d.shutdown().await;
         p.remove();
     }
