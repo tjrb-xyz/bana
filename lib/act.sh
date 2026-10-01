@@ -236,9 +236,46 @@ act_main() {
   done
   say "act: ${tier:-the workflow} from $(basename "$wf"), Linux jobs in $image ($arch, network $net)$([[ $os == Darwin ]] && echo ", macOS jobs on this Mac")"
   args=(workflow_dispatch "${args[@]}" ${extra[@]+"${extra[@]}"} ${jobs[@]+"${jobs[@]}"} ${pass[@]+"${pass[@]}"})
-  # The daemon reads act's output itself, and a dry run leaves the last run's log.
-  [[ $locked != 1 && -z $dry && $(conf ci.log yes) != no ]] || exec act "${args[@]}"
+  [[ -n $dry ]] || act_actions
+  # The daemon reads act's output itself, through relays that outlive it (act_relay).
+  [[ $locked != 1 ]] || exec act "${args[@]}" > >(act_relay) 2> >(act_relay >&2)
+  # A dry run leaves the last run's log.
+  [[ -z $dry && $(conf ci.log yes) != no ]] || exec act "${args[@]}"
   act_logged "${args[@]}"
+}
+
+# The workflow's actions, fetched before it runs, one job at a time (a dry run), and then
+# used as they are (--action-offline-mode). Jobs that run together and use one action (a
+# matrix) would each fetch it into act's one cache: one job's fetch rewrote the files another
+# was copying into its container, and the job failed. A fix round (offline already) fetches
+# nothing; what this cannot fetch, the run fetches as before.
+# act's dry run still runs a host job's steps (-self-hosted): for it, every label goes to
+# the image, where a dry run runs nothing (the last -P wins).
+act_actions() {
+  local a i dry=()
+  for a in "${args[@]}"; do [[ $a != --action-offline-mode ]] || return 0; done
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    case ${args[i]} in
+    -P | --platform) a=${args[i + 1]:-} ;;
+    -P=* | --platform=*) a=${args[i]#*=} ;;
+    -P?*) a=${args[i]#-P} ;;
+    *) continue ;;
+    esac
+    [[ $a != *=* ]] || dry+=(-P "${a%%=*}=$image")
+  done
+  act "${args[@]}" ${dry[@]+"${dry[@]}"} -n --concurrent-jobs 1 >/dev/null 2>&1 || true
+  args+=(--action-offline-mode)
+}
+
+# act's output on its way to the daemon. If the daemon dies, its pipes close: act, a Go
+# program, would die of SIGPIPE at its next line, and must run on (the daemon's next start
+# stops it). This passes the lines on while it can and drops them after; SIGPIPE is ignored
+# here only, so act and its steps keep the default, as on GitHub. A cancel's SIGINT (to the
+# process group) leaves it running, for act's last lines.
+act_relay() {
+  trap '' PIPE INT
+  local l
+  while IFS= read -r l || [[ -n $l ]]; do printf '%s\n' "$l" 2>/dev/null || :; done
 }
 
 # A run by hand keeps act's output, and what ran, for bana fix: in ~/.bana/<prefix>/ci,
