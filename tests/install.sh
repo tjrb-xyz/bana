@@ -359,7 +359,7 @@ unset FAKE_OS FAKE_ARCH
 fresh
 FAKE_GH=0
 fails_with "not signed in to gh, and a release curl cannot reach" env INSTALL_URL=https://127.0.0.1:1/v1.0.0 nosid "$SH" -s <"$T/releases/v1.0.0/install.sh" >"$T/out" 2>&1
-check "... may be private: gh auth login" out "may be private: install the GitHub CLI and run 'gh auth login'"
+check "... a private repository needs gh" out "(a private repository needs gh: gh auth login)"
 if openssl req -x509 -newkey rsa:2048 -nodes -keyout "$T/key.pem" -out "$T/cert.pem" -days 1 -subj /CN=127.0.0.1 \
   -addext subjectAltName=IP:127.0.0.1 2>/dev/null; then
   port=$((20000 + $$ % 20000))
@@ -388,6 +388,21 @@ fi
 export GITHUB_PATH=$T/github_path FAKE_GH=1
 inst v1.1.0
 check "GITHUB_PATH gets ~/.local/bin (CI)" grep -qx "$b" "$T/github_path"
+
+# bana's own release (.github/release.sh pack and dist, a fake bana-manager): its install.sh and
+# its hook (lib/install-hook.sh), which makes way for the old install.sh's link into ~/.bana/src.
+fresh
+V=$(sed -n 's/^BANA_VERSION=//p' "$bana")
+printf '#!/bin/sh\necho %s\n' "$V" >"$T/bana-manager" && chmod +x "$T/bana-manager"
+if (GITHUB_SHA=0123456789abcdef0123456789abcdef01234567 "$render_bash" "$here/../.github/release.sh" pack "$T/bana-manager" "$V" linux-x64 "$T/bana" &&
+  "$render_bash" "$here/../.github/release.sh" dist "$T/bana" "$V") >"$T/out" 2>&1; then ok "bana's release files"; else bad "bana's release files"; fi
+mkdir -p "$HOME/.bana/src/bin" "$b" && cp "$bana" "$HOME/.bana/src/bin/bana" && ln -s "$HOME/.bana/src/bin/bana" "$b/bana"
+check "bana's install.sh, over the old install.sh's link" x "$T/bana/install.sh" --from "$T/bana" --yes
+check "... bana is the release's" test "$(readlink "$b/bana")" = "$HOME/.local/share/bana/current/bin/bana" -a "$("$b/bana" version)" = "bana $V (release v$V)"
+check "... the old link is in ~/.bana/.upgrade-from" test "$(cat "$HOME/.bana/.upgrade-from")" = "$HOME/.bana/src/bin/bana"
+check "... uninstall" x "$T/bana/install.sh" --uninstall --yes
+check "... ~/.bana stays" test -f "$HOME/.bana/src/bin/bana" -a ! -e "$HOME/.local/share/bana" -a ! -e "$b/bana"
+rm -rf "$T/bana" "$T/bana-manager"
 
 echo "$((n - fails)) of $n passed ($SH)"
 ((fails == 0))

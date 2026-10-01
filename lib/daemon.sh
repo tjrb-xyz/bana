@@ -105,6 +105,9 @@ d_is_ours() { grep -Eq '"global": *true' <<<"$1"; } # the one daemon, not a proj
 # The bana version and the process a health answer names (none: a daemon from before they did).
 d_health_version() { sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' <<<"$1"; } # HEALTH
 d_health_pid() { sed -n 's/.*"pid": *\([0-9][0-9]*\).*/\1/p' <<<"$1"; }        # HEALTH
+d_health_latest() { sed -n 's/.*"latest": *"\(v[0-9A-Za-z.-]*\)".*/\1/p' <<<"$1"; } # HEALTH
+# A newer bana is out (the daemon checks once a day): a line that says so.
+d_latest_line() { local l; l=$(d_health_latest "$1"); [[ -z $l ]] || echo "bana $l is out: bana upgrade"; } # HEALTH
 d_up() { local h; h=$(d_health "$(d_port)") && d_is_ours "$h"; }
 # The daemon reads the projects' files again, and says how each stands: one JSON line a
 # project. A project that starts again waits for its build's checkout first.
@@ -933,10 +936,11 @@ daemon_status() {
     return 1
   fi
   echo "The daemon ($v): http://127.0.0.1:$port/"
-  daemon_list
+  d_list 1
   while IFS= read -r p; do
     [[ -z $p ]] || d_status_project "$port" "$p"
   done < <(d_curl "$port" /ci/v1/projects 2>/dev/null | grep -E '"error": *null' | sed -n 's/.*"prefix": *"\([a-z0-9-]*\)".*/\1/p')
+  d_latest_line "$h"
 }
 
 # The projects, a line each: PROJECT REPO STATE QUEUE LAST CHECKOUT FILES, tab-separated.
@@ -974,8 +978,12 @@ d_list_rows() { # UP
 # bana list: what each project added here does; FILES is where bana keeps its clone,
 # builds and state.
 daemon_list() {
-  local up='' rows
-  ! d_up || up=1
+  local h
+  if h=$(d_health "$(d_port)") && d_is_ours "$h"; then d_list 1; else h='' && d_list ''; fi
+  d_latest_line "$h"
+}
+d_list() { # UP
+  local up=$1 rows
   rows=$(d_list_rows "$up") || rows=''
   if [[ -z $rows ]]; then
     echo "No projects yet: bana add, in a project's checkout, adds one."

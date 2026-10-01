@@ -31,7 +31,7 @@ fresh() {
   export HOME=$T/w/home FAKE_STATE=$T/w/state FAKE_LOG=$T/w/log
   unset FAKE_OS FAKE_ARCH FAKE_UID FAKE_IOREG BANA_SYS_ROOT BANA_TOKEN FAKE_GH FAKE_POOL FAKE_SVC_FAIL GITHUB_TOKEN \
     FAKE_HEALTH FAKE_LINGER FAKE_GH_SCOPES BANA_DAEMON_BIN BANA_DAEMON_STEP CARGO_TARGET_DIR \
-    FAKE_CARGO_FAIL FAKE_VERSION FAKE_LATEST FAKE_SEEN BANA_UPGRADE_NOW
+    FAKE_CARGO_FAIL FAKE_VERSION FAKE_LATEST FAKE_SEEN BANA_UPGRADE_NOW FAKE_RELEASES BANA_RELEASES BANA_RELEASE_REPO
   # What the host (GitHub's runners, act, a daemon's build) may have set, which bana reads.
   unset XDG_CONFIG_HOME BANA_HOME BANA_CONFIG BANA_PROJECT_ROOT BANA_ACT_LOCKED BANA_DAEMON ACT \
     RUNNER_ENVIRONMENT GITHUB_WORKSPACE DOCKER_HOST DISPLAY WAYLAND_DISPLAY
@@ -936,7 +936,8 @@ ODD=it's \"quoted\""
 check "installer: --tag, so downloads" has "$dist/install.sh" "LOCAL=0"
 check "installer: this platform's archive and its sha256" has "$dist/install.sh" \
   "linux-x64 wid-nightly-abc-linux-x64.tar.gz $(sha256sum "$dist/wid-nightly-abc-linux-x64.tar.gz" | cut -d' ' -f1)"
-check "installer: the gh one-liner in its header" has "$dist/install.sh" "gh release download v1.0.0 -R acme/widget -p install.sh -O - | sh"
+check "installer: the curl one-liner in its header" has "$dist/install.sh" "curl -fsSL https://github.com/acme/widget/releases/download/v1.0.0/install.sh | sh"
+check "installer: and gh's, for a private repository" has "$dist/install.sh" "gh release download v1.0.0 -R acme/widget -p install.sh -O - | sh   (a private repository)"
 if command -v shellcheck >/dev/null; then
   check "installer: shellcheck -s sh passes on install.sh" shellcheck -s sh "$dist/install.sh"
 fi
@@ -1877,6 +1878,353 @@ check "handover (Linux): the snapshot before is kept" test -e "$m.prev/bin/bana"
 check "handover (Linux): back on the one before" has "$T/out" "the daemon is back on 0.0.0"
 check "handover (Linux): restarted twice" same "$(grep -c 'systemctl --user restart bana.service' "$FAKE_LOG")" 2
 unset BANA_DAEMON_BIN BANA_DAEMON_STEP
+
+# ---- package: bana's release files, from .github/release.sh pack and dist -----------------------
+# The four archives (a fake bana-manager), then install.sh, SHA256SUMS and notes.md. A copy of
+# bana as 9.9.9 (no git: GITHUB_SHA is the commit) makes a second release, for the hook below.
+fresh
+sha=0123456789abcdef0123456789abcdef01234567
+fake_release_manager() { # FILE VERSION
+  cat >"$1" <<EOF
+#!/bin/sh
+case \$* in
+version) echo $2 ;;
+*--usage*) echo "usage: bana-manager mcp --dir DIR" ;;
+*) echo "release bana-manager \$*" >>"\$FAKE_LOG" ;;
+esac
+EOF
+  chmod 755 "$1"
+}
+fake_release_manager "$T/manager" "$V"
+rm -rf "$T/dist" && : >"$T/out"
+for p in linux-x64 linux-arm64 macos-x64 macos-arm64; do
+  GITHUB_SHA=$sha bash "$release_sh" pack "$T/manager" "$V" "$p" "$T/dist" >>"$T/out" 2>&1 || { cat "$T/out"; false; }
+done
+bash "$release_sh" dist "$T/dist" "$V" >>"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "package: the four archives, install.sh, SHA256SUMS and notes.md" same "$(find "$T/dist" -type f | sed 's|.*/||' | LC_ALL=C sort | tr '\n' ' ')" \
+  "SHA256SUMS bana-v$V-linux-arm64.tar.gz bana-v$V-linux-x64.tar.gz bana-v$V-macos-arm64.tar.gz bana-v$V-macos-x64.tar.gz install.sh notes.md "
+check "package: SHA256SUMS passes sha256sum -c" bash -c "cd '$T/dist' && sha256sum -c --quiet SHA256SUMS"
+check "package: SHA256SUMS has the archives and install.sh" same "$(awk '{ print $2 }' "$T/dist/SHA256SUMS" | tr '\n' ' ')" \
+  "bana-v$V-linux-arm64.tar.gz bana-v$V-linux-x64.tar.gz bana-v$V-macos-arm64.tar.gz bana-v$V-macos-x64.tar.gz install.sh "
+want=$( (cd "$here/.." && { printf '%s\n' bin/bana bin/bana-manager LICENSE README.md lib/install.sh.in lib/install.ps1.in; ls lib/*.sh; }) |
+  sed "s|^|bana-v$V/|" | LC_ALL=C sort)
+for p in linux-x64 linux-arm64 macos-x64 macos-arm64; do
+  check "package: $p holds bana-v$V/, with bana's files and nothing else" same "$(tar -tzf "$T/dist/bana-v$V-$p.tar.gz" | LC_ALL=C sort)" "$want"
+done
+tar -xzOf "$T/dist/bana-v$V-linux-x64.tar.gz" "bana-v$V/bin/bana" >"$T/w/bana.packed"
+check "package: bin/bana has the commit stamped" has "$T/w/bana.packed" "BANA_COMMIT=$sha #"
+check "package: and only that line differs from bana's" same "$(diff "$bana" "$T/w/bana.packed" | grep -c '^[<>]')" 2
+check "package: bana's own bin/bana is not stamped" has "$bana" "BANA_COMMIT= #"
+check "package: install.sh is bana's, for v$V" bash -c "grep -qx \"NAME='bana'\" '$T/dist/install.sh' && grep -qx \"TAG='v$V'\" '$T/dist/install.sh' && grep -qx \"HOOK='lib/install-hook.sh'\" '$T/dist/install.sh'"
+check "package: notes.md says how to install" has "$T/dist/notes.md" \
+  "curl -fsSL https://github.com/tjrb-xyz/bana/releases/latest/download/install.sh | sh"
+check "package: notes.md names the platforms" has "$T/dist/notes.md" "Platforms: linux-arm64, linux-x64, macos-arm64, macos-x64."
+check "package: pack refuses another version than bin/bana's" bash -c "! GITHUB_SHA=$sha bash '$release_sh' pack '$T/manager' 9.9.9 linux-x64 '$T/w/x' 2>'$T/out'"
+check "package: and says so" has "$T/out" "pack: bin/bana is bana $V, not 9.9.9"
+check "package: pack refuses an unknown platform" bash -c "! GITHUB_SHA=$sha bash '$release_sh' pack '$T/manager' $V linux-riscv '$T/w/x' 2>/dev/null"
+mkdir -p "$T/w/x" && cp "$T/dist/bana-v$V-linux-x64.tar.gz" "$T/w/x/bana-v0.0.1-linux-x64.tar.gz"
+check "package: dist refuses another version's archive" bash -c "! bash '$release_sh' dist '$T/w/x' $V 2>/dev/null"
+# bana 9.9.9: a copy of bana, its version bumped.
+c=$T/w/c9
+mkdir -p "$c/bin" "$c/manager" "$c/.github"
+cp -R "$here/../lib" "$here/../LICENSE" "$here/../README.md" "$c/"
+cp "$bana" "$c/bin/" && cp "$here/../manager/Cargo.toml" "$here/../manager/Cargo.lock" "$c/manager/" && cp "$release_sh" "$c/.github/"
+bash "$c/.github/release.sh" bump 9.9.9 >/dev/null
+fake_release_manager "$T/manager9" 9.9.9
+rm -rf "$T/dist9"
+(GITHUB_SHA=$sha bash "$c/.github/release.sh" pack "$T/manager9" 9.9.9 linux-x64 "$T/dist9" &&
+  bash "$c/.github/release.sh" dist "$T/dist9" 9.9.9) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "package: a copy of bana, outside git, with GITHUB_SHA" test -f "$T/dist9/install.sh" -a -f "$T/dist9/bana-v9.9.9-linux-x64.tar.gz"
+
+# ---- workflows: release.yml publishes only from a tag; test.yml, called, runs no self-test ------
+gh_dir=$here/../.github/workflows
+check "workflows: publish only from a v tag's push" grep -qxF \
+  "    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')" "$gh_dir/release.yml"
+check "workflows: Run workflow takes a version, nothing else" same \
+  "$(awk '/^  workflow_dispatch:/ { d = 1; next } d && !/^    / { exit } d && /^      [a-z_]+:$/ { print }' "$gh_dir/release.yml")" \
+  "      version:"
+check "workflows: test.yml, called, runs its four suites" same \
+  "$(grep -c "^    if: inputs.called || github.event_name != 'workflow_dispatch'$" "$gh_dir/test.yml")" 4
+check "workflows: and neither self-test" same "$(grep -c '^    if: .*&& !inputs.called$' "$gh_dir/test.yml")" 2
+# bana is public: 'private' in its README, install.sh and workflows is about a project's repository.
+grep -n -i private "$here/../README.md" "$here/../install.sh" "$gh_dir"/*.yml |
+  grep -v -e 'Use the daemon only on a private repository' -e 'Use bana with private' \
+    -e '# a private repository' -e '# Windows, a private repository' -e 'for private images' >"$T/out" || true
+check "workflows: no 'private' about bana itself" same "$(cat "$T/out")" ""
+
+# ---- hook: bana's install.sh; the daemon moves to the new bana first, or nothing changes ---------
+fresh
+daemon_world
+unset BANA_DAEMON_BIN
+export FAKE_CARGO_FAIL=1
+p=$T/w/p b=$T/w/b m=$HOME/.bana/daemon.d
+inst() { # DIST [ARGS]: its install.sh, as bana upgrade runs it
+  local d=$1
+  shift
+  (cd "$HOME" && sh "$d/install.sh" --from "$d" --prefix "$p" --bin-dir "$b" --yes "$@") >"$T/out" 2>&1
+}
+check "hook: installs, with no daemon here" inst "$T/dist"
+check "hook: bana is linked" same "$(readlink "$b/bana")" "$p/current/bin/bana"
+check "hook: bana version" same "$("$b/bana" version)" "bana $V (release v$V)"
+check "hook: and no daemon is installed" test ! -e "$m"
+(cd "$HOME" && "$b/bana" daemon install --no-open) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "hook: the release's daemon" same "$(curl -fsS http://127.0.0.1:8470/ci/v1/health | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')" "$V"
+# 9.9.9's daemon answers as another bana: the daemon goes back, and so does the install.
+rm -rf "$T/before" && cp -R "$m" "$T/before"
+FAKE_VERSION=0.0.0 inst "$T/dist9" && st=0 || st=$?
+check "hook: a new daemon that does not come up stops the install" same "$st" 1
+check "hook: nothing changed, the installer says" has "$T/out" "the pre-install hook failed; nothing changed"
+check "hook: and the daemon is back" has "$T/out" "the daemon is back on 0.0.0"
+check "hook: current stays" same "$(readlink "$p/current")" "v$V"
+check "hook: 9.9.9 is not installed" test ! -e "$p/v9.9.9"
+check "hook: the daemon's files are the ones before" diff -r "$T/before" "$m"
+rm -rf "$T/before"
+pid=$(health_pid)
+: >"$FAKE_LOG"
+check "hook: upgrade to 9.9.9, with the daemon" inst "$T/dist9"
+check "hook: the daemon moved first" has "$T/out" "The daemon runs bana 9.9.9 (was $V)."
+check "hook: restarted, as another process" bash -c "grep -q 'systemctl --user restart bana.service' '$FAKE_LOG' && test '$(health_pid)' != '$pid'"
+check "hook: the daemon before is kept" same "$(sed -n 's/^BANA_VERSION=//p' "$m.prev/bin/bana")" "$V"
+check "hook: then current" same "$(readlink "$p/current")" v9.9.9
+check "hook: the daemon runs 9.9.9's bana" cmp -s "$p/v9.9.9/bin/bana" "$m/bin/bana"
+check "hook: no file of bana's names the installer's temp" same "$(grep -rlF "$p/.install." "$HOME/.bana" 2>/dev/null)" ""
+mkdir -p "$HOME/.bana/wid" && echo '{}' >"$HOME/.bana/wid/state.json"
+(cd "$HOME" && sh "$T/dist9/install.sh" --uninstall --prefix "$p" --yes) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "hook: --uninstall removes the release" test ! -e "$p" -a ! -e "$b/bana"
+check "hook: and leaves ~/.bana: the projects, the daemon" test -f "$HOME/.bana/wid/state.json" -a -f "$m/settings"
+check "hook: saying how to remove the daemon" has "$T/out" "The daemon keeps running, from $m: $m/bin/bana daemon uninstall removes it"
+(cd "$HOME" && "$m/bin/bana" daemon uninstall) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "hook: which works" test ! -e "$m" -a ! -e "$m.prev"
+
+# The old install.sh's link into ~/.bana/src (BANA_HOME's) makes way; a link elsewhere does not.
+fresh
+export BANA_HOME=$T/w/bh
+p=$T/w/p b=$T/w/b
+mkdir -p "$BANA_HOME/src/bin" "$b" && cp "$bana" "$BANA_HOME/src/bin/bana"
+ln -s "$BANA_HOME/src/bin/bana" "$b/bana"
+check "hook: over the old install.sh's link" inst "$T/dist"
+check "hook: bana is the release's now" same "$(readlink "$b/bana")" "$p/current/bin/bana"
+check "hook: .upgrade-from says where it pointed" same "$(cat "$BANA_HOME/.upgrade-from")" "$BANA_HOME/src/bin/bana"
+check "hook: ~/.bana/src stays" cmp -s "$bana" "$BANA_HOME/src/bin/bana"
+(cd "$HOME" && sh "$T/dist/install.sh" --uninstall --prefix "$p" --yes) >/dev/null 2>&1 || true
+rm -f "$BANA_HOME/.upgrade-from" && mkdir -p "$T/w/other" && cp "$bana" "$T/w/other/bana"
+ln -s "$T/w/other/bana" "$b/bana"
+inst "$T/dist" || true
+check "hook: a link elsewhere stays" same "$(readlink "$b/bana")" "$T/w/other/bana"
+check "hook: as the installer says" has "$T/out" "$b/bana is not bana's: left alone"
+check "hook: and no .upgrade-from" test ! -e "$BANA_HOME/.upgrade-from"
+unset FAKE_CARGO_FAIL BANA_DAEMON_STEP BANA_HOME
+rm -rf "$T/dist" "$T/dist9" "$T/manager" "$T/manager9"
+
+# ---- upgrade: bana upgrade, from a releases page (FAKE_RELEASES, served by the curl stand-in) ----
+# Two releases of a copy of bana, as 8.0.0 and 8.0.1 (above any real one), for linux-x64: their
+# files in FAKE_RELEASES/download/<tag>/, as GitHub serves them at BANA_RELEASES/download/<tag>/.
+sha=0123456789abcdef0123456789abcdef01234567
+mirror_release() { # VERSION
+  local c=$T/w/rc d=$FAKE_RELEASES/download/v$1
+  rm -rf "$c" "$d" && mkdir -p "$c/bin" "$c/manager" "$c/.github"
+  cp -R "$here/../lib" "$here/../LICENSE" "$here/../README.md" "$c/"
+  cp "$bana" "$c/bin/" && cp "$here/../manager/Cargo.toml" "$here/../manager/Cargo.lock" "$c/manager/" && cp "$release_sh" "$c/.github/"
+  bash "$c/.github/release.sh" bump "$1" >/dev/null
+  fake_release_manager "$T/w/manager.$1" "$1"
+  GITHUB_SHA=$sha bash "$c/.github/release.sh" pack "$T/w/manager.$1" "$1" linux-x64 "$d" >/dev/null
+  bash "$c/.github/release.sh" dist "$d" "$1" >/dev/null
+  rm -rf "$c" "$T/w/manager.$1"
+}
+releases() { export FAKE_RELEASES=$T/releases BANA_RELEASES=https://releases.test/bana/releases; }
+fresh
+releases
+rm -rf "$FAKE_RELEASES"
+mirror_release 8.0.0
+mirror_release 8.0.1
+daemon_world
+unset BANA_DAEMON_BIN
+export FAKE_CARGO_FAIL=1
+p=$HOME/.local/share/bana b=$HOME/.local/bin m=$HOME/.bana/daemon.d d1=$FAKE_RELEASES/download/v8.0.1
+up() { (cd "$HOME" && "$b/bana" upgrade "$@") >"$T/out" 2>&1; } # ARGS
+(cd "$HOME" && sh "$FAKE_RELEASES/download/v8.0.0/install.sh" --from "$FAKE_RELEASES/download/v8.0.0" --yes &&
+  "$b/bana" daemon install --no-open) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+echo v8.0.0 >"$FAKE_RELEASES/latest"
+up --check && st=0 || st=$?
+check "upgrade: --check, the newest here: exit 0" same "$st $(cat "$T/out")" "0 bana 8.0.0 (release); newest v8.0.0"
+cp "$p/receipt" "$T/receipt"
+up && st=0 || st=$?
+check "upgrade: the newest here says so" same "$st $(cat "$T/out")" "0 bana v8.0.0 is the newest"
+check "upgrade: and changes nothing" cmp -s "$p/receipt" "$T/receipt"
+echo v8.0.1 >"$FAKE_RELEASES/latest"
+up --check && st=0 || st=$?
+check "upgrade: --check, a newer one: exit 10" same "$st $(cat "$T/out")" "10 bana 8.0.0 (release); newest v8.0.1: bana upgrade"
+check "upgrade: --check changes nothing" cmp -s "$p/receipt" "$T/receipt"
+
+# What does not check out stops it before anything changes.
+cp "$d1/install.sh" "$T/install.sh.good"
+echo '# changed' >>"$d1/install.sh"
+up && st=0 || st=$?
+check "upgrade: an install.sh other than SHA256SUMS says is refused" same "$st" 1
+check "upgrade: and says so" has "$T/out" "install.sh does not match SHA256SUMS: nothing changed"
+check "upgrade: current stays" same "$(readlink "$p/current")" v8.0.0
+cp "$T/install.sh.good" "$d1/install.sh"
+cp "$d1/bana-v8.0.1-linux-x64.tar.gz" "$T/archive.good"
+printf x >>"$d1/bana-v8.0.1-linux-x64.tar.gz"
+up && st=0 || st=$?
+check "upgrade: an archive other than install.sh says is refused (by install.sh)" same "$st" 1
+check "upgrade: install.sh says why" has "$T/out" "but the release says"
+check "upgrade: current stays, the daemon too" bash -c "test \"\$(readlink '$p/current')\" = v8.0.0 && cmp -s '$p/v8.0.0/bin/bana' '$m/bin/bana'"
+cp "$T/archive.good" "$d1/bana-v8.0.1-linux-x64.tar.gz"
+echo 'v8.0.1;x' >"$FAKE_RELEASES/latest"
+up && st=0 || st=$?
+check "upgrade: a tag that is not one is refused" bash -c "test $st = 1 && grep -qF \"not a bana release: 'v8.0.1;x'\" '$T/out'"
+cp -R "$d1" "$FAKE_RELEASES/download/v8.0.2"
+up v8.0.2 && st=0 || st=$?
+check "upgrade: an install.sh of another tag is refused" bash -c "test $st = 1 && grep -qF 'download/v8.0.2/install.sh is not bana v8.0.2'\"'\"'s: nothing changed' '$T/out'"
+rm -rf "$FAKE_RELEASES/download/v8.0.2"
+echo v8.0.1 >"$FAKE_RELEASES/latest"
+check "upgrade: and nothing changed" cmp -s "$p/receipt" "$T/receipt"
+
+# The new daemon does not come up: it and bana stay on 8.0.0.
+FAKE_VERSION=0.0.0 up && st=0 || st=$?
+check "upgrade: a daemon that does not come up stops it" same "$st" 1
+check "upgrade: the daemon is back" has "$T/out" "the daemon is back on 0.0.0"
+check "upgrade: bana stays on 8.0.0" bash -c "test \"\$(readlink '$p/current')\" = v8.0.0 && test ! -e '$p/v8.0.1'"
+check "upgrade: and the daemon" cmp -s "$p/v8.0.0/bin/bana" "$m/bin/bana"
+
+# 8.0.1, with --now while a build runs.
+printf '[\n{"prefix":"wid","running":{"id":7,"ref":"main"}}\n]\n' >"$FAKE_STATE/projects.json"
+up --now && st=0 || st=$?
+rm -f "$FAKE_STATE/projects.json"
+check "upgrade: to 8.0.1" same "$st" 0
+check "upgrade: --now does not wait for the build" lacks "$T/out" "runs: restarting"
+check "upgrade: the daemon moved first" has "$T/out" "The daemon runs bana 8.0.1 (was 8.0.0)."
+check "upgrade: current is 8.0.1" same "$(readlink "$p/current")" v8.0.1
+check "upgrade: the receipt keeps both" same "$(grep '^version=' "$p/receipt" | tr '\n' ' ')" "version=v8.0.1 version=v8.0.0 "
+check "upgrade: the daemon runs 8.0.1's bana" cmp -s "$p/v8.0.1/bin/bana" "$m/bin/bana"
+check "upgrade: and says which bana it is now" same "$(tail -1 "$T/out")" "bana 8.0.1 (release v8.0.1)"
+up && st=0 || st=$?
+check "upgrade: then the newest" same "$st $(cat "$T/out")" "0 bana v8.0.1 is the newest"
+
+# Back to 8.0.0: a downgrade, which asks (no terminal: it needs --yes).
+if ! (: </dev/tty) 2>/dev/null; then
+  up v8.0.0 && st=0 || st=$?
+  check "upgrade: a downgrade with no terminal needs --yes" bash -c "test $st = 1 && grep -qF 'v8.0.0 is older than bana 8.0.1, a downgrade: --yes' '$T/out'"
+fi
+up v8.0.0 --yes && st=0 || st=$?
+check "upgrade: v8.0.0 --yes" same "$st" 0
+check "upgrade: the daemon went first" has "$T/out" "The daemon runs bana 8.0.0 (was 8.0.1)."
+check "upgrade: current is 8.0.0 again, the daemon's too" bash -c "test \"\$(readlink '$p/current')\" = v8.0.0 && cmp -s '$p/v8.0.0/bin/bana' '$m/bin/bana'"
+rm "$FAKE_RELEASES/latest"
+up && st=0 || st=$?
+check "upgrade: no release yet" same "$st $(cat "$T/out")" "0 no bana release yet (https://releases.test/bana/releases)"
+touch "$FAKE_RELEASES/down"
+up && st=0 || st=$?
+check "upgrade: offline is not 'no release'" bash -c "test $st = 1 && grep -qF 'could not ask https://releases.test/bana/releases/latest' '$T/out'"
+rm "$FAKE_RELEASES/down"
+echo v8.0.1 >"$FAKE_RELEASES/latest"
+(cd "$HOME" && "$m/bin/bana" daemon uninstall && sh "$p/v8.0.0/install.sh" --uninstall --prefix "$p" --yes) >/dev/null 2>&1 || true
+
+# The old install.sh's checkout (~/.bana/src, its link in ~/.local/bin): the hook moves the
+# daemon to the release, then the link; a failure after puts the link back.
+fresh
+releases
+daemon_world
+export FAKE_CARGO_FAIL=1
+p=$HOME/.local/share/bana b=$HOME/.local/bin m=$HOME/.bana/daemon.d s=$HOME/.bana/src
+legacy_src() { # a clone of bana in ~/.bana/src, from $T/w/bana.git, linked as ~/.local/bin/bana
+  local g=$T/w/bana-src
+  if [[ ! -d $T/w/bana.git ]]; then
+    mkdir -p "$g/bin" && cp "$bana" "$g/bin/" && cp -R "$here/../lib" "$g/"
+    git -C "$g" init -q && git -C "$g" checkout -q -b main
+    git -C "$g" add -A && git -C "$g" -c user.name=t -c user.email=t@t commit -q -m one
+    git clone -q --bare "$g" "$T/w/bana.git"
+  fi
+  rm -rf "$s" && git clone -q "$T/w/bana.git" "$s"
+  mkdir -p "$b" && ln -sfn "$s/bin/bana" "$b/bana"
+}
+legacy_src
+lup() { (cd "$HOME" && PATH=$b:$PATH "$b/bana" upgrade) >"$T/out" 2>&1; }
+check "upgrade (legacy): ~/.bana/src's bana is legacy" has <("$b/bana" settings 2>&1 | head -1) "(legacy)"
+(cd "$HOME" && "$b/bana" daemon install --no-open) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+unset BANA_DAEMON_BIN
+cp -R "$d1" "$T/v801.good"
+# shellcheck disable=SC2016 # install.sh's line
+sed 's|^ln -sfn "$TAG" "$prefix/current"$|exit 3|' "$T/v801.good/install.sh" >"$d1/install.sh"
+(cd "$d1" && sha256sum bana-v8.0.1-linux-x64.tar.gz install.sh >SHA256SUMS)
+lup && st=0 || st=$?
+check "upgrade (legacy): an install that fails after the hook" same "$st" 3
+check "upgrade (legacy): puts the link back" same "$(readlink "$b/bana")" "$s/bin/bana"
+check "upgrade (legacy): and says so" has "$T/out" "$b/bana points to $s/bin/bana again"
+rm -rf "$d1" "$p" && mv "$T/v801.good" "$d1"
+lup && st=0 || st=$?
+check "upgrade (legacy): to the release" same "$st" 0
+check "upgrade (legacy): bana is the release's" same "$(readlink "$b/bana")" "$p/current/bin/bana"
+check "upgrade (legacy): bana version" same "$("$b/bana" version)" "bana 8.0.1 (release v8.0.1)"
+check "upgrade (legacy): the daemon runs it" cmp -s "$p/v8.0.1/bin/bana" "$m/bin/bana"
+check "upgrade (legacy): .upgrade-from says where it pointed" same "$(cat "$HOME/.bana/.upgrade-from")" "$s/bin/bana"
+check "upgrade (legacy): ~/.bana/src is untouched" bash -c "cmp -s '$bana' '$s/bin/bana' && test -z \"\$(git -C '$s' status --porcelain)\""
+check "upgrade (legacy): says how to remove it" has "$T/out" "$s is no longer used: rm -rf $s (to go back: ln -sfn $s/bin/bana $b/bana)"
+(cd "$HOME" && "$m/bin/bana" daemon uninstall) >/dev/null 2>&1 || true
+
+# A git checkout, a submodule and a copy do not upgrade: each says how instead.
+g=$T/w/kd
+mkdir -p "$g/bin" && cp "$bana" "$g/bin/" && cp -R "$here/../lib" "$g/"
+git -C "$g" init -q && git -C "$g" add -A && git -C "$g" -c user.name=t -c user.email=t@t commit -q -m one
+bash "$g/bin/bana" upgrade >"$T/out" 2>&1 && st=0 || st=$?
+check "upgrade: a git checkout says git pull" bash -c "test $st = 1 && grep -qF 'bana is a git checkout here: git -C $g pull, then bana daemon install' '$T/out'"
+mkdir -p "$T/w/super" && git -C "$T/w/super" init -q
+git -C "$T/w/super" -c protocol.file.allow=always submodule add -q "$g" vendor/bana >/dev/null 2>&1
+bash "$T/w/super/vendor/bana/bin/bana" upgrade >"$T/out" 2>&1 && st=0 || st=$?
+check "upgrade: a submodule says git submodule update" bash -c "test $st = 1 && grep -qF 'submodule update --remote vendor/bana' '$T/out'"
+copy_bana "$T/w/t"
+bash "$T/w/t/bin/bana" upgrade >"$T/out" 2>&1 && st=0 || st=$?
+check "upgrade: a copy says how to install a release" bash -c "test $st = 1 && grep -qF 'curl -fsSL https://releases.test/bana/releases/latest/download/install.sh | sh' '$T/out'"
+unset FAKE_CARGO_FAIL BANA_DAEMON_STEP
+
+# ---- root-install: install.sh, from the releases (no release yet: the git checkout) -------------
+fresh
+releases
+p=$HOME/.local/share/bana b=$HOME/.local/bin s=$HOME/.bana/src
+legacy_src
+root_install() { (cd "$HOME" && BANA_URL=$T/w/bana.git sh "$here/../install.sh" "$@") >"$T/out" 2>&1; } # ARGS
+root_install && st=0 || st=$?
+check "root-install: the newest release" bash -c "test $st = 0 && test \"\$(readlink '$p/current')\" = v8.0.1"
+check "root-install: the old checkout's link is the release's now" same "$(readlink "$b/bana")" "$p/current/bin/bana"
+check "root-install: .upgrade-from" same "$(cat "$HOME/.bana/.upgrade-from")" "$s/bin/bana"
+check "root-install: says ~/.bana/src is no longer used" has "$T/out" "$s is no longer used"
+check "root-install: and what comes next" has "$T/out" "Next: bana daemon install"
+root_install v8.0.0 && st=0 || st=$?
+check "root-install: a release named" bash -c "test $st = 0 && test \"\$(readlink '$p/current')\" = v8.0.0"
+: >"$FAKE_LOG"
+root_install --git main && st=0 || st=$?
+check "root-install: --git main: the checkout" bash -c "test $st = 0 && test \"\$(readlink '$b/bana')\" = '$s/bin/bana'"
+check "root-install: --git asks no release" lacks "$FAKE_LOG" "releases.test"
+ln -sfn "$p/current/bin/bana" "$b/bana"
+root_install main && st=0 || st=$?
+check "root-install: install.sh main, as before" bash -c "test $st = 0 && test \"\$(readlink '$b/bana')\" = '$s/bin/bana'"
+rm -rf "$s"
+touch "$FAKE_RELEASES/down"
+root_install && st=0 || st=$?
+check "root-install: offline fails, with no git fallback" bash -c "test $st = 1 && grep -qF 'could not ask' '$T/out' && test ! -e '$s'"
+rm "$FAKE_RELEASES/down"
+mv "$FAKE_RELEASES/latest" "$T/latest"
+root_install && st=0 || st=$?
+check "root-install: no release yet: the git checkout" bash -c "test $st = 0 && test -d '$s/.git' && test \"\$(readlink '$b/bana')\" = '$s/bin/bana'"
+check "root-install: and says so" has "$T/out" "No bana release yet: a git checkout in $s instead"
+mv "$T/latest" "$FAKE_RELEASES/latest"
+
+# ---- notice: a newer bana is out (the daemon's health says), and a daemon on another bana ------
+fresh
+daemon_world
+(cd "$HOME" && bash "$bana" daemon install) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+FAKE_LATEST=v9.9.9 bash "$bana" list >"$T/out" 2>&1 || true
+check "notice: bana list's last line" same "$(tail -1 "$T/out")" "bana v9.9.9 is out: bana upgrade"
+FAKE_LATEST=v9.9.9 bash "$bana" daemon status >"$T/out" 2>&1 || true
+check "notice: bana daemon status's last line" same "$(tail -1 "$T/out")" "bana v9.9.9 is out: bana upgrade"
+bash "$bana" list >"$T/out" 2>&1 || true
+check "notice: none when none is out" lacks "$T/out" "is out"
+check "notice: bana version, with the daemon on another" same "$(FAKE_VERSION=0.0.1 bash "$bana" version | tail -1)" \
+  "the daemon runs 0.0.1: bana daemon install"
+bash "$bana" daemon uninstall >/dev/null 2>&1 || true
+unset BANA_DAEMON_BIN BANA_DAEMON_STEP
+rm -rf "$T/releases"
 
 # ---- Tart --------------------------------------------------------------------------------------
 fresh

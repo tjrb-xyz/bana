@@ -13,24 +13,26 @@ The [README](../README.md#ci-on-push-bana-daemon) has the short version. This pa
 ## Install
 
 What it needs: act (`brew install act`), Docker (OrbStack, running), the GitHub CLI signed in with the `repo`
-scope (`gh auth login`), and cargo (rustup), which builds the daemon the first time. Anywhere, once a machine:
+scope (`gh auth login`), and, in a git checkout of bana, cargo (rustup), which builds the daemon the first time (a
+release has it built). Anywhere, once a machine:
 
 ```sh
 bana daemon install             # check, build, start; on a Mac it opens the page
 bana daemon install --port 8471 # another port (the default is 8470, or the one installed)
-bana daemon install --no-tray   # on a Mac: no menu bar item (a Mac mini nobody looks at)
+bana daemon install --no-tray   # on a Mac: no menu bar item (a Mac mini nobody looks at; kept, --tray: back)
 bana daemon install --no-open   # don't open the page afterwards
 bana daemon install --now       # restart at once, even while a build runs
 ```
 
 Install first checks the machine (the doctor): act, Docker, unzip and sha256, gh and its token's scope, and
-whether gh can publish releases. Then it builds `bana-manager`, puts a snapshot of bana in `~/.bana/daemon.d`,
+whether gh can publish releases. Then it takes the release's `bana-manager` (or builds one), puts a snapshot of bana in `~/.bana/daemon.d`,
 writes the machine's settings there, and starts the daemon: the LaunchAgent `xyz.tjrb.bana` on a Mac, the user
 unit `bana.service` on Linux. It lists the projects it serves (none, the first time).
 
-Run install again to take a newer bana, or another port. If a build is running, install waits for it to end;
+`bana upgrade` takes a newer bana: the new release's install.sh runs install from the new files before it
+switches bana over. Run install again for another port. If a build is running, install waits for it to end;
 with `--now` it restarts at once and the build runs again. The push hooks read the port when they run, so a new
-port needs nothing else.
+port needs nothing else. If the new daemon does not come up, the one before runs again ([Upgrades](#upgrades)).
 
 ## Projects
 
@@ -85,7 +87,7 @@ settings name (from any directory: `bana remove wid`). Its clone, builds, fixes 
 `bana remove wid --purge` after a `bana remove wid`). Neither touches the project's pool runners (`bana up`) or
 your `vars`.
 
-**`bana daemon uninstall`** stops the daemon and removes `~/.bana/daemon.d` and the LaunchAgent or unit. The
+**`bana daemon uninstall`** stops the daemon and removes `~/.bana/daemon.d` (and `.new`, `.prev`, `.bad`) and the LaunchAgent or unit. The
 projects stay added: their pushes wait for the next install. `--purge` runs `bana remove --purge` for each first.
 
 ## On GitHub
@@ -404,6 +406,34 @@ crash cuts short one build at most. `bana daemon uninstall` stops a running buil
 While a project is paused, such a retry of a push waits for `bana resume`, and so does one of a *Run now* or a
 *Re-run* (a retry no longer knows what started it); a fix round's retry runs.
 
+## Upgrades
+
+`bana daemon install`, run again (by hand, or by an upgrade), hands the daemon over to the bana it runs from:
+
+1. It puts the new snapshot and settings in `~/.bana/daemon.d.new`; the running daemon's `daemon.d` is not
+   touched, so a build running meanwhile keeps its bana.
+2. It waits for the running build to end (and for one that starts as it ends), unless `--now`.
+3. It renames `daemon.d` to `daemon.d.prev` and `daemon.d.new` to `daemon.d`, and restarts the service.
+4. It waits up to a minute for the daemon to answer its health as this bana's version, from a new process.
+5. If it does not, `daemon.d` becomes `daemon.d.bad` (its files, for `bana daemon log`), `daemon.d.prev` becomes
+   `daemon.d` again, and the daemon before restarts; install fails, naming both versions. If that one does not
+   come up either, both stay as they are and install prints the commands to start either.
+
+One `daemon.d.prev` is kept. The settings are written by the new bana and go back with the snapshot, so a
+release writes only the settings keys its own `bana-manager` reads. A change to `state.json` comes with a new
+`version` in it, which the new daemon upgrades itself.
+
+`bana upgrade` runs the newest release's install.sh, once its sha256 matches the release's SHA256SUMS. Its hook
+runs the steps above from the new files first: if the new daemon does not come up, the install stops and bana
+stays as it was. With `--now`, the daemon restarts at once. `bana upgrade vX.Y.Z` takes that release; an older
+one is a downgrade, which asks (`--yes`). The installer keeps the release before, so going back is quick.
+
+**The release check.** Two minutes after it starts, then once a day, the daemon asks
+`https://github.com/tjrb-xyz/bana/releases/latest` where it redirects (curl, with the settings' `path`); no API,
+no token. When that release is newer than the daemon's bana, the health says `"latest"`, and the page, the menu
+bar (*bana vX.Y.Z is out…*), `bana list`, `bana daemon status` and the fix tools' status say so. Nothing is
+installed by itself. To turn it off: `touch ~/.bana/.no-upgrade-check`.
+
 ## What the workflow needs
 
 The daemon runs the workflow as `workflow_dispatch`, with an event shaped like the push (`github.ref`,
@@ -505,6 +535,9 @@ Logs stay on the machine.
 | | |
 |---|---|
 | `~/.bana/daemon.d/` | the machine's: the snapshot (`bana-manager`, `bin/bana`, `lib/`), `settings`, and `daemon.lock` (one daemon a machine) |
+| `~/.bana/daemon.d.new`, `.prev`, `.bad` | an install's: the snapshot it stages, the one before, and one that did not come up ([Upgrades](#upgrades)) |
+| `~/.bana/.upgrade-from` | where `bana` pointed into `~/.bana/src` before a release took its place |
+| `~/.bana/.no-upgrade-check` | there: the daemon does not ask for a newer bana ([Upgrades](#upgrades)) |
 | `~/.bana/<prefix>/daemon/settings` | the project's settings, from bana.conf: while it is there, the project is added |
 | `~/.bana/<prefix>/daemon/paused` | there while the project is paused |
 | `~/.bana/<prefix>/src/` | the daemon's clone |
@@ -551,7 +584,7 @@ first.
 ## Commands
 
 ```sh
-bana daemon install [--port N] [--no-tray] [--no-open] [--now]
+bana daemon install [--port N] [--no-tray | --tray] [--no-open] [--now]
 bana daemon status             # whether it runs, and what each project builds and waits for
 bana daemon log                # its log, followed
 bana daemon open [PROJECT]     # the page

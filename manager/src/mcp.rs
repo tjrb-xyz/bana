@@ -299,7 +299,8 @@ pub fn tools() -> Value {
             "outputSchema": {"type": "object", "properties": {
                 "state": {"type": "string", "enum": ["open", "working", "green", "red", "out_of_rounds", "kept", "pushed"]},
                 "rounds": {"type": "array", "items": {"type": "object"}}, "recheck": {"type": ["object", "null"]},
-                "changed_since_last_round": {"type": "boolean"}, "diffstat": {"type": "array", "items": {"type": "string"}}
+                "changed_since_last_round": {"type": "boolean"}, "diffstat": {"type": "array", "items": {"type": "string"}},
+                "upgrade": {"type": "string", "description": "a newer bana is out: tell the owner"}
             }, "required": ["state", "rounds", "changed_since_last_round", "diffstat"]},
             "annotations": reader,
         },
@@ -1212,7 +1213,7 @@ impl Server {
                 "repeat": r.repeat,
             })
         };
-        Ok(json!({
+        let mut v = json!({
             "fix": f.fix,
             "state": st.state,
             "rounds": rs.rounds.iter().filter(|r| r.n > 0).map(view).collect::<Vec<_>>(),
@@ -1224,7 +1225,14 @@ impl Server {
             "new_files": new_files,
             "branch": f.branch,
             "commits": st.commits.unwrap_or(0),
-        }))
+        });
+        // A newer bana is out (the daemon's health says): the same line as bana list's.
+        if let Ok((200, h)) = self.daemon.call("GET", "/ci/v1/health", None, 5) {
+            if let Some(l) = h["latest"].as_str() {
+                v["upgrade"] = json!(format!("bana {l} is out: bana upgrade"));
+            }
+        }
+        Ok(v)
     }
 
     fn commit_fix(&self, a: &Map<String, Value>) -> Answer {

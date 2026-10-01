@@ -1,12 +1,19 @@
 name: test
 # bana's own tests, on GitHub's runners (bana should not need itself to be
 # tested). macOS: its stock bash 3.2 and BSD tools, where bana has to work.
-# macOS minutes cost 10x on a private repo: its jobs are few and short.
 on:
+  # Branches only: a tag's tests run once, in release.yml, which calls this with called: true.
   push:
+    branches: ['**']
   pull_request:
   # By hand (Actions, test, Run workflow): release-selftest only.
   workflow_dispatch:
+  # From release.yml: the four suites, never the self-tests (whatever started the release).
+  workflow_call:
+    inputs:
+      called:
+        type: boolean
+        default: false
 permissions:
   contents: read
 env:
@@ -16,7 +23,7 @@ env:
   ACT_SHA256_DARWIN_ARM64: 48ae218af96725f7635a66de2b87e1e346893b02add0f16b92f560296b2151fc
 jobs:
   scripts:
-    if: github.event_name != 'workflow_dispatch'
+    if: inputs.called || github.event_name != 'workflow_dispatch'
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -44,7 +51,7 @@ jobs:
         if: runner.os == 'macOS'
         run: SH=/bin/sh tests/install.sh && SH=/bin/sh tests/install-real.sh
   manager:
-    if: github.event_name != 'workflow_dispatch'
+    if: inputs.called || github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -60,7 +67,7 @@ jobs:
   # loop with the test as Claude Code (bana's MCP server over stdio), and a second
   # project: one build at a time, bana pause and resume, bana remove.
   e2e:
-    if: github.event_name != 'workflow_dispatch'
+    if: inputs.called || github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -79,7 +86,7 @@ jobs:
   # the daemon end to end with host jobs only (no Docker on GitHub's Macs). One job,
   # so one build of the manager.
   macos-daemon:
-    if: github.event_name != 'workflow_dispatch'
+    if: inputs.called || github.event_name != 'workflow_dispatch'
     runs-on: macos-latest
     timeout-minutes: 35
     steps:
@@ -143,6 +150,46 @@ jobs:
           fi
           test ! -e "$plist"
           test ! -e "$HOME/.bana/wid/daemon"
+      # bana's own release (this manager, packed), installed over a running daemon and then
+      # again with --force: each time its hook moves the real LaunchAgent to the release's
+      # bana-manager, a new process, and keeps the snapshot before.
+      - name: bana's release through its install.sh and hook, twice, over a LaunchAgent
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          V=$(.github/release.sh check | sed 's/^bana //')
+          bana=$PWD/bin/bana
+          T=$(cd "$(mktemp -d)" && pwd -P)
+          export HOME=$T/home BANA_HOME=$T/home/.bana
+          mkdir -p "$HOME" "$T/bin"
+          ln -s "$PWD/tests/stand-ins/gh" "$T/bin/gh"
+          ln -s "$PWD/tests/stand-ins/act" "$T/bin/act"
+          # shellcheck disable=SC2016 # the stub's own $1
+          printf '#!/bin/sh\ncase $1 in info) exit 0 ;; esac\n' >"$T/bin/docker"
+          chmod +x "$T/bin/docker"
+          export PATH=$T/bin:$PATH
+          .github/release.sh pack manager/target/debug/bana-manager "$V" macos-arm64 "$T/dist"
+          .github/release.sh dist "$T/dist" "$V"
+          health() { curl -fsS --noproxy '*' http://127.0.0.1:8470/ci/v1/health | tee "$T/$1"; echo; }
+          pid() { sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "$T/$1"; }
+          inst() { (cd "$T" && sh "$T/dist/install.sh" --from "$T/dist" --prefix "$T/p" --bin-dir "$T/b" --yes "$@"); }
+          # The checkout's daemon first (BANA_DAEMON_BIN: this manager); then the release's own.
+          (cd "$T" && bash "$bana" daemon install --no-tray --no-open)
+          health h0
+          unset BANA_DAEMON_BIN
+          for i in 1 2; do
+            if [ "$i" = 1 ]; then inst; else inst --force; fi
+            health "h$i"
+            grep -q "\"version\":\"$V\"" "$T/h$i"
+            test -n "$(pid "h$i")" && test "$(pid "h$i")" != "$(pid "h$((i - 1))")"
+            test -d "$BANA_HOME/daemon.d.prev"
+            cmp "$T/p/v$V/bin/bana-manager" "$BANA_HOME/daemon.d/bana-manager"
+          done
+          "$T/b/bana" version
+          grep -qx 'tray = no' "$BANA_HOME/daemon.d/settings"
+          "$T/b/bana" daemon uninstall --purge
+          inst --uninstall
+          test ! -e "$T/p"
       - name: act ${{ env.ACT_VERSION }}
         if: ${{ !cancelled() }}
         run: |
@@ -159,7 +206,7 @@ jobs:
   # The daemon's own poster posts to this commit, with one and then without, and reads
   # both back. Not on pull requests from forks: their token cannot write statuses.
   status-selftest:
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && !inputs.called
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -205,7 +252,7 @@ jobs:
   # its name and digest, generate-notes with previous_tag_name, and deleting the draft
   # leaves no tag. By hand only: it writes a draft on this repository, then deletes it.
   release-selftest:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && !inputs.called
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

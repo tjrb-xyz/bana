@@ -1,0 +1,228 @@
+name: release
+# bana's own releases. A tag vX.Y.Z, pushed by hand, of a commit on main whose version is X.Y.Z
+# publishes one (through the `release` environment, where reviewers can be required). By hand
+# (Actions, release, Run workflow, a version): a dry run, the same jobs up to the artifact
+# bana-vX.Y.Z-dist, and never a release. README.md's "Releasing bana" has the steps.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: X.Y.Z, the version on this branch (a dry run; it never publishes)
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+env:
+  MACOSX_DEPLOYMENT_TARGET: '11.0'
+jobs:
+  # The version: the tag's (or the one asked for), bin/bana's and the manager's, all one.
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      v: ${{ steps.v.outputs.v }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: v
+        name: .github/release.sh check
+        env:
+          ASKED: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = push ]; then V=${GITHUB_REF_NAME#v}; else V=$ASKED; fi
+          .github/release.sh check "$V"
+          if [ "$GITHUB_EVENT_NAME" = push ] && ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME is not a commit on main"
+            exit 1
+          fi
+          case $V in *-*) pre=true ;; *) pre=false ;; esac
+          echo "v=$V" >>"$GITHUB_OUTPUT"
+          echo "prerelease=$pre" >>"$GITHUB_OUTPUT"
+
+  # bana's tests, as on a push. test.yml's self-tests ask for more than contents: read, and a
+  # called workflow may not ask for more than its caller gives, even for a job it skips: they
+  # are granted here, and never run (called: true skips them).
+  tests:
+    uses: ./.github/workflows/test.yml
+    with:
+      called: true
+    permissions:
+      contents: write
+      statuses: write
+
+  # bana-manager for each platform, run once where it can, then packed with bin/bana and lib/.
+  build:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, target: x86_64-unknown-linux-musl, plat: linux-x64}
+          - {os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, plat: linux-arm64}
+          - {os: macos-latest, target: aarch64-apple-darwin, plat: macos-arm64}
+          - {os: macos-latest, target: x86_64-apple-darwin, plat: macos-x64}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      V: ${{ needs.check.outputs.v }}
+      T: ${{ matrix.target }}
+      PLAT: ${{ matrix.plat }}
+      B: manager/target/${{ matrix.target }}/release/bana-manager
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add "$T"
+      - run: cargo build --release --locked --target "$T" --manifest-path manager/Cargo.toml
+      - name: statically linked
+        if: runner.os == 'Linux'
+        run: |
+          f=$(file "$B")
+          echo "$f"
+          case $f in *'statically linked'* | *'static-pie linked'*) ;; *) exit 1 ;; esac
+      # An arm64 Mac kills an unsigned program: ad hoc, when the linker did not sign it.
+      - name: signed, and its arch
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          codesign -v "$B" 2>/dev/null || codesign -s - -f "$B"
+          codesign -v "$B"
+          case $T in aarch64-*) a=arm64 ;; *) a=x86_64 ;; esac
+          test "$(lipo -archs "$B")" = "$a"
+      - name: bana-manager version says ${{ needs.check.outputs.v }}
+        run: |
+          set -euo pipefail
+          if [ "$PLAT" = macos-x64 ]; then
+            if ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+              echo "::notice::No Rosetta on this runner: macos-x64's bana-manager is built, not run"
+              exit 0
+            fi
+            got=$(arch -x86_64 "$B" version)
+          else
+            got=$("$B" version)
+          fi
+          test "$got" = "$V" || { echo "::error::bana-manager version says '$got', not $V"; exit 1; }
+      - run: .github/release.sh pack "$B" "$V" "$PLAT" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bana-${{ matrix.plat }}
+          path: dist/bana-v${{ needs.check.outputs.v }}-${{ matrix.plat }}.tar.gz
+          retention-days: 7
+          if-no-files-found: error
+
+  # The release's files: the archives, install.sh and SHA256SUMS, and notes.md (its text). A dry
+  # run ends here, with them as the artifact bana-vX.Y.Z-dist.
+  dist:
+    needs: [check, build, tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      V: ${{ needs.check.outputs.v }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bana-*
+          merge-multiple: true
+          path: dist
+      - run: .github/release.sh dist dist "$V"
+      - run: cd dist && sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bana-v${{ needs.check.outputs.v }}-dist
+          path: dist
+          retention-days: 7
+          if-no-files-found: error
+
+  # The release as people get it: its install.sh, with no Rust on the PATH, then gone again.
+  verify:
+    needs: [check, dist]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    env:
+      V: ${{ needs.check.outputs.v }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: bana-v${{ needs.check.outputs.v }}-dist
+          path: dist
+      - name: install.sh --from dist, bana version, bana daemon status, --uninstall
+        run: |
+          set -euo pipefail
+          PATH=$(printf '%s\n' "$PATH" | tr ':' '\n' | grep -v '/\.cargo/bin$' | paste -sd: -)
+          if command -v cargo; then echo "::error::cargo is still on the PATH"; exit 1; fi
+          export BANA_HOME=$RUNNER_TEMP/h
+          p=$RUNNER_TEMP/p b=$RUNNER_TEMP/b
+          sh dist/install.sh --from dist --prefix "$p" --bin-dir "$b" --yes
+          "$b/bana" version | tee "$RUNNER_TEMP/version"
+          grep -qx "bana $V (release v$V)" "$RUNNER_TEMP/version"
+          test "$(readlink "$p/current")" = "v$V"
+          "$b/bana" daemon status
+          sh dist/install.sh --from dist --prefix "$p" --bin-dir "$b" --uninstall --yes
+          test ! -e "$p" || test -z "$(ls -A "$p")"
+
+  # Only from a tag: a draft with the files, its assets read back (names and sha256s), then
+  # published; Latest when it is the highest final version, as bana's own publish does.
+  publish:
+    needs: [check, tests, dist, verify]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+      V: ${{ needs.check.outputs.v }}
+      PRE: ${{ needs.check.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: bana-v${{ needs.check.outputs.v }}-dist
+          path: dist
+      - name: gh release create --draft, checked, then published
+        run: |
+          set -euo pipefail
+          R=$GITHUB_REPOSITORY
+          if gh release view "$TAG" -R "$R" >/dev/null 2>&1; then
+            echo "::error::$TAG has a release already: nothing changed"
+            exit 1
+          fi
+          cd dist
+          sha256sum -c SHA256SUMS
+          files=$(ls -- *.tar.gz install.sh SHA256SUMS)
+          pre=''
+          [ "$PRE" = false ] || pre=--prerelease
+          # Until it is published, a failure deletes the draft (there was no release before).
+          trap 'gh release delete "$TAG" -R "$R" --yes --cleanup-tag=false || true' EXIT
+          # shellcheck disable=SC2086 # the file names and the flag, split on purpose
+          gh release create "$TAG" -R "$R" --draft --verify-tag --title "bana $V" \
+            --notes-file notes.md --generate-notes $pre $files
+          # shellcheck disable=SC2086
+          want=$(sha256sum -- $files | awk '{ print $2, "sha256:" $1 }' | sort)
+          got=$(gh release view "$TAG" -R "$R" --json assets --jq '.assets[] | "\(.name) \(.digest // "none")"' | sort)
+          if [ "$got" != "$want" ]; then
+            printf 'The draft has:\n%s\nnot:\n%s\n' "$got" "$want"
+            echo "::error::the draft's assets are not dist's: deleted, nothing published"
+            exit 1
+          fi
+          latest=--latest=false
+          top=$(git tag -l 'v*' | grep -v -- - | sort -V | tail -1)
+          if [ "$PRE" = false ] && [ "$top" = "$TAG" ]; then latest=--latest; fi
+          gh release edit "$TAG" -R "$R" --draft=false "$latest"
+          trap - EXIT
+          gh release view "$TAG" -R "$R" --json url --jq .url

@@ -5,7 +5,7 @@
 #
 # CI on push, on this machine (one daemon builds every push of each project added, through
 # act, and posts commit statuses):
-#   bana daemon install [--port N] [--no-tray] [--no-open] [--now]   start it, once a machine
+#   bana daemon install [--port N] [--no-tray | --tray] [--no-open] [--now]   start it, once a machine
 #                            (bana daemon help)
 #   bana daemon uninstall [--purge] | run [--build] | status | log | open | poke [PROJECT]
 #   bana add [--check] [--diff] [--workflow F] [--no-hook] [--no-claude]   in a project's checkout:
@@ -57,6 +57,8 @@
 #   bana apt PACKAGE...      installs the Debian packages that are missing
 #   bana settings            the settings in effect, and where they came from
 #   bana version             this bana (a release's, or a checkout's commit), and the daemon's if other
+#   bana upgrade [vX.Y.Z] [--check] [--now] [--yes]   the newest release (or this one), the daemon
+#                            first; a downgrade asks (bana upgrade help)
 #
 # Settings come from bana.conf (or .github/bana.conf) in your repository, or in the
 # checkout BANA_PROJECT_ROOT names; any key can be overridden by BANA_<KEY> in the
@@ -1027,6 +1029,12 @@ changed | plan | keep-builds)
   ;;
 apt) apt_missing "$@" ;;
 version | --version) bana_version ;;
+upgrade)
+  # shellcheck source=SCRIPTDIR/../lib/upgrade.sh
+  source "$bana_root/lib/upgrade.sh"
+  case ${1:-} in help | -h | --help) upgrade_usage ;; esac
+  upgrade_main "$@"
+  ;;
 # Used by the commands above, inside a Linux machine:
 linux-one) # K: the K-th Linux runner of a Mac's Linux machine
   [[ $(id -u) == 0 ]] && die "run as a normal user"

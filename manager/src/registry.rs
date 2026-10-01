@@ -15,6 +15,7 @@
 //! the others run on.
 
 use crate::daemon::{Daemon, Machine, Settings, MACHINE_DIR};
+use crate::upgrade;
 use axum::Router;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -54,6 +55,8 @@ pub struct Registry {
     scanning: tokio::sync::Mutex<()>,
     stop: watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// A newer bana's tag, when one is out ([`upgrade`]).
+    latest: Mutex<Option<String>>,
 }
 
 /// A prefix, as bana.conf takes it: `^[a-z0-9][a-z0-9-]*$`.
@@ -80,6 +83,7 @@ impl Registry {
             scanning: tokio::sync::Mutex::new(()),
             stop: watch::Sender::new(false),
             tasks: Mutex::new(Vec::new()),
+            latest: Mutex::new(None),
         }
     }
 
@@ -91,6 +95,7 @@ impl Registry {
         let tasks = vec![
             tokio::spawn(r.clone().runner()),
             tokio::spawn(r.clone().rescan()),
+            tokio::spawn(r.clone().upgrade_check()),
         ];
         *locked(&r.tasks) = tasks;
         r
@@ -108,6 +113,7 @@ impl Registry {
             home: s.home.clone(),
             home_set: s.home_set,
             recheck: s.recheck,
+            path: s.path.clone(),
         };
         let r = Self::new(&home, machine);
         for d in daemons {
@@ -377,6 +383,46 @@ impl Registry {
                 _ = stop.changed() => return,
             }
             self.scan().await;
+        }
+    }
+
+    /// A newer bana's tag (`v0.2.0`), when one is out.
+    pub fn latest(&self) -> Option<String> {
+        locked(&self.latest).clone()
+    }
+
+    /// What a release check found ([`upgrade::remember`]); the page and the
+    /// menu bar hear of a change.
+    pub fn found_latest(&self, found: &Result<Option<String>, String>) {
+        if upgrade::remember(&self.latest, found) {
+            self.changed.send_modify(|n| *n = n.wrapping_add(1));
+        }
+    }
+
+    /// Whether a newer bana is out: after [`upgrade::FIRST`], then every
+    /// [`upgrade::EVERY`]. A failure is one line in the log.
+    async fn upgrade_check(self: Arc<Self>) {
+        let mut stop = self.stop.subscribe();
+        let mut wait = upgrade::FIRST;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = stop.changed() => return,
+            }
+            wait = upgrade::EVERY;
+            let env = std::env::var("BANA_RELEASES").ok();
+            let Some(releases) = upgrade::releases(env.as_deref()) else {
+                return;
+            };
+            if upgrade::off(&self.machine.home, env.as_deref()) {
+                continue;
+            }
+            let found =
+                upgrade::check(&releases, &self.machine.path, env!("CARGO_PKG_VERSION")).await;
+            if let Err(e) = &found {
+                eprintln!("bana daemon: is a newer bana out? {e}");
+            }
+            self.found_latest(&found);
         }
     }
 

@@ -717,12 +717,14 @@ pub fn install(repo: &str, tag: &str, names: &[String], platforms: &[String]) ->
     let mut s = String::new();
     if has("install.sh") {
         s.push_str(&format!(
-            "```sh\ngh release download {tag} -R {repo} -p install.sh -O - | sh\n```\n\n"
+            "```sh\ncurl -fsSL https://github.com/{repo}/releases/download/{tag}/install.sh | sh\n\
+             gh release download {tag} -R {repo} -p install.sh -O - | sh   # a private repository\n```\n\n"
         ));
     }
     if has("install.ps1") {
         s.push_str(&format!(
-            "```powershell\ngh release download {tag} -R {repo} -p install.ps1 -O - | Out-String | iex\n```\n\n"
+            "```powershell\nirm https://github.com/{repo}/releases/download/{tag}/install.ps1 | iex\n\
+             gh release download {tag} -R {repo} -p install.ps1 -O - | Out-String | iex   # a private repository\n```\n\n"
         ));
     }
     if !platforms.is_empty() {
@@ -1252,13 +1254,17 @@ mod tests {
             .to_vec();
         let plats = vec!["linux-x64".to_string()];
         let i = install("o/r", "v1", &names, &plats).unwrap();
-        assert!(i.starts_with("```sh\ngh release download v1 -R o/r -p install.sh -O - | sh\n```"));
-        assert!(i.contains("-p install.ps1 -O - | Out-String | iex"));
+        assert!(i.starts_with(
+            "```sh\ncurl -fsSL https://github.com/o/r/releases/download/v1/install.sh | sh\n\
+             gh release download v1 -R o/r -p install.sh -O - | sh   # a private repository\n```"
+        ));
+        assert!(i.contains("irm https://github.com/o/r/releases/download/v1/install.ps1 | iex\n"));
+        assert!(i.contains("-p install.ps1 -O - | Out-String | iex   # a private repository\n```"));
         assert!(i.ends_with("Platforms: linux-x64. SHA256SUMS lists every file."));
         assert_eq!(install("o/r", "v1", &["a.deb".into()], &[]), None);
         let b = body("Notes\n\n", Some(&t), Some(&i));
         assert!(b.starts_with("Notes\n\n## Tested\n\nBuild #5"));
-        assert!(b.ends_with("## Install\n\n```sh\ngh release download v1 -R o/r -p install.sh -O - | sh\n```\n\n```powershell\ngh release download v1 -R o/r -p install.ps1 -O - | Out-String | iex\n```\n\nPlatforms: linux-x64. SHA256SUMS lists every file.\n"), "{b}");
+        assert!(b.ends_with(&format!("## Install\n\n{i}\n")), "{b}");
         assert_eq!(body("Notes", None, None), "Notes\n");
         let conf = "release.platforms = linux-arm64, linux-x64\tmacos-arm64 linux-x64 Bad/1\n";
         let declared = platforms(conf);

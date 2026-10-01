@@ -11,6 +11,11 @@
 # local.next, if any); a fix registered (…/fixes) has its round 0 queued, a fix dropped
 # (…/forget) had two round builds, and what comes on stdin (-H @-: the token) goes to
 # $FAKE_STATE/curl.stdin.
+# Releases: with FAKE_RELEASES (a directory) and BANA_RELEASES (their URL), it serves
+# BANA_RELEASES/download/TAG/FILE from FAKE_RELEASES/download/TAG/FILE (404 when missing),
+# and BANA_RELEASES/latest redirects to BANA_RELEASES/tag/<FAKE_RELEASES/latest's tag>, or to
+# BANA_RELEASES when there is no such file (GitHub's answer with no release). With a file
+# FAKE_RELEASES/down, every one of them fails as offline.
 echo "curl $*" >>"$FAKE_LOG"
 url=${*: -1}
 for a in "$@"; do [[ $a == @- ]] && cat >"$FAKE_STATE/curl.stdin"; done
@@ -22,6 +27,22 @@ added() { # the prefixes added
     echo "${p##*/}"
   done
 }
+if [[ -n ${FAKE_RELEASES:-} && -n ${BANA_RELEASES:-} && $url == "$BANA_RELEASES/"* ]]; then
+  [[ ! -e $FAKE_RELEASES/down ]] || { echo "curl: (6) Could not resolve host: ${BANA_RELEASES#*://}" >&2; exit 6; }
+  out=/dev/stdout
+  while (($#)); do [[ $1 != -o ]] || out=$2; shift; done
+  case ${url#"$BANA_RELEASES"/} in
+  latest)
+    if [[ -f $FAKE_RELEASES/latest ]]; then printf '%s/tag/%s' "$BANA_RELEASES" "$(cat "$FAKE_RELEASES/latest")"
+    else printf '%s' "$BANA_RELEASES"; fi ;;
+  download/*/*)
+    f=$FAKE_RELEASES/${url#"$BANA_RELEASES"/}
+    [[ -f $f ]] || { echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; }
+    cat "$f" >"$out" ;;
+  *) echo "curl: (22) The requested URL returned error: 404" >&2; exit 22 ;;
+  esac
+  exit 0
+fi
 case $url in
 http://127.0.0.1:*/ci/v1/health)
   if [[ -n ${FAKE_HEALTH:-} ]]; then echo "$FAKE_HEALTH"; exit 0; fi

@@ -426,6 +426,7 @@ impl Settings {
             home,
             home_set,
             recheck,
+            path: _,
         } = Machine::from(&kv, &env)?;
         let wait = |k: &str, d: u64| {
             get(k)
@@ -620,6 +621,8 @@ pub struct Machine {
     pub home_set: bool,
     /// How often a held queue looks again.
     pub recheck: Duration,
+    /// PATH for what the daemon runs itself (the release check's curl).
+    pub path: String,
 }
 
 impl Machine {
@@ -669,6 +672,10 @@ impl Machine {
             home,
             home_set,
             recheck,
+            path: get("path")
+                .map(String::from)
+                .or_else(|| env.get("PATH").cloned())
+                .unwrap_or_else(|| "/usr/bin:/bin".into()),
         })
     }
 }
@@ -7682,7 +7689,11 @@ exec git \"$@\"
             "{body}"
         );
         assert!(
-            body.ends_with("\n\n## Install\n\n```sh\ngh release download v0.1.0 -R o/r -p install.sh -O - | sh\n```\n\nPlatforms: linux-x64. SHA256SUMS lists every file.\n"),
+            body.ends_with(
+                "\n\n## Install\n\n```sh\ncurl -fsSL https://github.com/o/r/releases/download/v0.1.0/install.sh | sh\n\
+                 gh release download v0.1.0 -R o/r -p install.sh -O - | sh   # a private repository\n```\n\n\
+                 Platforms: linux-x64. SHA256SUMS lists every file.\n"
+            ),
             "{body}"
         );
         let log = p.read("gh-release.log");
