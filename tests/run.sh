@@ -1973,7 +1973,8 @@ for p in linux-x64 linux-arm64 macos-x64 macos-arm64; do
   check "package: $p holds bana-v$V/, with bana's files and nothing else" same "$(tar -tzf "$T/dist/bana-v$V-$p.tar.gz" | LC_ALL=C sort)" "$want"
 done
 check "package: its files are root's (0:0), not the build's user's" \
-  same "$(tar --numeric-owner -tvzf "$T/dist/bana-v$V-linux-x64.tar.gz" | awk '{ print $2 }' | sort -u)" "0/0"
+  same "$(tar --numeric-owner -tvzf "$T/dist/bana-v$V-linux-x64.tar.gz" |
+    awk '{ print ($2 ~ /\//) ? $2 : $3 "/" $4 }' | sort -u)" "0/0" # GNU tar: 0/0; BSD tar: 0 0
 tar -xzOf "$T/dist/bana-v$V-linux-x64.tar.gz" "bana-v$V/bin/bana" >"$T/w/bana.packed"
 check "package: bin/bana has the commit stamped" has "$T/w/bana.packed" "BANA_COMMIT=$sha #"
 check "package: and only that line differs from bana's" same "$(diff "$bana" "$T/w/bana.packed" | grep -c '^[<>]')" 2

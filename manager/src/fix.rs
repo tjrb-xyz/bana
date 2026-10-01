@@ -4979,10 +4979,18 @@ Error: {say} /Users/l/.cache/act/x-bana-actions-plan@1/y
             Gate::Block(UNTESTED.into()),
             Gate::Pass("blocked once for this tree"),
         ] {
+            // Under a second, or, on a machine this suite keeps busy, within
+            // ten plain `git status`es of this tree timed just before.
+            let t = std::time::Instant::now();
+            git(&wt, &["status", "--porcelain"]);
+            let one = t.elapsed();
             let t = std::time::Instant::now();
             assert_eq!(gate(&r.dir, &wt, "git", None), want);
             let took = t.elapsed();
-            assert!(took < Duration::from_secs(1), "{took:?}");
+            assert!(
+                took < Duration::from_secs(1).max(one * 10),
+                "{took:?} (git status: {one:?})"
+            );
         }
     }
 
