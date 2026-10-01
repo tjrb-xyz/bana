@@ -25,7 +25,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: shellcheck
         if: runner.os == 'Linux'
-        run: shellcheck -x bin/bana lib/*.sh install.sh tests/*.sh tests/stand-ins/* tests/fixtures/runner/*.sh examples/example/*.sh
+        run: shellcheck -x bin/bana lib/*.sh install.sh tests/*.sh tests/stand-ins/* tests/fixtures/runner/*.sh examples/example/*.sh .github/*.sh
+      - name: one version (bin/bana, manager/Cargo.toml and Cargo.lock agree)
+        if: runner.os == 'Linux'
+        run: .github/release.sh check
       - name: tests (macOS's /bin/bash 3.2 and awk)
         if: runner.os == 'macOS'
         run: BASH_UNDER_TEST=/bin/bash tests/run.sh

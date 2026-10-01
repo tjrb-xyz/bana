@@ -8,9 +8,11 @@
 #
 #   bana daemon install [options]   check this machine, build, and start the daemon (again)
 #     --port N         the page's port (default 8470, or the one installed)
-#     --no-tray        on a Mac: no menu bar item
+#     --no-tray        on a Mac: no menu bar item (kept when you install again; --tray: back)
 #     --no-open        on a Mac: don't open the page afterwards
 #     --now            restart at once, even while a build runs (it runs again once)
+#                    A new snapshot runs only once it answers as this bana; else the one before
+#                    runs again (the new one stays in ~/.bana/daemon.d.bad).
 #   bana daemon uninstall [--purge]  stop and remove it; the projects stay added (--purge:
 #                    bana remove --purge each one)
 #   bana daemon run [--build]   in the foreground, for debugging (--build: from this checkout first)
@@ -100,6 +102,9 @@ d_health() { # PORT
   grep -Eq '"daemon": *true' <<<"$h"
 }
 d_is_ours() { grep -Eq '"global": *true' <<<"$1"; } # the one daemon, not a project's of before
+# The bana version and the process a health answer names (none: a daemon from before they did).
+d_health_version() { sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' <<<"$1"; } # HEALTH
+d_health_pid() { sed -n 's/.*"pid": *\([0-9][0-9]*\).*/\1/p' <<<"$1"; }        # HEALTH
 d_up() { local h; h=$(d_health "$(d_port)") && d_is_ours "$h"; }
 # The daemon reads the projects' files again, and says how each stands: one JSON line a
 # project. A project that starts again waits for its build's checkout first.
@@ -288,12 +293,13 @@ d_put() { # FROM TO MODE
   mv -f "$2.new.$$" "$2"
 }
 
-# The snapshot the daemon runs: a branch switch in your checkout never changes it.
-d_snapshot() { # BIN
+# The snapshot the daemon runs, in DIR (a new one): a branch switch in your checkout never
+# changes it, and a file bana no longer has is not in it.
+d_snapshot() { # DIR BIN
   local f
-  d_put "$1" "$d_dir/bana-manager" 755
-  d_put "$bana_root/bin/bana" "$d_dir/bin/bana" 755
-  for f in "$bana_root"/lib/*.sh "$bana_root"/lib/install.*.in; do d_put "$f" "$d_dir/lib/$(basename "$f")" 644; done
+  d_put "$2" "$1/bana-manager" 755
+  d_put "$bana_root/bin/bana" "$1/bin/bana" 755
+  for f in "$bana_root"/lib/*.sh "$bana_root"/lib/install.*.in; do d_put "$f" "$1/lib/$(basename "$f")" 644; done
 }
 
 # The daemon's own clone of the project: made from your checkout (quick), then pointed at GitHub.
@@ -348,8 +354,9 @@ d_write_keys() { # FILE
   fi
 }
 
-# daemon.d/settings: the machine's keys (another is an error there).
-d_write_machine() { # PORT TRAY GH
+# daemon.d/settings, in DIR: the machine's keys (another is an error there). A release
+# writes only keys its own bana-manager reads.
+d_write_machine() { # DIR PORT TRAY GH
   local k prog login b
   login=$(gh api user --jq .login 2>/dev/null || true)
   # The bana commit the snapshot is of (a fix's brief names it): a checkout's or a
@@ -357,13 +364,13 @@ d_write_machine() { # PORT TRAY GH
   b=$(bana_commit)
   {
     echo "# Written by bana daemon install ($(date '+%Y-%m-%d %H:%M')); run it again to change this."
-    echo "port = $1"
+    echo "port = $2"
     echo "host = $host"
     [[ ! $login =~ ^[A-Za-z0-9-]+$ ]] || echo "login = $login"
     echo "path = $PATH"
-    echo "tray = $2"
+    echo "tray = $3"
     [[ -z ${BANA_HOME:-} ]] || echo "home = $base_home"
-    echo "gh = $3"
+    echo "gh = $4"
     # caffeinate keeps a Mac awake while act runs.
     for k in git docker bash $([[ $os != Darwin ]] || echo caffeinate); do
       prog=$(command -v "$k" 2>/dev/null) || prog=
@@ -372,7 +379,7 @@ d_write_machine() { # PORT TRAY GH
     done
     echo "script = $d_dir/bin/bana"
     [[ -z $b ]] || echo "bana_commit = $b"
-  } | d_write "$d_settings"
+  } | d_write "$1/settings"
 }
 
 # <prefix>/daemon/settings: the project's keys, from bana.conf (another is an error there).
@@ -494,15 +501,23 @@ EOF
   mv -f "$d_unit_file.new.$$" "$d_unit_file"
 }
 
-# Waits while the daemon runs a build (a restart would interrupt it).
+# Waits while the daemon runs a build (a restart would interrupt it). A queued build may
+# start as the one waited for ends: it asks once more, a moment later.
 d_wait_build() { # PORT
-  local flat line said=''
-  while line=$(d_curl "$1" /ci/v1/projects 2>/dev/null | grep -E '"running": *\{' | head -1) && [[ -n $line ]]; do
-    if [[ -z $said ]]; then
-      flat=$(d_flat <<<"$line")
-      say "$(d_val "$flat" prefix)'s build #$(d_val "$flat" running.id) ($(d_val "$flat" running.ref)) runs: restarting the daemon when it ends (--now: restart now; it runs again)"
-      said=1
+  local flat line b said='' again=''
+  while :; do
+    line=$(d_curl "$1" /ci/v1/projects 2>/dev/null | grep -E '"running": *\{' | head -1) || line=''
+    if [[ -z $line ]]; then
+      [[ -n $said && -z $again ]] || return 0
+      again=1
+      sleep "$d_step"
+      continue
     fi
+    again=''
+    flat=$(d_flat <<<"$line")
+    b="$(d_val "$flat" prefix)'s build #$(d_val "$flat" running.id) ($(d_val "$flat" running.ref))"
+    [[ $said == "$b" ]] || say "$b runs: restarting the daemon when it ends (--now: restart now; it runs again)"
+    said=$b
     sleep $((d_step * 10))
   done
 }
@@ -681,22 +696,63 @@ d_migrate() { # NOW
 
 # ---- the commands ------------------------------------------------------------------------
 
-# Everything the daemon needs but its service: checks, build, snapshot, settings.
-d_prepare() { # PORT TRAY
+# Everything the daemon needs but its service, in daemon.d.new: checks, build, snapshot,
+# settings (the new bana writes them). The running daemon's daemon.d is not touched.
+d_stage() { # PORT TRAY
   local bin
   d_doctor_machine
   bin=$(d_build)
-  d_snapshot "$bin"
-  d_write_machine "$1" "$2" "$(command -v gh)"
+  rm -rf "$d_dir.new"
+  d_snapshot "$d_dir.new" "$bin"
+  d_write_machine "$d_dir.new" "$1" "$2" "$(command -v gh)"
   echo "  settings: $d_settings"
 }
 
+# daemon.d.new becomes daemon.d, by two renames: the one before is daemon.d.prev (a
+# daemon still running keeps its files).
+d_swap() {
+  rm -rf "$d_dir.prev"
+  [[ ! -d $d_dir ]] || mv "$d_dir" "$d_dir.prev"
+  mv "$d_dir.new" "$d_dir"
+}
+
+# Waits for the daemon on PORT to answer as bana VERSION, from a process other than
+# NOT-PID (if given). d_last: the last answer of the one daemon.
+d_confirm() { # PORT VERSION [NOT-PID]
+  local k h
+  d_last=''
+  for ((k = 0; k < 60; k++)); do
+    if h=$(d_health "$1") && d_is_ours "$h"; then
+      d_last=$h
+      if [[ $(d_health_version "$h") == "$2" ]] && [[ -z ${3:-} || $(d_health_pid "$h") != "$3" ]]; then return 0; fi
+    fi
+    sleep "$d_step"
+  done
+  return 1
+}
+
+# The service, started again on daemon.d: its own settings' PATH and tray. A subshell, so
+# that a die there returns.
+d_restart() { (d_service "$(d_setting path)" "$(d_setting tray || echo no)"); }
+
+# What the last answer says it is, for a message.
+d_said() { # VERSION
+  local v
+  [[ -n $d_last ]] || { echo "did not answer"; return; }
+  v=$(d_health_version "$d_last")
+  [[ $v == "$1" ]] || { echo "answered as bana ${v:-of before}"; return; }
+  echo "answered from the process before (pid $(d_health_pid "$d_last"))"
+}
+
 daemon_install() {
-  local port='' tray=yes open=1 now='' h k olds n=0 old=''
+  local port='' tray=yes open=1 now=${BANA_UPGRADE_NOW:+1} h k olds n=0 old='' pid='' was name
+  # The menu bar as installed (--no-tray stays), unless said.
+  case $(d_setting tray || true) in no) tray=no ;; esac
   [[ $os == Darwin ]] || tray=no
   while (($#)); do
     case $1 in
     --port) port=${2:?--port N}; shift ;;
+    --tray) [[ $os != Darwin ]] || tray=yes ;;
     --no-tray) tray=no ;;
     --no-open) open='' ;;
     --now) now=1 ;;
@@ -723,23 +779,63 @@ daemon_install() {
       die "Something else serves port $port (bana manager, say): pass --port"
     fi
   fi
-  d_prepare "$port" "$tray"
+  d_stage "$port" "$tray"
   [[ -n $now ]] || ! d_installed || d_wait_build "$port"
   d_migrate "$now"
-  d_service "$(d_setting path)" "$tray"
-  say "Waiting for the daemon on port $port"
-  for ((k = 0; k < 60; k++)); do
-    h=$(d_health "$port") && d_is_ours "$h" && break
-    h=
-    sleep "$d_step"
-  done
-  if [[ -z $h ]]; then
-    die "The daemon does not answer on port $port: 'bana daemon log' says why"
+  # What runs now (a daemon from before says no pid or version; one may not run): the new
+  # daemon is another process, of this bana. NAME: the version of the snapshot before.
+  name=$(sed -n 's/^BANA_VERSION=//p' "$d_dir/bin/bana" 2>/dev/null) || name=''
+  if h=$(d_health "$port") && d_is_ours "$h"; then
+    pid=$(d_health_pid "$h") was=$(d_health_version "$h")
+  else
+    was=$name
   fi
-  say "The daemon runs. Its page: $(d_url "$port")"
+  d_swap
+  say "Waiting for the daemon on port $port"
+  if d_restart && d_confirm "$port" "$BANA_VERSION" "$pid"; then
+    if [[ -n ${was:-$name} && ${was:-$name} != "$BANA_VERSION" ]]; then
+      say "The daemon runs bana $BANA_VERSION (was ${was:-$name}). Its page: $(d_url "$port")"
+    else
+      say "The daemon runs. Its page: $(d_url "$port")"
+    fi
+  else
+    [[ -d $d_dir.prev ]] || die "The daemon $(d_said "$BANA_VERSION") on port $port: 'bana daemon log' says why"
+    d_rollback "$port" "$was" "${was:-$name}" "$(d_said "$BANA_VERSION")"
+  fi
   daemon_list
   echo "bana add, in a project's checkout, adds a project."
   if [[ $os == Darwin && -n $open ]]; then open "$(d_url "$port")" || true; fi
+}
+
+# The new snapshot's daemon did not come up as this bana (SAID): the one before
+# (daemon.d.prev, bana NAME, whose health says WAS) runs again, and the new one stays in
+# daemon.d.bad for its log.
+d_rollback() { # PORT WAS NAME SAID
+  local bad start
+  bad=$(d_health_pid "$d_last")
+  rm -rf "$d_dir.bad"
+  mv "$d_dir" "$d_dir.bad"
+  mv "$d_dir.prev" "$d_dir"
+  warn "bana $BANA_VERSION's daemon $4: starting bana $3's again"
+  if d_restart && d_confirm "$1" "$2" "$bad"; then
+    die "bana $BANA_VERSION's daemon did not come up; the daemon is back on $3. Its log: bana daemon log, files in $(d_tilde "$d_dir.bad")"
+  fi
+  # Nothing more is tried, and nothing is deleted.
+  if [[ $os == Darwin ]]; then
+    start="launchctl bootout gui/$(id -u)/$d_label; launchctl bootstrap gui/$(id -u) $d_plist"
+  else
+    start="systemctl --user restart $d_unit"
+  fi
+  {
+    echo "bana $BANA_VERSION's daemon did not come up, and bana $3's did not either ($(d_said "$2")). Both are kept:"
+    echo "  $(d_tilde "$d_dir"): bana $3's, which the service runs"
+    echo "  $(d_tilde "$d_dir.bad"): bana $BANA_VERSION's"
+    echo "Why: bana daemon log. To start bana $3's again:"
+    echo "  $start"
+    echo "To try bana $BANA_VERSION's instead:"
+    echo "  mv $d_dir $d_dir.prev && mv $d_dir.bad $d_dir && $start"
+  } >&2
+  exit 1
 }
 
 daemon_uninstall() {
@@ -757,7 +853,7 @@ daemon_uninstall() {
     rm -f "$d_unit_file"
     systemctl --user daemon-reload 2>/dev/null || true
   fi
-  rm -rf "$d_dir"
+  rm -rf "$d_dir" "$d_dir.new" "$d_dir.prev" "$d_dir.bad"
   [[ -z $purge ]] || rm -f "$d_logfile"
   for p in $(d_prefixes); do n=$((n + 1)); done
   if ((n)); then
@@ -771,7 +867,8 @@ daemon_run() {
   local build=''
   case ${1:-} in '') ;; --build) build=1 ;; *) daemon_usage ;; esac
   if [[ -n $build || ! -x $d_dir/bana-manager || ! -f $d_settings ]]; then
-    d_prepare "$(d_port)" "$([[ $os == Darwin ]] && echo yes || echo no)"
+    d_stage "$(d_port)" "$([[ $os == Darwin ]] && echo yes || echo no)"
+    d_swap
   fi
   exec "$d_dir/bana-manager" daemon --home "$base_home" --no-tray
 }

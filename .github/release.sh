@@ -51,6 +51,7 @@ rewrite() { # FILE AWK-PROGRAM VERSION
   rm -f "$tmp"
 }
 
+# shellcheck disable=SC2016 # awk's own $0
 bump() { # VERSION
   valid "${1:-}" || die "bump X.Y.Z (X.Y.Z-pre for a prerelease), not '${1:-}'"
   rewrite bin/bana '/^BANA_VERSION=/ && !d { $0 = "BANA_VERSION=" v; d = 1 } { print }' "$1"

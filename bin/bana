@@ -266,13 +266,13 @@ bana_version() {
   # shellcheck source=SCRIPTDIR/../lib/daemon.sh
   source "$bana_root/lib/daemon.sh"
   h=$(d_health "$(d_port)") && d_is_ours "$h" || return 0
-  v=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' <<<"$h")
+  v=$(d_health_version "$h")
   [[ -z $v || $v == "$BANA_VERSION" ]] || echo "the daemon runs $v: bana daemon install"
 }
 
 settings() {
   local k v
-  echo "# bana $BANA_VERSION at $bana_root"
+  echo "# bana $BANA_VERSION at $bana_root ($(bana_kind))"
   echo "# bana.conf: ${conf_file:-none}"
   for k in repo prefix labels vm vm_x64 linux_user packages.linux path hook.mac hook.linux \
     runner_version workflow tiers tier_input act.image act.network act.args act.docker_config ci.log keep keep_max_gb \

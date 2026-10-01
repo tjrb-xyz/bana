@@ -30,7 +30,8 @@ fresh() {
   mkdir -p "$T/w/project/.github" "$T/w/home" "$T/w/state/vmroot/run/systemd/system"
   export HOME=$T/w/home FAKE_STATE=$T/w/state FAKE_LOG=$T/w/log
   unset FAKE_OS FAKE_ARCH FAKE_UID FAKE_IOREG BANA_SYS_ROOT BANA_TOKEN FAKE_GH FAKE_POOL FAKE_SVC_FAIL GITHUB_TOKEN \
-    FAKE_HEALTH FAKE_LINGER FAKE_GH_SCOPES BANA_DAEMON_BIN BANA_DAEMON_STEP CARGO_TARGET_DIR
+    FAKE_HEALTH FAKE_LINGER FAKE_GH_SCOPES BANA_DAEMON_BIN BANA_DAEMON_STEP CARGO_TARGET_DIR \
+    FAKE_CARGO_FAIL FAKE_VERSION FAKE_LATEST FAKE_SEEN BANA_UPGRADE_NOW
   # What the host (GitHub's runners, act, a daemon's build) may have set, which bana reads.
   unset XDG_CONFIG_HOME BANA_HOME BANA_CONFIG BANA_PROJECT_ROOT BANA_ACT_LOCKED BANA_DAEMON ACT \
     RUNNER_ENVIRONMENT GITHUB_WORKSPACE DOCKER_HOST DISPLAY WAYLAND_DISPLAY
@@ -85,6 +86,49 @@ check "without bana.conf, the repository comes from git's origin" has "$T/out" "
 check "and the prefix from its name" has "$T/out" "prefix = widget"
 (cd "$T" && BANA_PROJECT_ROOT=$T/w/project bash "$bana" settings) >"$T/out"
 check "BANA_PROJECT_ROOT names the checkout from elsewhere" has "$T/out" "repo = acme/widget"
+
+# ---- version: one version, in bin/bana, Cargo.toml and Cargo.lock; how bana came ----------
+fresh
+V=$(sed -n 's/^BANA_VERSION=//p' "$bana")
+release_sh=$here/../.github/release.sh
+check "version: release.sh check, as committed" same "$(bash "$release_sh" check 2>&1)" "bana $V"
+r=$T/w/r
+mkdir -p "$r/bin" "$r/manager" "$r/.github"
+cp "$bana" "$r/bin/"
+cp "$here/../manager/Cargo.toml" "$here/../manager/Cargo.lock" "$r/manager/"
+cp "$release_sh" "$r/.github/"
+awk '!d && /^version =/ { $0 = "version = \"0.0.9\""; d = 1 } { print }' "$here/../manager/Cargo.toml" >"$r/manager/Cargo.toml"
+check "version: check fails when Cargo.toml differs" bash -c "! bash '$r/.github/release.sh' check 2>'$T/out'"
+check "version: and says which file" has "$T/out" "manager/Cargo.toml: 0.0.9"
+check "version: check X.Y.Z fails when that is not the version" bash -c "! bash '$release_sh' check 9.9.9 2>/dev/null"
+check "version: check takes no tag" bash -c "! bash '$release_sh' check v$V 2>/dev/null"
+bash "$r/.github/release.sh" bump 9.9.9 >"$T/out" 2>&1 || true
+check "version: bump sets all three" same "$(bash "$r/.github/release.sh" check 9.9.9 2>&1)" "bana 9.9.9"
+check "version: bump, in bin/bana" has "$r/bin/bana" "BANA_VERSION=9.9.9"
+check "version: bump, in Cargo.lock's bana-manager" same "$(grep -A1 '^name = "bana-manager"$' "$r/manager/Cargo.lock" | tail -1)" 'version = "9.9.9"'
+check "version: bump keeps bin/bana a program" test -x "$r/bin/bana"
+check "version: bump leaves the rest" same "$(diff "$bana" "$r/bin/bana" | grep -c '^[<>]')" 2
+# How bana came, as bana settings says: a dev checkout, the old install.sh's ~/.bana/src, a
+# submodule, a copy inside a project, a release.
+k=$T/w/k
+kind_of() { (cd "$T/w/project" && bash "$1/bin/bana" settings 2>&1 | head -1); } # ROOT
+mkdir -p "$k/dev/bin" "$k/home"
+cp "$bana" "$k/dev/bin/"
+git -C "$k/dev" init -q && git -C "$k/dev" add -A && git -C "$k/dev" -c user.name=t -c user.email=t@t commit -q -m one
+check "kind: a checkout of bana is dev" same "$(kind_of "$k/dev")" "# bana $V at $k/dev (dev)"
+check "version: a checkout's names its commit" same "$(bash "$k/dev/bin/bana" version)" \
+  "bana $V (checkout $(git -C "$k/dev" rev-parse HEAD | cut -c1-7))"
+git clone -q "$k/dev" "$k/home/src"
+check "kind: ~/.bana/src is legacy" has <(BANA_HOME=$k/home kind_of "$k/home/src") "(legacy)"
+check "kind: another BANA_HOME's is dev" has <(BANA_HOME=$k/dev kind_of "$k/home/src") "(dev)"
+mkdir -p "$k/super"
+git -C "$k/super" init -q
+git -C "$k/super" -c protocol.file.allow=always submodule add -q "$k/dev" bana >/dev/null 2>&1
+check "kind: a submodule" has <(kind_of "$k/super/bana") "(submodule)"
+mkdir -p vendor/bana/bin && cp "$bana" vendor/bana/bin/
+check "kind: a copy inside a project" has <(kind_of "$PWD/vendor/bana") "(copy)"
+check "version: a copy's names no commit" same "$(bash vendor/bana/bin/bana version)" "bana $V"
+rm -rf vendor
 
 # ---- plan, changed, keep-builds -------------------------------------------------
 fresh
@@ -1661,6 +1705,66 @@ check "bana init is said only where it points to bana add" same "$(grep -rn 'ban
 check "no doc says the daemon is a project's" same "$(grep -rnE '<prefix>/daemon/bana-manager|<prefix>/daemon/. \||Logs/bana/<prefix>|install \[[^]]*\] \[--no-claude\]|daemon install. registers' \
   "$here/../README.md" "$here/../docs" "$here/../lib" "$here/../bin")" ""
 unset BANA_DAEMON_BIN BANA_DAEMON_STEP
+
+# ---- a release: a prebuilt bana-manager, no Rust ------------------------------------------------
+# The compiled installer's layout: PREFIX/vX/{bin/bana, bin/bana-manager, lib}, PREFIX/current,
+# PREFIX/receipt, and BIN/bana -> PREFIX/current/bin/bana. cargo fails here.
+fresh
+daemon_world
+unset BANA_DAEMON_BIN
+export FAKE_CARGO_FAIL=1
+p=$T/w/p r=$T/w/p/v$V m=$HOME/.bana/daemon.d sha=0123456789abcdef0123456789abcdef01234567
+mkdir -p "$r/bin" "$r/lib" "$T/w/b"
+sed "s/^BANA_COMMIT=/BANA_COMMIT=$sha/" "$bana" >"$r/bin/bana"
+chmod 755 "$r/bin/bana"
+cp "$here"/../lib/*.sh "$here"/../lib/install.*.in "$r/lib/"
+fake_manager() { # VERSION
+  cat >"$r/bin/bana-manager" <<EOF
+#!/bin/sh
+case \$* in
+version) echo $1 ;;
+*--usage*) echo "usage: bana-manager mcp --dir DIR" ;;
+*) echo "release bana-manager \$*" >>"\$FAKE_LOG" ;;
+esac
+EOF
+  chmod 755 "$r/bin/bana-manager"
+}
+fake_manager "$V"
+ln -s "v$V" "$p/current"
+ln -s "$p/current/bin/bana" "$T/w/b/bana"
+printf 'name=bana\nrepo=tjrb-xyz/bana\ntag=v%s\nbin=%s\nversion=v%s\n' "$V" "$T/w/b" "$V" >"$p/receipt"
+bash "$T/w/b/bana" settings >"$T/out" 2>&1 || true
+check "prebuilt: bana runs from its version's own directory, not current" same "$(head -1 "$T/out")" \
+  "# bana $V at $(cd "$r" && pwd -P) (release)"
+check "prebuilt: bana version says the release" same "$(bash "$T/w/b/bana" version)" "bana $V (release v$V)"
+bash "$T/w/b/bana" mcp --config >"$T/out" 2>&1 || true
+check "prebuilt: bana's tools run the release's bana-manager" has "$FAKE_LOG" "release bana-manager mcp --dir $HOME/.bana/wid --config"
+: >"$FAKE_LOG"
+(cd "$HOME" && bash "$T/w/b/bana" daemon install --no-open) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "prebuilt: daemon install" has "$T/out" "The daemon runs."
+check "prebuilt: the snapshot has the release's bana-manager" cmp -s "$r/bin/bana-manager" "$m/bana-manager"
+check "prebuilt: and its bana" cmp -s "$r/bin/bana" "$m/bin/bana"
+check "prebuilt: and its lib" cmp -s "$r/lib/daemon.sh" "$m/lib/daemon.sh"
+check "prebuilt: no cargo" lacks "$FAKE_LOG" "cargo "
+check "prebuilt: nothing built" lacks "$T/out" "Building"
+check "prebuilt: bana_commit is the release's" has "$m/settings" "bana_commit = $sha"
+check "prebuilt: script is the snapshot's" has "$m/settings" "script = $m/bin/bana"
+check "prebuilt: no setting names the release's directory" lacks "$m/settings" "$T/w/p"
+check "prebuilt: the daemon says its version" has <(curl -fsS http://127.0.0.1:8470/ci/v1/health) "\"version\":\"$V\""
+check "prebuilt: bana version, with the daemon on it" same "$(bash "$T/w/b/bana" version)" "bana $V (release v$V)"
+check "prebuilt: bana version, with the daemon on another" same "$(FAKE_VERSION=0.0.1 bash "$T/w/b/bana" version | tail -1)" \
+  "the daemon runs 0.0.1: bana daemon install"
+fake_manager 0.0.1
+bash "$T/w/b/bana" daemon install --no-open >"$T/out" 2>&1 || true
+check "prebuilt: a bana-manager of another version is refused" has "$T/out" \
+  "$r/bin/bana-manager is not bana $V's bana-manager (it says '0.0.1'): install this release again (its install.sh --force)"
+check "prebuilt: and the snapshot keeps the one before" same "$("$m/bana-manager" version)" "$V"
+fake_manager "$V"
+rm -f "$p/receipt"
+bash "$T/w/b/bana" settings >"$T/out" 2>&1 || true
+check "prebuilt: without a receipt, a copy (as current/)" same "$(head -1 "$T/out")" "# bana $V at $p/current (copy)"
+bash "$T/w/b/bana" daemon uninstall >/dev/null 2>&1 || true
+unset FAKE_CARGO_FAIL BANA_DAEMON_STEP
 
 # ---- Tart --------------------------------------------------------------------------------------
 fresh
