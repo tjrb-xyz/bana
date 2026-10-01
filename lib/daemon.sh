@@ -653,11 +653,19 @@ d_migrate() { # NOW
         index(drop, " " k " ") == 0' "$s" | d_write "$s"
       r=$(d_setting repo "$s") || r=$p
       checkout=$(d_setting checkout "$s") || checkout=
+      # The hook and Claude Code's MCP server point at the one daemon now: only where the
+      # old install put them (--no-hook, --no-claude: still none).
       if [[ -n $checkout && -d $checkout ]]; then
-        d_hook_install "$checkout" "$p" >/dev/null
-        d_claude_add "$checkout" "$dir" >/dev/null
+        h=$(d_hook_file "$checkout") || h=
+        if [[ -f $h ]] && grep -qF "$d_hook_mark" "$h"; then
+          d_hook_install "$checkout" "$p" >/dev/null
+        fi
+        if command -v claude >/dev/null && (cd "$checkout" && claude mcp get bana) >/dev/null 2>&1; then
+          d_claude_add "$checkout" "$dir" >/dev/null
+        fi
       fi
     fi
+    [[ $os != Darwin ]] || rm -f "$HOME/Library/Logs/bana/$p.log"
     say "Moved $p ($r) to the one daemon: its builds, fixes and releases stay"
   done 3< <(d_olds)
   [[ -z $reload ]] || systemctl --user daemon-reload 2>/dev/null || true

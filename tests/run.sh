@@ -1522,10 +1522,17 @@ checkout = $top
 bana_commit = 0123
 EOF
 printf '#!/bin/sh\n# bana: tells the daemon about your pushes (bana daemon install added it).\ncurl http://127.0.0.1:8471/ci/v1/daemon/poll\n' >"$hook"
+echo bana >"$FAKE_STATE/claude.mcp" # its old install registered it
+mkdir -p "$HOME/Library/Logs/bana" && echo old >"$HOME/Library/Logs/bana/wid.log"
+bash "$bana" add </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "add: a project with its own daemon of before stops" same "$st" 1
+check "add: and says install moves it first" has "$T/out" "wid still has its own daemon of before: bana daemon install moves it"
+check "add: its settings untouched" has "$d/daemon/settings" "port = 8471"
 echo '{"now":100,"watcher":{},"running":{"id":7,"ref":"main"},"queue":[],"last":null}' >"$FAKE_STATE/local.json"
 echo '{"now":100,"watcher":{},"running":null,"queue":[],"last":null}' >"$FAKE_STATE/local.next"
 : >"$FAKE_LOG"
 (cd "$HOME" && bash "$bana" daemon install --no-open) >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "migrate: its own log of before goes" test ! -e "$HOME/Library/Logs/bana/wid.log"
 check "migrate: waits for the old daemon's build" has "$T/out" "wid's build #7 (main) runs: moving wid to the one daemon when it ends"
 check "migrate: on its port, by its own routes" has "$FAKE_LOG" "http://127.0.0.1:8471/ci/v1/local"
 check "migrate: boots the old one out" has "$FAKE_LOG" "launchctl bootout gui/1000/xyz.tjrb.bana.wid"
@@ -1553,7 +1560,7 @@ unset BANA_DAEMON_BIN
 export CARGO_TARGET_DIR=$T/w/target
 uu=$HOME/.config/systemd/user
 mkdir -p "$uu" "$d/daemon" "$HOME/.bana/two/daemon"
-printf 'repo = acme/widget\nprefix = wid\nport = 8471\n' >"$d/daemon/settings"
+printf 'repo = acme/widget\nprefix = wid\nport = 8471\ncheckout = %s\n' "$(git rev-parse --show-toplevel)" >"$d/daemon/settings"
 printf 'repo = acme/two\nprefix = two\nport = 8472\npath = %s\n' "$PATH" >"$HOME/.bana/two/daemon/settings"
 for q in wid two; do echo unit >"$uu/bana-$q.service" && touch "$FAKE_STATE/systemd-bana-$q.service"; done
 echo '{"now":100,"watcher":{},"running":{"id":7,"ref":"main"},"queue":[],"last":null}' >"$FAKE_STATE/local.json"
@@ -1564,6 +1571,8 @@ check "migrate (Linux): stops each" same "$(grep -o 'systemctl --user disable --
   "systemctl --user disable --now bana-two.service systemctl --user disable --now bana-wid.service "
 check "migrate (Linux): and deletes them" test ! -e "$uu/bana-wid.service" -a ! -e "$uu/bana-two.service"
 check "migrate (Linux): two ports of before: the default one" has "$m/settings" "port = 8470"
+check "migrate (Linux): installed with --no-hook, still no hook" test ! -e "$(git rev-parse --git-path hooks)/reference-transaction"
+check "migrate (Linux): installed with --no-claude, still not in Claude Code" lacks "$FAKE_LOG" "mcp add"
 check "migrate (Linux): a path that is the machine's goes" same "$(tr '\n' ' ' <"$HOME/.bana/two/daemon/settings")" \
   "repo = acme/two prefix = two "
 check "daemon (Linux): built with cargo, locked" has "$FAKE_LOG" "cargo build -q --release --locked --manifest-path $bana_root/manager/Cargo.toml"
@@ -1885,6 +1894,11 @@ YML
   check "add: a CPU asked for, not checked in a step: a note" has "$T/out" "ci.yml:28: arm: it asks for ubuntu-24.04-arm"
   check "add --check: every job has a place" has "$T/out" "bana add --check: 0 jobs with no place here, 0 split matrices, workflow_dispatch: yes"
   check "add --check: exit 0" same "$st" 0
+  # What the report chose and bana.conf does not say stops the add: the daemon reads bana.conf.
+  FAKE_OS=Linux FAKE_ARCH=x86_64 bash "$bana" add --workflow release.yml </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+  check "add: a workflow bana.conf does not name stops it" same "$st" 1
+  check "add: and says the line" has "$T/out" "  workflow = release.yml"
+  check "add: nothing registered" bash -c "! grep -rqs release.yml '$HOME/.bana'/*/daemon/settings"
 fi
 
 # The doctor (bana add): a push trigger behind a vars.*_CI_AUTO gate is fine;

@@ -1951,22 +1951,29 @@ impl Daemon {
     /// Stops: a running build ends (and runs again once at the next start),
     /// waiting two minutes at most for it, as the process exits after.
     pub async fn shutdown(&self) {
-        self.stop(Some(Duration::from_secs(120))).await
+        self.stop(Some(Duration::from_secs(120)), INTERRUPTED).await
     }
 
     /// Stops, and waits for the running build to end however long its
     /// checkout takes: a daemon started again in this process only then
     /// takes its daemon.lock, state.json and builds.
     pub async fn stop_fully(&self) {
-        self.stop(None).await
+        self.stop(None, INTERRUPTED).await
     }
 
-    async fn stop(&self, most: Option<Duration>) {
+    /// Stops for good, as [`Daemon::stop_fully`], but a running build ends
+    /// with `why`: under the same lock as the stop, so a build the runner
+    /// starts meanwhile gets it too.
+    pub async fn stop_with(&self, why: &str) {
+        self.stop(None, why).await
+    }
+
+    async fn stop(&self, most: Option<Duration>, why: &str) {
         {
             let mut inner = self.0.lock();
             inner.stopping = true;
             if let Some(r) = &inner.running {
-                let _ = r.cancel.send(INTERRUPTED.into());
+                let _ = r.cancel.send(why.into());
             }
         }
         let _ = self.0.stop.send(true);
@@ -1974,9 +1981,18 @@ impl Daemon {
         for t in tasks {
             let _ = tokio::time::timeout(Duration::from_secs(120), t).await;
         }
-        // The registry's runner ends the build it runs here (the short ladder).
+        // The registry's runner ends the build it runs here (the short ladder),
+        // and a publish ends on its own (publish_timeout): a daemon started
+        // again in this process would otherwise mark it interrupted under it.
         let since = Instant::now();
-        while self.0.lock().running.is_some() && most.is_none_or(|m| since.elapsed() < m) {
+        let busy = |inner: &Inner| {
+            inner.running.is_some()
+                || inner
+                    .releases
+                    .values()
+                    .any(|r| r.state == release::State::Publishing)
+        };
+        while busy(&self.0.lock()) && most.is_none_or(|m| since.elapsed() < m) {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         self.0
@@ -8010,7 +8026,21 @@ exec git \"$@\"
             (r.state, r.reason.as_deref()),
             (State::Failed, Some(release::INTERRUPTED))
         );
-        d.shutdown().await;
+
+        // A daemon stopped for a restart in this process waits for a publish
+        // to end: the new one would mark it interrupted while it runs.
+        d.0.lock().releases.get_mut("v0.4.0").unwrap().state = State::Publishing;
+        let stopping = tokio::spawn({
+            let d = d.clone();
+            async move { d.stop_fully().await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!stopping.is_finished(), "it waits for the publish");
+        d.0.lock().releases.get_mut("v0.4.0").unwrap().state = State::Published;
+        tokio::time::timeout(Duration::from_secs(5), stopping)
+            .await
+            .expect("it stops once the publish ended")
+            .unwrap();
         p.remove();
     }
 }

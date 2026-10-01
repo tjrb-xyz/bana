@@ -92,6 +92,8 @@ struct Items {
     status: MenuItem,
     open: MenuItem,
     quit: MenuItem,
+    /// After the projects' submenus, while there are any.
+    gap: PredefinedMenuItem,
 }
 
 /// One project's submenu and its items, each in it while it applies.
@@ -206,19 +208,14 @@ fn menu() -> (Menu, Items) {
     let status = MenuItem::new("bana: starting", false, None);
     let open = MenuItem::new("Open bana", false, None);
     let quit = MenuItem::new("Quit bana (local CI stops until next login)", true, None);
-    let menu = Menu::with_items(&[
-        &status,
-        &open,
-        &PredefinedMenuItem::separator(),
-        &PredefinedMenuItem::separator(),
-        &quit,
-    ])
-    .expect("menu");
+    let menu =
+        Menu::with_items(&[&status, &open, &PredefinedMenuItem::separator(), &quit]).expect("menu");
     let it = Items {
         menu: menu.clone(),
         status,
         open,
         quit,
+        gap: PredefinedMenuItem::separator(),
     };
     (menu, it)
 }
@@ -244,6 +241,7 @@ fn show(tray: &TrayIcon, it: &Items, s: &mut Shown) {
         for p in s.projects.values() {
             let _ = it.menu.remove(&p.sub);
         }
+        let _ = it.menu.remove(&it.gap);
         let mut old = std::mem::take(&mut s.projects);
         for (i, pv) in v.projects.iter().enumerate() {
             let p = old
@@ -251,6 +249,9 @@ fn show(tray: &TrayIcon, it: &Items, s: &mut Shown) {
                 .unwrap_or_else(|| ShownProject::new(&pv.prefix));
             let _ = it.menu.insert(&p.sub, PROJECTS_AT + i);
             s.projects.insert(pv.prefix.clone(), p);
+        }
+        if !v.projects.is_empty() {
+            let _ = it.menu.insert(&it.gap, PROJECTS_AT + v.projects.len());
         }
     }
     for pv in v.projects {

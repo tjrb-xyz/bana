@@ -86,14 +86,37 @@ add_main() {
   rc=$?
   set -e
   read -r unmapped split <"$counts" || true
-  rm -f "$counts"
   case $rc in
   0) ;;
   2) warn "So where each job runs here is not checked; bana add goes on." ;;
-  *) exit "$rc" ;;
+  *) rm -f "$counts"; exit "$rc" ;;
   esac
   load_project
+  [[ -s $counts ]] || echo >"$counts"
+  [[ -z $wf ]] || echo "workflow ${wf##*/}" >>"$counts"
+  add_agrees "$counts" || { rm -f "$counts"; exit 1; }
+  rm -f "$counts"
   add_register "$hook" "$claude" "$unmapped" "$split"
+}
+
+# The daemon builds as bana.conf says, as bana ci does. A workflow or prefix the report
+# found and bana.conf does not say yet (it was not written) stops bana add; tiers only warn.
+add_agrees() { # COUNTS: "KEY VALUE" lines after the first
+  local k want have missing='' differ=''
+  while read -r k want; do
+    have=$(conf_lookup "$k" 2>/dev/null) || have=$(add_default "$k")
+    have=$(words "$have" | tr -s ' ' | sed 's/^ //; s/ $//')
+    [[ $have != "$want" ]] || continue
+    case $k in
+    workflow | prefix) missing+="  $k =${want:+ $want}"$'\n' ;;
+    *) differ+=" $k = $have (the workflow says${want:+ $want}${want:- none})," ;;
+    esac
+  done < <(sed 1d "$1")
+  [[ -z $differ ]] || warn "The daemon builds with${differ%,}: bana.conf says so."
+  [[ -n $missing ]] || return 0
+  printf 'bana.conf does not say what this project needs yet:\n%s' "$missing" >&2
+  echo "Add these lines to ${conf_file:-.github/bana.conf} (or rerun bana add on a terminal and say yes), then bana add again." >&2
+  return 1
 }
 
 # The project, added to the daemon here: its settings, its clone, the push hook, bana's
@@ -106,6 +129,8 @@ add_register() { # HOOK CLAUDE UNMAPPED SPLIT
   say "Adding $repo to the daemon here, as $prefix"
   old=$(d_setting repo "$(d_project "$prefix")") || old=''
   [[ -z $old || $old == "$repo" ]] || die "$prefix is $old's here already (bana list): set another prefix in bana.conf"
+  ! d_olds | cut -f1 | grep -qx "$prefix" ||
+    die "$prefix still has its own daemon of before: bana daemon install moves it to the one daemon (keeping its port), then bana add"
   gh=$(command -v gh) || die "The GitHub CLI is needed: brew install gh, then gh auth login"
   d_doctor_project "$root" "$gh" "$3" "$4"
   d_write_project "$root"
@@ -205,7 +230,13 @@ add_look() { # CHECK DIFF WORKFLOW
     echo "bana add --check: $i_unmapped jobs with no place here, $i_split split matrices, workflow_dispatch: $([[ $i_dispatch == true ]] && echo yes || echo no)"
     return "$rc"
   fi
-  [[ -z ${i_counts:-} ]] || echo "$i_unmapped $i_split" >"$i_counts"
+  [[ -z ${i_counts:-} ]] || {
+    echo "$i_unmapped $i_split"
+    echo "prefix ${i_prefix_read:-$i_prefix}"
+    echo "workflow $i_name"
+    echo "tiers $i_tiers"
+    [[ -z $i_tier_input ]] || echo "tier_input $i_tier_input"
+  } >"$i_counts"
   add_write
 }
 

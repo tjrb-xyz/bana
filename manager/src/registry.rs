@@ -248,10 +248,17 @@ impl Registry {
             };
             // Its settings changed: as a restart, its build is run again once,
             // by the new daemon only once the old one's build has ended.
-            if let Some(Entry { daemon: Ok(d), .. }) = old {
-                d.stop_fully().await;
-            }
-            let entry = self.open(&prefix, text, first).await;
+            let said = match old {
+                Some(Entry { daemon: Ok(d), .. }) => {
+                    d.stop_fully().await;
+                    None
+                }
+                Some(Entry {
+                    daemon: Err(why), ..
+                }) => Some(why),
+                None => None,
+            };
+            let entry = self.open(&prefix, text, first, said.as_deref()).await;
             first += stagger;
             locked(&self.entries).insert(prefix, entry);
         }
@@ -281,7 +288,14 @@ impl Registry {
         found
     }
 
-    async fn open(&self, prefix: &str, stamp: String, first_poll: Duration) -> Entry {
+    /// `said`: why it could not start last time, not logged again.
+    async fn open(
+        &self,
+        prefix: &str,
+        stamp: String,
+        first_poll: Duration,
+        said: Option<&str>,
+    ) -> Entry {
         let daemon = match Settings::load(&self.home, prefix) {
             Ok(s) => Daemon::start_in(s, self.run.clone(), self.changed.clone(), first_poll).await,
             Err(e) => Err(e),
@@ -291,7 +305,8 @@ impl Registry {
                 "bana daemon: {prefix}: CI on push for {}",
                 d.settings().repo
             ),
-            Err(e) => eprintln!("bana daemon: {prefix}: {e}"),
+            Err(e) if said != Some(e.as_str()) => eprintln!("bana daemon: {prefix}: {e}"),
+            Err(_) => {}
         }
         Entry {
             router: daemon
@@ -384,14 +399,11 @@ impl Registry {
     }
 }
 
-/// A project removed: its running build is cancelled (so a later add does
-/// not run it again), then it stops, and lets go of its daemon.lock once
-/// that build has ended.
+/// A project removed: its running build ends as removed (so a later add does
+/// not run it again), then it lets go of its daemon.lock once that build has
+/// ended.
 async fn remove(d: &Daemon) {
-    if let Some((id, _)) = d.running() {
-        let _ = d.cancel(id, REMOVED);
-    }
-    d.stop_fully().await;
+    d.stop_with(REMOVED).await;
 }
 
 /// A project between its old daemon and its new one.
