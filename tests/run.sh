@@ -312,9 +312,13 @@ BANA_ROUND_CONF=$T/w/round.conf BANA_PROJECT_ROOT=$src BANA_ACT_LOCKED=1 bash "$
 check "daemon round without a token (offline): no fetch of the actions first" lacks "$FAKE_LOG" "--concurrent-jobs"
 mv "$T/w/bana.conf.was" "$src/.github/bana.conf"
 : >"$FAKE_LOG"
-BANA_PROJECT_ROOT=$src BANA_ACT_LOCKED=1 bash "$bana" ci quick --event event.json -- --secret-file secrets --json >/dev/null
+rm -f "$FAKE_STATE/act.fetch"
+BANA_PROJECT_ROOT=$src BANA_ACT_LOCKED=1 bash "$bana" ci quick --event event.json -- -P box=-self-hosted --secret-file secrets --json >/dev/null
 check "daemon ci: the actions first, one job at a time, a dry run" same "$(grep -c -- '-n --concurrent-jobs 1$' "$FAKE_LOG")" 1
 check "daemon ci: then the run, which fetches none" grep -q -- '--json --action-offline-mode$' "$FAKE_LOG"
+# Each label's last -P (act takes the last) in the fetch's dry run: the image, never the host.
+last_maps() { tr ' ' '\n' <"$FAKE_STATE/act.fetch" | awk 'p { split($0, kv, "="); m[kv[1]] = kv[2] } { p = ($0 == "-P") } END { for (k in m) print m[k] }' | sort -u; }
+check "daemon ci: the fetch runs no host step: each label goes to the image" same "$(last_maps)" "catthehacker/ubuntu:act-24.04"
 check "daemon ci: BANA_PROJECT_ROOT does not reach act's jobs" lacks "$FAKE_STATE/act.env" "BANA_PROJECT_ROOT="
 check "daemon ci: nor BANA_ACT_LOCKED" lacks "$FAKE_STATE/act.env" "BANA_ACT_LOCKED="
 check "daemon ci: BANA_ACT_LOCKED=1 leaves the lock to the daemon" test ! -e "$HOME/.bana/act.lock"

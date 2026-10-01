@@ -249,10 +249,21 @@ act_main() {
 # matrix) would each fetch it into act's one cache: one job's fetch rewrote the files another
 # was copying into its container, and the job failed. A fix round (offline already) fetches
 # nothing; what this cannot fetch, the run fetches as before.
+# act's dry run still runs a host job's steps (-self-hosted): for it, every label goes to
+# the image, where a dry run runs nothing (the last -P wins).
 act_actions() {
-  local a
+  local a i dry=()
   for a in "${args[@]}"; do [[ $a != --action-offline-mode ]] || return 0; done
-  act "${args[@]}" -n --concurrent-jobs 1 >/dev/null 2>&1 || true
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    case ${args[i]} in
+    -P | --platform) a=${args[i + 1]:-} ;;
+    -P=* | --platform=*) a=${args[i]#*=} ;;
+    -P?*) a=${args[i]#-P} ;;
+    *) continue ;;
+    esac
+    [[ $a != *=* ]] || dry+=(-P "${a%%=*}=$image")
+  done
+  act "${args[@]}" ${dry[@]+"${dry[@]}"} -n --concurrent-jobs 1 >/dev/null 2>&1 || true
   args+=(--action-offline-mode)
 }
 
