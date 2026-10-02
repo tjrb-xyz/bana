@@ -322,7 +322,11 @@ impl View<'_> {
         }
         let why = match j.result.as_str() {
             "skipped" => Some("skipped".to_string()),
-            "unsupported" => Some("no platform for it here".to_string()),
+            "unsupported" => Some(
+                j.elsewhere
+                    .clone()
+                    .unwrap_or_else(|| "no platform for it here".to_string()),
+            ),
             "not_planned" => Some(match self.r.build.tier.as_deref() {
                 Some(t) if !t.is_empty() => format!("not planned at {t}"),
                 _ => "not planned".to_string(),

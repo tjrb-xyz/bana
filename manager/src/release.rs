@@ -275,6 +275,59 @@ pub fn seeded(
     true
 }
 
+/// bana's own notes for `r` from its changes: [`notes::public_notes`] for a
+/// public release repository's, else [`notes::default_notes`]. None before the
+/// changes are known.
+fn git_notes(r: &Release, repo: &str) -> Option<String> {
+    let c = r.changes.as_ref()?;
+    Some(match &r.public_repo {
+        Some(_) => notes::public_notes(c),
+        None => {
+            let prev = r.previous.as_ref().and_then(|p| p.tag.as_deref());
+            notes::default_notes(c, repo, prev, &r.tag)
+        }
+    })
+}
+
+/// bana split moved the releases since `r` was made (`public`: the public
+/// release repository now, if any): the record takes it, and bana's own notes
+/// (source git) are written again for it. Why a publish stops then; none when
+/// nothing moved.
+pub fn moved(r: &mut Release, public: Option<&str>, repo: &str, now: i64) -> Option<String> {
+    if r.public_repo.as_deref() == public {
+        return None;
+    }
+    r.public_repo = public.map(String::from);
+    r.updated_at = now;
+    let git = r.notes.as_ref().is_none_or(|n| n.source == "git");
+    let mut wrote = false;
+    if git {
+        if let Some(text) =
+            git_notes(r, repo).filter(|t| r.notes.as_ref().is_none_or(|n| n.text != *t))
+        {
+            let rev = r.rev() + 1;
+            r.prev_notes = r.notes.take();
+            r.notes = Some(Notes {
+                text,
+                title: None,
+                rev,
+                source: "git".into(),
+                saved_at: now,
+            });
+            wrote = true;
+        }
+    }
+    Some(format!(
+        "the releases go to {} now, not where they went when its notes were written: {}; nothing was published",
+        public.unwrap_or(repo),
+        if wrote {
+            "bana wrote them again for it, read them, then Publish again"
+        } else {
+            "read them (a public repository's must name nothing private), then Publish again"
+        }
+    ))
+}
+
 /// At Publish: the previous release gh gives now, for the record's commit.
 /// When it is another release than the notes started from (a lower version
 /// published since, or local tags stood in when gh failed), the record takes
@@ -588,25 +641,36 @@ pub fn same_files(assets: &[Asset], want: &[(String, String)]) -> bool {
 
 /// What in a release file's bytes would tell a public release repository's
 /// readers about the private code (`bana split`): the first of `needles` it
-/// holds, ASCII case aside. A needle `(text, true)` is a repository name,
-/// matched as a whole name (`o/r` is not in `o/r-releases`, is in
-/// `github.com/o/r.git`); `(text, false)` a path, matched anywhere.
+/// holds, ASCII case aside, in ASCII (or UTF-8) or in UTF-16LE (Windows'
+/// strings). A needle `(text, true)` is a repository name, matched as a whole
+/// name (`o/r` is not in `o/r-releases`, is in `github.com/o/r.git`);
+/// `(text, false)` a path, matched anywhere.
 pub fn leak<'a>(bytes: &[u8], needles: &'a [(String, bool)]) -> Option<&'a str> {
     let hay = bytes.to_ascii_lowercase();
     let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
     for (text, name) in needles {
-        let n = text.to_ascii_lowercase().into_bytes();
-        if n.is_empty() || n.len() > hay.len() {
-            continue;
-        }
-        let found = (0..=hay.len() - n.len()).any(|i| {
-            hay[i..i + n.len()] == n[..]
-                && (!name
-                    || ((i == 0 || !(word(hay[i - 1]) || hay[i - 1] == b'.'))
-                        && hay.get(i + n.len()).is_none_or(|&b| !word(b))))
-        });
-        if found {
-            return Some(text);
+        let ascii = text.to_ascii_lowercase().into_bytes();
+        let wide: Vec<u8> = ascii.iter().flat_map(|&b| [b, 0]).collect();
+        // A character before and after: one byte, or two (the second 0) in UTF-16LE.
+        for (n, w) in [(&ascii, 1), (&wide, 2)] {
+            if n.is_empty() || n.len() > hay.len() {
+                continue;
+            }
+            let before = |i: usize| (i >= w && (w == 1 || hay[i - 1] == 0)).then(|| hay[i - w]);
+            let after = |e: usize| {
+                hay.get(e)
+                    .copied()
+                    .filter(|_| w == 1 || hay.get(e + 1) == Some(&0))
+            };
+            let found = (0..=hay.len() - n.len()).any(|i| {
+                hay[i..i + n.len()] == n[..]
+                    && (!name
+                        || (before(i).is_none_or(|b| !(word(b) || b == b'.'))
+                            && after(i + n.len()).is_none_or(|b| !word(b))))
+            });
+            if found {
+                return Some(text);
+            }
         }
     }
     None
@@ -721,8 +785,9 @@ pub fn body(notes: &str, tested: Option<&str>, install: Option<&str>) -> String 
 }
 
 /// The build's CI report (report.md) for `## Tested`: its line on where and
-/// how it ran, and its standards table.
-pub fn tested(report: &str) -> Option<String> {
+/// how it ran (not for a `public` release repository: it names this machine),
+/// and its standards table.
+pub fn tested(report: &str, public: bool) -> Option<String> {
     let lines: Vec<&str> = report.lines().collect();
     let at = lines.iter().position(|l| l.starts_with("| Standard |"))?;
     let end = lines[at..]
@@ -732,7 +797,8 @@ pub fn tested(report: &str) -> Option<String> {
     let meta = lines[..at]
         .iter()
         .map(|l| l.trim())
-        .find(|l| !l.is_empty() && !l.starts_with('#'));
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter(|_| !public);
     let mut s = String::new();
     if let Some(m) = meta {
         s.push_str(m);
@@ -1302,17 +1368,36 @@ mod tests {
             Some("/home/runner/work/")
         );
         assert_eq!(leak(""), None);
+        let wide = |t: &str| t.bytes().flat_map(|b| [b, 0]).collect::<Vec<u8>>();
+        let needles2 = needles.clone();
+        let leak16 = |t: &str| super::leak(&wide(t), &needles2);
+        assert_eq!(
+            leak16("C:\\src acme/widget\0"),
+            Some("Acme/Widget"),
+            "UTF-16LE"
+        );
+        assert_eq!(
+            leak16("acme/widget-releases"),
+            None,
+            "UTF-16LE, a whole name"
+        );
+        assert_eq!(leak16("x/home/runner/work/y"), Some("/home/runner/work/"));
     }
 
     #[test]
     fn what_is_published_below_the_notes() {
         let report = "# CI report: o/r · v1 abc1234 · release · passed\n\nBuild #5 on mbp · act 0.2.89\n\n| Standard | Checks | Tests | Not run here |\n|---|---|---|---|\n| **all** | 100% (3/3) | — | |\n\n## Artifacts\n";
-        let t = tested(report).unwrap();
+        let t = tested(report, false).unwrap();
+        assert_eq!(
+            tested(report, true).unwrap(),
+            "| Standard | Checks | Tests | Not run here |\n|---|---|---|---|\n| **all** | 100% (3/3) | — | |",
+            "a public repository's: no machine"
+        );
         assert_eq!(
             t,
             "Build #5 on mbp · act 0.2.89\n\n| Standard | Checks | Tests | Not run here |\n|---|---|---|---|\n| **all** | 100% (3/3) | — | |"
         );
-        assert_eq!(tested("# nothing\n"), None);
+        assert_eq!(tested("# nothing\n", false), None);
         let names: Vec<String> = ["a-linux-x64.tar.gz", "install.sh", "install.ps1"]
             .map(String::from)
             .to_vec();

@@ -129,6 +129,8 @@ pub struct Job {
     pub result: String,
     pub ms: Option<u64>,
     pub steps: Vec<Step>,
+    /// An unsupported job's place, when act's skip says ([`actlog::ELSEWHERE_SYSTEMD`]).
+    pub elsewhere: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -856,6 +858,7 @@ impl Folder {
                     (Some(a), Some(b)) if a > 0 && b >= a => Some((b - a) as u64 * 1000),
                     _ => None,
                 },
+                elsewhere: j.elsewhere.clone(),
                 // Not a Pre stage that only fetched its action (act's `git
                 // clone` note): only steps that ran.
                 steps: j
@@ -2090,6 +2093,8 @@ enum Line {
         result: String,
         #[serde(default)]
         ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        elsewhere: Option<String>,
     },
     Step {
         key: String,
@@ -2178,6 +2183,7 @@ impl Results {
                 matrix: j.matrix.clone(),
                 result: j.result.clone(),
                 ms: j.ms,
+                elsewhere: j.elsewhere.clone(),
             });
             for s in &j.steps {
                 let (key, step) = (j.key.as_str(), s.name.as_str());
@@ -2252,6 +2258,7 @@ impl Results {
                     matrix,
                     result,
                     ms,
+                    elsewhere,
                 } => r.jobs.push(Job {
                     key,
                     id: job,
@@ -2259,6 +2266,7 @@ impl Results {
                     result,
                     ms,
                     steps: Vec::new(),
+                    elsewhere,
                 }),
                 Line::Step {
                     key,

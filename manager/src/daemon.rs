@@ -1101,6 +1101,23 @@ impl Daemon {
                 eprintln!("bana daemon: publishing {} was interrupted", r.tag);
                 release::save(&dir, r);
             }
+            // bana split moved the releases since: bana's own notes are written again
+            // for the repository they go to now (the owner's wait for Publish).
+            let open = !matches!(
+                r.state,
+                release::State::Publishing | release::State::Published
+            );
+            let git = r.notes.as_ref().is_none_or(|n| n.source == "git");
+            if open
+                && git
+                && release::moved(r, settings.public_release(), &settings.repo, now()).is_some()
+            {
+                eprintln!(
+                    "bana daemon: {}'s notes are for {} now",
+                    r.tag, settings.release_repo
+                );
+                release::save(&dir, r);
+            }
         }
         let summary = tokio::sync::watch::Sender::new(Summary::default());
         let (stop, _) = tokio::sync::watch::channel(false);
@@ -1568,7 +1585,7 @@ impl Daemon {
         v["tested"] = json!(
             std::fs::read_to_string(self.0.build_dir(build).join("report.md"))
                 .ok()
-                .and_then(|m| release::tested(&m))
+                .and_then(|m| release::tested(&m, s.public_release().is_some()))
         );
         Some(v)
     }
@@ -2711,8 +2728,13 @@ impl Shared {
     async fn publish_steps(&self, tag: &str) -> Result<String, String> {
         let s = &self.settings;
         let (sha, build, text, title) = {
-            let inner = self.lock();
-            let r = inner.releases.get(tag).ok_or("the release is gone")?;
+            let mut inner = self.lock();
+            let r = inner.releases.get_mut(tag).ok_or("the release is gone")?;
+            // bana split moved the releases since it was made: its notes were for the other.
+            if let Some(why) = release::moved(r, s.public_release(), &s.repo, now()) {
+                self.save_release(r);
+                return Err(why);
+            }
             let n = r.notes.clone().unwrap_or_default();
             (r.sha.clone(), r.build, n.text, n.title)
         };
@@ -2752,19 +2774,14 @@ impl Shared {
                 tag,
                 "looking in the files for the private repo's name and paths",
             );
-            let mut needles = vec![
-                (s.repo.clone(), true),
-                ("/home/runner/work/".to_string(), false),
-                (self.src().to_string_lossy().into_owned(), false),
-            ];
-            if let Some(c) = &s.checkout {
-                needles.push((c.to_string_lossy().into_owned(), false));
-            }
+            let needles = self.needles();
             let (at, names, path) = (dist.clone(), upload.clone(), s.path.clone());
-            let found =
-                tokio::task::spawn_blocking(move || scan_files(&at, &names, &needles, &path))
-                    .await
-                    .map_err(|e| e.to_string())?;
+            let scratch = self.build_dir(build).join("scan.tmp");
+            let found = tokio::task::spawn_blocking(move || {
+                crate::scan::scan(&at, &names, &needles, &path, &scratch)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
             if let Some((name, what)) = found {
                 return Err(format!(
                     "{name} holds {what}, and {public} is public: nothing was published (docs/SPLIT.md: Releases)"
@@ -2877,18 +2894,25 @@ impl Shared {
         let title = title.unwrap_or_else(|| release::title(&conf, &s.prefix, tag));
         let tested = std::fs::read_to_string(self.build_dir(build).join("report.md"))
             .ok()
-            .and_then(|m| release::tested(&m));
+            .and_then(|m| release::tested(&m, s.public_release().is_some()));
         let mut platforms: Vec<String> = files
             .iter()
             .filter_map(|f| crate::artifacts::platform(f))
             .collect();
         platforms.sort();
         let install = release::install(&s.release_repo, tag, files, &platforms);
-        std::fs::write(
-            &notes_file,
-            release::body(&text, tested.as_deref(), install.as_deref()),
-        )
-        .map_err(|e| format!("{}: {e}", notes_file.display()))?;
+        let body = release::body(&text, tested.as_deref(), install.as_deref());
+        if let Some(public) = s.public_release() {
+            // What the release's page says: its title and its notes, as gh sends them.
+            for (what, t) in [("title holds", &title), ("notes hold", &body)] {
+                if let Some(found) = release::leak(t.as_bytes(), &self.needles()) {
+                    return Err(format!(
+                        "the release's {what} {found}, and {public} is public: nothing was published (edit them on bana's page)"
+                    ));
+                }
+            }
+        }
+        std::fs::write(&notes_file, body).map_err(|e| format!("{}: {e}", notes_file.display()))?;
         let public = s.public_release().is_some();
         let args = release::create_args(
             &s.release_repo,
@@ -2910,6 +2934,21 @@ impl Shared {
             .rfind(|l| l.starts_with("https://"))
             .map(String::from)
             .unwrap_or_else(|| format!("https://github.com/{}/releases/tag/{tag}", s.release_repo)))
+    }
+
+    /// What a public release must not hold ([`release::leak`]): the private
+    /// repository's name, GitHub's runner's paths and this machine's checkouts.
+    fn needles(&self) -> Vec<(String, bool)> {
+        let s = &self.settings;
+        let mut needles = vec![
+            (s.repo.clone(), true),
+            ("/home/runner/work/".to_string(), false),
+            (self.src().to_string_lossy().into_owned(), false),
+        ];
+        if let Some(c) = &s.checkout {
+            needles.push((c.to_string_lossy().into_owned(), false));
+        }
+        needles
     }
 
     /// gh in src, its words in the release's log: its stdout, or its last
@@ -5080,47 +5119,6 @@ fn wanted(f: &fix::Fix, jobs: Option<Vec<String>>) -> Result<Vec<String>, RoundE
         ));
     }
     Ok(want)
-}
-
-/// The first of `names` (in `dir`) that holds one of `needles`
-/// ([`release::leak`]), and what: a `.tar.gz` and a `.zip` are read through
-/// `tar -xzO` and `unzip -p`, the rest as they are. A file none of those can
-/// read counts as holding it.
-fn scan_files(
-    dir: &Path,
-    names: &[String],
-    needles: &[(String, bool)],
-    path: &str,
-) -> Option<(String, String)> {
-    for name in names {
-        let file = dir.join(name);
-        let run = |program: &str, args: &[&str]| {
-            std::process::Command::new(program)
-                .args(args)
-                .arg(&file)
-                .env("PATH", path)
-                .stdin(Stdio::null())
-                .stderr(Stdio::null())
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| o.stdout)
-        };
-        let bytes = if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
-            run("tar", &["-xzOf"])
-        } else if name.ends_with(".zip") {
-            run("unzip", &["-p"])
-        } else {
-            std::fs::read(&file).ok()
-        };
-        let Some(bytes) = bytes else {
-            return Some((name.clone(), "what bana cannot read".into()));
-        };
-        if let Some(what) = release::leak(&bytes, needles) {
-            return Some((name.clone(), what.to_string()));
-        }
-    }
-    None
 }
 
 /// A commit comment's limit is 65,536 characters; bana's stays under this.
@@ -8392,7 +8390,30 @@ exec git \"$@\"
         );
         std::fs::remove_file(dist.join("NOTICE.txt")).unwrap();
         std::fs::write(dist.join("SHA256SUMS"), sums).unwrap();
-        let r = publish_now(&d, "v0.1.0", n.rev).await;
+        // The notes, and the title, are read too (a merge's subject names the private repo).
+        let merge = "- Merge branch 'main' of github.com:o/r\n";
+        let v = d.save_notes("v0.1.0", merge, None, n.rev, "you").unwrap();
+        let r = publish_now(&d, "v0.1.0", v["rev"].as_u64().unwrap()).await;
+        assert_eq!(
+            r.reason.as_deref(),
+            Some("the release's notes hold o/r, and o/r-releases is public: nothing was published (edit them on bana's page)")
+        );
+        let v = d
+            .save_notes("v0.1.0", &n.text, Some("o/r v0.1.0"), r.rev(), "you")
+            .unwrap();
+        let r = publish_now(&d, "v0.1.0", v["rev"].as_u64().unwrap()).await;
+        assert_eq!(
+            r.reason.as_deref(),
+            Some("the release's title holds o/r, and o/r-releases is public: nothing was published (edit them on bana's page)")
+        );
+        assert_eq!(
+            p.read("gh-release.log").matches("release create").count(),
+            0
+        );
+        let v = d
+            .save_notes("v0.1.0", &n.text, None, r.rev(), "you")
+            .unwrap();
+        let r = publish_now(&d, "v0.1.0", v["rev"].as_u64().unwrap()).await;
         assert_eq!(
             (r.state, r.url.as_deref()),
             (
@@ -8417,64 +8438,79 @@ exec git \"$@\"
             body.contains("curl -fsSL https://github.com/o/r-releases/releases/download/v0.1.0/install.sh | sh"),
             "{body}"
         );
+        // `## Tested` names no machine of the owner's: the table alone.
+        assert!(body.contains("## Tested\n\n| Standard |"), "{body}");
         d.shutdown().await;
         p.remove();
     }
 
-    #[test]
-    fn a_public_releases_files_are_read_inside_their_archives() {
-        let dir = std::env::temp_dir().join(format!("bana-scan-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("demo-1/bin")).unwrap();
-        std::fs::write(
-            dir.join("demo-1/bin/demo"),
-            "built from git@github.com:o/r.git\n",
-        )
-        .unwrap();
-        let tar = |name: &str| {
-            let ok = Std::new("tar")
-                .args(["-czf", name, "demo-1"])
-                .current_dir(&dir)
-                .status()
-                .unwrap()
-                .success();
-            assert!(ok);
-        };
-        tar("demo-1-linux-x64.tar.gz");
-        std::fs::write(dir.join("install.sh"), "REPO='o/r-releases'\n").unwrap();
-        std::fs::write(dir.join("SHA256SUMS"), "abc  demo-1-linux-x64.tar.gz\n").unwrap();
-        let needles = vec![
-            ("o/r".to_string(), true),
-            ("/home/runner/work/".to_string(), false),
-        ];
-        let path = std::env::var("PATH").unwrap();
-        let names = |n: &[&str]| n.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_release_made_before_split_on_is_written_again_for_the_public_repo() {
+        use release::State;
+        let p = Project::new("moved");
+        let d = start(&p, "daemon.tags = v*\n").await;
+        let a = p.commit("files", "Packages for all (#7)");
+        p.push("main");
+        p.tag("v0.1.0");
+        poll(&d).await;
+        let id = tag_build(&d, "v0.1.0").unwrap();
+        assert_eq!(finished(&d, id).await.build.state, BuildState::Success);
+        let r = rel_in(&d, "v0.1.0", State::Asking).await;
+        assert_eq!(r.public_repo, None);
+        let private = r.notes.clone().unwrap();
+        assert!(private.text.contains("(#7)"), "{}", private.text);
+        d.shutdown().await;
+        // bana split on: the releases go to the public repo from here on.
+        let s = p
+            .settings("daemon.tags = v*\nrelease.repo = o/r-releases\nsplit.repo = o/r-releases\n");
+        let d = start_with(s).await;
+        let r = rel(&d, "v0.1.0").unwrap();
         assert_eq!(
-            scan_files(&dir, &names(&["install.sh", "SHA256SUMS"]), &needles, &path),
-            None
+            r.public_repo.as_deref(),
+            Some("o/r-releases"),
+            "as it loads"
         );
+        let n = r.notes.clone().unwrap();
+        assert_eq!(n.rev, private.rev + 1);
+        assert!(
+            !n.text.contains("#7") && !n.text.contains(&a[..7]),
+            "{}",
+            n.text
+        );
+        // Publish with the rev the owner saw before: refused, as for any other rev.
+        assert!(d.publish_release("v0.1.0", private.rev).is_err());
+        d.shutdown().await;
+        // The owner's own notes, written before: Publish stops once, to have them read again.
+        let mut r = release::load(&p.dir).remove("v0.1.0").unwrap();
+        r.public_repo = None;
+        r.notes = Some(release::Notes {
+            text: "Fixes #7 in o/r.\n".into(),
+            source: "you".into(),
+            rev: n.rev + 1,
+            ..release::Notes::default()
+        });
+        release::save(&p.dir, &r);
+        let s = p
+            .settings("daemon.tags = v*\nrelease.repo = o/r-releases\nsplit.repo = o/r-releases\n");
+        let d = start_with(s).await;
         assert_eq!(
-            scan_files(
-                &dir,
-                &names(&["install.sh", "demo-1-linux-x64.tar.gz"]),
-                &needles,
-                &path
-            ),
-            Some(("demo-1-linux-x64.tar.gz".into(), "o/r".into())),
-            "inside the archive"
+            rel(&d, "v0.1.0").unwrap().public_repo,
+            None,
+            "the owner's notes wait"
         );
-        std::fs::write(dir.join("demo-1/bin/demo"), "clean\n").unwrap();
-        tar("demo-1-linux-x64.tar.gz");
-        std::fs::write(dir.join("broken.tar.gz"), "not gzip").unwrap();
+        let r = publish_now(&d, "v0.1.0", n.rev + 1).await;
         assert_eq!(
-            scan_files(&dir, &names(&["demo-1-linux-x64.tar.gz"]), &needles, &path),
-            None
+            r.reason.as_deref(),
+            Some("the releases go to o/r-releases now, not where they went when its notes were written: read them (a public repository's must name nothing private), then Publish again; nothing was published")
         );
+        assert_eq!(r.public_repo.as_deref(), Some("o/r-releases"));
+        let r = publish_now(&d, "v0.1.0", n.rev + 1).await;
         assert_eq!(
-            scan_files(&dir, &names(&["broken.tar.gz"]), &needles, &path),
-            Some(("broken.tar.gz".into(), "what bana cannot read".into()))
+            r.reason.as_deref(),
+            Some("the release's notes hold o/r, and o/r-releases is public: nothing was published (edit them on bana's page)")
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        d.shutdown().await;
+        p.remove();
     }
 
     #[tokio::test(flavor = "multi_thread")]
