@@ -1,0 +1,5 @@
+#!/bin/sh
+# Stand-in: sysctl -n hw.optional.arm64 is 1 when FAKE_ARM64=1 (Apple silicon), else an
+# unknown oid, as on an Intel Mac.
+[ "$1 $2" = "-n hw.optional.arm64" ] || { echo "sysctl stand-in: $*" >&2; exit 2; }
+if [ "${FAKE_ARM64:-}" = 1 ]; then echo 1; else echo "sysctl: unknown oid 'hw.optional.arm64'" >&2; exit 1; fi

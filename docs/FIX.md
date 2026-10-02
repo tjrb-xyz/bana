@@ -58,10 +58,10 @@ fix_brief, test only with run_jobs, and when it is green call commit_fix with a 
 push, never switch branches. Without the daemon, it says to reproduce with the rerun command and commit by hand
 instead.
 
-bana's tools come from its MCP server, `bana-manager mcp` (`bana mcp` runs it by hand). `bana daemon install`
-registers it with Claude Code in your checkout, at local scope (private to you, and seen in its worktrees):
-`claude mcp add -s local bana -- ~/.bana/<prefix>/daemon/bana-manager mcp --dir ~/.bana/<prefix>`.
-`--no-claude` skips that, and `bana daemon uninstall` removes it. `bana fix` asks `claude mcp get bana` in each
+bana's tools come from its MCP server, `bana-manager mcp` (`bana mcp` runs it by hand). `bana add` registers
+it with Claude Code in your checkout, at local scope (private to you, and seen in its worktrees):
+`claude mcp add -s local bana -- ~/.bana/daemon.d/bana-manager mcp --dir ~/.bana/<prefix>`. `--no-claude`
+skips that, and `bana remove` removes it. `bana fix` asks `claude mcp get bana` in each
 new worktree and, if the server is missing there or does not connect, passes it with `--mcp-config`.
 
 | Tool | Asks you | What |
@@ -73,7 +73,9 @@ new worktree and, if the server is missing there or does not connect, passes it 
 | `ci_report` | no | the CI report of the fix's build (or of a build named): checks and tests per standard, as Markdown and as data |
 | `commit_fix` | yes | commits the green round's tree on the fix's branch |
 
-A tool called with arguments that do not fit says why as its result, so Claude can call it again.
+A tool called with arguments that do not fit says why as its result, so Claude can call it again. The same server has
+the release tools, for a release's notes ([DAEMON.md](DAEMON.md#notes-with-claude)); a fix's settings do not
+allow them.
 
 Claude Code runs as you, with your own settings and permission mode, plus what the settings file adds: those
 five tools allowed, rules that deny `git push` (`git -C … push`, `git -c …` and `git config … alias` too) and
@@ -129,8 +131,8 @@ The daemon enforces them all:
 - one round at a time;
 - a tree that already ran with the same jobs gets that round's result back if it passed or failed, unless
   run_jobs asks for `repeat` (a flaky check); one that ended in error runs again;
-- no rounds while the daemon is paused: run_jobs says so at once, and after ten minutes when Docker or your own
-  `bana ci` holds a round back (the round stays queued);
+- after ten minutes, run_jobs says so when Docker or your own `bana ci` holds a round back (the round stays
+  queued). A pause (`bana pause`) holds only pushes: rounds still run;
 - each job keeps `daemon.timeout`.
 
 A refused round comes back to Claude with the reason, and out of rounds the prompt says to stop and sum up.
@@ -190,12 +192,12 @@ branch, and `cd <worktree> && claude --resume <session>` to take over. It never 
 ## bana-manager
 
 bana fix's work is done by `bana-manager fix …` and `bana-manager mcp`: the daemon's copy, which `bana daemon
-install` puts in `~/.bana/<prefix>/daemon`, else a release build in bana's `manager/`, which bana makes with
-cargo when there is none (the first time takes a minute).
+install` puts in `~/.bana/daemon.d`, else a release build in bana's `manager/`, which bana makes with cargo when
+there is none (the first time takes a minute).
 
 ## Check once on the Mac
 
-These could not be tried without a Mac. Run through them once after `bana daemon install`:
+These could not be tried without a Mac. Run through them once after `bana daemon install` and `bana add`:
 
 1. *Fix with Claude* on a failed build (or `bana fix --open`) opens your terminal in the worktree with the prompt
    typed. Claude Code registers the `claude-cli://` link the first time it runs. Note what asks: the browser,

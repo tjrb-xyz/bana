@@ -1,7 +1,8 @@
 //! What a build did, step by step, for the fix brief and the CI report: act's
 //! `--json` lines (the daemon's act.jsonl) or act's plain text (a hand run's
 //! ci/last.log, a pasted log) folded into [`Results`], and results.jsonl out
-//! ([`Results::to_jsonl`]).
+//! ([`Results::to_jsonl`]), with the artifacts the daemon collected
+//! ([`crate::artifacts`]).
 //!
 //! Jobs and steps are [`actlog::Build`]'s, as for the statuses: a line of plain
 //! text is read into an [`actlog::JobLine`] first. What each step printed is
@@ -112,6 +113,8 @@ pub struct Results {
     pub jobs: Vec<Job>,
     /// Errors outside the jobs.
     pub errors: Vec<LogError>,
+    /// What the jobs uploaded, as the daemon collected it ([`crate::artifacts`]).
+    pub artifacts: Vec<Artifact>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -254,6 +257,27 @@ pub struct LogError {
     pub key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub step: Option<String>,
+}
+
+/// An artifact a job uploaded (upload-artifact@v4: one zip).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Artifact {
+    pub name: String,
+    /// The job and step that uploaded it, when the log says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+    /// The zip's size and sha256 (upload-artifact's artifact-digest).
+    pub bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// The files it gave the build's dist/, by their names there.
+    pub files: Vec<String>,
+    /// Why it was not collected, or a note (an upload-artifact@v3 layout).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
 }
 
 impl Results {
@@ -886,6 +910,7 @@ impl Folder {
             },
             jobs,
             errors,
+            artifacts: Vec::new(),
         }
     }
 }
@@ -2109,6 +2134,7 @@ enum Line {
         step: String,
         lines: Vec<String>,
     },
+    Artifact(Artifact),
     Error(LogError),
 }
 
@@ -2135,7 +2161,8 @@ fn is_false(b: &bool) -> bool {
 
 impl Results {
     /// results.jsonl: the build, then each job with its steps and what they
-    /// printed, then the errors outside the jobs; one JSON object per line.
+    /// printed, then the artifacts, then the errors outside the jobs; one JSON
+    /// object per line.
     pub fn to_jsonl(&self) -> String {
         self.to_jsonl_with(|_| false)
     }
@@ -2198,6 +2225,7 @@ impl Results {
                 }
             }
         }
+        lines.extend(self.artifacts.iter().cloned().map(Line::Artifact));
         lines.extend(self.errors.iter().cloned().map(Line::Error));
         let mut out = String::new();
         for l in &lines {
@@ -2274,6 +2302,7 @@ impl Results {
                     markdown,
                 } => r.step_mut(&key, &step).summaries.push(markdown),
                 Line::Tail { key, step, lines } => r.step_mut(&key, &step).tail = lines,
+                Line::Artifact(a) => r.artifacts.push(a),
                 Line::Error(e) => r.errors.push(e),
             }
         }

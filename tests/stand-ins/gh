@@ -1,16 +1,166 @@
 #!/bin/sh
 # Stand-in GitHub CLI: signed in when FAKE_GH=1 (FAKE_GH_SCOPES: its token's); tokens,
-# labels, the runner list and the user.
+# labels, the runner list and the user; release download TAG -R REPO -p NAME -D DIR from
+# FAKE_RELEASES/TAG (install.sh's tests); release list prints FAKE_RELEASE_LIST (default []).
+# With FAKE_RELEASE_STORE (a directory, one per tag: draft, prerelease, assets, notes (the
+# body), digests (NAME sha256:HEX lines), argv: one argument a line), release list, view,
+# create and delete keep releases there,
+# as GitHub would; FAKE_GH_FAIL_AT=list|view|create|delete makes that one fail,
+# FAKE_GH_SLOW=N makes a create take N seconds (a draft meanwhile, left if it is killed),
+# and FAKE_GH_OLD=1 is a gh without --verify-tag and --latest.
+# api graphql answers each nN:issueOrPullRequest(number:N) alias from FAKE_PRS/N.json (the
+# node), and like GitHub gives null and an error, and exits 1, for a number it lacks;
+# api -X POST repos/O/R/releases/generate-notes gives notes naming the tags it was given.
 echo "gh $*" >>"$FAKE_LOG"
 [ "${FAKE_GH:-1}" = 1 ] || exit 1
+store=${FAKE_RELEASE_STORE:-}
+
+# A release as gh release view --json prints it: an asset's digest is null until digests
+# names it, as GitHub's are for older files.
+view_json() { # DIR TAG REPO
+  draft=false pre=false
+  [ ! -e "$1/draft" ] || draft=true
+  [ ! -e "$1/prerelease" ] || pre=true
+  assets=''
+  if [ -f "$1/assets" ]; then
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      dg=$(awk -v n="$n" '$1 == n { print $2 }' "$1/digests" 2>/dev/null)
+      if [ -n "$dg" ]; then dg="\"$dg\""; else dg=null; fi
+      assets="$assets${assets:+,}{\"name\":\"$n\",\"digest\":$dg}"
+    done <"$1/assets"
+  fi
+  body=''
+  [ ! -f "$1/notes" ] || body=$(awk '{ gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t"); printf "%s%s", (NR > 1 ? "\\n" : ""), $0 }' "$1/notes")
+  printf '{"tagName":"%s","isDraft":%s,"isPrerelease":%s,"url":"https://github.com/%s/releases/tag/%s","body":"%s","assets":[%s]}\n' \
+    "$2" "$draft" "$pre" "$3" "$2" "$body" "$assets"
+}
+
+fail_at() { # WHAT
+  [ "${FAKE_GH_FAIL_AT:-}" = "$1" ] || return 0
+  echo "HTTP 422: Validation Failed (https://api.github.com/repos/o/r/releases)" >&2
+  echo "gh auth refresh -h github.com -s workflow" >&2
+  exit 1
+}
+
 case "$*" in
 "auth status") echo "  - Token scopes: ${FAKE_GH_SCOPES-'gist', 'repo', 'workflow'}" ;;
 "auth git-credential"*) ;;
 "api user --jq .login") echo octo ;;
 "auth token") echo FAKE-GH-TOKEN ;;
+"api graphql "*)
+  q='' owner='' name=''
+  shift 2
+  while [ $# -gt 0 ]; do
+    case $1 in
+    -f) case $2 in query=*) q=${2#query=} ;; owner=*) owner=${2#owner=} ;; name=*) name=${2#name=} ;; esac; shift ;;
+    esac
+    shift
+  done
+  if [ -z "$owner" ] || [ -z "$name" ]; then echo "gh: Variable \$owner of type String! was provided invalid value" >&2; exit 1; fi
+  nodes='' errors=''
+  for n in $(printf '%s\n' "$q" | tr -s '{} ' '\n' | sed -n 's/^n[0-9]*:issueOrPullRequest(number:\([0-9]*\))$/\1/p'); do
+    if [ -f "${FAKE_PRS:-/nowhere}/$n.json" ]; then
+      nodes="$nodes${nodes:+,}\"n$n\":$(cat "$FAKE_PRS/$n.json")"
+    else
+      nodes="$nodes${nodes:+,}\"n$n\":null"
+      errors="$errors${errors:+,}{\"type\":\"NOT_FOUND\",\"path\":[\"repository\",\"n$n\"],\"message\":\"Could not resolve to an issue or pull request with the number of $n.\"}"
+    fi
+  done
+  if [ -z "$errors" ]; then
+    printf '{"data":{"repository":{%s}}}\n' "$nodes"
+  else
+    printf '{"data":{"repository":{%s}},"errors":[%s]}\n' "$nodes" "$errors"
+    echo "gh: Could not resolve to an issue or pull request." >&2
+    exit 1
+  fi ;;
+"api -X POST repos/"*"/releases/generate-notes "*)
+  repo=${4#repos/} tag='' prev=''
+  repo=${repo%/releases/generate-notes}
+  shift 4
+  while [ $# -gt 0 ]; do
+    case $1 in
+    -f) case $2 in tag_name=*) tag=${2#tag_name=} ;; previous_tag_name=*) prev=${2#previous_tag_name=} ;; esac; shift ;;
+    esac
+    shift
+  done
+  if [ -n "$prev" ]; then full="https://github.com/$repo/compare/$prev...$tag"; else full="https://github.com/$repo/commits/$tag"; fi
+  printf '{"name":"%s","body":"## What'"'"'s Changed\\n* Add C by @octo in https://github.com/%s/pull/5\\n\\n**Full Changelog**: %s"}\n' \
+    "$tag" "$repo" "$full" ;;
 *registration-token*) echo REG-TOKEN ;;
 *remove-token*) echo REMOVE-TOKEN ;;
 *"-X PUT"*labels*) echo '{}' ;;
 *"-X DELETE"*) ;;
+"release download "*)
+  tag=$3; shift 3; p='' d=.
+  while [ $# -gt 0 ]; do case $1 in -R) shift ;; -p) p=$2; shift ;; -D) d=$2; shift ;; esac; shift; done
+  [ -f "$FAKE_RELEASES/$tag/$p" ] || { echo "no assets match the file pattern" >&2; exit 1; }
+  cp "$FAKE_RELEASES/$tag/$p" "$d/$p" ;;
+"release create --help"*)
+  if [ "${FAKE_GH_OLD:-}" = 1 ]; then echo "      --draft   Save the release as a draft"
+  else printf '%s\n' "      --latest   Mark this release as \"Latest\"" "      --verify-tag   Abort in case the git tag doesn't already exist in the remote repository"; fi ;;
+"release list"*)
+  fail_at list
+  if [ -z "$store" ]; then printf '%s\n' "${FAKE_RELEASE_LIST:-[]}"; exit 0; fi
+  drafts=1 pres=1
+  case "$*" in *--exclude-drafts*) drafts=0 ;; esac
+  case "$*" in *--exclude-pre-releases*) pres=0 ;; esac
+  out=''
+  for d in "$store"/*/; do
+    [ -d "$d" ] || continue
+    t=$(basename "$d") p=false
+    [ "$drafts" = 1 ] || [ ! -e "$d/draft" ] || continue
+    [ ! -e "$d/prerelease" ] || p=true
+    [ "$pres" = 1 ] || [ "$p" = false ] || continue
+    out="$out${out:+,}{\"tagName\":\"$t\",\"isPrerelease\":$p}"
+  done
+  echo "[$out]" ;;
+"release view "*)
+  fail_at view
+  tag=$3 repo=''
+  shift 3
+  while [ $# -gt 0 ]; do case $1 in -R) repo=$2; shift ;; esac; shift; done
+  if [ -z "$store" ] || [ ! -d "$store/$tag" ]; then echo "release not found" >&2; exit 1; fi
+  view_json "$store/$tag" "$tag" "$repo" ;;
+"release delete "*)
+  fail_at delete
+  tag=$3
+  if [ -z "$store" ] || [ ! -d "$store/$tag" ]; then echo "release not found" >&2; exit 1; fi
+  rm -rf "${store:?}/$tag" ;;
+"release create "*)
+  fail_at create
+  tag=$3 repo='' notes='' files=''
+  argv=$(printf '%s\n' "$@")
+  shift 3
+  while [ $# -gt 0 ]; do
+    case $1 in
+    -R) repo=$2; shift ;;
+    --title) shift ;;
+    --notes-file) notes=$2; shift ;;
+    -*) ;;
+    *) [ -f "$1" ] || { echo "$1: no such file" >&2; exit 1; }
+      files="$files$1
+" ;;
+    esac
+    shift
+  done
+  [ -n "$store" ] || { echo "release create: no FAKE_RELEASE_STORE" >&2; exit 1; }
+  [ ! -d "$store/$tag" ] || { echo "a release with the same tag name already exists: $tag" >&2; exit 1; }
+  # As gh does: a draft first, then the uploads, then published. A gh killed meanwhile
+  # leaves the draft.
+  mkdir -p "$store/$tag"
+  : >"$store/$tag/draft"
+  printf '%s\n' "$argv" >"$store/$tag/argv"
+  [ -z "$notes" ] || cp "$notes" "$store/$tag/notes"
+  sleep "${FAKE_GH_SLOW:-0}"
+  printf '%s' "$files" >"$store/$tag/assets"
+  printf '%s' "$files" | while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    h=$({ sha256sum "$f" 2>/dev/null || shasum -a 256 "$f"; } | cut -d' ' -f1)
+    echo "$f sha256:$h"
+  done >"$store/$tag/digests"
+  case "$argv" in *--prerelease*) : >"$store/$tag/prerelease" ;; esac
+  rm -f "$store/$tag/draft"
+  echo "https://github.com/$repo/releases/tag/$tag" ;;
 *actions/runners*) printf '%s\n' "${FAKE_POOL:-}" ;;
 esac

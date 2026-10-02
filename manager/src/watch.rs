@@ -15,7 +15,8 @@
 //! 2. its head's message has none of GitHub's skip markers ([`has_skip_marker`]);
 //! 3. the workflow is in that commit;
 //! 4. no build of that commit at that tier passed or failed ([`Built`]), so the
-//!    same commit on a new branch, or pushed again, does not run twice.
+//!    same commit on a new branch, or pushed again, does not run twice. A tag
+//!    always runs: its build is the release, even of a commit built already.
 //!
 //! The rules come from the daemon's install snapshot, never from the pushed
 //! commit. The first start only records the heads: nothing is built.
@@ -360,8 +361,11 @@ pub struct Request {
 impl Request {
     /// A push build whose commit was built while it waited (from another
     /// ref): it is dropped when its turn comes, as it would not be queued now.
+    /// A tag's never is.
     pub fn already_built(&self, built: &Built) -> bool {
-        self.trigger == Trigger::Push && built.contains(&self.sha, &self.tier)
+        self.trigger == Trigger::Push
+            && !is_tag(&self.git_ref)
+            && built.contains(&self.sha, &self.tier)
     }
 
     /// A round's build (or its retry): no statuses, not built, no green.
@@ -468,8 +472,9 @@ pub enum Action {
 /// Only push builds are ever replaced or dropped: a manual build, a re-run or
 /// a retry was asked for as it is. A branch keeps at most one queued push
 /// build, and a newer head replaces its commit. A tag's builds are never
-/// replaced: each push of a tag is built. A deleted ref drops its queued push
-/// builds.
+/// replaced: each push of a tag is built, even of a commit built already at
+/// that tier, since that build is the tag's release. A deleted ref drops its
+/// queued push builds.
 pub fn decide(
     changes: &[Change],
     rules: &Rules,
@@ -518,7 +523,7 @@ pub fn decide(
         } else {
             queued.next()
         };
-        if built.contains(&sha, &tier) {
+        if !is_tag(&git_ref) && built.contains(&sha, &tier) {
             if let Some(q) = replaced {
                 out.push(Action::Drop {
                     id: q.id,
@@ -1093,6 +1098,8 @@ not a ref line
         built_a.add(A, "quick", BuildState::Failure);
         let mut errored_a = Built::default();
         errored_a.add(A, "quick", BuildState::Error);
+        let mut released_a = Built::default();
+        released_a.add(A, "release", BuildState::Success);
         let cases = vec![
             Case {
                 name: "a new branch",
@@ -1200,6 +1207,25 @@ not a ref line
                 pushed: vec![read(A, "fix", true)],
                 built: built_a,
                 want: vec![enqueue("tags/v1.0", A, "release")],
+            },
+            Case {
+                name: "a tag of a commit built at the tag tier, from main",
+                rules: rules(),
+                change: new("tags/v1.0", A),
+                pushed: vec![read(A, "fix", true)],
+                built: released_a.clone(),
+                want: vec![enqueue("tags/v1.0", A, "release")],
+            },
+            Case {
+                name: "a branch at that commit, pushed at the tag tier",
+                rules: Rules {
+                    tier: "release".into(),
+                    ..rules()
+                },
+                change: new("release/1", A),
+                pushed: vec![read(A, "fix", true)],
+                built: released_a,
+                want: vec![],
             },
             Case {
                 name: "a commit whose build ended in error runs again",
@@ -1333,7 +1359,38 @@ not a ref line
         d.finish(BuildState::Failure);
         assert_eq!(
             d.poll(&[("main", A), ("tags/v1.1", B), ("tags/v1.2", B)]),
-            []
+            [enqueue("tags/v1.2", B, "release")],
+            "a new tag of a commit built already is built: it is a release"
+        );
+        assert_eq!(
+            d.poll(&[("main", A), ("tags/v1.1", B), ("tags/v1.2", B)]),
+            [],
+            "an unchanged tag"
+        );
+        assert_eq!(d.start(), Some(4), "not dropped as built while it waited");
+    }
+
+    #[test]
+    fn a_tag_of_a_built_commit_runs() {
+        let mut d = Daemon::new(rules());
+        d.poll(&[("main", A)]);
+        d.poll(&[("main", B)]);
+        assert_eq!(d.start(), Some(1));
+        d.finish(BuildState::Success);
+        // main's head, built at release too (Run now, or a nightly).
+        d.built.add(B, "release", BuildState::Success);
+        assert_eq!(
+            d.poll(&[("main", B), ("tags/v0.1.0", B)]),
+            [enqueue("tags/v0.1.0", B, "release")]
+        );
+        assert_eq!(d.poll(&[("main", B), ("tags/v0.1.0", B)]), []);
+        assert!(!d.queue[0].already_built(&d.built));
+        assert_eq!(d.start(), Some(2));
+        d.finish(BuildState::Success);
+        assert_eq!(
+            d.poll(&[("main", B), ("tags/v0.1.0", B), ("hotfix", B)]),
+            [],
+            "a branch at the built commit is still skipped"
         );
     }
 
@@ -1387,6 +1444,10 @@ not a ref line
             assert!(!request(9, t, "main", D, "quick").already_built(&built));
         }
         assert!(!request(9, Trigger::Push, "main", D, "nightly").already_built(&built));
+        assert!(
+            !request(9, Trigger::Push, "tags/v1", D, "quick").already_built(&built),
+            "a queued tag push"
+        );
     }
 
     #[test]

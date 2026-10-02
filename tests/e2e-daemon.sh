@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# The daemon end to end: real act, real Docker, the daemon built from this tree
-# (bana daemon run), a local bare origin over file:// in GitHub's place, and the gh
-# stand-in (tests/stand-ins/gh), whose log is the statuses posted. Slow (minutes), so
-# it runs only when asked:
+# The daemon end to end: real act, real Docker, the one daemon built from this tree
+# (bana daemon run, outside any checkout), projects added with bana add, local bare origins
+# over file:// in GitHub's place, and the gh stand-in (tests/stand-ins/gh), whose log is
+# the statuses posted. Slow (minutes), so it runs only when asked:
 #
 #   BANA_E2E=1 tests/e2e-daemon.sh
 #
@@ -11,7 +11,7 @@
 #   BANA_E2E_DOCKER=0        no Docker: every job on the host (act's host mode), as on a
 #                            Mac without OrbStack; docker is a stub that says it runs
 #   BANA_E2E_IMAGE=IMAGE     the Linux jobs' image (default: catthehacker/ubuntu:act-24.04
-#                            when Docker has it, else buildpack-deps:bookworm-scm, pulled)
+#                            when Docker has it, else pulled from ghcr.io)
 #   BANA_E2E_PORT=N          the daemon's port (default 18470)
 #   BANA_E2E_KEEP=1          keep the scratch directory
 #
@@ -23,8 +23,16 @@
 # The fix loop, with the test as Claude Code: Fix with Claude on the failed build makes its
 # worktree in the checkout and runs round 0; the test then starts bana's MCP server as Claude
 # Code does and calls its tools (fix_brief, run_jobs red, run_jobs green, commit_fix), and
-# pushes the branch with bana fix push, which the daemon builds as any push. Last, a hand
-# bana ci that fails, bana fix last (the claude stand-in), and run_jobs until green.
+# pushes the branch with bana fix push, which the daemon builds as any push. Then a hand
+# bana ci that fails, bana fix last (the claude stand-in), and run_jobs until green. Last,
+# a matrix that uploads an archive per CPU: the green build keeps them as its files with the
+# project's installer, which installs demo under a scratch home, as bana install does. Then
+# a release: the pushed tag v0.1.0 builds at the tag tier, bana asks, the notes are saved,
+# and Publish runs gh release create --verify-tag (the stand-in's release store).
+#
+# Then a second project, added while the daemon runs: one build at a time on the machine
+# (its push waits "after wid #N"), its push hook, bana pause (Run now still builds, the push
+# waits until bana resume), and bana remove of the first, which the second's build outlives.
 set -euo pipefail
 
 if [[ ${BANA_E2E:-} != 1 ]]; then
@@ -50,8 +58,10 @@ fi
 image=${BANA_E2E_IMAGE:-}
 if [[ $docker_mode == 1 && -z $image ]]; then
   image=catthehacker/ubuntu:act-24.04
-  # Small, with git and bash: the builds run with --pull=false, so it is pulled here.
-  docker image inspect "$image" >/dev/null 2>&1 || image=buildpack-deps:bookworm-scm
+  # act's Ubuntu image: the jobs use node actions (upload-artifact), so the image needs node.
+  # The builds run with --pull=false, so it is pulled here, from ghcr.io when Docker lacks it
+  # (Docker Hub limits anonymous pulls).
+  docker image inspect "$image" >/dev/null 2>&1 || image=ghcr.io/catthehacker/ubuntu:act-24.04
 fi
 if [[ $docker_mode == 1 ]] && ! docker image inspect "$image" >/dev/null 2>&1; then
   docker pull -q "$image" >/dev/null
@@ -85,8 +95,8 @@ until_ok() { # SECONDS WHAT COMMAND...
 
 # rustup and cargo find their toolchains through HOME: keep yours for the daemon's build.
 export RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup} CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}
-export HOME=$T/home FAKE_LOG=$T/gh.log FAKE_STATE=$T/state
-mkdir -p "$HOME" "$FAKE_STATE" "$T/bin"
+export HOME=$T/home FAKE_LOG=$T/gh.log FAKE_STATE=$T/state FAKE_RELEASE_STORE=$T/releases
+mkdir -p "$HOME" "$FAKE_STATE" "$FAKE_RELEASE_STORE" "$T/bin"
 : >"$FAKE_LOG"
 # Only this world's git config: no signing, no rewrites from the machine's.
 unset GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GITHUB_TOKEN GH_TOKEN BANA_HOME BANA_PROJECT_ROOT BANA_BUILD
@@ -114,6 +124,8 @@ export PATH=$T/bin:$PATH
 
 d=$HOME/.bana/wid
 w=$T/work
+# The project the API helpers ask (P=two api /local asks the second one).
+P=wid
 hold=$T/hold
 mkdir -p "$w/.github/workflows" "$w/ci"
 cd "$w"
@@ -129,6 +141,9 @@ repo = acme/wid
 prefix = wid
 tiers = quick nightly
 daemon.poll = 10
+daemon.tags = v*
+# The gh stand-in's token is no token: act fetches upload-artifact from GitHub without one.
+daemon.token = none
 act.args = $host_args
 act.image = ${image:-none}
 report.work = linux/work host
@@ -234,7 +249,12 @@ git -C "$T/origin.git" symbolic-ref HEAD refs/heads/main
 
 # ---- the daemon ---------------------------------------------------------------------------
 
-api() { # PATH [CURL-OPTIONS...]
+api() { # PATH [CURL-OPTIONS...]: project P's route
+  local p=$1
+  shift
+  top "/p/$P$p" "$@"
+}
+top() { # PATH [CURL-OPTIONS...]: the daemon's own route (/projects)
   local p=$1
   shift
   printf 'Authorization: Bearer %s\n' "$(cat "$HOME/.bana/manager-token")" |
@@ -242,7 +262,8 @@ api() { # PATH [CURL-OPTIONS...]
 }
 # A value from JSON on stdin: a Python expression of j.
 jq_() { python3 -c 'import json,sys; j=json.load(sys.stdin); v=eval(sys.argv[1]); print("" if v is None else v)' "$1"; }
-healthy() { curl -fsS --noproxy '*' --max-time 3 "http://127.0.0.1:$port/ci/v1/health" | grep -q '"daemon":true'; }
+health() { curl -fsS --noproxy '*' --max-time 3 "http://127.0.0.1:$port/ci/v1/health"; }
+healthy() { health | grep -q '"global":true'; }
 # Healthy, or given up: a daemon that could not start (its build failed) stops the wait.
 up_or_gone() {
   healthy && return 0
@@ -250,9 +271,10 @@ up_or_gone() {
 }
 
 start_daemon() {
-  # bana daemon run: the checks, the snapshot, the clone and the settings the first time
-  # (it takes the port already in the settings), then the daemon in the foreground.
-  (cd "$w" && exec bash "$bana" daemon run >>"$T/daemon.log" 2>&1) &
+  # bana daemon run, in no checkout: the machine's checks, the snapshot and its settings the
+  # first time (it takes the port already in daemon.d/settings), then the one daemon in the
+  # foreground, for every project added.
+  (cd "$T" && exec bash "$bana" daemon run >>"$T/daemon.log" 2>&1) &
   daemon_pid=$!
   until_ok 600 "the daemon's health" up_or_gone
   healthy || { echo "e2e-daemon: the daemon exited before it was healthy" >&2; return 1; }
@@ -264,17 +286,17 @@ stop_daemon() {
   daemon_pid=''
 }
 
-# Processes that carry a build's marker (BANA_BUILD=wid-<id>), as the sweep finds them.
+# Processes that carry a build of P's marker (BANA_BUILD=<P>-<id>), as the sweep finds them.
 markers() {
   local f
   if [[ $os == Linux ]]; then
     for f in /proc/[0-9]*/environ; do
-      { tr '\0' '\n' <"$f" | grep -q '^BANA_BUILD=wid-' && echo "${f//[^0-9]/}"; } 2>/dev/null
+      { tr '\0' '\n' <"$f" | grep -q "^BANA_BUILD=$P-" && echo "${f//[^0-9]/}"; } 2>/dev/null
     done
     return 0
   fi
   # shellcheck disable=SC2009 # pgrep cannot see environments; ps -E can (macOS)
-  ps -Eww -o pid=,command= -U "$(id -u)" | grep '[B]ANA_BUILD=wid-' | awk '{ print $1 }' || true
+  ps -Eww -o pid=,command= -U "$(id -u)" | grep "[B]ANA_BUILD=$P-" | awk '{ print $1 }' || true
 }
 has_marker() { markers | grep -x "$1" >/dev/null; }
 # PID runs (a zombie, killed but not yet reaped by whoever inherited it, does not).
@@ -283,15 +305,15 @@ alive() { # PID
   st=$(ps -o stat= -p "$1" 2>/dev/null) || return 1
   [[ $st != Z* ]]
 }
-containers() { [[ $docker_mode != 1 ]] || docker ps -aq --filter label=xyz.tjrb.bana=wid; }
-workspaces() { find "$d/act-cache" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | grep -E '/[0-9a-f]{16}$' || true; }
-secrets() { find "$d/builds" -name secrets 2>/dev/null || true; }
+containers() { [[ $docker_mode != 1 ]] || docker ps -aq --filter "label=xyz.tjrb.bana=$P"; }
+workspaces() { find "$HOME/.bana/$P/act-cache" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | grep -E '/[0-9a-f]{16}$' || true; }
+secrets() { find "$HOME/.bana/$P/builds" -name secrets 2>/dev/null || true; }
 
 cleanup() {
   local code=$?
   stop_daemon
   pkill -9 -f "$T/" 2>/dev/null || true
-  [[ $docker_mode != 1 ]] || containers | xargs docker rm -f >/dev/null 2>&1 || true
+  [[ $docker_mode != 1 ]] || docker ps -aq --filter label=xyz.tjrb.bana | xargs docker rm -f >/dev/null 2>&1 || true
   if ((code != 0 || fails > 0)); then
     echo "---- daemon log (last 60 lines)"
     tail -n 60 "$T/daemon.log" 2>/dev/null || true
@@ -304,9 +326,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Nothing a build left: no job container, act workspace, marker process, secrets or lock.
+# Nothing a build of P left: no job container, act workspace, marker process, secrets or lock.
 clean() { # WHAT
-  check "$1: no job containers labelled xyz.tjrb.bana=wid" same "$(containers)" ""
+  check "$1: no job containers labelled xyz.tjrb.bana=$P" same "$(containers)" ""
   check "$1: no act workspaces in act-cache" same "$(workspaces)" ""
   check "$1: no processes with the build's marker" same "$(markers | tr '\n' ' ')" ""
   check "$1: the secrets file is gone" same "$(secrets)" ""
@@ -315,7 +337,7 @@ clean() { # WHAT
 
 # The statuses posted for SHA, in order: CONTEXT|STATE|DESCRIPTION.
 posts() { # SHA
-  grep -F "gh api -X POST repos/acme/wid/statuses/$1 " "$FAKE_LOG" |
+  grep -F "gh api -X POST repos/acme/$P/statuses/$1 " "$FAKE_LOG" |
     sed -e 's/ -f target_url=.*$//' -e 's/^.* -f state=\([a-z]*\) -f context=\(.*\) -f description=\(.*\)$/\2|\1|\3/' || true
 }
 # CONTEXT's last state for SHA, and its description.
@@ -356,8 +378,8 @@ state_of() { builds_of "$1" | tail -n 1 | cut -d'|' -f2; }
 
 # ---- Claude Code's side of a fix ----------------------------------------------------------
 
-# The MCP server Claude Code starts, as {command, args}: what bana daemon install registers.
-mcp_server='{"command": "'"$d/daemon/bana-manager"'", "args": ["mcp", "--dir", "'"$d"'"]}'
+# The MCP server Claude Code starts, as {command, args}: what bana add registers.
+mcp_server='{"command": "'"$HOME/.bana/daemon.d/bana-manager"'", "args": ["mcp", "--dir", "'"$d"'"]}'
 # Starts the server in DIR over stdio, says what Claude Code 2.1.284 says (initialize,
 # notifications/initialized, tools/list), then calls TOOL with ARGS (JSON) and a progress token.
 # Prints the result's structuredContent (else its text as {"text": ...}) with isError, and
@@ -431,10 +453,25 @@ stop_hook() { # WT
     (cd "$1" && sh -c "$cmd" >/dev/null 2>&1) && echo 0 || echo $?
 }
 
-mkdir -p "$d/daemon"
-echo "port = $port" >"$d/daemon/settings"
+# bana add, off a terminal: the report, nothing written in the checkout but the push hook,
+# and the project added. The daemon does not run yet.
+say "bana add in the checkout"
+mkdir -p "$HOME/.bana/daemon.d"
+echo "port = $port" >"$HOME/.bana/daemon.d/settings"
+out=$(cd "$w" && bash "$bana" add </dev/null 2>&1) && code=0 || code=$?
+[[ $code == 0 ]] || echo "$out" >&2
+check "add: bana add, off a terminal" same "$code" 0
+check "add: the project's settings, with this checkout" has "$d/daemon/settings" "checkout = $w"
+check "add: they hold no machine key" not grep -q '^port' "$d/daemon/settings"
+check "add: the daemon's clone" test -d "$d/src/.git"
+check "add: the push hook, which reads the daemon's port when it runs" has "$w/.git/hooks/reference-transaction" "/ci/v1/p/wid/daemon/poll"
+check "add: it says bana daemon install starts the daemon" has <(printf '%s\n' "$out") "bana daemon install starts CI"
+check "add: nothing else in the checkout" same "$(git -C "$w" status --porcelain)" ""
+
 say "starting the daemon (port $port, $([[ $docker_mode == 1 ]] && echo "Linux jobs in $image" || echo "host jobs only"))"
 start_daemon
+check "setup: the one daemon, for wid" same "$(health | jq_ 'j["projects"]')" "['wid']"
+check "setup: its snapshot is the machine's" test -x "$HOME/.bana/daemon.d/bana-manager"
 until_ok 60 "the first fetch" bash -c "grep -q '\"first_start_done\": true' '$d/state.json'"
 check "setup: the daemon's clone fetches the origin" same "$(git -C "$d/src" rev-parse origin/main)" "$(git -C "$w" rev-parse HEAD)"
 check "setup: the first fetch builds nothing" same "$(grep -c 'statuses' "$FAKE_LOG" || true)" "0"
@@ -457,7 +494,7 @@ for j in linux host broken; do
   check "pass: bana/$j success (after pending, unless the job was quicker)" same \
     "$(posts "$a" | grep "^bana/$j|" | cut -d'|' -f2 | tr '\n' ' ' | sed 's/^pending //')" "success "
 done
-check "pass: statuses link to the daemon's page" has "$FAKE_LOG" "target_url=http://127.0.0.1:$port/#build=$id"
+check "pass: statuses link to the project on the daemon's page" has "$FAKE_LOG" "target_url=http://127.0.0.1:$port/#p=wid&build=$id"
 check "pass: in the job, HEAD is the pushed commit" has <(build_log "$id") "HEAD $a"
 check "pass: report.md, titled with the push" same "$(head -1 "$d/builds/$id/report.md")" "# CI report: acme/wid · main ${a:0:7} · quick · passed"
 check "pass: the report's meta line, with act's version" bash -c "[[ '$(sed -n 3p "$d/builds/$id/report.md")' == 'Build #$id on '*' · act '[0-9]* ]]"
@@ -519,10 +556,12 @@ check "fix: the link opens Claude Code in the worktree, the prompt typed" same "
 fixed=$(api "/builds/$id/fix" -X POST)
 check "fix: a second click goes on with it" same "$(fx '"%s %s" % (j["worktree"], j["reused"])')" "$wt True"
 check "fix: its branch has nothing on it yet" same "$(api "/fixes/$sha7" | jq_ 'j["ahead"]')" 0
-# The HTTP status of a POST.
-posted_status() { # PATH
+# The HTTP status of a POST to project P's route (a GET: -X GET).
+posted_status() { # PATH [CURL-OPTIONS...]
+  local p=$1
+  shift
   printf 'Authorization: Bearer %s\n' "$(cat "$HOME/.bana/manager-token")" |
-    curl -sS --noproxy '*' --max-time 10 -H @- -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$port/ci/v1$1"
+    curl -sS --noproxy '*' --max-time 10 -H @- -o /dev/null -w '%{http_code}' -X POST "$@" "http://127.0.0.1:$port/ci/v1/p/$P$p"
 }
 check "fix: none for a build that passed (409)" same "$(posted_status "/builds/$(builds_of "$a" | tail -n 1 | cut -d'|' -f1)/fix")" 409
 check "fix: none for a build that is not there (404)" same "$(posted_status /builds/9999/fix)" 404
@@ -720,7 +759,9 @@ git -C "$w" commit -q -am "fails, by hand"
 h=$(git -C "$w" rev-parse HEAD)
 h7=${h:0:7}
 s=$(date +%s)
-out=$(cd "$w" && bash "$bana" ci quick -j broken 2>&1) && code=0 || code=$?
+# --pull=false as the daemon's builds: act would pull the image again, and Docker Hub
+# answers repeated pulls with 429 (the run then fails in a second or two).
+out=$(cd "$w" && bash "$bana" ci quick -j broken -- --pull=false 2>&1) && code=0 || code=$?
 echo "   bana ci: exit $code in $(($(date +%s) - s)) s"
 check "hand: bana ci failed" test "$code" -ne 0
 check "hand: and points to bana fix" has <(printf '%s\n' "$out") "bana fix: hand this failure"
@@ -733,10 +774,10 @@ out=$(cd "$w" && bash "$bana" fix last 2>&1) && code=0 || code=$?
 wt=$d/fix/$h7
 check "hand: bana fix last makes the fix at the commit that failed" same "$(git -C "$wt" rev-parse HEAD 2>/dev/null)" "$h"
 check "hand: and starts Claude Code in its worktree" same "$(cat "$FAKE_STATE/claude.cwd" 2>/dev/null)" "$wt"
-# Claude Code has no bana server registered here (bana daemon run registers none), so bana fix
-# passes it one: the test starts that one, as Claude Code would.
+# Claude Code had no bana server registered here (bana add found no claude on PATH), so bana
+# fix passes it one: the test starts that one, as Claude Code would.
 mcp_server=$(tr '\0' '\n' <"$FAKE_STATE/claude.args" | sed -n '/^--mcp-config$/{n;p;}' | jq_ 'json.dumps(j["mcpServers"]["bana"])')
-check "hand: with bana's MCP server" same "$(jq_ '" ".join([j["command"]] + j["args"])' <<<"$mcp_server")" "$d/daemon/bana-manager mcp --dir $d"
+check "hand: with bana's MCP server" same "$(jq_ '" ".join([j["command"]] + j["args"])' <<<"$mcp_server")" "$HOME/.bana/daemon.d/bana-manager mcp --dir $d"
 check "hand: and the prompt, which says to test with run_jobs" has <(tr '\0' '\n' <"$FAKE_STATE/claude.args") "run_jobs"
 r=$(tool "$wt" fix_brief '{}') || r='{}'
 check "hand: fix_brief: a hand run of broken, with its failing test" same \
@@ -755,6 +796,311 @@ done
 check "hand: nor for the commit" same "$(posts "$h")" ""
 until_ok 60 "the daemon idle" idle
 clean "hand fix"
+
+# ---- 7. a green build's files, and an install from them -------------------------------------
+say "7. a package job's uploads: the build's files, and its installer"
+# A two-leg matrix packs demo for each CPU (the same script: act builds both on this one) and
+# uploads the archive with its .sha256 through upload-artifact@v4. Host jobs on a Mac pack
+# demo-macos-*, which the Mac's installer takes.
+cat >>"$w/.github/workflows/ci.yml" <<'EOF'
+  package:
+    runs-on: [self-hosted, wid-linux]
+    strategy:
+      matrix:
+        arch: [x64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: pack
+        run: sh ci/pack.sh ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: demo-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-${{ matrix.arch }}
+          path: out/
+EOF
+cat >"$w/ci/pack.sh" <<'EOF'
+# out/demo-OS-ARCH.tar.gz, one directory with bin/demo and the hook; and its .sha256.
+case $(uname -s) in Darwin) d=demo-macos-$1 ;; *) d=demo-linux-$1 ;; esac
+mkdir -p "out/$d/bin"
+printf '#!/bin/sh\necho "demo works (%s)"\n' "$1" >"out/$d/bin/demo"
+chmod +x "out/$d/bin/demo"
+printf 'mkdir -p "$WID_LOG_DIR" && echo "$1 $INSTALL_TAG" >>"$WID_LOG_DIR/hook.log"\n' >"out/$d/hook.sh"
+tar -C out -czf "out/$d.tar.gz" "$d"
+rm -rf "out/$d"
+(cd out && { sha256sum "$d.tar.gz" 2>/dev/null || shasum -a 256 "$d.tar.gz"; } >"$d.tar.gz.sha256")
+EOF
+cat >>"$w/.github/bana.conf" <<'EOF'
+install.bins = demo
+install.hook = hook.sh
+install.env.WID_LOG_DIR = ~/wid-logs
+EOF
+g=$(push pass "packages")
+until_ok 900 "build of $g" finished "$g"
+until_ok 60 "the daemon idle" idle
+id=$(builds_of "$g" | tail -n 1 | cut -d'|' -f1)
+dist=$d/builds/$id/dist
+label=quick-${g:0:10}
+# What the jobs packed, and the build this machine's installer takes.
+pos=linux && [[ $os == Darwin ]] && pos=macos
+cpu=x64 && [[ $(uname -m) == arm64 || $(uname -m) == aarch64 ]] && cpu=arm64
+names() { find "$1" -mindepth 1 -maxdepth 1 2>/dev/null | sed 's|.*/||' | LC_ALL=C sort | tr '\n' ' '; }
+echo "   build #$id: $(state_of "$g"), files: $(names "$dist")"
+check "files: the build passed" same "$(state_of "$g")" success
+check "files: its dist: both archives, the installer and SHA256SUMS" same "$(names "$dist")" \
+  "SHA256SUMS demo-$pos-arm64.tar.gz demo-$pos-x64.tar.gz install.sh "
+check "files: SHA256SUMS holds for them" bash -c "cd '$dist' && sha256sum -c --quiet SHA256SUMS"
+check "files: the installer is this build's (a label: --from only)" has "$dist/install.sh" "TAG='$label'"
+check "files: the zips act kept are gone" test ! -e "$d/builds/$id/artifacts/$id"
+check "files: the build lists them" same \
+  "$(api "/builds/$id" | jq_ '" ".join("%s:%s" % (f["name"], f.get("platform") or "") for f in j["dist"]["files"])')" \
+  "SHA256SUMS: demo-$pos-arm64.tar.gz:$pos-arm64 demo-$pos-x64.tar.gz:$pos-x64 install.sh:"
+check "files: without a problem" same "$(api "/builds/$id" | jq_ 'j["dist"].get("problem")')" ""
+check "files: the history counts them" same "$(api /builds | jq_ '[b.get("files") for b in j["builds"] if b["id"] == '"$id"'][0]')" 4
+check "files: a download is the file" cmp -s <(api "/builds/$id/files/demo-$pos-x64.tar.gz") "$dist/demo-$pos-x64.tar.gz"
+check "files: nothing else is served" not api "/builds/$id/files/..%2Fbuild.json" -o /dev/null
+check "files: the report lists the artifacts" has "$d/builds/$id/report.md" "- \`demo-$pos-x64\` (package (x64), "
+check "files: the page has its Files section" bash -c "curl -fsS --noproxy '*' 'http://127.0.0.1:$port/' | grep -q 'id=\"files-table\"'"
+# Installed from the build's own files, under a home of its own.
+out=$(env HOME="$T/inst" XDG_DATA_HOME= XDG_BIN_HOME= XDG_CONFIG_HOME= sh "$dist/install.sh" --from "$dist" --yes 2>&1) && code=0 || code=$?
+[[ $code == 0 ]] || echo "$out" >&2
+check "install: sh dist/install.sh --from dist --yes" same "$code" 0
+check "install: demo in the bin it links, and it works" same "$("$T/inst/.local/bin/demo" 2>&1)" "demo works ($cpu)"
+check "install: the hook ran, with install.env" same "$(tr '\n' ' ' <"$T/inst/wid-logs/hook.log" 2>/dev/null)" \
+  "pre-install $label post-install $label "
+check "install: a receipt" has "$T/inst/.local/share/wid/receipt" "tag=$label"
+out=$(cd "$w" && bash "$bana" install "$id" --yes 2>&1) && code=0 || code=$?
+[[ $code == 0 ]] || echo "$out" >&2
+check "install: bana install $id, in this home" same "$code|$("$HOME/.local/bin/demo" 2>&1)" "0|demo works ($cpu)"
+out=$(cd "$w" && bash "$bana" install "$id" --uninstall --yes 2>&1) && code=0 || code=$?
+[[ $code == 0 ]] || echo "$out" >&2
+check "install: and --uninstall takes it away" same "$code|$(ls "$HOME/.local/bin" 2>/dev/null)" "0|"
+clean files
+
+# ---- 8. a release: the tag builds, bana asks, and publishes on the owner's yes ---------------
+say "8. a release: v0.1.0 is pushed, built, asked about, and published"
+git -C "$w" tag -a v0.1.0 -m "wid 0.1.0"
+git -C "$w" push -q origin v0.1.0
+(cd "$w" && bash "$bana" daemon poke >/dev/null)
+rel() { api /releases/v0.1.0 | jq_ "$1"; }
+asking() { [[ $(rel 'j["state"]') == asking && $(rel 'j["seeded"]') == True ]]; }
+answered() { [[ $(rel 'j["state"]') =~ ^(asking|blocked)$ && $(rel 'j["seeded"]') == True ]]; }
+until_ok 900 "v0.1.0 asked about, or blocked" answered
+if [[ $(rel 'j["state"]') == blocked ]]; then
+  # Two legs that fetch one action at once can race in act's action cache: a re-run takes
+  # the release over.
+  echo "   v0.1.0 blocked: $(rel 'j["reason"]'); re-running build #$(rel 'j["build"]["id"]')"
+  api "/builds/$(rel 'j["build"]["id"]')/rerun" -X POST >/dev/null
+  check "release: a re-run takes it over" same "$(rel 'j["state"]')" building
+  until_ok 900 "v0.1.0 asked about" asking
+fi
+until_ok 60 "the daemon idle" idle
+id=$(rel 'j["build"]["id"]')
+dist=$d/builds/$id/dist
+check "release: its build is the tag's, at the tag tier" same "$(rel '"%s %s %s" % (j["build"]["ref"], j["build"]["tier"], j["build"]["state"])')" "v0.1.0 nightly success"
+check "release: the installer is the tag's" has "$dist/install.sh" "TAG='v0.1.0'"
+check "release: bana asks (the summary)" same "$(api /local | jq_ '"%s %s" % (j["release"]["tag"], j["release"]["state"])')" "v0.1.0 asking"
+check "release: a first release, found with gh" same "$(rel '"%s|%s" % (j["previous"]["tag"] or "", j["previous"]["how"])')" "|gh release list"
+check "release: git's notes list the pushes" same "$(rel '"packages" in j["notes"]["text"] and j["notes"]["source"]')" git
+check "release: the report's table, for Tested" has <(rel 'j["tested"]') "| Standard |"
+check "release: nothing was written on GitHub yet" same "$(grep -cE 'gh release (create|edit|upload|delete) [^-]' "$FAKE_LOG" || true)" 0
+check "bana daemon status: waiting for your answer" has <(cd "$w" && bash "$bana" daemon status) "release v0.1.0: waiting for your answer"
+rev=$(rel 'j["notes"]["rev"]')
+code=$(api /releases/v0.1.0/notes -o /dev/null -w '%{http_code}' -X PUT -H 'content-type: application/json' \
+  -d '{"notes":"The first wid.\n","rev":0}' 2>/dev/null || true)
+check "release: a stale rev is refused" same "$code" 409
+# Claude's side, over MCP stdio as Claude Code drives it: what bana knows, GitHub's
+# pull requests and notes (reads), then the notes saved for the owner to review.
+r=$(tool "$w" release_context '{}') || r='{}'
+check "mcp: release_context: the release bana asks about, and its rev" same \
+  "$(jq_ '"%s %s %s %s" % (j["tag"], j["state"], j["notes"]["rev"], j["changes"]["counts"]["commits"] > 0)' <<<"$r")" "v0.1.0 asking $rev True"
+r=$(tool "$w" pull_requests '{"numbers": [1]}') || r='{}'
+check "mcp: pull_requests: one query, and what GitHub lacks" same "$(jq_ 'j["missing"]' <<<"$r")" "[1]"
+check "mcp: pull_requests: through gh api graphql" has "$FAKE_LOG" "gh api graphql -f query=query("
+r=$(tool "$w" github_notes '{"tag": "v0.1.0"}') || r='{}'
+check "mcp: github_notes: GitHub's, for the tested commit" has "$FAKE_LOG" \
+  "gh api -X POST repos/acme/wid/releases/generate-notes -f tag_name=v0.1.0 -f target_commitish=$(rel 'j["sha"]')"
+check "mcp: github_notes: a first release" same "$(jq_ '"%s %s" % (j["previous_tag"], "commits/v0.1.0" in j["body"])' <<<"$r")" "None True"
+r=$(tool "$w" save_release_notes '{"tag": "v0.1.0", "notes": "The first wid.\n", "rev": '"$rev"'}') || r='{}'
+saved=$(jq_ 'j["rev"]' <<<"$r")
+check "mcp: save_release_notes: saved over the rev read" same "$saved" "$((rev + 1))"
+check "release: the page shows them as Claude's" same "$(rel '"%s|%s" % (j["notes"]["source"], j["notes"]["text"])')" "claude|The first wid."
+r=$(tool "$w" save_release_notes '{"tag": "v0.1.0", "notes": "x", "rev": '"$rev"'}') || r='{}'
+check "mcp: save_release_notes: a stale rev is Claude's error" same "$(jq_ '"%s %s" % (j["isError"], "changed since rev" in j.get("text", ""))' <<<"$r")" "True True"
+check "release: and no tool wrote on GitHub" same "$(grep -cE 'gh release (create|edit|upload|delete) [^-]' "$FAKE_LOG" || true)" 0
+code=$(api /releases/v0.1.0/publish -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' -d "{\"rev\":$saved}")
+check "release: Publish, with that rev" same "$code" 202
+published() { [[ $(rel 'j["state"]') == published ]]; }
+until_ok 120 "v0.1.0 published" published
+check "release: published, with its URL" same "$(rel 'j["url"]')" "https://github.com/acme/wid/releases/tag/v0.1.0"
+check "release: gh release create --verify-tag, from dist" has "$FAKE_LOG" "gh release create v0.1.0 -R acme/wid --verify-tag --title wid v0.1.0 --notes-file $d/releases/v0.1.0.notes.md --latest "
+check "release: its files are SHA256SUMS's, and SHA256SUMS" same "$(tr '\n' ' ' <"$FAKE_RELEASE_STORE/v0.1.0/assets")" \
+  "$(awk '{ print $2 }' "$dist/SHA256SUMS" | tr '\n' ' ')SHA256SUMS "
+check "release: its notes, then Tested and Install" same "$(grep -E '^## |^The first' "$FAKE_RELEASE_STORE/v0.1.0/notes" | tr '\n' '|')" \
+  "The first wid.|## Tested|## Install|"
+check "release: the ask is over" same "$(api /local | jq_ 'j["release"]')" ""
+clean release
+
+# ---- 9. a second project, added while the daemon runs ----------------------------------------
+say "9. a second project: added while the daemon runs, one build at a time, pause, remove"
+d2=$HOME/.bana/two
+w2=$T/two
+hold2=$T/hold2
+git init -q --bare "$T/two.git"
+cat >>"$HOME/.gitconfig" <<EOF
+[url "file://$T/two.git"]
+  insteadOf = https://github.com/acme/two.git
+EOF
+mkdir -p "$w2/.github/workflows" "$w2/ci"
+git -C "$w2" init -q
+git -C "$w2" remote add origin "https://github.com/acme/two.git"
+# One host job, quick unless the file ci/hold names is there. A poll an hour apart: only its
+# push hook (or bana daemon poke) brings its pushes to the daemon in time.
+cat >"$w2/.github/bana.conf" <<EOF
+repo = acme/two
+prefix = two
+tiers = quick nightly
+daemon.poll = 3600
+daemon.token = none
+act.args = -P two-host=-self-hosted
+act.image = ${image:-none}
+EOF
+cat >"$w2/.github/workflows/ci.yml" <<'EOF'
+name: ci
+on:
+  workflow_dispatch:
+    inputs:
+      tier:
+        default: quick
+jobs:
+  host:
+    runs-on: [self-hosted, two-host]
+    steps:
+      - uses: actions/checkout@v4
+      - name: work
+        run: sh ci/step.sh
+EOF
+cat >"$w2/ci/step.sh" <<'EOF'
+t=$(cat ci/t)
+echo "$$" >"$t/two-running"
+n=0
+while [ -e "$(cat ci/hold)" ] && [ $n -lt 600 ]; do sleep 1; n=$((n + 1)); done
+echo "two: done ($(cat ci/push))"
+EOF
+echo "$T" >"$w2/ci/t"
+echo "$hold2" >"$w2/ci/hold"
+echo first >"$w2/ci/push"
+git -C "$w2" add -A
+git -C "$w2" commit -q -m "the second project"
+git -C "$w2" push -q origin HEAD:main
+git -C "$T/two.git" symbolic-ref HEAD refs/heads/main
+push2() { # MESSAGE: commits and pushes, with no poke (the hook pokes); prints the sha
+  echo "$1" >"$w2/ci/push"
+  git -C "$w2" commit -q -am "$1"
+  git -C "$w2" push -q origin HEAD:main
+  git -C "$w2" rev-parse HEAD
+}
+# SHA's builds of TRIGGER: their ids, a line each.
+ids_of() { builds_of "$1" | awk -F'|' -v t="$2" '$3 == t { print $1 }'; } # SHA TRIGGER
+# Build ID of project P, from the history: TRIGGER SHA STATE.
+row_of() { api /builds | jq_ '[" ".join([b["trigger"], b["sha"], b["state"]]) for b in j["builds"] if b["id"] == '"$1"'][0]'; } # ID
+ended() { row_of "$1" | grep -Eq ' (success|failure|error)$'; } # ID
+gives() { [[ $("${@:2}") == "$1" ]]; } # WANT COMMAND...: COMMAND prints WANT
+# Project P's queue head, as SHA|WAITING.
+head_of() { api /local | jq_ '"%s|%s" % (j["queue"][0]["sha"], j["queue"][0]["waiting"]) if j["queue"] else ""'; }
+# Every build of wid and two, by start: no two at once on the machine.
+overlaps() {
+  { P=wid api '/builds?limit=100'; echo; P=two api '/builds?limit=100'; } | python3 -c '
+import json, sys
+spans = []
+for doc in sys.stdin.read().split("\n"):
+    if doc.strip():
+        for b in json.loads(doc)["builds"]:
+            if b["started_at"] and b["ended_at"]:
+                spans.append((b["started_at"], b["ended_at"], "%s #%s" % (b.get("ref"), b["id"])))
+spans.sort()
+for a, b in zip(spans, spans[1:]):
+    if b[0] < a[1]:
+        print("%s ran from %s to %s, %s from %s" % (a[2], a[0], a[1], b[2], b[0]))'
+}
+listed() { (cd "$T" && bash "$bana" list) | awk 'NR > 1 { print $1, $3 }' | tr '\n' ' '; }
+
+out=$(cd "$w2" && bash "$bana" add </dev/null 2>&1) && code=0 || code=$?
+[[ $code == 0 ]] || echo "$out" >&2
+check "two: bana add, while the daemon runs" same "$code" 0
+check "two: it links its page" has <(printf '%s\n' "$out") "Added acme/two: http://127.0.0.1:$port/#token="
+check "two: the daemon was not restarted" alive "$daemon_pid"
+check "two: Claude Code got bana's tools, for two" has "$FAKE_LOG" \
+  "claude mcp add -s local bana -- $HOME/.bana/daemon.d/bana-manager mcp --dir $d2 (in $w2)"
+check "two: the health names both" same "$(health | jq_ 'j["projects"]')" "['two', 'wid']"
+check "list: both, active" same "$(listed)" "two active wid active "
+check "status: a part for each" same "$(cd "$T" && bash "$bana" daemon status | grep -E '^(two|wid):$' | tr '\n' ' ')" "two: wid: "
+until_ok 60 "two's first fetch" bash -c "grep -q '\"first_start_done\": true' '$d2/state.json'"
+check "two: its first fetch builds nothing" same "$(P=two api /builds | jq_ 'len(j["builds"])')" 0
+
+# One build at a time: two's push waits for wid's.
+rm -f "$T/host-holding" "$T/two-running"
+touch "$hold"
+f=$(push hold "holds, while two waits")
+until_ok 300 "wid's host job holding" test -s "$T/host-holding"
+widb=$(ids_of "$f" push | tail -n 1)
+t1=$(push2 "waits for wid")
+until_ok 60 "two's push, through its hook" bash -c "grep -q '$t1' '$d2/state.json'"
+P=two until_ok 30 "two's push held" gives "$t1|after wid #$widb" head_of
+check "after: two's push waits after wid #$widb" same "$(P=two head_of)" "$t1|after wid #$widb"
+sleep 3
+check "after: and does not run meanwhile" same "$(P=two api /local | jq_ 'j["running"]')|$(test -e "$T/two-running" && echo ran)" "|"
+rm -f "$hold"
+until_ok 600 "wid's build" finished "$f"
+P=two until_ok 300 "two's build" finished "$t1"
+check "after: wid's build passed" same "$(state_of "$f")" success
+check "after: then two's" same "$(P=two state_of "$t1")" success
+check "after: two's statuses went to its own repo" same "$(P=two last "$t1" bana | cut -d'|' -f1)" success
+check "after: and link to it on the page" has "$FAKE_LOG" "target_url=http://127.0.0.1:$port/#p=two&build=$(P=two ids_of "$t1" push)"
+check "one at a time: no two builds of the machine ran at once" same "$(overlaps)" ""
+P=two clean two
+
+# bana pause: two's pushes wait; Run now still builds; bana resume builds them.
+out=$(cd "$w2" && bash "$bana" pause 2>&1) || echo "$out" >&2
+check "pause: bana pause, in two's checkout" has <(printf '%s\n' "$out") "two: automatic builds paused; Run now, fixes and releases still work"
+check "pause: its flag" test -e "$d2/daemon/paused"
+check "list: two paused" same "$(listed)" "two paused wid active "
+t2=$(push2 "paused")
+P=two until_ok 60 "the paused push queued" gives "$t2|paused" head_of
+sleep 3
+check "pause: the push waits, paused" same "$(P=two head_of)|$(P=two api /local | jq_ 'j["running"]')" "$t2|paused|"
+check "pause: nothing posted for it" same "$(P=two posts "$t2")" ""
+# Run now at nightly: at quick, the push's commit would be built, and the push dropped.
+m=$(P=two api /builds -X POST -H 'content-type: application/json' -d '{"ref":"main","tier":"nightly"}' | jq_ 'j["build"]')
+P=two until_ok 300 "two's Run now" ended "$m"
+check "pause: Run now builds while paused" same "$(P=two row_of "$m")" "manual $t2 success"
+check "pause: the push still waits" same "$(P=two head_of)" "$t2|paused"
+pb=$(P=two ids_of "$t2" push)
+check "pause: never built" same "$(P=two row_of "$pb")" "push $t2 queued"
+out=$(cd "$T" && bash "$bana" resume two 2>&1) || echo "$out" >&2
+check "resume: bana resume two, from elsewhere" has <(printf '%s\n' "$out") "two: resumed; 1 queued builds start"
+check "resume: the flag is gone" test ! -e "$d2/daemon/paused"
+P=two until_ok 300 "the push, resumed" ended "$pb"
+check "resume: the push built" same "$(P=two row_of "$pb")" "push $t2 success"
+check "list: two active again" same "$(listed)" "two active wid active "
+P=two clean "pause and resume"
+
+# bana remove wid, while two builds: two's build goes on.
+rm -f "$T/two-running"
+touch "$hold2"
+t3=$(push2 "outlives wid")
+until_ok 300 "two's job holding" test -s "$T/two-running"
+out=$(cd "$T" && bash "$bana" remove wid 2>&1) || echo "$out" >&2
+check "remove: bana remove wid, from elsewhere" has <(printf '%s\n' "$out") "Removed wid (acme/wid): its builds and clone stay in"
+check "remove: wid's settings are gone" test ! -e "$d/daemon"
+check "remove: and its push hook, in its checkout" test ! -e "$w/.git/hooks/reference-transaction"
+check "remove: its builds and clone stay" test -d "$d/builds" -a -d "$d/src/.git"
+check "remove: the daemon serves only two" same "$(health | jq_ 'j["projects"]')" "['two']"
+check "remove: wid's routes are gone (404)" same "$(P=wid posted_status /local -X GET)" 404
+check "list: two only" same "$(listed)" "two active "
+check "remove: two's build runs on" same "$(P=two api /local | jq_ 'j["running"]["sha"]')" "$t3"
+rm -f "$hold2"
+P=two until_ok 300 "two's build" finished "$t3"
+check "remove: two's build passed" same "$(P=two builds_of "$t3" | cut -d'|' -f2,3,4)" "success|push|1"
+P=two clean remove
 
 stop_daemon
 check "stop: the daemon leaves no lock" test ! -e "$HOME/.bana/act.lock"

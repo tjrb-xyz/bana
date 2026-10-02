@@ -3,9 +3,17 @@
 # Each machine runs `bana up` once; GitHub gives each job to a free runner whose
 # labels match, so Macs, Linux PCs and VMs share the work. README.md has the details.
 #
-# Making bana the project's CI:
-#   bana init [--check] [--diff] [--workflow F]   map its runners to this machine and to a pool,
-#                            and propose bana.conf and workflow changes (bana init --help)
+# CI on push, on this machine (one daemon builds every push of each project added, through
+# act, and posts commit statuses):
+#   bana daemon install [--port N] [--no-tray | --tray] [--no-open] [--now]   start it, once a machine
+#                            (bana daemon help)
+#   bana daemon uninstall [--purge] | run [--build] | status | log | open | poke [PROJECT]
+#   bana add [--check] [--diff] [--workflow F] [--no-hook] [--no-claude]   in a project's checkout:
+#                            map its runners to this machine and to a pool, propose bana.conf and
+#                            workflow changes, and add the project to the daemon (bana add --help)
+#   bana list                the projects added here, and what each does
+#   bana remove [PROJECT] [--purge]   the project's CI here goes (--purge: its builds too)
+#   bana pause|resume [PROJECT]   hold the builds of its pushes, or build them again
 # On this machine, when you want it (act, in OrbStack's Docker; nothing stays running):
 #   bana ci [TIER] [-j JOB] [--x64] [--list] [--event FILE]   the workflow's jobs here (bana ci --help);
 #                            act's output stays in ~/.bana/<prefix>/ci/last.log, for bana fix
@@ -14,12 +22,12 @@
 #   bana report [BUILD | last | --log FILE|-] [--json]   the CI report (Markdown): a daemon build's,
 #                            the last bana ci's (the newer by default), or act's output from
 #                            elsewhere; checks and tests per standard (bana.conf's report.* keys)
+#   bana installer DIST (--tag T | --label L)   the project's installer for a build's files: install.sh,
+#                            install.ps1 and SHA256SUMS, from bana.conf's install.* keys (bana installer help)
+#   bana install [BUILD | --from FILE|DIR]   a daemon build's files on this machine, through that
+#                            installer (the project's hook may ask, and use sudo)
 #   bana mcp                 bana's tools for Claude Code in a fix (an MCP server on stdin and
-#                            stdout); bana daemon install registers it with Claude Code here
-# CI on push, on this machine (a daemon runs each push through act and posts commit statuses):
-#   bana daemon install [--port N] [--no-tray] [--no-open] [--now] [--no-claude]   start it
-#                            (bana daemon help)
-#   bana daemon uninstall [--purge] | run [--build] | status | log | open | poke
+#                            stdout); bana add registers it with Claude Code here
 # A runner pool, if you want GitHub to run the jobs on your machines (they must stay awake):
 #   bana up [options]        join the pool
 #       on a Mac:   a macOS runner (in your login session: real CoreAudio, real USB
@@ -40,7 +48,7 @@
 #   bana usb                 the USB audio devices here, and the labels they give
 #   bana relabel             update this machine's runner labels (after plugging a device in)
 #   bana manager [--port N]  the dev manager: a page that shows and drives all this
-#                            (the daemon's page instead, when this project's daemon runs)
+#                            (the daemon's page instead, when the daemon runs)
 #   bana tart up|status|log|shell|down   a Linux VM in Tart on a Mac (bana tart help)
 # In workflows (and by hand):
 #   bana changed BEFORE [BRANCH]   files changed since BEFORE, else since BRANCH ('*': unknown)
@@ -48,6 +56,9 @@
 #   bana keep-builds         on a self-hosted runner: a clean checkout that keeps build caches
 #   bana apt PACKAGE...      installs the Debian packages that are missing
 #   bana settings            the settings in effect, and where they came from
+#   bana version             this bana (a release's, or a checkout's commit), and the daemon's if other
+#   bana upgrade [vX.Y.Z] [--check] [--now] [--yes]   the newest release (or this one), the daemon
+#                            first; a downgrade asks (bana upgrade help)
 #
 # Settings come from bana.conf (or .github/bana.conf) in your repository, or in the
 # checkout BANA_PROJECT_ROOT names; any key can be overridden by BANA_<KEY> in the
@@ -55,6 +66,7 @@
 set -euo pipefail
 
 BANA_VERSION=0.1.0
+BANA_COMMIT= # a release's commit (.github/release.sh pack writes it); a checkout's is git's
 
 say() { printf '\033[1m%s\033[0m\n' "$*"; }
 warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
@@ -68,6 +80,9 @@ while [[ -L $self ]]; do
   case $link in /*) self=$link ;; *) self=$(dirname "$self")/$link ;; esac
 done
 bana_root=$(cd "$(dirname "$self")/.." && pwd)
+# A release (PREFIX/current/bin/bana): its version's own directory, so a bana that runs
+# while an upgrade moves current keeps its own lib/.
+[[ ! -f $bana_root/../receipt ]] || bana_root=$(cd "$bana_root" && pwd -P)
 self=$bana_root/bin/$(basename "$self")
 
 os=$(uname -s)
@@ -102,9 +117,6 @@ find_config() {
   done
   true
 }
-conf_file=$(find_config)
-conf_dir=
-[[ -z $conf_file ]] || conf_dir=$(cd "$(dirname "$conf_file")" && pwd)
 
 # `key = value` lines; '#' starts a comment line. Prints the value, or fails.
 conf_lookup() {
@@ -156,23 +168,79 @@ repo_from_git() {
   esac
 }
 
-repo=$(conf repo)
-[[ -n $repo ]] || repo=$(repo_from_git)
-prefix=$(conf prefix "$(printf '%s' "${repo##*/}" | lower | tr -c 'a-z0-9-\n' '-')")
-[[ -n $prefix ]] || prefix=bana
-[[ $prefix =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "prefix: lowercase letters, digits and '-', not '$prefix'"
 base_home=${BANA_HOME:-$HOME/.bana}
-home=$base_home/$prefix
+
+# How this bana came: release (bana's installer, PREFIX/receipt), submodule (of a project),
+# legacy (the old install.sh's checkout, ~/.bana/src), dev (another checkout of bana) or
+# copy (anything else: the daemon's snapshot, a copy inside a project).
+bana_kind() {
+  local top
+  if grep -qx 'name=bana' "$bana_root/../receipt" 2>/dev/null; then echo release; return; fi
+  top=$(git -C "$bana_root" rev-parse --show-toplevel 2>/dev/null) || top=
+  if [[ -z $top || $top != "$(cd "$bana_root" && pwd -P)" ]]; then
+    echo copy
+  elif [[ -n $(git -C "$bana_root" rev-parse --show-superproject-working-tree 2>/dev/null) ]]; then
+    echo submodule
+  elif [[ $top == "$(cd "$base_home/src" 2>/dev/null && pwd -P)" ]]; then
+    echo legacy
+  else
+    echo dev
+  fi
+}
+# bana's own commit: a checkout's HEAD, else the release's (none for a copy).
+bana_commit() {
+  if [[ $(git -C "$bana_root" rev-parse --show-toplevel 2>/dev/null) == "$(cd "$bana_root" && pwd -P)" ]]; then
+    git -C "$bana_root" rev-parse HEAD 2>/dev/null || true
+  else
+    echo "$BANA_COMMIT"
+  fi
+}
+# Where bana keeps a project's files (its runners, the daemon's clone, builds and state),
+# and the daemon's own (its snapshot and settings: no prefix has a dot).
+project_home() { echo "$base_home/$1"; } # PREFIX
+machine_dir=$base_home/daemon.d
+
+# The project: its bana.conf, repository and prefix, and its files' home. bana add reads
+# them again once it has written bana.conf.
+load_project() {
+  conf_file=$(find_config)
+  conf_dir=
+  [[ -z $conf_file ]] || conf_dir=$(cd "$(dirname "$conf_file")" && pwd)
+  repo=$(conf repo)
+  [[ -n $repo ]] || repo=$(repo_from_git)
+  prefix=$(conf prefix "$(printf '%s' "${repo##*/}" | lower | tr -c 'a-z0-9-\n' '-')")
+  [[ -n $prefix ]] || prefix=bana
+  [[ $prefix =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "prefix: lowercase letters, digits and '-', not '$prefix'"
+  home=$(project_home "$prefix")
+}
+load_project
 vm=$(conf vm bana)          # the Linux machine on a Mac (its own CPU); shared by projects
 vm_x64=$(conf vm_x64 bana-x64) # the x86_64 one (OrbStack only)
 linux_user=$(conf linux_user bana) # who runners run as on a Linux machine entered as root
+
+# PROJECT, a project bana add added (bana list), in place of this checkout's. LEFT: or one
+# removed whose files are left (bana remove PROJECT --purge).
+pick_project() { # PREFIX [LEFT]
+  local f
+  f=$(project_home "$1")/daemon/settings
+  [[ $1 =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "No project $1 (bana list)"
+  [[ -f $f ]] || { [[ -n ${2:-} ]] && project_left "$1"; } || die "No project $1 (bana list)"
+  prefix=$1 home=$(project_home "$1") picked=1 repo=''
+  [[ ! -f $f ]] || repo=$(awk '/^repo *=/ { sub(/^repo *= */, ""); print; exit }' "$f")
+}
+# The files bana remove leaves (its clone, builds, fixes and state) are there.
+project_left() { # PREFIX
+  local d
+  for d in src builds fix releases act-cache state.json; do [[ ! -e $(project_home "$1")/$d ]] || return 0; done
+  return 1
+}
 
 need_repo() {
   [[ -n $repo ]] || die "Which repository? Set repo = owner/name in bana.conf (no bana.conf found${conf_file:+; using $conf_file})"
   [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "repo: owner/name, not '$repo'"
 }
 
-# A daemon.* setting, with its default (`bana daemon install` writes them for the daemon).
+# A daemon.* setting, with its default (`bana add` writes them for the daemon).
 daemon_conf() { # KEY
   local t=()
   read -r -a t <<<"$(words "$(conf tiers "quick nightly release")")" || true
@@ -188,14 +256,32 @@ daemon_conf() { # KEY
   esac
 }
 
+# bana version: this bana, and the daemon's when that differs.
+bana_version() {
+  local c h v
+  case $(bana_kind) in
+  release) echo "bana $BANA_VERSION (release v$BANA_VERSION)" ;;
+  copy) c=$BANA_COMMIT; echo "bana $BANA_VERSION${c:+ (commit ${c:0:7})}" ;;
+  *) c=$(bana_commit); echo "bana $BANA_VERSION${c:+ (checkout ${c:0:7})}" ;;
+  esac
+  [[ -f $machine_dir/settings ]] || return 0
+  # shellcheck source=SCRIPTDIR/../lib/daemon.sh
+  source "$bana_root/lib/daemon.sh"
+  h=$(d_health "$(d_port)") && d_is_ours "$h" || return 0
+  v=$(d_health_version "$h")
+  [[ -z $v || $v == "$BANA_VERSION" ]] || echo "the daemon runs $v: bana daemon install"
+}
+
 settings() {
   local k v
-  echo "# bana $BANA_VERSION at $bana_root"
+  echo "# bana $BANA_VERSION at $bana_root ($(bana_kind))"
   echo "# bana.conf: ${conf_file:-none}"
   for k in repo prefix labels vm vm_x64 linux_user packages.linux path hook.mac hook.linux \
     runner_version workflow tiers tier_input act.image act.network act.args act.docker_config ci.log keep keep_max_gb \
     daemon.branches daemon.tags daemon.tier daemon.tag_tier daemon.poll daemon.timeout \
-    daemon.supersede daemon.token fix.rounds fix.token fix.allow fix.turns fix.budget_usd tart_name; do
+    daemon.supersede daemon.token fix.rounds fix.token fix.allow fix.turns fix.budget_usd \
+    install.name install.bins install.hook install.hook_ps1 install.prefix install.bin install.config \
+    release.files release.platforms tart_name; do
     case $k in
     repo) v=$repo ;; prefix) v=$prefix ;; vm) v=$vm ;; vm_x64) v=$vm_x64 ;; linux_user) v=$linux_user ;;
     hook.*) v=$(conf_path "$k") ;;
@@ -214,6 +300,8 @@ settings() {
     fix.token) v=$(conf "$k" none) ;;
     fix.turns) v=$(conf "$k" 60) ;;
     fix.budget_usd) v=$(conf "$k" 5) ;;
+    install.name) v=$(conf "$k" "$prefix") ;;
+    release.files) v=$(conf "$k" '*') ;;
     tart_name) v=$(conf "$k" bana-tart) ;;
     *) v=$(conf "$k") ;;
     esac
@@ -778,12 +866,12 @@ relabel() {
   say "Labels are up to date."
 }
 
-# bana-manager for its SUBCOMMAND: the daemon's snapshot, else this bana's own release build,
-# which cargo builds (or brings up to date) when neither has it, as for bana manager. One
-# older than the subcommand (its usage lacks it) does not count.
+# bana-manager for its SUBCOMMAND: a release's own, else the daemon's snapshot, else this
+# checkout's release build, which cargo builds (or brings up to date) when none has it, as
+# for bana manager. One older than the subcommand (its usage lacks it) does not count.
 bm() { # SUBCOMMAND
   local b built=${CARGO_TARGET_DIR:-$bana_root/manager/target}/release/bana-manager
-  for b in "$home/daemon/bana-manager" "$built"; do
+  for b in "$bana_root/bin/bana-manager" "$machine_dir/bana-manager" "$built"; do
     if bm_has "$b" "$1"; then echo "$b"; return; fi
   done
   command -v cargo >/dev/null ||
@@ -797,21 +885,25 @@ bm() { # SUBCOMMAND
 bm_has() { [[ -x $1 ]] && grep -q "bana-manager $2 " <<<"$("$1" "$2" --usage </dev/null 2>&1)"; } # BINARY SUBCOMMAND
 
 manager() {
-  need_repo
-  local bin=$bana_root/manager/target/release/bana-manager port='' a h
-  # This project's daemon serves the same page (and more): open that one instead.
+  local bin=$bana_root/manager/target/release/bana-manager port='' a h p=''
+  # The daemon serves the same page (and more): open that one instead, at this project.
   # shellcheck source=SCRIPTDIR/../lib/daemon.sh
   source "$bana_root/lib/daemon.sh"
   for a in "$@"; do [[ $port == next ]] && port=$a; [[ $a == --port ]] && port=next; done
   [[ -n $port && $port != next ]] || port=$(d_port)
-  if h=$(d_health "$port"); then
-    d_is_ours "$h" || die "Another project's bana daemon serves port $port: pass --port"
-    say "$repo's daemon serves the page: $(d_url "$port")"
-    if [[ $os == Darwin ]]; then open "$(d_url "$port")" || true; fi
+  if h=$(d_health "$port") && d_is_ours "$h"; then
+    ! d_added || p="p=$prefix"
+    say "The bana daemon serves the page: $(d_url "$port" "$p")"
+    if [[ $os == Darwin ]]; then open "$(d_url "$port" "$p")" || true; fi
     return 0
   fi
-  command -v cargo >/dev/null || [[ -x $bin ]] || die "cargo is needed to build the manager: https://rustup.rs"
-  if command -v cargo >/dev/null; then
+  need_repo
+  # A release's own, prebuilt; a checkout's, which cargo builds.
+  if [[ -x $bana_root/bin/bana-manager ]]; then
+    bin=$bana_root/bin/bana-manager
+  elif ! command -v cargo >/dev/null; then
+    [[ -x $bin ]] || die "cargo is needed to build the manager: https://rustup.rs"
+  else
     say "Building the manager (the first time takes a minute)"
     cargo build -q --release --locked --manifest-path "$bana_root/manager/Cargo.toml"
   fi
@@ -904,12 +996,34 @@ ci)
   source "$bana_root/lib/act.sh"
   act_main "$@"
   ;;
-init)
-  # shellcheck source=SCRIPTDIR/../lib/init.sh
-  source "$bana_root/lib/init.sh"
-  init_main "$@"
+add)
+  # shellcheck source=SCRIPTDIR/../lib/daemon.sh
+  source "$bana_root/lib/daemon.sh"
+  # shellcheck source=SCRIPTDIR/../lib/add.sh
+  source "$bana_root/lib/add.sh"
+  add_main "$@"
+  ;;
+init) printf '\033[31m%s\033[0m\n' "bana init is now bana add" >&2; exit 2 ;;
+list | remove | pause | resume)
+  [[ $cmd == list || -z ${1:-} || $1 == -* ]] || { pick_project "$1" "$([[ $cmd == remove && $* == *--purge* ]] && echo 1)"; shift; }
+  # shellcheck source=SCRIPTDIR/../lib/daemon.sh
+  source "$bana_root/lib/daemon.sh"
+  case $cmd in
+  list) (($# == 0)) || project_usage; daemon_list ;;
+  remove) daemon_remove "$@" ;;
+  *) daemon_pause "$cmd" "$@" ;;
+  esac
   ;;
 report) report "$@" ;;
+installer | install)
+  # shellcheck source=SCRIPTDIR/../lib/installer.sh
+  source "$bana_root/lib/installer.sh"
+  case $cmd:${1:-} in
+  *:help | *:-h | *:--help) installer_usage ;;
+  installer:*) installer_main "$@" ;;
+  install:*) install_main "$@" ;;
+  esac
+  ;;
 mcp)
   # Claude Code starts it; stdout is the protocol's alone.
   need_repo
@@ -931,7 +1045,13 @@ changed | plan | keep-builds)
   ci_main "$cmd" "$@"
   ;;
 apt) apt_missing "$@" ;;
-version | --version) echo "bana $BANA_VERSION" ;;
+version | --version) bana_version ;;
+upgrade)
+  # shellcheck source=SCRIPTDIR/../lib/upgrade.sh
+  source "$bana_root/lib/upgrade.sh"
+  case ${1:-} in help | -h | --help) upgrade_usage ;; esac
+  upgrade_main "$@"
+  ;;
 # Used by the commands above, inside a Linux machine:
 linux-one) # K: the K-th Linux runner of a Mac's Linux machine
   [[ $(id -u) == 0 ]] && die "run as a normal user"

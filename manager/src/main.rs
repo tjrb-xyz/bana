@@ -7,12 +7,14 @@
 //!
 //! Prints `http://127.0.0.1:8470/#token=…`; open it. Loopback only.
 //!
-//!   bana-manager daemon --dir ~/.bana/<prefix> [--no-tray]
+//!   bana-manager daemon --home ~/.bana [--no-tray]
 //!
-//! runs the project's CI on push (bana_manager::daemon), with the settings
-//! `bana daemon install` wrote to <dir>/daemon/settings. It serves the same
-//! page, with the daemon's builds, on the settings' port, and on a Mac shows
-//! 🧱 in the menu bar (bana_manager::tray) unless --no-tray or `tray = no`.
+//! runs CI on push for every project `bana add` added in the home (each has
+//! <home>/<prefix>/daemon/settings; bana_manager::registry), one build at a
+//! time, with the machine's settings `bana daemon install` wrote to
+//! <home>/daemon.d/settings. It serves the same page, with the projects'
+//! builds, on the settings' port, and on a Mac shows 🧱 in the menu bar
+//! (bana_manager::tray) unless --no-tray or `tray = no`.
 //!
 //!   bana-manager post-status --repo OWNER/REPO --sha SHA --context C
 //!                --state pending|success|failure|error --description D
@@ -67,10 +69,15 @@
 //! bana's MCP server for Claude Code, on stdin and stdout (bana_manager::mcp):
 //! the fix loop's tools, in the fix worktree it runs in. `--config` prints the
 //! --mcp-config JSON that starts it instead.
+//!
+//!   bana-manager version
+//!
+//! prints its version (bana's), as a release's bin/bana checks it.
 
 use bana_manager::actlog::{Status, StatusState};
-use bana_manager::daemon::{post_status, Daemon, Settings};
+use bana_manager::daemon::{post_status, Machine, MACHINE_DIR};
 use bana_manager::guard::Access;
+use bana_manager::registry::Registry;
 use bana_manager::server::{daemon_router, health_at, router, Manager, Tools};
 use bana_manager::{valid_repo, valid_tier, valid_workflow};
 use std::io::Read;
@@ -82,7 +89,7 @@ use tokio::sync::Notify;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: bana-manager --script PATH --repo OWNER/REPO [--port N] [--workflow FILE] [--tiers A,B] [--tier-input NAME] [--gh PATH] [--token T]\n       bana-manager daemon --dir DIR [--no-tray]\n       bana-manager results (--json FILE | --text FILE|-)\n       bana-manager report (--build DIR | --text FILE|- [--env FILE]) [--conf FILE] [--repo OWNER/REPO] [--machine NAME] [--json]\n       bana-manager fix prepare --dir DIR --checkout DIR (--build N | --run | --log FILE|- [--sha S] [--ref R] [--tier T]) [--repo OWNER/REPO] [--workflow FILE] [--bana CMD] [--recheck] [--headless]\n       bana-manager fix brief --dir DIR [FIX]\n       bana-manager fix status --dir DIR [FIX]\n       bana-manager fix gate --dir DIR\n       bana-manager fix push --dir DIR FIX\n       bana-manager fix drop --dir DIR FIX [--force] [--delete-branch]\n       bana-manager fix result FILE\n       bana-manager mcp --dir DIR [--config]"
+        "usage: bana-manager --script PATH --repo OWNER/REPO [--port N] [--workflow FILE] [--tiers A,B] [--tier-input NAME] [--gh PATH] [--token T]\n       bana-manager daemon --home DIR [--no-tray]\n       bana-manager results (--json FILE | --text FILE|-)\n       bana-manager report (--build DIR | --text FILE|- [--env FILE]) [--conf FILE] [--repo OWNER/REPO] [--machine NAME] [--json]\n       bana-manager fix prepare --dir DIR --checkout DIR (--build N | --run | --log FILE|- [--sha S] [--ref R] [--tier T]) [--repo OWNER/REPO] [--workflow FILE] [--bana CMD] [--recheck] [--headless]\n       bana-manager fix brief --dir DIR [FIX]\n       bana-manager fix status --dir DIR [FIX]\n       bana-manager fix gate --dir DIR\n       bana-manager fix push --dir DIR FIX\n       bana-manager fix drop --dir DIR FIX [--force] [--delete-branch]\n       bana-manager fix result FILE\n       bana-manager mcp --dir DIR [--config]\n       bana-manager version"
     );
     std::process::exit(2)
 }
@@ -140,6 +147,10 @@ fn fail(msg: &str) -> ! {
 
 fn main() {
     let mut args = std::env::args().skip(1).peekable();
+    if args.peek().is_some_and(|a| a == "version") {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if args.peek().is_some_and(|a| a == "results") {
         args.next();
         results(args);
@@ -176,73 +187,94 @@ fn main() {
         return;
     }
     args.next();
-    let (settings, no_tray) = daemon_args(args);
+    let (home, machine, no_tray) = daemon_args(args);
     let quit = Arc::new(Notify::new());
     // On a Mac the menu bar takes the main thread (AppKit wants it); the
     // daemon runs on the runtime's threads and tells the menu bar when it stops.
     #[cfg(target_os = "macos")]
-    if settings.tray && !no_tray {
+    if machine.tray && !no_tray {
         let handle = rt.handle().clone();
         let q = quit.clone();
         bana_manager::tray::run(quit, move |tray| {
             let (ready, stopped) = (tray.clone(), tray);
             handle.spawn(daemon(
-                settings,
+                home,
+                machine,
                 q,
-                move |d, url| ready.ready(d, url),
+                move |r, url| ready.ready(r, url),
                 move || stopped.stopped(),
             ));
         });
     }
     #[cfg(not(target_os = "macos"))]
     let _ = no_tray; // no menu bar here
-    rt.block_on(daemon(settings, quit, |_, _| {}, || {}));
+    rt.block_on(daemon(home, machine, quit, |_, _| {}, || {}));
 }
 
-fn daemon_args(mut args: impl Iterator<Item = String>) -> (Settings, bool) {
-    let (mut dir, mut no_tray) = (None, false);
+fn daemon_args(mut args: impl Iterator<Item = String>) -> (PathBuf, Machine, bool) {
+    let (mut home, mut no_tray) = (None, false);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--dir" => dir = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
+            "--home" => home = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
             "--no-tray" => no_tray = true,
             _ => usage(),
         }
     }
-    let Some(dir) = dir else { usage() };
-    (Settings::load(&dir).unwrap_or_else(|e| fail(&e)), no_tray)
+    let Some(home) = home else { usage() };
+    let machine = Machine::load(&home).unwrap_or_else(|e| fail(&e));
+    (home, machine, no_tray)
 }
 
-/// `daemon --dir D`: serves the page on the settings' port and runs until
-/// SIGTERM, Ctrl-C or `quit`, then stops the build it runs. `ready` gets the
-/// daemon and the page's URL (with the token) once it runs; `stopped` is
-/// called after it has stopped.
+/// `<home>/daemon.d/daemon.lock`, locked (flock) while the daemon runs;
+/// none while another daemon holds it.
+fn claim(home: &Path) -> Result<Option<std::fs::File>, String> {
+    use std::os::fd::AsRawFd;
+    let dir = home.join(MACHINE_DIR);
+    let path = dir.join("daemon.lock");
+    let f = std::fs::create_dir_all(&dir)
+        .and_then(|_| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+        })
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    // SAFETY: flock on a descriptor this function owns.
+    let locked = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    Ok(locked.then_some(f))
+}
+
+/// `daemon --home H`: serves the page on the settings' port, runs every
+/// project added in H until SIGTERM, Ctrl-C or `quit`, then stops the build
+/// it runs. `ready` gets the projects and the page's URL (with the token)
+/// once it runs; `stopped` is called after it has stopped.
 async fn daemon(
-    settings: Settings,
+    home: PathBuf,
+    machine: Machine,
     quit: Arc<Notify>,
-    ready: impl FnOnce(&Daemon, String),
+    ready: impl FnOnce(&Arc<Registry>, String),
     stopped: impl FnOnce(),
 ) {
-    let (repo, prefix, port) = (
-        settings.repo.clone(),
-        settings.prefix.clone(),
-        settings.port,
-    );
-    let dir = settings.dir.clone();
-    let token = stored_token(&settings.home);
+    let port = machine.port;
+    let token = stored_token(&machine.home);
     let url = format!("http://127.0.0.1:{port}/#token={token}");
-    // The port first: a second daemon for this project leaves, with success
-    // (under launchd a failure would start it again every 10 s).
+    // One daemon a machine: a second one leaves, with success (under
+    // launchd a failure would start it again every 10 s).
+    let already = || -> ! {
+        println!("bana-manager: the bana daemon already runs: {url}");
+        std::process::exit(0)
+    };
+    let Some(_claimed) = claim(&home).unwrap_or_else(|e| fail(&e)) else {
+        already()
+    };
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => match health_at(port).await {
-            Some(h) if h["daemon"] == true && h["repo"] == repo.as_str() => {
-                println!("bana-manager: the daemon for {repo} already runs: {url}");
-                std::process::exit(0)
-            }
+            Some(h) if h["global"] == true => already(),
             Some(h) if h["daemon"] == true => fail(&format!(
-                "port {port} is taken by the bana daemon for {}; set another port",
-                h["repo"].as_str().unwrap_or("another project")
+                "port {port} is taken (an old per-project bana daemon? bana daemon install migrates it)"
             )),
             Some(_) => fail(&format!(
                 "port {port} is taken by bana's manager; stop it (bana manager) or set another port"
@@ -255,13 +287,9 @@ async fn daemon(
     let mut term =
         signal(SignalKind::terminate()).unwrap_or_else(|e| fail(&format!("SIGTERM: {e}")));
     let mut int = signal(SignalKind::interrupt()).unwrap_or_else(|e| fail(&format!("SIGINT: {e}")));
-    let d = Daemon::start(settings).await.unwrap_or_else(|e| fail(&e));
-    let manager = Manager::new(
-        Tools::from_settings(d.settings()),
-        d.settings().machine.clone(),
-    );
+    let r = Registry::start(&home, machine).await;
     let access = Arc::new(Access::loopback(token, port, &["/ci/v1/"]));
-    let app = daemon_router(manager, d.clone(), access);
+    let app = daemon_router(r.clone(), access);
     let (stop_http, http_stopped) = tokio::sync::oneshot::channel::<()>();
     let http = tokio::spawn(async move {
         let stop = async {
@@ -274,18 +302,22 @@ async fn daemon(
             eprintln!("bana-manager: {addr}: {e}");
         }
     });
+    let projects = match r.prefixes() {
+        p if p.is_empty() => "no project yet (bana add in its checkout adds one)".to_string(),
+        p => p.join(", "),
+    };
     println!(
-        "bana-manager: CI on push for {repo} ({prefix}), in {}: {url}",
-        dir.display()
+        "bana-manager: CI on push in {}, for {projects}: {url}",
+        home.display()
     );
-    ready(&d, url);
+    ready(&r, url);
     tokio::select! {
         _ = int.recv() => {}
         _ = term.recv() => {}
         _ = quit.notified() => {}
     }
     println!("bana-manager: stopping");
-    d.shutdown().await;
+    r.shutdown().await;
     let _ = stop_http.send(());
     let _ = tokio::time::timeout(Duration::from_secs(5), http).await;
     stopped();

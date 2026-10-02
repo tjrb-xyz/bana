@@ -148,7 +148,7 @@ act_lock() { # LABEL
 
 act_main() {
   local tier='' x64='' list='' dry='' event='' secrets='' locked jobs=() pass=() args=() extra=() verbose=''
-  local wf root here tiers image arch net i o dc all=() mlabels=''
+  local wf root here tiers image arch net i o dc all=() mlabels='' act_fetched=''
   while (($#)); do
     case $1 in
     -j | --job) jobs=(-j "${2:?-j JOB}"); shift ;;
@@ -188,7 +188,12 @@ act_main() {
     die "This workflow takes no tier (bana.conf: tiers)"
   fi
   [[ -z $event || -f $event ]] || die "--event: no file $event"
-  [[ $locked == 1 ]] || act_lock "bana ci${tier:+ $tier} ($prefix)"
+  if [[ $locked != 1 ]]; then
+    act_lock "bana ci${tier:+ $tier} ($prefix)"
+    # Every run by hand is act's run 1, and download-artifact hands a run every artifact of
+    # its run id: the last run's go, so a run gets only its own. (A dry run uploads nothing.)
+    [[ -n $dry ]] || rm -rf "$base_home/act/artifacts"
+  fi
   act_docker
 
   image=$(act_conf act.image catthehacker/ubuntu:act-24.04)
@@ -256,13 +261,57 @@ act_main() {
   say "act: ${tier:-the workflow} from $(basename "$wf"), Linux jobs in $image ($arch, network $net)$([[ $os == Darwin ]] && echo ", macOS jobs on this Mac")"
   args=(workflow_dispatch "${args[@]}" ${extra[@]+"${extra[@]}"} ${jobs[@]+"${jobs[@]}"} ${pass[@]+"${pass[@]}"})
   [[ -n $dry ]] || mlabels=$(act_machine_labels)
-  # The daemon reads act's output itself, and a dry run leaves the last run's log.
-  if [[ $locked == 1 || -n $dry || $(conf ci.log yes) == no ]]; then
+  [[ -n $dry ]] || act_actions
+  # The daemon reads act's output itself, through relays that outlive it (act_relay): the
+  # machine's act and bash's own lines (act_both) as well.
+  if [[ $locked == 1 ]]; then
+    [[ -n $mlabels ]] || exec act "${args[@]}" > >(act_relay) 2> >(act_relay >&2)
+    act_both "${args[@]}" > >(act_relay) 2> >(act_relay >&2)
+    exit
+  fi
+  # A dry run leaves the last run's log.
+  if [[ -n $dry || $(conf ci.log yes) == no ]]; then
     [[ -n $mlabels ]] || exec act "${args[@]}"
     act_both "${args[@]}"
     exit
   fi
   act_logged "${args[@]}"
+}
+
+# The workflow's actions, fetched before it runs, one job at a time (a dry run), and then
+# used as they are (--action-offline-mode). Jobs that run together and use one action (a
+# matrix) would each fetch it into act's one cache: one job's fetch rewrote the files another
+# was copying into its container, and the job failed. A fix round (offline already) fetches
+# nothing; what this cannot fetch, the run fetches as before.
+# act's dry run still runs a host job's steps (-self-hosted): for it, every label goes to
+# the image, where a dry run runs nothing (the last -P wins). The Linux machine's act (act_machine)
+# fetches its own the same way, into its own cache.
+act_actions() {
+  local a i dry=()
+  for a in "${args[@]}"; do [[ $a != --action-offline-mode ]] || return 0; done
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    case ${args[i]} in
+    -P | --platform) a=${args[i + 1]:-} ;;
+    -P=* | --platform=*) a=${args[i]#*=} ;;
+    -P?*) a=${args[i]#-P} ;;
+    *) continue ;;
+    esac
+    [[ $a != *=* ]] || dry+=(-P "${a%%=*}=$image")
+  done
+  act "${args[@]}" ${dry[@]+"${dry[@]}"} -n --concurrent-jobs 1 >/dev/null 2>&1 || true
+  args+=(--action-offline-mode)
+  act_fetched=1
+}
+
+# act's output on its way to the daemon. If the daemon dies, its pipes close: act, a Go
+# program, would die of SIGPIPE at its next line, and must run on (the daemon's next start
+# stops it). This passes the lines on while it can and drops them after; SIGPIPE is ignored
+# here only, so act and its steps keep the default, as on GitHub. A cancel's SIGINT (to the
+# process group) leaves it running, for act's last lines.
+act_relay() {
+  trap '' PIPE INT
+  local l
+  while IFS= read -r l || [[ -n $l ]]; do printf '%s\n' "$l" 2>/dev/null || :; done
 }
 
 # act, then a second act in the Linux machine for the jobs the first skipped for a machine
@@ -342,10 +391,12 @@ act_machine_jobs() { # FILE...
 # The machine is made and made ready first (bana linux-prepare: packages.linux, hook.linux,
 # and act, at this act's version), then act runs there on the same checkout, event and
 # options, with the jobs' platforms (act_platforms_machine) and a cache on the machine's own
-# disk. Under --json only the jobs' own lines (and errors) come out: the jobs they need ran in
-# the first act already. Uses act_main's locals.
+# disk. When the first act's actions were fetched first (act_actions), the machine's are too,
+# into that cache, with every label to the image (a dry run of a host job runs its steps).
+# Under --json only the jobs' own lines (and errors) come out: the jobs they need ran in the
+# first act already. Uses act_main's locals.
 act_machine() { # IDS ACT-ARGUMENT...
-  local ids=$1 a=() vc=() j json='' v pf tf st=0 i names
+  local ids=$1 a=() f=() vc=() sc j l json='' v pf tf st=0 i names
   shift
   for ((i = 1; i <= $#; i++)); do
     case ${!i} in
@@ -355,6 +406,11 @@ act_machine() { # IDS ACT-ARGUMENT...
   done
   while IFS= read -r j; do a+=("$j"); done < <(act_platforms_machine)
   for j in $ids; do a+=(-j "$j"); done
+  if [[ -n $act_fetched ]]; then
+    for j in "${a[@]}"; do [[ $j == --action-offline-mode ]] || f+=("$j"); done
+    while IFS=$'\t' read -r l _; do f+=(-P "$l=$image"); done < <(act_platform_table)
+    f+=(-n --concurrent-jobs 1)
+  fi
   v=$(act --version 2>/dev/null | awk 'NR == 1 { print $NF }')
   [[ -n $v ]] || { warn "act has no version to install in the Linux machine"; return 1; }
   # The jobs' names, as act's text shows them.
@@ -372,14 +428,18 @@ act_machine() { # IDS ACT-ARGUMENT...
   printf '%s' "${GITHUB_TOKEN:-}" >"$tf"
   # vm_run's command itself, so that act_child is orb's (or limactl's) pid, not a subshell's.
   case $(vm_kind) in orbstack) vc=(orb -m "$vm") ;; *) vc=(limactl shell "$vm") ;; esac
-  act_vm_pid=$pf
+  # act in the machine, in the checkout; its pid in PF (- for none).
   # shellcheck disable=SC2016 # expanded in the machine
-  (trap - INT; exec "${vc[@]}" bash -c 'cd "$1" || exit 1
+  sc='cd "$1" || exit 1
     pf=$2 v=$3 tf=$4 c=$5; shift 5
     GITHUB_TOKEN=$(cat "$tf"); export GITHUB_TOKEN
-    echo $$ >"$pf"
-    exec "$HOME/.local/bin/act-$v" "$@" --action-cache-path "$HOME/.cache/bana/$c"' \
-    bana-act "$here" "$pf" "$v" "$tf" "act-$prefix" "${a[@]}") > >(act_only "$json" "$ids" "$names") &
+    [ "$pf" = - ] || echo $$ >"$pf"
+    exec "$HOME/.local/bin/act-$v" "$@" --action-cache-path "$HOME/.cache/bana/$c"'
+  # The fetch: a cancel meanwhile (act_forward) stops the run before it starts.
+  ((${#f[@]} == 0)) || "${vc[@]}" bash -c "$sc" bana-act "$here" - "$v" "$tf" "act-$prefix" "${f[@]}" >/dev/null 2>&1 || true
+  if [[ -n $act_stop ]]; then rm -f "$tf"; return 130; fi
+  act_vm_pid=$pf
+  (trap - INT; exec "${vc[@]}" bash -c "$sc" bana-act "$here" "$pf" "$v" "$tf" "act-$prefix" "${a[@]}") > >(act_only "$json" "$ids" "$names") &
   act_child=$!
   act_wait "$act_child" || st=$?
   act_child='' act_vm_pid=''
@@ -439,10 +499,8 @@ act_logged() { # ACT-ARGUMENT...
   dirty=$(git -C "$root" -c core.quotePath=false status --porcelain 2>/dev/null |
     awk '{ p = substr($0, 4); i = index(p, " -> "); if (i) p = substr(p, i + 4); printf "%s%s", s, p; s = " " }') || true
   v=$(act --version 2>/dev/null | awk 'NR == 1 { print $NF }') || true
-  # bana's own commit, unless it is a copy inside another repository.
-  if [[ $(git -C "$bana_root" rev-parse --show-toplevel 2>/dev/null) == "$(cd "$bana_root" && pwd -P)" ]]; then
-    b=$(git -C "$bana_root" rev-parse HEAD 2>/dev/null) || true
-  fi
+  # bana's own commit (a checkout's or a release's; none for a copy).
+  b=$(bana_commit)
   started=$(date +%s)
   # Ctrl-C reaches act, which stops its jobs and ends; tee -i and bash (trapping it) wait
   # for that, so the log ends as act's output does.
@@ -467,7 +525,7 @@ act_logged() { # ACT-ARGUMENT...
 # (none is built for it): last.report.md, and its table on the terminal.
 act_report() { # DIR
   local b m='' opts=()
-  for b in "$home/daemon/bana-manager" "${CARGO_TARGET_DIR:-$bana_root/manager/target}/release/bana-manager"; do
+  for b in "$bana_root/bin/bana-manager" "$machine_dir/bana-manager" "${CARGO_TARGET_DIR:-$bana_root/manager/target}/release/bana-manager"; do
     if bm_has "$b" report; then m=$b; break; fi
   done
   [[ -n $m ]] || return 0
@@ -500,6 +558,6 @@ act_unmapped() { # LOG
       for l in $labels; do
         case $keys in *" $(lower <<<"$l") "*) known=1 ;; esac
       done
-      [[ -n $known ]] || warn "not run here: $job (runs-on: $labels): see bana init"
+      [[ -n $known ]] || warn "not run here: $job (runs-on: $labels): see bana add"
     done
 }

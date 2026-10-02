@@ -13,7 +13,8 @@
 //! - one round at a time;
 //! - a tree equal to the last finished round's gets that round back, unless
 //!   `repeat`, if that round passed or failed with the jobs asked for;
-//! - none while the daemon is paused.
+//! - none while `paused` (the daemon never says so: a project's pause holds
+//!   its pushes only, never a fix's rounds).
 
 use crate::actlog::BuildState;
 use crate::results::Results;
@@ -115,7 +116,8 @@ impl Rounds {
 
     /// Whether a round of `jobs` on `tree` may run now, in the limits' order:
     /// one at a time; the same tree again gets its result ([`Round::answers`]);
-    /// not while `paused`; not past the limit.
+    /// not while `paused` (the daemon passes false: its pause holds pushes
+    /// only); not past the limit.
     pub fn ask(
         &self,
         tree: &str,

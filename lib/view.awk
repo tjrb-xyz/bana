@@ -18,7 +18,7 @@ function reason(job, label, l, v, r) {
   }
   if (v == "mac") return label ": on a Mac only"
   if (v ~ /^skip/) { r = v; sub(/^skip ?/, "", r); return label ": " (r != "" ? r : "act.platform." l " = skip") }
-  if (v == "") return "no place here for " label ": see bana init"
+  if (v == "") return "no place here for " label ": see bana add"
   return ""
 }
 function plan(o, n, i, kv, k, v, yes, no, tier) {

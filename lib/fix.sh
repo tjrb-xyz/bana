@@ -111,7 +111,7 @@ fix_default() { # BRANCH (refs/heads/…, or empty)
 }
 
 # bana's tools for Claude Code in worktree WT: none when Claude Code has them there already
-# (bana daemon install registers them in your checkout, and its worktrees see them), else
+# (bana add registers them in your checkout, and its worktrees see them), else
 # --mcp-config with bana's MCP server. `claude mcp get` is a config command: no prompt runs.
 fix_mcp() { # BANA-MANAGER WT
   local got
@@ -125,13 +125,16 @@ fix_mcp() { # BANA-MANAGER WT
   printf '%s\n' --mcp-config "$("$1" mcp --dir "$home" --config)"
 }
 
-# This project's daemon, if it answers: its port in fix_port (else fix_port is empty).
+# The daemon, if it answers and runs this project: its port in fix_port (else fix_port is empty).
 fix_daemon() {
   local h
   # shellcheck source=SCRIPTDIR/daemon.sh
   source "$bana_root/lib/daemon.sh"
   fix_port=$(d_port)
-  if h=$(d_health "$fix_port") && d_is_ours "$h"; then return 0; fi
+  if h=$(d_health "$fix_port") && d_is_ours "$h" &&
+    d_curl "$fix_port" /ci/v1/projects 2>/dev/null | d_row "$prefix" | grep -Eq '"error": *null'; then
+    return 0
+  fi
   fix_port=''
   return 1
 }
@@ -167,7 +170,7 @@ fix_headless_check() {
     die "fix.allow: narrow rules only, like 'Bash(cargo test:*)', not $bad: not all of Bash, nor git (its --output writes files; commit_fix commits), nor a command that runs others"
   fi
   command -v claude >/dev/null || die "Claude Code (claude) is not on PATH: https://claude.com/claude-code"
-  fix_daemon || die "bana fix --headless needs the daemon, whose rounds test Claude's changes: bana daemon install (or status)"
+  fix_daemon || die "bana fix --headless needs the daemon, whose rounds test Claude's changes: bana add, and bana daemon install (or status)"
 }
 
 # Fix FIX, with worktree WT, registered with the daemon: it runs the failed jobs again at
@@ -177,7 +180,7 @@ fix_register() { # FIX WT
   local out sha
   sha=$(fx "$1" sha)
   if out=$(git -C "$2" -c core.hooksPath=/dev/null -c core.fsmonitor=false push -q "$home/src" "$sha:refs/bana/fix/$1/base" 2>&1) &&
-    out=$(d_curl "$fix_port" /ci/v1/fixes -X POST -H 'Content-Type: application/json' --data "{\"fix\":\"$1\"}" 2>&1); then
+    out=$(d_curl "$fix_port" "/ci/v1/p/$prefix/fixes" -X POST -H 'Content-Type: application/json' --data "{\"fix\":\"$1\"}" 2>&1); then
     [[ $(fix_json recheck <<<"$out") != 0 ]] || echo "  round 0: the daemon runs the failed jobs again at $1"
   else
     warn "The daemon did not take fix $1, so no round 0: ${out:-no answer}"
@@ -267,7 +270,7 @@ fix_start() {
   if [[ -n $headless ]]; then fix_headless "$m" "$fix" "$wt" "$dir"; return; fi
   while IFS= read -r a; do mcp+=("$a"); done < <(fix_mcp "$m" "$wt")
   if [[ -n $open ]]; then
-    ((${#mcp[@]} == 0)) || warn "Claude Code has no bana tools in $wt (bana daemon install registers them): without them, bana fix $fix in a terminal"
+    ((${#mcp[@]} == 0)) || warn "Claude Code has no bana tools in $wt (bana add registers them): without them, bana fix $fix in a terminal"
     # Claude Code's own handler opens a terminal in the worktree, with the prompt typed.
     if [[ $os == Darwin ]]; then open "$link"
     elif command -v xdg-open >/dev/null; then xdg-open "$link"
@@ -429,7 +432,7 @@ fix_drop() { # [FIX] [--force] [--delete-branch]
   [[ $(fix_json removed <<<"$out") != true ]] || say "Removed the worktree $(fix_json worktree <<<"$out")"
   # Its rounds go too: the daemon drops their builds (cancels one that runs) and its refs.
   if fix_daemon; then
-    if out=$(d_curl "$fix_port" "/ci/v1/fixes/$x/forget" -X POST 2>&1); then
+    if out=$(d_curl "$fix_port" "/ci/v1/p/$prefix/fixes/$x/forget" -X POST 2>&1); then
       n=$(fix_json builds <<<"$out")
       [[ ${n:-0} == 0 ]] || echo "  the daemon dropped its $(plural "$n" "round build")"
     else
