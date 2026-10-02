@@ -14,6 +14,9 @@
 #   bana list                the projects added here, and what each does
 #   bana remove [PROJECT] [--purge]   the project's CI here goes (--purge: its builds too)
 #   bana pause|resume [PROJECT]   hold the builds of its pushes, or build them again
+#   bana split [on | off | plan | check | ci github|local | logs private|public ...]   the project's
+#                            builds and releases on a public repository's GitHub Actions, its code
+#                            private (bana split help; docs/SPLIT.md)
 # On this machine, when you want it (act, in OrbStack's Docker; nothing stays running):
 #   bana ci [TIER] [-j JOB] [--x64] [--list] [--event FILE]   the workflow's jobs here (bana ci --help);
 #                            act's output stays in ~/.bana/<prefix>/ci/last.log, for bana fix
@@ -1040,6 +1043,8 @@ fix)
   fix_main "$@"
   ;;
 split)
+  # shellcheck source=SCRIPTDIR/../lib/daemon.sh
+  source "$bana_root/lib/daemon.sh"
   # shellcheck source=SCRIPTDIR/../lib/split.sh
   source "$bana_root/lib/split.sh"
   split_main "$@"

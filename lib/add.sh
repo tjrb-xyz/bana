@@ -6,7 +6,7 @@
 # workflow, written only if you say so. Then it adds the project to the daemon (bana daemon
 # install starts it, once a machine). Sourced by bin/bana.
 #
-#   bana add [--check] [--diff] [--workflow FILE] [--no-hook] [--no-claude]
+#   bana add [--check] [--diff] [--workflow FILE] [--no-hook] [--no-claude] [--split[=OWNER/NAME]]
 #     --workflow FILE  the workflow in .github/workflows (default: bana.conf's workflow, else
 #                      ci.yml, else the only one with jobs and workflow_dispatch)
 #     --check          ask, write and add nothing; exit 1 when a job has no place here, a
@@ -14,6 +14,8 @@
 #     --diff           only the proposed workflow changes, as a patch for git apply
 #     --no-hook        no git hook that tells the daemon about your pushes at once
 #     --no-claude      don't register bana's tools (its MCP server) with Claude Code here
+#     --split[=R]      then bana split on: builds and releases on a public repository's
+#                      GitHub Actions, the code private (docs/SPLIT.md; R: bana split on --repo R)
 #   It needs act, and mikefarah's yq (else the one in act.image, through Docker). On a
 #   terminal it asks where a label bana does not know runs (bana.conf keeps the answer),
 #   then whether to write bana.conf and to apply the workflow changes (git apply: no
@@ -57,7 +59,7 @@ add_strip='{"on": {"workflow_dispatch": ((.on | select(tag == "!!map") | .workfl
     map_values(pick(["runs-on", "strategy"]) | .steps = [{"run": "true"}]))}'
 
 add_main() {
-  local check='' diff='' wf='' hook=1 claude=1 rc counts unmapped='' split=''
+  local check='' diff='' wf='' hook=1 claude=1 rc counts unmapped='' split='' to_split='' split_args=()
   i_counts=''
   while (($#)); do
     case $1 in
@@ -66,6 +68,8 @@ add_main() {
     --workflow) wf=${2:?--workflow FILE}; shift ;;
     --no-hook) hook='' ;;
     --no-claude) claude='' ;;
+    --split) to_split=1 ;;
+    --split=*) to_split=1 split_args=(--repo "${1#--split=}") ;;
     *) add_usage ;;
     esac
     shift
@@ -97,6 +101,11 @@ add_main() {
   add_agrees "$counts" || { rm -f "$counts"; exit 1; }
   rm -f "$counts"
   add_register "$hook" "$claude" "$unmapped" "$split"
+  [[ -n $to_split ]] || return 0
+  echo
+  # shellcheck source=SCRIPTDIR/split.sh
+  source "$bana_root/lib/split.sh"
+  split_main on ${split_args[@]+"${split_args[@]}"}
 }
 
 # The daemon builds as bana.conf says, as bana ci does. A workflow or prefix the report
@@ -837,6 +846,7 @@ add_next() {
   [[ ! -s $i_tmp/conf && ! -s $i_tmp/patch ]] ||
     printf '  %-22s  %s\n' "git commit, git push" "bana.conf and the workflow changes: the daemon builds pushed commits, with theirs"
   [[ -z $l ]] || printf '  %-22s  %s\n' "bana up$l" "a pool of runners, for the jobs that wait for one"
+  printf '  %-22s  %s\n' "bana split plan" "or builds and releases on a public repository's GitHub Actions, the code private"
   [[ -z $i_gate ]] || printf '  %-22s  %s\n' "gh variable set $i_gate --body false" "" "" "once the daemon builds the pushes: GitHub then runs no push or nightly"
 }
 

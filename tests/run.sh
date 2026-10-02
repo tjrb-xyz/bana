@@ -31,7 +31,9 @@ fresh() {
   export HOME=$T/w/home FAKE_STATE=$T/w/state FAKE_LOG=$T/w/log
   unset FAKE_OS FAKE_ARCH FAKE_UID FAKE_IOREG BANA_SYS_ROOT BANA_TOKEN FAKE_GH FAKE_POOL FAKE_SVC_FAIL GITHUB_TOKEN \
     FAKE_HEALTH FAKE_LINGER FAKE_GH_SCOPES BANA_DAEMON_BIN BANA_DAEMON_STEP CARGO_TARGET_DIR \
-    FAKE_CARGO_FAIL FAKE_VERSION FAKE_LATEST FAKE_SEEN BANA_UPGRADE_NOW FAKE_RELEASES BANA_RELEASES BANA_RELEASE_REPO
+    FAKE_CARGO_FAIL FAKE_VERSION FAKE_LATEST FAKE_SEEN BANA_UPGRADE_NOW FAKE_RELEASES BANA_RELEASES BANA_RELEASE_REPO \
+    FAKE_GH_STORE FAKE_GH_DENY FAKE_GH_FAIL_AT FAKE_GH_MISSING FAKE_RUN_CONCLUSION FAKE_RUN_BUNDLE FAKE_RUN_NOBUNDLE \
+    FAKE_RUN_VIEWS BANA_SPLIT_CONSENT
   # What the host (GitHub's runners, act, a daemon's build) may have set, which bana reads.
   unset XDG_CONFIG_HOME BANA_HOME BANA_CONFIG BANA_PROJECT_ROOT BANA_ACT_LOCKED BANA_DAEMON ACT \
     RUNNER_ENVIRONMENT GITHUB_WORKSPACE DOCKER_HOST DISPLAY WAYLAND_DISPLAY
@@ -2443,6 +2445,7 @@ else
   check "add: which workflow, and why" has "$T/out" "The workflow: bana's default."
   check "add: next, commit and push what it proposes" has "$T/out" \
     "git commit, git push    bana.conf and the workflow changes: the daemon builds pushed commits, with theirs"
+  check "add: next, or builds on a public repository's GitHub Actions" has "$T/out" "bana split plan"
   check "add: no terminal, nothing written (no bana.conf made)" test ! -e .github/bana.conf -a ! -e bana.conf
   check "add: the workflow as it was" same "$(git status --porcelain)" ""
   FAKE_OS=Darwin FAKE_ARCH=arm64 bash "$bana" add >"$T/out" 2>&1 || true

@@ -175,3 +175,360 @@ unsealed "an archive with more" "$T/w/s4" "the bundle holds more than out/ and a
 check "steps: only the step lines" same "$(sp split_runner_steps <"$fx/act.jsonl" | tr '\n' '|')" \
   "rust / Set up job: ok (2s)|rust / cargo test: failed (12s)|rust: failed|package / build *: ok (61s)|package / Post upload: ok (1s)|package: ok|"
 check "steps, logs public: and the output" same "$(BANA_LOGS=public sp split_runner_steps <"$fx/act.jsonl" | grep -c PRIVATE)" 2
+
+# ---- split: bana split on, the wizard (GitHub: the gh stand-in's store) --------------------------
+# A terminal for bana: SCRIPT's lines are `expect TEXT` (wait until bana printed it), `send TEXT`
+# (a line typed), `run COMMAND` (in sh, meanwhile). Prints what bana printed; bana's exit.
+on_tty() { # SCRIPT COMMAND...
+  python3 - "$@" <<'PY'
+import os, pty, select, subprocess, sys, time
+script, cmd = sys.argv[1], sys.argv[2:]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp(cmd[0], cmd)
+out = b""
+def read(until=None, limit=20.0):
+    global out
+    end = time.time() + limit
+    while time.time() < end:
+        if until is not None and until.encode() in out:
+            return True
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if r:
+            try:
+                data = os.read(fd, 4096)
+            except OSError:
+                return until is None
+            if not data:
+                return until is None
+            out += data
+    return until is None
+for line in open(script).read().splitlines():
+    what, _, arg = line.partition(" ")
+    if what == "expect" and not read(arg):
+        out += ("\n[on_tty: never saw %r]\n" % arg).encode()
+        break
+    if what == "send":
+        os.write(fd, (arg + "\n").encode())
+    if what == "run":
+        subprocess.call(arg, shell=True)
+read(None, 30.0)
+_, st = os.waitpid(pid, 0)
+sys.stdout.write(out.decode("utf-8", "replace").replace("\r\n", "\n"))
+sys.exit(os.WEXITSTATUS(st) if os.WIFEXITED(st) else 1)
+PY
+}
+# The world: acme/widget added here, private, its admin signed in to gh.
+split_world() {
+  daemon_world
+  bash "$bana" add </dev/null >/dev/null 2>&1 || { echo "bana add failed" >&2; return 1; }
+  export FAKE_GH_STORE=$T/w/github
+  mkdir -p "$FAKE_GH_STORE/repos/acme/widget/files"
+  echo PRIVATE >"$FAKE_GH_STORE/repos/acme/widget/visibility"
+  echo x >"$FAKE_GH_STORE/repos/acme/widget/files/README.md"
+  : >"$FAKE_LOG"
+}
+writes() { grep -E 'gh api -X (POST|PUT|DELETE)|gh repo create|gh (secret|variable) (set|delete)|gh workflow' "$FAKE_LOG" || true; } # gh's writes
+yes_phrase="yes, build acme/widget in public"
+pub=$T/w/github/repos/acme/widget-releases
+s=$HOME/.bana/wid/split
+sset=$HOME/.bana/wid/daemon/settings
+
+fresh
+split_world
+bash "$bana" split on --repo acme/widget-releases </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "split on: no terminal, no BANA_SPLIT_CONSENT: refused" same "$st" 1
+check "split on: says what it needs" has "$T/out" "No terminal: BANA_SPLIT_CONSENT must hold \"$yes_phrase\""
+check "split on: refused: the plan and the risks first" has "$T/out" "anyone who takes over your GitHub account or gh token"
+check "split on: refused: nothing written on GitHub" same "$(writes)" ""
+check "split on: refused: nothing kept here" test ! -e "$s"
+BANA_SPLIT_CONSENT="yes" bash "$bana" split on --repo acme/widget-releases </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "split on: another phrase: refused, nothing written" same "$st:$(writes)" "1:"
+bash "$bana" split on </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "split on: no terminal, no --repo: refused" same "$st" 1
+check "split on: says to name it" has "$T/out" "bana split on --repo OWNER/NAME"
+bash "$bana" split on --web --repo acme/widget-releases </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "split on --web: needs a terminal" same "$st:$(grep -c 'needs a terminal' "$T/out")" "1:1"
+bash "$bana" split plan --repo acme/widget-releases </dev/null >"$T/out" 2>&1 || cat "$T/out"
+check "split plan: how it is made: gh, here" has "$T/out" "3. acme/widget-releases, public: gh repo create acme/widget-releases --public"
+check "split plan: the deploy key first" has "$T/out" "2. a read-only deploy key on acme/widget, first"
+check "split plan: changes nothing" same "$(writes)" ""
+bash "$bana" split plan --repo acme/widget-releases --web </dev/null >"$T/out" 2>&1 || cat "$T/out"
+check "split plan --web: on GitHub's page" has "$T/out" "3. acme/widget-releases, public: on GitHub's new-repository page"
+echo PUBLIC >"$FAKE_GH_STORE/repos/acme/widget/visibility"
+bash "$bana" split plan --repo acme/widget-releases </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "split plan: a public repository's code: refused" same "$st" 1
+check "split plan: says why" has "$T/out" "acme/widget is not private (PUBLIC)"
+echo PRIVATE >"$FAKE_GH_STORE/repos/acme/widget/visibility"
+
+# All of it, off a terminal with the phrase.
+: >"$FAKE_LOG"
+BANA_SPLIT_CONSENT=$yes_phrase bash "$bana" split on --repo acme/widget-releases </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "split on: done" same "$st" 0
+[[ $st == 0 ]] || sed 's/^/  | /' "$T/out"
+check "split on: each step, ok" same "$(grep -c '^\[[1-9]/9\] .* ok$' "$T/out")" 9
+check "split on: the deploy key before the public repository" same \
+  "$(grep -oE 'gh api -X POST repos/acme/widget/keys|gh repo create acme/widget-releases' "$FAKE_LOG" | tr '\n' '|')" \
+  "gh api -X POST repos/acme/widget/keys|gh repo create acme/widget-releases|"
+check "split on: the deploy key, read-only" same "$(cat "$FAKE_GH_STORE"/repos/acme/widget/keys/*/read_only)" true
+check "split on: titled for the public repository" same "$(cat "$FAKE_GH_STORE"/repos/acme/widget/keys/*/title)" "bana split: acme/widget-releases"
+check "split on: the public repository, public" same "$(cat "$pub/visibility")" PUBLIC
+check "split on: its README, with the marker" has "$pub/files/README.md" "<!-- bana split: "
+check "split on: its marker names no repository" lacks "$pub/files/README.md" "acme/widget "
+check "split on: its one workflow, bana's render" same "$(cat "$pub/files/.github/workflows/bana.yml")" "$(bash "$bana" split render)"
+check "split on: and nothing else" same "$(cd "$pub/files" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" "./.github/workflows/bana.yml ./README.md "
+check "split on: bana-source's secrets" same "$(cd "$pub/envs/bana-source/secrets" && echo *)" "BANA_SOURCE BANA_SOURCE_KEY"
+check "split on: the deploy key went in on stdin (its length only here)" same "$(cat "$pub/envs/bana-source/secrets/BANA_SOURCE_KEY")" 89
+check "split on: no repository secret" test ! -d "$pub/secrets"
+check "split on: BANA_SEAL_PUB, the seal key's public half" same "$(cat "$pub/vars/BANA_SEAL_PUB")" "$(cat "$s/seal.pub.pem")"
+check "split on: bana-source takes main only" same "$(cat "$pub/envs/bana-source/branches")" main
+check "split on: upload-artifact the only action" has "$pub/settings/actions.permissions.selected-actions" "patterns_allowed[]=actions/upload-artifact@*"
+check "split on: a read-only token" has "$pub/settings/actions.permissions.workflow" "default_workflow_permissions=read"
+check "split on: a ruleset on the default branch" has "$(ls "$pub"/rulesets/*.json)" '"include": ["~DEFAULT_BRANCH"]'
+check "split on: logs and artifacts, a day" has "$pub/settings/retention" "days=1"
+check "split on: its settings" same "$(grep -E '^(split|release)\.' "$sset" | sed 's/= [0-9a-f]\{40\}$/= SHA/; s/split.key = [0-9]*$/split.key = ID/' | tr '\n' '|')" \
+  "split.repo = acme/widget-releases|split.ci = github|split.logs = private|split.workflow = SHA|split.key = ID|release.repo = acme/widget-releases|"
+check "split on: split.workflow is bana.yml's blob" has "$sset" "split.workflow = $(git hash-object "$pub/files/.github/workflows/bana.yml")"
+check "split on: the daemon's settings take them" only_keys "$project_keys" "$sset"
+check "split on: the seal key, its owner's alone" same "$(find "$s/seal.pem" -perm 600)" "$s/seal.pem"
+check "split on: in a directory its owner's alone" same "$(find "$s" -maxdepth 0 -perm 700)" "$s"
+check "split on: no private key material on GitHub, in gh's log or here" bash -c \
+  "! grep -rq 'FAKE-PRIVATE-KEY' '$FAKE_GH_STORE' '$FAKE_LOG' '$HOME/.bana' '$T/out'"
+check "split on: the deploy key's public half stays, for check" test -f "$s/deploy.pub"
+check "split on: checks itself" has "$T/out" "ok    acme/widget-releases's one workflow is bana.yml, as bana pushed it"
+check "split on: no FAIL" lacks "$T/out" "FAIL"
+check "split on: says where runs are" has "$T/out" "bana split is on: acme/widget's pushes build on https://github.com/acme/widget-releases/actions"
+bash "$bana" settings >"$T/out"
+check "settings: split's" has "$T/out" "split.repo = acme/widget-releases"
+check "settings: the release repo" has "$T/out" "release.repo = acme/widget-releases"
+: >"$FAKE_LOG"
+bash "$bana" split check >"$T/out" 2>&1 && st=0 || st=$?
+check "split check: all ok" same "$st:$(grep -c '^  ok ' "$T/out")" "0:14"
+check "split check: writes nothing" same "$(writes)" ""
+bash "$bana" split status >"$T/out" 2>&1 || true
+check "split status: on, where" has "$T/out" "public repository: https://github.com/acme/widget-releases"
+check "split status: the logs" has "$T/out" "logs: private"
+BANA_SPLIT_CONSENT=$yes_phrase bash "$bana" split on --repo acme/widget-releases </dev/null >"$T/out" 2>&1 || true
+check "split on again: on already" has "$T/out" "bana split is on already: acme/widget-releases"
+
+# bana split check: what it fails on, and warns of (each put back after).
+failed_check() { # NAME WHY
+  bash "$bana" split check >"$T/out" 2>&1 && st=0 || st=$?
+  check "split check: $1: exit 1" same "$st" 1
+  check "split check: $1: says so" has "$T/out" "$2"
+}
+wfs=$pub/files/.github/workflows
+echo 'on: push' >"$wfs/other.yml"
+failed_check "another workflow" "FAIL  acme/widget-releases's workflows are not bana's"
+bash "$bana" split check --quick >"$T/out" 2>&1 && st=0 || st=$?
+check "split check --quick: catches it too" same "$st:$(grep -c '^  ok \|^  FAIL ' "$T/out")" "1:2"
+rm "$wfs/other.yml"
+cp "$wfs/bana.yml" "$T/w/kept.yml" && echo '# changed' >>"$wfs/bana.yml"
+failed_check "an edited bana.yml" "FAIL  acme/widget-releases's workflows are not bana's"
+cp "$T/w/kept.yml" "$wfs/bana.yml"
+k=$(echo "$FAKE_GH_STORE"/repos/acme/widget/keys/*)
+echo false >"$k/read_only"
+failed_check "a writable deploy key" "FAIL  acme/widget's deploy key $(basename "$k") can write"
+echo true >"$k/read_only"
+echo 3 >"$pub/envs/bana-source/secrets/EXTRA"
+failed_check "another secret" "FAIL  bana-source's secrets should be BANA_SOURCE and BANA_SOURCE_KEY alone"
+rm "$pub/envs/bana-source/secrets/EXTRA"
+echo true >"$pub/vars/ACTIONS_STEP_DEBUG"
+failed_check "a debug variable" "FAIL  acme/widget-releases has a debug variable"
+rm "$pub/vars/ACTIONS_STEP_DEBUG"
+echo dev >>"$pub/envs/bana-source/branches"
+failed_check "another branch for bana-source" "FAIL  the environment bana-source should take main only"
+echo main >"$pub/envs/bana-source/branches"
+git rev-parse HEAD >>"$pub/commits"
+failed_check "a commit of the private repo" "FAIL  acme/widget-releases has acme/widget's commit"
+sed -i.bak '$d' "$pub/commits" && rm -f "$pub/commits.bak"
+git remote add public git@github.com:acme/widget-releases.git
+failed_check "a remote that points at it" "FAIL  a remote of $(git rev-parse --show-toplevel) points at acme/widget-releases"
+git remote remove public
+printf 'octo\nmallory\n' >"$pub/collaborators"
+bash "$bana" split check >"$T/out" 2>&1 && st=0 || st=$?
+check "split check: another collaborator warns, and passes" same "$st" 0
+check "split check: who" has "$T/out" "WARN  acme/widget-releases's other collaborators can each read acme/widget (through the deploy key): mallory"
+rm "$pub/collaborators"
+check "split check: never writes" same "$(writes)" ""
+
+# The toggles.
+: >"$FAKE_LOG"
+bash "$bana" split logs public </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "split logs public: needs its own phrase" same "$st:$(grep -c '^split.logs = private$' "$sset")" "1:1"
+BANA_SPLIT_CONSENT="yes, logs are public" bash "$bana" split logs public </dev/null >"$T/out" 2>&1 || cat "$T/out"
+check "split logs public: with it" has "$sset" "split.logs = public"
+check "split logs public: says the old runs keep theirs" has "$T/out" "bana split purge-runs deletes them"
+bash "$bana" split logs private </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "split logs private: off a terminal, --yes" same "$st:$(grep -c 'split.logs = public' "$sset")" "1:1"
+bash "$bana" split logs private --yes </dev/null >/dev/null 2>&1
+check "split logs private: back" has "$sset" "split.logs = private"
+bash "$bana" split ci local >"$T/out" 2>&1
+check "split ci local: pushes build here" same "$(grep '^split.ci' "$sset")" "split.ci = local"
+check "split ci local: releases stay public" has "$T/out" "releases still publish on acme/widget-releases"
+bash "$bana" split ci github >/dev/null 2>&1
+check "split ci github: back" same "$(grep '^split.ci' "$sset")" "split.ci = github"
+check "split's toggles: nothing on GitHub" same "$(writes)" ""
+
+# sync: bana.yml again after it changes (here: another timeout).
+bash "$bana" split sync --yes >"$T/out" 2>&1
+check "split sync: nothing to do" has "$T/out" "acme/widget-releases's bana.yml is this bana's already"
+sed -i.bak 's/^daemon.timeout = .*/daemon.timeout = 45/' "$sset" && rm -f "$sset.bak"
+bash "$bana" split check >"$T/out" 2>&1 || true
+check "split check: another render warns: sync" has "$T/out" "WARN  bana.yml is another bana's render: bana split sync"
+bash "$bana" split sync </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "split sync: off a terminal, --yes" same "$st" 1
+bash "$bana" split sync --yes >"$T/out" 2>&1 || cat "$T/out"
+check "split sync: shows the change" has "$T/out" "+    timeout-minutes: 45"
+check "split sync: pushes it" has "$wfs/bana.yml" "timeout-minutes: 45"
+check "split sync: and records its blob" has "$sset" "split.workflow = $(git hash-object "$wfs/bana.yml")"
+bash "$bana" split check >"$T/out" 2>&1 && st=0 || st=$?
+check "split sync: check passes again" same "$st:$(grep -c WARN "$T/out")" "0:0"
+
+# rekey: a new deploy key and seal key, the old ones gone.
+old=$(basename "$k") oldpub=$(cat "$s/seal.pub.pem")
+: >"$FAKE_LOG"
+bash "$bana" split rekey --yes >"$T/out" 2>&1 || cat "$T/out"
+new=$(sed -n 's/^split.key = //p' "$sset")
+check "split rekey: another deploy key" bash -c "[[ '$new' != '$old' && -d '$FAKE_GH_STORE/repos/acme/widget/keys/$new' ]]"
+check "split rekey: the old one gone" test ! -e "$FAKE_GH_STORE/repos/acme/widget/keys/$old"
+check "split rekey: the new one in first" same "$(grep -oE 'POST repos/acme/widget/keys|secret set BANA_SOURCE_KEY|DELETE repos/acme/widget/keys/[0-9]+' "$FAKE_LOG" | tr '\n' '|')" \
+  "POST repos/acme/widget/keys|secret set BANA_SOURCE_KEY|DELETE repos/acme/widget/keys/$old|"
+check "split rekey: a new seal key" bash -c "[[ \"\$(cat '$pub/vars/BANA_SEAL_PUB')\" != '$oldpub' ]]"
+check "split rekey: its public half on GitHub" same "$(cat "$pub/vars/BANA_SEAL_PUB")" "$(cat "$s/seal.pub.pem")"
+check "split rekey: the old seal key kept, for runs sealed before" test -f "$s/seal.old.pem"
+check "split rekey: no private key left here" test ! -e "$s/deploy"
+bash "$bana" split check >"$T/out" 2>&1 && st=0 || st=$?
+check "split rekey: check passes" same "$st" 0
+
+# remove waits for off; off: the deploy key first; the repository stays.
+bash "$bana" remove </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "remove: refused while bana split is on" same "$st" 1
+check "remove: says so" has "$T/out" "bana split off first"
+check "remove: removes nothing" test -f "$sset"
+mkdir -p "$pub/runs/9001" "$pub/runs/9002"
+echo "bana wid-1" >"$pub/runs/9001/title" && echo "someone else's" >"$pub/runs/9002/title"
+: >"$FAKE_LOG"
+bash "$bana" split off </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "split off: off a terminal, --yes" same "$st:$(writes)" "1:"
+bash "$bana" split off --yes --purge-runs </dev/null >"$T/out" 2>&1 || cat "$T/out"
+check "split off: the deploy key first" same "$(writes | head -1)" "gh api -X DELETE repos/acme/widget/keys/$new"
+check "split off: the key is gone" test -z "$(ls "$FAKE_GH_STORE/repos/acme/widget/keys")"
+check "split off: the secrets, environment and variable" test ! -e "$pub/envs/bana-source" -a ! -e "$pub/vars/BANA_SEAL_PUB"
+check "split off: the workflow disabled" test -e "$pub/settings/disabled.bana.yml"
+check "split off: --purge-runs: bana's runs" test ! -e "$pub/runs/9001" -a -e "$pub/runs/9002"
+check "split off: never deletes or archives the repository" bash -c "! grep -E 'gh repo (delete|archive)' '$FAKE_LOG'"
+check "split off: the repository stays" test -f "$pub/files/README.md"
+check "split off: says how to archive or delete it" has "$T/out" "gh auth refresh -s delete_repo && gh repo delete acme/widget-releases"
+check "split off: split's settings gone" same "$(grep -c '^split\.' "$sset")" 0
+check "split off: releases stay on the public repository" has "$sset" "release.repo = acme/widget-releases"
+check "split off: its files here gone" test ! -e "$s"
+bash "$bana" split status >"$T/out" 2>&1
+check "split status: off" has "$T/out" "bana split is off for wid (acme/widget): its builds run here."
+bash "$bana" remove </dev/null >/dev/null 2>&1 && st=0 || st=$?
+check "remove: once off, as before" same "$st" 0
+
+# A stop half way, then on again: it goes on, and does nothing twice.
+fresh
+split_world
+FAKE_GH_FAIL_AT=secret BANA_SPLIT_CONSENT=$yes_phrase bash "$bana" split on --repo acme/widget-releases </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "split on, gh failing: stops" same "$st" 1
+check "split on, gh failing: at that step" has "$T/out" "[6/9] bana-source's secrets ... failed"
+check "split on, gh failing: says what is done" has "$T/out" "Done so far: seal, key, repo, readme, actions. bana split on goes on from here; bana split off undoes it."
+check "split on, gh failing: no settings yet" same "$(grep -c '^split\.' "$sset")" 0
+bash "$bana" split status >"$T/out" 2>&1
+check "split status: half way" has "$T/out" "bana split on stopped half way, with acme/widget-releases"
+: >"$FAKE_LOG"
+bash "$bana" split on </dev/null >"$T/out" 2>&1 || cat "$T/out"
+check "split on again: goes on, no phrase asked again" has "$T/out" "Going on with bana split on for acme/widget-releases (done: seal, key, repo, readme, actions)"
+check "split on again: the steps done before" same "$(grep -c 'done before$' "$T/out")" 5
+check "split on again: no second repository, key or ruleset" same "$(grep -cE 'repo create|POST repos/acme/widget/keys|POST repos/acme/widget-releases/rulesets' "$FAKE_LOG")" 0
+check "split on again: done" has "$T/out" "bana split is on: acme/widget's pushes build on"
+check "split on again: one deploy key" same "$(find "$FAKE_GH_STORE/repos/acme/widget/keys" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" 1
+check "split on again: its private half gone from here" test ! -e "$s/deploy"
+
+# An organization that forbids deploy keys: stopped before anything public is made.
+fresh
+split_world
+FAKE_GH_DENY=deploy-key BANA_SPLIT_CONSENT=$yes_phrase bash "$bana" split on --repo acme/widget-releases </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "split on, no deploy keys allowed: stops" same "$st" 1
+check "split on, no deploy keys allowed: at the key" has "$T/out" "[2/9] a read-only deploy key on acme/widget ... failed"
+check "split on, no deploy keys allowed: says why" has "$T/out" "An organization's policy may forbid deploy keys"
+check "split on, no deploy keys allowed: nothing public made" test ! -e "$pub"
+check "split on, no deploy keys allowed: no repo create" bash -c "! grep -q 'repo create' '$FAKE_LOG'"
+check "split on, no deploy keys allowed: no key material left" bash -c "! grep -rq FAKE-PRIVATE-KEY '$HOME/.bana'"
+
+# A public repository there already, not empty: refused, nothing changed.
+fresh
+split_world
+mkdir -p "$pub/files" && echo PUBLIC >"$pub/visibility" && echo x >"$pub/files/main.c" && echo x >"$pub/files/README.md"
+BANA_SPLIT_CONSENT=$yes_phrase bash "$bana" split on --repo acme/widget-releases </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "split on: a repository with things in it: refused" same "$st:$(writes)" "1:"
+check "split on: says what it holds" has "$T/out" "acme/widget-releases holds more than a README (README.md main.c)"
+rm "$pub/files/main.c"
+BANA_SPLIT_CONSENT=$yes_phrase bash "$bana" split on --repo acme/widget-releases </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "split on: an empty one but a README (GitHub's page may add one): taken" same "$st" 0
+check "split on: its README replaced by bana's" has "$pub/files/README.md" "<!-- bana split: "
+check "split on: the plan says it was there" bash -c "grep -q 'there already: kept as it is' '$T/out'"
+
+# On a terminal: the name asked (Enter takes the default), then how it is made.
+fresh
+split_world
+printf '%s\n' "expect The public repository [acme/widget-releases]:" "send " "expect Which? [1]" "send 1" \
+  "expect Which? [1]" "send " "expect Type \"$yes_phrase\"" "send $yes_phrase" >"$T/w/tty"
+on_tty "$T/w/tty" bash "$bana" split on >"$T/out" 2>&1 && st=0 || st=$?
+check "split on, a terminal: done" same "$st" 0
+check "split on, a terminal: offers both ways" has "$T/out" "2. on GitHub's new-repository page, filled in for you; then press Enter here"
+check "split on, a terminal: 1 makes it with gh" has "$FAKE_LOG" "gh repo create acme/widget-releases --public --disable-wiki --disable-issues --description CI runs and releases of widget, built by bana. The source is private."
+check "split on, a terminal: logs private, the default" has "$sset" "split.logs = private"
+
+# GitHub's page: bana opens it filled in, waits, and takes the repository once it is there.
+fresh
+split_world
+printf '%s\n' "expect The public repository [acme/widget-releases]:" "send acme/widget-ci" "expect Which? [1]" "send 2" \
+  "expect Press Enter once it is made" "send " "expect is not there yet" \
+  "run mkdir -p '$FAKE_GH_STORE/repos/acme/widget-ci/files' && echo PRIVATE >'$FAKE_GH_STORE/repos/acme/widget-ci/visibility'" \
+  "expect Press Enter once it is made" "send " "expect is not public" \
+  "run echo PUBLIC >'$FAKE_GH_STORE/repos/acme/widget-ci/visibility'" \
+  "expect Press Enter once it is made" "send " "expect Which? [1]" "send 2" "expect Type \"yes, logs are public\"" \
+  "send yes, logs are public" "expect Type \"$yes_phrase\"" "send $yes_phrase" >"$T/w/tty"
+FAKE_OS=Darwin on_tty "$T/w/tty" bash "$bana" split on >"$T/out" 2>&1 && st=0 || st=$?
+check "split on, GitHub's page: done" same "$st" 0
+[[ $st == 0 ]] || tail -20 "$T/out"
+check "split on, GitHub's page: opened, filled in" has "$FAKE_LOG" \
+  "open https://github.com/new?owner=acme&name=widget-ci&visibility=public&description=CI%20runs%20and%20releases%20of%20widget%2C%20built%20by%20bana.%20The%20source%20is%20private."
+check "split on, GitHub's page: the URL shown too" has "$T/out" "  https://github.com/new?owner=acme&name=widget-ci&visibility=public"
+check "split on, GitHub's page: waits until it is there" has "$T/out" "acme/widget-ci is not there yet"
+check "split on, GitHub's page: and public" has "$T/out" "acme/widget-ci is not public (PRIVATE)"
+check "split on, GitHub's page: no gh repo create" bash -c "! grep -q 'repo create' '$FAKE_LOG'"
+check "split on, GitHub's page: the rest as with gh" has "$sset" "split.repo = acme/widget-ci"
+check "split on: logs public, with its own phrase" has "$sset" "split.logs = public"
+fresh
+split_world
+printf '%s\n' "expect Press Enter once it is made" "send q" >"$T/w/tty"
+FAKE_OS=Linux on_tty "$T/w/tty" bash "$bana" split on --repo acme/widget-ci --web >"$T/out" 2>&1 && st=0 || st=$?
+check "split on --web, q: stops" same "$st" 1
+check "split on --web, q: nothing changed" same "$(grep -c 'Stopped: nothing changed' "$T/out"):$(writes)" "1:"
+check "split on --web, Linux without a display: the URL to open" has "$T/out" "https://github.com/new?owner=acme&name=widget-ci"
+
+# bana add --split: the wizard after adding the project.
+fresh
+daemon_world
+export FAKE_GH_STORE=$T/w/github
+mkdir -p "$FAKE_GH_STORE/repos/acme/widget/files" && echo PRIVATE >"$FAKE_GH_STORE/repos/acme/widget/visibility"
+bash "$bana" add </dev/null >"$T/out" 2>&1 || cat "$T/out"
+check "add: no --split, no bana split" bash -c "! grep -qE 'keys|repo (create|view)' '$FAKE_LOG'"
+bash "$bana" remove </dev/null >/dev/null 2>&1
+bash "$bana" add --split=acme/widget-releases </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "add --split, no phrase: the project is added" test -f "$sset"
+check "add --split, no phrase: bana split refused, nothing on GitHub" same "$st:$(writes)" "1:"
+BANA_SPLIT_CONSENT=$yes_phrase bash "$bana" add --split=acme/widget-releases </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "add --split: added and split" same "$st:$(grep '^split.repo' "$sset")" "0:split.repo = acme/widget-releases"
+bash "$bana" add </dev/null >"$T/out" 2>&1 || true
+check "add again: the doctor checks bana split's side" has "$T/out" "bana split: acme/widget-releases's workflow and acme/widget's deploy key are as bana left them"
+check "add again: keeps bana split's settings" has "$sset" "split.repo = acme/widget-releases"
+
+# The risks, word for word: what the wizard says is docs/SPLIT.md's.
+check "split: the risks in docs/SPLIT.md are the wizard's" same \
+  "$(awk '/^```text$/ { n++; if (n == 2) { on = 1; next } } on && /^```$/ { exit } on' "$bana_root/docs/SPLIT.md")" "$(sp split_risk)"
+check "split help: every command" same "$(bash "$bana" split help 2>&1 | grep -c '^  bana split')" 12

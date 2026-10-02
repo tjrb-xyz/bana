@@ -263,6 +263,12 @@ d_doctor_project() { # ROOT GH UNMAPPED SPLIT
     n=$((n + 1))
   fi
   ((n)) || echo "  $name: runs as workflow_dispatch, nothing to change"
+  # bana split's public side, as bana left it (bana split check has all of it).
+  if d_setting split.repo "$(d_project "$prefix")" | grep -q .; then
+    # shellcheck source=SCRIPTDIR/split.sh
+    source "$bana_root/lib/split.sh"
+    split_doctor
+  fi
 }
 
 # ---- install -----------------------------------------------------------------------------
@@ -1098,6 +1104,8 @@ daemon_remove() {
     return
   fi
   d_need_added
+  ! d_setting split.repo "$(d_project "$prefix")" | grep -q . ||
+    die "$prefix builds and releases through bana split ($(d_setting split.repo "$(d_project "$prefix")")): bana split off first"
   d_remove "$prefix" "$purge"
 }
 
