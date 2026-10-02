@@ -1367,6 +1367,31 @@ bash "$bana" add --no-hook --no-claude </dev/null >"$T/out" 2>&1 || { cat "$T/ou
 check "add --no-hook: no hook" test ! -e "$hook"
 check "add --no-claude: leaves Claude Code alone" lacks "$T/out" "Claude Code"
 bash "$bana" add </dev/null >/dev/null 2>&1
+# bana split's keys: bana add keeps them; bana settings and the installer read them.
+printf '%s\n' "release.repo = acme/widget-releases" "split.repo = acme/widget-releases" "split.ci = github" \
+  "split.logs = private" "split.workflow = 0123456789abcdef0123456789abcdef01234567" "split.key = 42" >>"$d/daemon/settings"
+echo "release.repo = acme/from-a-commit" >>.github/bana.conf
+bash "$bana" add </dev/null >/dev/null 2>&1
+check "add again: keeps bana split's keys" same "$(grep '^split\.\|^release\.' "$d/daemon/settings" | tr '\n' ' ')" \
+  "release.repo = acme/widget-releases split.repo = acme/widget-releases split.ci = github split.logs = private split.workflow = 0123456789abcdef0123456789abcdef01234567 split.key = 42 "
+check "add again: and only the project's keys" only_keys "$project_keys" "$d/daemon/settings"
+bash "$bana" settings >"$T/out"
+check "settings: the release repo, bana split's over bana.conf's" has "$T/out" "release.repo = acme/widget-releases"
+check "settings: split's keys" has "$T/out" "split.ci = github"
+mkdir -p "$T/w/rr"
+printf 'x\n' >"$T/w/rr/x.txt" && mkdir -p "$T/w/rr/wid-1" && tar czf "$T/w/rr/wid-1-linux-x64.tar.gz" -C "$T/w/rr" wid-1
+rm "$T/w/rr/x.txt"
+bash "$bana" installer "$T/w/rr" --tag v1 >/dev/null 2>&1 || true
+check "installer --tag: downloads from the release repo" has "$T/w/rr/install.sh" "REPO='acme/widget-releases'"
+BANA_RELEASE_REPO=acme/the-daemons bash "$bana" installer "$T/w/rr" --tag v1 >/dev/null 2>&1 || true
+check "installer --tag: the daemon's BANA_RELEASE_REPO first" has "$T/w/rr/install.sh" "REPO='acme/the-daemons'"
+check "installer --tag: its one-liner too" has "$T/w/rr/install.sh" "https://github.com/acme/the-daemons/releases/download/v1/install.sh"
+sed -i.bak '/^release\.repo = acme\/from-a-commit$/d' .github/bana.conf && rm -f .github/bana.conf.bak
+grep -v '^split\.\|^release\.' "$d/daemon/settings" >"$T/s" && cp "$T/s" "$d/daemon/settings"
+bash "$bana" installer "$T/w/rr" --tag v1 >/dev/null 2>&1 || true
+check "installer --tag: no split: the repo" has "$T/w/rr/install.sh" "REPO='acme/widget'"
+rm -rf "$T/w/rr"
+bash "$bana" add </dev/null >/dev/null 2>&1
 
 # A second project: its own settings, hook and tools.
 two_world

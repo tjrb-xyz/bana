@@ -133,6 +133,11 @@ pub struct Release {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub answered_at: Option<i64>,
     pub updated_at: i64,
+    /// The public repository it is published to, when that is not the
+    /// project's (`release.repo`, `bana split`): bana's notes then name no
+    /// pull request, commit or link of the private one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_repo: Option<String>,
 }
 
 impl Release {
@@ -141,8 +146,12 @@ impl Release {
         self.notes.as_ref().map_or(0, |n| n.rev)
     }
 
-    /// What the notes say of the range's pull requests.
+    /// What the notes say of the range's pull requests (nothing for a public
+    /// repository's, whose notes name none: [`notes::public_notes`]).
     pub fn check(&self) -> Check {
+        if self.public_repo.is_some() {
+            return Check::default();
+        }
         match (&self.notes, &self.changes) {
             (Some(n), Some(c)) => notes::check(&n.text, c),
             _ => Check::default(),
@@ -246,7 +255,10 @@ pub fn seeded(
     r.seed_error = None;
     let git = r.notes.as_ref().is_none_or(|n| n.source == "git");
     if git {
-        let text = notes::default_notes(&changes, repo, previous.tag.as_deref(), &r.tag);
+        let text = match &r.public_repo {
+            Some(_) => notes::public_notes(&changes),
+            None => notes::default_notes(&changes, repo, previous.tag.as_deref(), &r.tag),
+        };
         if r.notes.as_ref().is_none_or(|n| n.text != text) {
             let rev = r.rev() + 1;
             r.prev_notes = r.notes.take();
@@ -645,28 +657,25 @@ pub fn flags(tag: &str, finals: Result<&str, &str>) -> Vec<String> {
     vec![if above { "--latest" } else { "--latest=false" }.into()]
 }
 
-/// The create: `--verify-tag`, so gh never makes the tag.
+/// The create: `--verify-tag`, so gh never makes the tag. In a public
+/// release repository (`public`), which has none of the private commits, gh
+/// makes the tag itself, on that repository's default branch.
 pub fn create_args(
     repo: &str,
+    public: bool,
     tag: &str,
     title: &str,
     notes_file: &Path,
     flags: &[String],
     files: &[String],
 ) -> Vec<String> {
-    let mut a: Vec<String> = [
-        "release",
-        "create",
-        tag,
-        "-R",
-        repo,
-        "--verify-tag",
-        "--title",
-        title,
-        "--notes-file",
-    ]
-    .map(String::from)
-    .to_vec();
+    let mut a: Vec<String> = ["release", "create", tag, "-R", repo]
+        .map(String::from)
+        .to_vec();
+    if !public {
+        a.push("--verify-tag".into());
+    }
+    a.extend(["--title", title, "--notes-file"].map(String::from));
     a.push(notes_file.to_string_lossy().into_owned());
     a.extend(flags.iter().cloned());
     a.extend(files.iter().cloned());
@@ -1222,17 +1231,27 @@ mod tests {
         assert_eq!(flags("v1.0.0", Err("offline")), ["--latest=false"]);
         assert_eq!(flags("v1.0.0", Ok("<html>")), ["--latest=false"]);
         assert!(flags("nightly", Ok(list)).is_empty());
-        let args = create_args(
-            "o/r",
-            "v1",
-            "demo v1",
-            Path::new("/n.md"),
-            &flags("v1", Ok("[]")),
-            &["a.tar.gz".into(), "SHA256SUMS".into()],
-        );
+        let files = ["a.tar.gz".to_string(), "SHA256SUMS".into()];
+        let args = |repo, public| {
+            create_args(
+                repo,
+                public,
+                "v1",
+                "demo v1",
+                Path::new("/n.md"),
+                &flags("v1", Ok("[]")),
+                &files,
+            )
+            .join(" ")
+        };
         assert_eq!(
-            args.join(" "),
+            args("o/r", false),
             "release create v1 -R o/r --verify-tag --title demo v1 --notes-file /n.md --latest a.tar.gz SHA256SUMS"
+        );
+        // A public release repo has none of the private commits: gh tags its default branch.
+        assert_eq!(
+            args("o/r-releases", true),
+            "release create v1 -R o/r-releases --title demo v1 --notes-file /n.md --latest a.tar.gz SHA256SUMS"
         );
         assert_eq!(
             finals_args("o/r").join(" "),

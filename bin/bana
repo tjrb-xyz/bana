@@ -235,6 +235,24 @@ project_left() { # PREFIX
   return 1
 }
 
+# A key of the project's daemon settings (bana add's, and bana split's: split.*, release.repo).
+project_setting() { # KEY
+  local f=$home/daemon/settings
+  [[ -f $f ]] || return 1
+  awk -v k="$1" '/^[ \t]*#/ { next } { i = index($0, "=") } i == 0 { next }
+    { key = substr($0, 1, i - 1); gsub(/^[ \t]+|[ \t]+$/, "", key) }
+    key == k { v = substr($0, i + 1); gsub(/^[ \t]+|[ \t\r]+$/, "", v); found = 1 }
+    END { if (found && v != "") print v; exit !(found && v != "") }' "$f"
+}
+# Where the project's releases are: BANA_RELEASE_REPO (the daemon's), else the daemon's
+# settings (bana split's public repo), else bana.conf's release.repo, else repo.
+release_repo() {
+  local r
+  if [[ -n ${BANA_RELEASE_REPO:-} ]]; then echo "$BANA_RELEASE_REPO"
+  elif r=$(project_setting release.repo); then echo "$r"
+  else conf release.repo "$repo"; fi
+}
+
 need_repo() {
   [[ -n $repo ]] || die "Which repository? Set repo = owner/name in bana.conf (no bana.conf found${conf_file:+; using $conf_file})"
   [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "repo: owner/name, not '$repo'"
@@ -281,7 +299,7 @@ settings() {
     daemon.branches daemon.tags daemon.tier daemon.tag_tier daemon.poll daemon.timeout \
     daemon.supersede daemon.token fix.rounds fix.token fix.allow fix.turns fix.budget_usd \
     install.name install.bins install.hook install.hook_ps1 install.prefix install.bin install.config \
-    release.files release.platforms tart_name; do
+    release.files release.platforms release.repo split.repo split.ci split.logs tart_name; do
     case $k in
     repo) v=$repo ;; prefix) v=$prefix ;; vm) v=$vm ;; vm_x64) v=$vm_x64 ;; linux_user) v=$linux_user ;;
     hook.*) v=$(conf_path "$k") ;;
@@ -302,6 +320,10 @@ settings() {
     fix.budget_usd) v=$(conf "$k" 5) ;;
     install.name) v=$(conf "$k" "$prefix") ;;
     release.files) v=$(conf "$k" '*') ;;
+    release.repo) v=$(release_repo) ;;
+    split.ci) v=$(project_setting "$k" || echo local) ;;
+    split.logs) v=$(project_setting "$k" || echo private) ;;
+    split.*) v=$(project_setting "$k" || true) ;;
     tart_name) v=$(conf "$k" bana-tart) ;;
     *) v=$(conf "$k") ;;
     esac

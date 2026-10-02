@@ -88,6 +88,18 @@
 //!   checkout          the owner's checkout (absolute), where Fix with Claude
 //!                     makes its worktrees and branches (none: it cannot)
 //!   path              PATH for its builds, when bana.conf sets one
+//!   release.repo      owner/repo releases are published to (default: repo)
+//!   split.repo        the public repository of `bana split` (docs/SPLIT.md),
+//!                     which builds and releases a private repo (empty: off)
+//!   split.ci          local (default), or github: builds but fix rounds run
+//!                     on split.repo's GitHub Actions ([`Settings::remote`])
+//!   split.logs        private (default): a remote run's public log has its
+//!                     steps only; or public: its whole output too
+//!   split.workflow    the git blob sha of split.repo's bana.yml
+//!   split.key         the id of the deploy key split.repo reads repo with
+//!
+//! Only `bana split` writes the split.* keys and release.repo (`bana add`
+//! keeps them): a commit's bana.conf never moves CI, logs or releases.
 //!
 //! The machine's:
 //!
@@ -178,6 +190,12 @@ pub const PROJECT_KEYS: &[&str] = &[
     "fix.token",
     "checkout",
     "path",
+    "release.repo",
+    "split.repo",
+    "split.ci",
+    "split.logs",
+    "split.workflow",
+    "split.key",
 ];
 
 /// The machine's keys, in `daemon.d/settings` (`bana daemon install`).
@@ -304,6 +322,16 @@ pub struct Settings {
     pub fix_rounds: u32,
     /// `fix.token`: the rounds' GITHUB_TOKEN; an empty one also runs act offline.
     pub fix_token: JobToken,
+    /// `release.repo`: where releases are published; `repo` when not set.
+    pub release_repo: String,
+    /// `split.repo`: the public repository that builds `repo` remotely.
+    pub split_repo: Option<String>,
+    /// `split.ci = github`: builds but fix rounds run on split.repo.
+    pub split_github: bool,
+    /// `split.logs`: `private` or `public`.
+    pub split_logs: String,
+    /// `split.workflow`: split.repo's bana.yml, as a git blob sha.
+    pub split_workflow: Option<String>,
     pub port: u16,
     pub machine: String,
     pub login: String,
@@ -419,6 +447,39 @@ impl Settings {
             "none" => JobToken::Empty,
             _ => return Err(bad("fix.token", "gh or none")),
         };
+        let release_repo = match get("release.repo").unwrap_or("") {
+            "" => repo.clone(),
+            r if valid_repo(r) => r.to_string(),
+            _ => return Err(bad("release.repo", "owner/repo")),
+        };
+        let split_repo = match get("split.repo").unwrap_or("") {
+            "" => None,
+            r if !valid_repo(r) => return Err(bad("split.repo", "owner/repo")),
+            r if r.eq_ignore_ascii_case(&repo) => {
+                return Err(bad("split.repo", "a public repository, not repo itself"))
+            }
+            r => Some(r.to_string()),
+        };
+        let split_github = match get("split.ci").unwrap_or("local") {
+            "local" => false,
+            "github" if split_repo.is_some() => true,
+            "github" => return Err(bad("split.ci", "github needs split.repo")),
+            _ => return Err(bad("split.ci", "local or github")),
+        };
+        let split_logs = match get("split.logs").unwrap_or("private") {
+            l @ ("private" | "public") => l.to_string(),
+            _ => return Err(bad("split.logs", "private or public")),
+        };
+        let hex40 =
+            |v: &str| v.len() == 40 && v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        let split_workflow = match get("split.workflow").unwrap_or("") {
+            "" => None,
+            w if hex40(w) => Some(w.to_string()),
+            _ => return Err(bad("split.workflow", "a git blob sha")),
+        };
+        if get("split.key").is_some_and(|k| !k.bytes().all(|b| b.is_ascii_digit())) {
+            return Err(bad("split.key", "a deploy key's id"));
+        }
         let Machine {
             port,
             machine,
@@ -463,6 +524,11 @@ impl Settings {
             token,
             fix_rounds,
             fix_token,
+            release_repo,
+            split_repo,
+            split_github,
+            split_logs,
+            split_workflow,
             port,
             machine,
             login: or("login", ""),
@@ -494,6 +560,12 @@ impl Settings {
             grace: wait("grace", 5)?,
             publish_timeout: wait("publish_timeout", 30 * 60)?,
         })
+    }
+
+    /// The repository releases go to when it is not `repo` (`bana split`'s
+    /// public one): their notes link nothing of `repo`.
+    pub fn public_release(&self) -> Option<&str> {
+        (!self.release_repo.eq_ignore_ascii_case(&self.repo)).then_some(self.release_repo.as_str())
     }
 
     /// What a build's `bana` runs with: nothing of the daemon's environment
@@ -1431,7 +1503,7 @@ impl Daemon {
             });
             let check = r.check();
             let v = json!({
-                "repo": s.repo, "tag": r.tag, "sha": r.sha, "state": r.state,
+                "repo": s.repo, "public_repo": s.public_release(), "tag": r.tag, "sha": r.sha, "state": r.state,
                 "reason": r.reason, "progress": r.progress, "url": r.url,
                 "answered_at": r.answered_at, "updated_at": r.updated_at,
                 "build": rec.map(|b| self.0.view(&inner, b)), "machine": s.machine,
@@ -2378,7 +2450,8 @@ impl Shared {
             return;
         };
         let (tag, sha) = (tag.to_string(), q.sha.clone());
-        if let Some(r) = release::queued(inner.releases.get(&tag), &tag, &sha, id, now()) {
+        if let Some(mut r) = release::queued(inner.releases.get(&tag), &tag, &sha, id, now()) {
+            r.public_repo = self.settings.public_release().map(String::from);
             self.save_release(&r);
             inner.releases.insert(tag, r);
             self.seed.notify_one();
@@ -2443,6 +2516,8 @@ impl Shared {
                 let mut inner = self.lock();
                 let inner = &mut *inner;
                 if let Some(r) = inner.releases.get_mut(&tag) {
+                    // bana split may have moved the releases since it was queued.
+                    r.public_repo = self.settings.public_release().map(String::from);
                     let mut changed = release::seeded(r, &sha, found, &self.settings.repo, now());
                     if r.sha == sha && (r.title != title || r.platforms != platforms) {
                         (r.title, r.platforms, changed) = (title, platforms, true);
@@ -2469,7 +2544,7 @@ impl Shared {
         sha: &str,
     ) -> Result<(notes::Previous, notes::Changes), String> {
         let s = &self.settings;
-        let args = notes::list_args(&s.repo);
+        let args = notes::list_args(&s.release_repo);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let list = match self.output(&s.gh, &args, &self.src(), 30).await {
             Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
@@ -2672,7 +2747,7 @@ impl Shared {
                         "view",
                         tag,
                         "-R",
-                        &s.repo,
+                        &s.release_repo,
                         "--json",
                         release::VIEW_FIELDS,
                     ],
@@ -2692,7 +2767,7 @@ impl Shared {
                     self.progress(tag, "deleting a draft an earlier publish left");
                     self.gh(
                         &log,
-                        &["release", "delete", tag, "-R", &s.repo, "--yes"],
+                        &["release", "delete", tag, "-R", &s.release_repo, "--yes"],
                         60,
                     )
                     .await
@@ -2719,7 +2794,7 @@ impl Shared {
         let flags = if notes::is_prerelease(tag) || notes::version(tag).is_none() {
             release::flags(tag, Err(""))
         } else {
-            let args = release::finals_args(&s.repo);
+            let args = release::finals_args(&s.release_repo);
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             let finals = self.gh(&log, &args, 60).await;
             release::flags(tag, finals.as_deref().map_err(String::as_str))
@@ -2734,13 +2809,22 @@ impl Shared {
             .filter_map(|f| crate::artifacts::platform(f))
             .collect();
         platforms.sort();
-        let install = release::install(&s.repo, tag, files, &platforms);
+        let install = release::install(&s.release_repo, tag, files, &platforms);
         std::fs::write(
             &notes_file,
             release::body(&text, tested.as_deref(), install.as_deref()),
         )
         .map_err(|e| format!("{}: {e}", notes_file.display()))?;
-        let args = release::create_args(&s.repo, tag, &title, &notes_file, &flags, &upload);
+        let public = s.public_release().is_some();
+        let args = release::create_args(
+            &s.release_repo,
+            public,
+            tag,
+            &title,
+            &notes_file,
+            &flags,
+            &upload,
+        );
         self.progress(
             tag,
             &format!("gh release create: uploading {} files", upload.len()),
@@ -2751,7 +2835,7 @@ impl Shared {
             .map(str::trim)
             .rfind(|l| l.starts_with("https://"))
             .map(String::from)
-            .unwrap_or_else(|| format!("https://github.com/{}/releases/tag/{tag}", s.repo)))
+            .unwrap_or_else(|| format!("https://github.com/{}/releases/tag/{tag}", s.release_repo)))
     }
 
     /// gh in src, its words in the release's log: its stdout, or its last
@@ -4029,12 +4113,14 @@ impl Shared {
                 ["--label".to_string(), label]
             }
         };
+        // The release repo is the daemon's, never the built commit's bana.conf's.
         let run = Command::new(&s.bash)
             .arg(&s.script)
             .args(["installer", "dist"])
             .args(&how)
             .env_clear()
             .envs(s.child_env(id))
+            .env("BANA_RELEASE_REPO", &s.release_repo)
             .current_dir(self.build_dir(id))
             .stdin(Stdio::null())
             .kill_on_drop(true)
@@ -4997,6 +5083,7 @@ pub(crate) mod tests {
 if [[ $1 == installer ]]; then
   b=${BANA_BUILD##*-}
   printf '%s\n' "$@" "$BANA_PROJECT_ROOT" "$PWD" >"$ctl/installer.$b"
+  printf '%s\n' "${BANA_RELEASE_REPO-unset}" >"$ctl/installer-release.$b"
   [[ ! -e $ctl/installer-fails ]] || { echo "bana installer: install.name: not 'a b'" >&2; exit 1; }
   echo '#!/bin/sh' >"$2/install.sh"
   (cd "$2" && { sha256sum install.sh *.tar.gz 2>/dev/null || shasum -a 256 install.sh *.tar.gz; }) >"$2/SHA256SUMS"
@@ -5494,10 +5581,68 @@ exec git \"$@\"
             ),
             ("repo = o/r\nprefix = w\nladder = 60\n", "ladder"),
             ("repo = o/r\nprefix = w\ngrace = 0\n", "grace"),
+            ("repo = o/r\nprefix = w\nrelease.repo = r\n", "release.repo"),
+            ("repo = o/r\nprefix = w\nsplit.repo = o/r b\n", "split.repo"),
+            ("repo = o/r\nprefix = w\nsplit.repo = O/R\n", "split.repo"),
+            ("repo = o/r\nprefix = w\nsplit.ci = github\n", "split.ci"),
+            (
+                "repo = o/r\nprefix = w\nsplit.repo = o/p\nsplit.ci = cloud\n",
+                "split.ci",
+            ),
+            ("repo = o/r\nprefix = w\nsplit.logs = all\n", "split.logs"),
+            (
+                "repo = o/r\nprefix = w\nsplit.workflow = ABC\n",
+                "split.workflow",
+            ),
+            ("repo = o/r\nprefix = w\nsplit.key = k1\n", "split.key"),
         ] {
             let e = Settings::parse(text, dir, env.clone()).unwrap_err();
             assert!(e.contains(why), "{text:?}: {e}");
         }
+    }
+
+    #[test]
+    fn bana_split_keys_and_the_release_repo() {
+        let env: BTreeMap<String, String> = [("HOME", "/home/me")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let dir = Path::new("/x/wid");
+        let s = Settings::parse("repo = o/r\nprefix = wid\n", dir, env.clone()).unwrap();
+        assert_eq!(
+            (
+                s.release_repo.as_str(),
+                s.public_release(),
+                s.split_repo.as_deref()
+            ),
+            ("o/r", None, None)
+        );
+        assert_eq!((s.split_github, s.split_logs.as_str()), (false, "private"));
+        let text =
+            "repo = o/r\nprefix = wid\nrelease.repo = o/r-releases\nsplit.repo = o/r-releases\n\
+                    split.ci = github\nsplit.logs = public\nsplit.key = 1234\n\
+                    split.workflow = 0123456789abcdef0123456789abcdef01234567\n";
+        let s = Settings::parse(text, dir, env.clone()).unwrap();
+        assert_eq!(s.public_release(), Some("o/r-releases"));
+        assert_eq!(
+            (
+                s.split_repo.as_deref(),
+                s.split_github,
+                s.split_logs.as_str()
+            ),
+            (Some("o/r-releases"), true, "public")
+        );
+        assert_eq!(
+            s.split_workflow.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        // Releases alone (split.ci = local): private code, public releases.
+        let text = "repo = o/r\nprefix = wid\nrelease.repo = o/r-releases\nsplit.repo = o/r-releases\nsplit.ci = local\n";
+        let s = Settings::parse(text, dir, env).unwrap();
+        assert_eq!(
+            (s.public_release(), s.split_github),
+            (Some("o/r-releases"), false)
+        );
     }
 
     #[test]
@@ -7761,6 +7906,67 @@ exec git \"$@\"
             (r.state, r.build),
             (State::Published, id),
             "a re-run leaves it"
+        );
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_split_projects_release_goes_to_its_public_repo() {
+        use release::State;
+        let p = Project::new("public");
+        let d = start(
+            &p,
+            "daemon.tags = v*\nrelease.repo = o/r-releases\nsplit.repo = o/r-releases\n",
+        )
+        .await;
+        let first = git(&p.work, &["rev-parse", "HEAD"]);
+        let a = p.commit("files", "Packages for all (#7)");
+        p.push("main");
+        p.tag("v0.1.0");
+        poll(&d).await;
+        let id = tag_build(&d, "v0.1.0").unwrap();
+        assert_eq!(finished(&d, id).await.build.state, BuildState::Success);
+        let r = rel_in(&d, "v0.1.0", State::Asking).await;
+        assert_eq!(r.public_repo.as_deref(), Some("o/r-releases"));
+        // Notes for the public: no #7, no commit, no link to the private repo.
+        let n = r.notes.clone().unwrap();
+        assert_eq!(
+            n.text,
+            "## Pull requests\n\n- Packages for all\n\n## Other changes\n\n- the start\n"
+        );
+        assert!(!n.text.contains(&a[..7]) && !n.text.contains(&first[..7]));
+        let v = d.release("v0.1.0").unwrap();
+        assert_eq!(
+            (&v["public_repo"], &v["check"]["missing_prs"]),
+            (&json!("o/r-releases"), &json!([]))
+        );
+        // The installer downloads from the public repo: the daemon says so, not bana.conf.
+        assert_eq!(p.read(&format!("installer-release.{id}")), "o/r-releases\n");
+        let r = publish_now(&d, "v0.1.0", n.rev).await;
+        assert_eq!(
+            (r.state, r.url.as_deref()),
+            (
+                State::Published,
+                Some("https://github.com/o/r-releases/releases/tag/v0.1.0")
+            )
+        );
+        let log = p.read("gh-release.log");
+        assert!(
+            log.lines().count() >= 3 && log.lines().all(|l| l.contains(" -R o/r-releases ")),
+            "{log}"
+        );
+        // gh makes the tag on the public repo, which has none of the private commits.
+        let argv = std::fs::read_to_string(p.flag("releases/v0.1.0").join("argv")).unwrap();
+        assert!(
+            argv.starts_with("release\ncreate\nv0.1.0\n-R\no/r-releases\n--title\n"),
+            "{argv}"
+        );
+        assert!(!argv.contains("--verify-tag"), "{argv}");
+        let body = std::fs::read_to_string(p.flag("releases/v0.1.0").join("notes")).unwrap();
+        assert!(
+            body.contains("curl -fsSL https://github.com/o/r-releases/releases/download/v0.1.0/install.sh | sh"),
+            "{body}"
         );
         d.shutdown().await;
         p.remove();

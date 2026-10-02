@@ -48,6 +48,8 @@ d_unit_dir=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
 d_unit_file=$d_unit_dir/$d_unit
 # The keys only daemon.d/settings has (manager/src/daemon.rs's MACHINE_KEYS, but path).
 d_machine_keys=" port host login tray home git gh docker caffeinate bash script bana_commit retry recheck ladder ladder_short grace publish_timeout "
+# The project's keys only bana split writes (bana add keeps them).
+d_split_keys="release.repo split.repo split.ci split.logs split.workflow split.key"
 # Seconds between asks while install waits for the daemon to answer (60 asks), and a
 # tenth of those while it waits for a build to end. Tests make it 0.
 d_step=${BANA_DAEMON_STEP:-1}
@@ -388,7 +390,12 @@ d_write_machine() { # DIR PORT TRAY GH
 # <prefix>/daemon/settings: the project's keys, from bana.conf (another is an error there).
 # ROOT is this checkout: the page's Fix with Claude makes its worktrees and branches in it.
 d_write_project() { # ROOT
-  local root=$1 tiers k v
+  local root=$1 tiers k v keep=''
+  # bana split's keys are never bana.conf's: they stay as bana split wrote them.
+  for k in $d_split_keys; do
+    v=$(d_setting "$k" "$(d_project "$prefix")") || continue
+    keep+="$k = $v"$'\n'
+  done
   tiers=$(words "$(conf tiers "quick nightly release")" | tr -s ' ' | sed 's/^ //; s/ $//')
   for k in daemon.tier daemon.tag_tier; do
     v=$(daemon_conf "$k")
@@ -419,6 +426,7 @@ d_write_project() { # ROOT
     echo "fix.token = $(conf fix.token none)"
     [[ -z $(conf path) ]] || echo "path = $(d_path)"
     echo "checkout = $root"
+    printf '%s' "$keep"
   } | d_write_keys "$(d_project "$prefix")"
 }
 
