@@ -7302,7 +7302,11 @@ exec git \"$@\"
         let v = v.await.unwrap();
         assert_eq!(v["state"], "failure", "{v}");
         assert_eq!(d.summary().queue[0].id, push, "the push waits");
-        assert_eq!(d.summary().queue[0].waiting.as_deref(), Some(PAUSED));
+        // The runner says why once it looks again, after the round's build.
+        until("the push waits, paused", || {
+            d.summary().queue[0].waiting.as_deref() == Some(PAUSED)
+        })
+        .await;
         d.set_paused(false);
         assert_eq!(finished(&d, push).await.build.state, BuildState::Success);
         assert_eq!(d.fix_state(sha7).await.unwrap()["rounds_left"], 1);
