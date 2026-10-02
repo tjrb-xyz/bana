@@ -1,0 +1,67 @@
+# bana split: the CI runs and releases of a private repository, built by bana
+# (https://github.com/tjrb-xyz/bana: docs/SPLIT.md). bana renders this file from its own
+# lib/split.yml.in and checks it before every run: with any other workflow here, bana
+# builds nothing. A run fetches the private commit with a read-only deploy key (deleted
+# before any of the project's code runs), builds it with act, and encrypts act's output
+# to a key only bana's machine has. This log shows the steps, ok or failed, and their
+# times: no output, unless the owner made the logs public (bana split logs public).
+name: bana
+run-name: bana ${{ inputs.id }}
+on:
+  workflow_dispatch:
+    inputs:
+      id: {description: "bana's build", type: string, required: true}
+      sha: {description: "the commit", type: string, required: true}
+      ref: {description: "its branch or tag", type: string, required: false}
+      tier: {description: "the workflow's tier", type: string, required: false}
+      job: {description: "only this job", type: string, required: false}
+      logs: {description: "private or public", type: string, required: false, default: private}
+permissions: {}
+concurrency:
+  group: bana-${{ inputs.id }}
+jobs:
+  remote:
+    runs-on: ubuntu-latest
+    environment: bana-source
+    timeout-minutes: __BANA_TIMEOUT__
+    defaults:
+      run:
+        shell: bash --noprofile --norc -eo pipefail {0}
+    env:
+      BANA_ID: ${{ inputs.id }}
+      BANA_SHA: ${{ inputs.sha }}
+      BANA_REF: ${{ inputs.ref }}
+      BANA_TIER: ${{ inputs.tier }}
+      BANA_JOB: ${{ inputs.job }}
+      BANA_LOGS: ${{ inputs.logs }}
+    steps:
+      - name: check
+        run: |
+          mkdir -p "$RUNNER_TEMP/bana"
+          cat >"$RUNNER_TEMP/bana/runner.sh" <<'BANA_RUNNER'
+          __BANA_RUNNER__
+          BANA_RUNNER
+          bash "$RUNNER_TEMP/bana/runner.sh" check
+      - name: fetch
+        env:
+          BANA_SOURCE: ${{ secrets.BANA_SOURCE }}
+          BANA_SOURCE_KEY: ${{ secrets.BANA_SOURCE_KEY }}
+        run: bash "$RUNNER_TEMP/bana/runner.sh" fetch
+      - name: build
+        run: bash "$RUNNER_TEMP/bana/runner.sh" build
+      - name: summary
+        if: always()
+        run: bash "$RUNNER_TEMP/bana/runner.sh" summary
+      - name: seal
+        if: always()
+        env:
+          BANA_SEAL_PUB: ${{ vars.BANA_SEAL_PUB }}
+        run: bash "$RUNNER_TEMP/bana/runner.sh" seal
+      - name: upload
+        if: always()
+        uses: actions/upload-artifact@__BANA_UPLOAD__ # __BANA_UPLOAD_TAG__
+        with:
+          name: bana-sealed
+          path: ${{ runner.temp }}/bana/sealed
+          retention-days: 1
+          if-no-files-found: ignore

@@ -1039,6 +1039,11 @@ fix)
   source "$bana_root/lib/fix.sh"
   fix_main "$@"
   ;;
+split)
+  # shellcheck source=SCRIPTDIR/../lib/split.sh
+  source "$bana_root/lib/split.sh"
+  split_main "$@"
+  ;;
 tart)
   # shellcheck source=SCRIPTDIR/../lib/tart.sh
   source "$bana_root/lib/tart.sh"

@@ -2016,7 +2016,7 @@ check "package: the four archives, install.sh, SHA256SUMS and notes.md" same "$(
 check "package: SHA256SUMS passes sha256sum -c" bash -c "cd '$T/dist' && sha256sum -c --quiet SHA256SUMS"
 check "package: SHA256SUMS has the archives and install.sh" same "$(awk '{ print $2 }' "$T/dist/SHA256SUMS" | tr '\n' ' ')" \
   "bana-v$V-linux-arm64.tar.gz bana-v$V-linux-x64.tar.gz bana-v$V-macos-arm64.tar.gz bana-v$V-macos-x64.tar.gz install.sh "
-want=$( (cd "$here/.." && { printf '%s\n' bin/bana bin/bana-manager LICENSE README.md lib/install.sh.in lib/install.ps1.in; ls lib/*.sh; }) |
+want=$( (cd "$here/.." && { printf '%s\n' bin/bana bin/bana-manager LICENSE README.md lib/install.sh.in lib/install.ps1.in lib/split.yml.in; ls lib/*.sh; }) |
   sed "s|^|bana-v$V/|" | LC_ALL=C sort)
 for p in linux-x64 linux-arm64 macos-x64 macos-arm64; do
   check "package: $p holds bana-v$V/, with bana's files and nothing else" same "$(tar -tzf "$T/dist/bana-v$V-$p.tar.gz" | LC_ALL=C sort)" "$want"
@@ -2636,6 +2636,9 @@ fi
 check "doctor: adds anyway" test -e "$HOME/.bana/wid/daemon/settings"
 bash "$bana" remove --purge >/dev/null 2>&1 || true
 unset BANA_DAEMON_BIN BANA_DAEMON_STEP
+
+# shellcheck source=tests/split.sh
+source "$here/split.sh"
 
 echo "$((n - fails)) of $n passed"
 ((fails == 0))
