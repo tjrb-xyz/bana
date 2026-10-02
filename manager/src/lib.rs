@@ -12,10 +12,14 @@
 //! This module is the pure part: the programs' outputs in, the views out.
 
 pub mod actlog;
+pub mod artifacts;
 pub mod daemon;
 pub mod fix;
 pub mod guard;
 pub mod mcp;
+pub mod notes;
+pub mod registry;
+pub mod release;
 pub mod report;
 pub mod results;
 pub mod rounds;
@@ -23,6 +27,7 @@ pub mod server;
 pub mod sweep;
 #[cfg(target_os = "macos")]
 pub mod tray;
+pub mod upgrade;
 pub mod watch;
 
 use serde::Serialize;

@@ -56,6 +56,7 @@ a { color: var(--accent); }
 h3 { font-size: 13px; margin: 14px 0 6px; color: var(--muted); }
 .dot.running, .dot.waiting, .dot.queued { background: var(--warn); }
 .dot.error { background: var(--bad); }
+#picker select { font-weight: 600; }
 .chip.running, .chip.waiting { border-color: var(--warn); }
 .chip.error, .chip.cancelled { border-color: var(--bad); }
 .chip.skipped, .chip.unsupported { color: var(--muted); }
@@ -73,6 +74,14 @@ tr.sel td { background: var(--bg); }
 #fix p { margin: 4px 0; }
 #report-table td:nth-child(2), #report-table td:nth-child(3) { white-space: nowrap; }
 #report-text { max-height: 480px; }
+#files { margin-top: 10px; } #files p { margin: 4px 0; }
+#files-table td:nth-child(2) { white-space: nowrap; text-align: right; }
+#release { margin-top: 10px; border-left: 3px solid var(--accent); padding: 2px 0 2px 10px; }
+#release p { margin: 4px 0; }
+#release-name { width: 100%; max-width: 32em; }
+#release-notes, #release-yours-text { width: 100%; min-height: 12em; font: 12.5px/1.45 ui-monospace, "SF Mono", Menlo, monospace; color: var(--ink);
+  background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; resize: vertical; }
+#release-files td:nth-child(2) { white-space: nowrap; text-align: right; }
 code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px; background: var(--bg); border-radius: 4px; padding: 1px 4px; }
 </style>
 </head>
@@ -80,16 +89,49 @@ code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px
 <main>
   <header>
     <h1><span aria-hidden="true">🧱</span> bana</h1>
+    <label id="picker" hidden><span class="dot" id="project-dot"></span><select id="project" aria-label="Project"></select></label>
     <span class="muted" id="where"></span>
     <span class="muted" id="updated"></span>
   </header>
   <p class="error" id="fatal" hidden></p>
+  <p id="upgrade" hidden>bana <a id="upgrade-link" href="#" target="_blank" rel="noopener"></a> is out (this daemon runs <span id="upgrade-runs"></span>): run <code>bana upgrade</code></p>
 
   <section id="ci" hidden>
     <h2>Local CI</h2>
+    <p class="error" id="project-error" hidden></p>
+    <div id="ci-body">
     <p id="watcher" class="muted"></p>
+    <div id="release" hidden>
+      <p><strong id="release-title"></strong></p>
+      <p class="muted" id="release-meta"></p>
+      <pre class="mono error" id="release-reason" hidden></pre>
+      <p id="release-url" hidden>On GitHub: <a id="release-link" href="#" target="_blank" rel="noopener"></a></p>
+      <div class="wrap"><table id="release-files"></table></div>
+      <p class="muted" id="release-not-built" hidden></p>
+      <details id="release-tested-box" hidden><summary>Tested <span class="muted" id="release-tested-meta"></span></summary>
+        <div class="wrap"><table id="release-tested"></table></div></details>
+      <p><label for="release-name"><strong>Title</strong></label> <input id="release-name" type="text" maxlength="200"></p>
+      <p><label for="release-notes"><strong>Notes</strong></label> <span class="muted" id="release-source"></span></p>
+      <p class="error" id="release-new" hidden></p>
+      <div id="release-conflict" hidden>
+        <p class="error" id="release-conflict-text"></p>
+        <div class="row"><button id="release-load" type="button"></button> <button id="release-overwrite" type="button"></button></div>
+      </div>
+      <textarea id="release-notes" spellcheck="true"></textarea>
+      <details id="release-yours" hidden><summary>Your text before you loaded the newer notes</summary>
+        <textarea id="release-yours-text" readonly></textarea></details>
+      <p class="muted" id="release-check"></p>
+      <div class="row">
+        <button id="release-save" type="button">Save notes</button>
+        <button id="release-publish" class="primary" type="button"
+          title="gh release create --verify-tag: these notes, then Tested and Install; the files SHA256SUMS lists, and SHA256SUMS">Publish</button>
+        <button id="release-dismiss" type="button">Not now</button>
+      </div>
+      <p class="error" id="release-error" hidden></p>
+      <p class="muted" id="release-hint"></p>
+    </div>
     <div class="row">
-      <button id="pause" type="button">Pause new builds</button>
+      <button id="pause" type="button" title="Pushes wait; Run now, fixes and releases still run">Pause automatic builds</button>
       <button id="poll" type="button">Check now</button>
       <button id="clear" class="danger" type="button">Clear queue</button>
     </div>
@@ -131,6 +173,14 @@ code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px
         </div>
         <p class="error" id="fix-error" hidden></p>
       </div>
+      <div id="files" hidden>
+        <p><strong>Files</strong> <span class="muted" id="files-note"></span></p>
+        <p class="error" id="files-problem" hidden></p>
+        <div class="wrap"><table id="files-table"></table></div>
+        <p id="files-install" hidden>Install on this machine, in a terminal (the project's hook may ask, and use sudo):
+          <code id="files-cmd"></code> <button id="files-copy" type="button">Copy</button>
+          <span class="muted">or <code id="files-sh"></code></span></p>
+      </div>
       <div class="chips" id="jobs" style="margin-top:10px"></div>
       <pre class="mono" id="log"></pre>
       <div id="report" hidden>
@@ -148,6 +198,7 @@ code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px
     <p class="muted" id="history-empty">No builds yet.</p>
     <div class="wrap"><table id="history"></table></div>
     <details id="skipped-box" hidden><summary class="muted">Pushes not built</summary><ul class="plain" id="skipped"></ul></details>
+    </div>
   </section>
 
   <details id="pool-box" open>
@@ -220,16 +271,32 @@ const token = (() => {
   try { return localStorage.getItem("bana-token") || sessionStorage.getItem("bana"); } catch (e) { return null; }
 })();
 let daemon = false;
+// The project shown (#p=…): the daemon serves each under /ci/v1/p/<prefix>.
+// Its rows (GET /ci/v1/projects) fill the picker.
+let project = "", rows = [];
+const hashProject = () => new URLSearchParams(location.hash.slice(1)).get("p") || "";
+// A link within the page: the project shown, then `rest` (build=4&job=lint).
+const at = (rest) => "#" + [project ? "p=" + encodeURIComponent(project) : "", rest || ""].filter(Boolean).join("&");
 const noToken = () => daemon
   ? "Click the bana icon in the menu bar once (or run `bana daemon open`): that gives this browser the page's token."
   : "Open the link bana-manager printed (it carries the token).";
 const $ = (id) => document.getElementById(id);
 const chip = (l) => `<span class="chip${/^usb-/.test(l) ? " hw" : ""}">${esc(l)}</span>`;
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+// A newer bana (the health's or a summary's "latest"): one line under the header.
+let runs = "";
+function showLatest(o) {
+  $("upgrade").hidden = !o.latest;
+  if (!o.latest) return;
+  $("upgrade-link").textContent = o.latest;
+  $("upgrade-link").href = o.latest_url;
+  $("upgrade-runs").textContent = runs;
+}
 function show(id, text) { const el = $(id); el.hidden = !text; el.textContent = text || ""; }
 
+const apiBase = () => daemon ? "/ci/v1/p/" + encodeURIComponent(project) : "/ci/v1";
 async function api(method, path, body) {
-  const r = await fetch("/ci/v1" + path, {
+  const r = await fetch(apiBase() + path, {
     method, headers: { authorization: "Bearer " + token, ...(body ? { "content-type": "application/json" } : {}) },
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -295,7 +362,7 @@ function taskBlocks(s) {
 }
 
 async function refresh() {
-  if (busy) return;
+  if (busy || (daemon && !project)) return;
   busy = true;
   try {
     const s = await api("GET", "/state");
@@ -356,6 +423,9 @@ function dur(sec) {
 }
 const ago = (now, t) => t == null ? "" : dur(now - t) + " ago";
 const githubUrl = (u) => typeof u === "string" && /^https:\/\/github\.com\//.test(u) ? u : null;
+// A Markdown table's cells: split at | but not at \\|, and without **.
+const mdCells = (l) => l.replace(/\\\|/g, "\u0000").slice(1, -1).split("|")
+  .map((c) => c.split("\u0000").join("|").trim().replace(/^\*\*(.*)\*\*$/, "$1"));
 function route() {
   const h = new URLSearchParams(location.hash.slice(1));
   const b = Number(h.get("build"));
@@ -370,7 +440,7 @@ const selectedId = () => route().build || currentId();
 function watcherLine(l) {
   const w = l.watcher, parts = [`${l.prefix} · ${l.repo} on ${l.machine}`];
   parts.push(w.fetch_error ? "fetch failed: " + w.fetch_error : w.fetched_at ? "checked " + ago(l.now, w.fetched_at) : "not checked yet");
-  if (w.paused) parts.push("new builds paused");
+  if (w.paused) parts.push("automatic builds paused");
   parts.push(w.docker ? "Docker up" : "Docker down");
   if (w.lock_holder) parts.push("act is busy here: " + w.lock_holder);
   parts.push(w.unposted
@@ -383,10 +453,17 @@ function queueRows(l) {
   if (!l.queue.length) return "";
   return "<tr><th>Ref</th><th>Commit</th><th>Tier</th><th>Why</th><th>Queued</th><th>Waiting for</th><th></th></tr>" + l.queue.map((q) => {
     const id = Number(q.id);
-    return `<tr><td><a href="#build=${id}">${esc(q.ref)}</a></td><td class="mono">${esc(shortSha(q.sha))}</td><td>${esc(q.tier)}</td>
-      <td>${esc(q.trigger)}</td><td>${esc(ago(l.now, q.queued_at))}</td><td>${esc(q.waiting || (l.running ? "the build before it" : ""))}</td>
+    return `<tr><td><a href="${esc(at("build=" + id))}">${esc(q.ref)}</a></td><td class="mono">${esc(shortSha(q.sha))}</td><td>${esc(q.tier)}</td>
+      <td>${esc(q.trigger)}</td><td>${esc(ago(l.now, q.queued_at))}</td><td>${waitingFor(q, l)}</td>
       <td><button data-remove="${id}">Remove</button></td></tr>`;
   }).join("");
+}
+
+// Why a queued build waits: another project's build is a link to it.
+function waitingFor(q, l) {
+  const m = /^after ([a-z0-9][a-z0-9-]*) #(\d+)$/.exec(q.waiting || "");
+  if (m) return `after <a href="#p=${esc(m[1])}&amp;build=${Number(m[2])}">${esc(m[1])} #${Number(m[2])}</a>`;
+  return esc(q.waiting || (l.running ? "the build before it" : ""));
 }
 
 function historyRows(l) {
@@ -398,11 +475,24 @@ function historyRows(l) {
     const when = b.ended_at ? ago(l.now, b.ended_at) : b.state;
     const why = (b.fix ? `fix ${b.fix} · round ${Number(b.round)}` + (b.job ? ` · ${b.job}` : "") : b.trigger)
       + (b.attempt > 1 ? ` (attempt ${Number(b.attempt)})` : "");
-    return `<tr class="${id === sel ? "sel" : ""}"><td><span class="dot ${esc(b.state)}"></span><a href="#build=${id}">#${id}</a> <span class="muted">${esc(when)}</span></td>
+    return `<tr class="${id === sel ? "sel" : ""}"><td><span class="dot ${esc(b.state)}"></span><a href="${esc(at("build=" + id))}">#${id}</a> <span class="muted">${esc(when)}</span></td>
       <td>${esc(b.ref)}</td><td class="mono">${esc(shortSha(b.sha))}</td><td>${esc(b.tier)}</td><td>${esc(why)}</td>
       <td>${b.started_at ? esc(dur(b.elapsed)) : ""}</td><td>${esc(st)}</td>
-      <td title="${esc(b.description)}">${esc(b.state)}${b.reason ? ": " + esc(b.reason) : ""}${b.tests ? ` <a class="chip" href="#build=${id}&report=1">${esc(b.tests)}</a>` : ""}</td></tr>`;
+      <td title="${esc(b.description)}">${esc(b.state)}${b.reason ? ": " + esc(b.reason) : ""}${b.tests ? ` <a class="chip" href="${esc(at(`build=${id}&report=1`))}">${esc(b.tests)}</a>` : ""}${filesChip(b)}${releaseChip(id)}</td></tr>`;
   }).join("");
+}
+
+// A build's files: how many to download, and whether something is wrong with them.
+function filesChip(b) {
+  if (!b.files && !b.files_problem) return "";
+  const label = b.files ? `${Number(b.files)} file${b.files > 1 ? "s" : ""}` : "no files";
+  return ` <a class="chip${b.files_problem ? " failure" : ""}" href="${esc(at("build=" + Number(b.id)))}"${b.files_problem ? ' title="See the build"' : ""}>${label}</a>`;
+}
+const filesSig = (v) => v ? `${v.files || 0}:${!!v.files_problem}` : "";
+// The release a build decides: its card, whatever its state (published, Not now too).
+function releaseChip(id) {
+  const x = releases.find((r) => Number(r.build) === id);
+  return x ? ` <a class="chip" href="${esc(at("release=" + encodeURIComponent(x.tag)))}">${esc(x.tag)} ${esc(x.state)}</a>` : "";
 }
 
 function fillSelect(sel, values, label) {
@@ -434,10 +524,10 @@ async function renderBuild() {
   if (!v) {
     try { v = (await api("GET", `/builds?before=${id + 1}&limit=1`)).builds.find((b) => b.id === id) || null; } catch (e) {}
   }
-  if (!shown || shown.id !== id || (v && shown.state !== v.state)) {
+  if (!shown || shown.id !== id || (v && (shown.state !== v.state || shown.files !== filesSig(v)))) {
     let detail;
     try { detail = await api("GET", `/builds/${id}`); } catch (e) { detail = { error: e.message }; }
-    shown = { id, detail, state: v && v.state, fix: await loadFix(v), sig: lastSig, made: false, error: null };
+    shown = { id, detail, state: v && v.state, files: filesSig(v), fix: await loadFix(v), sig: lastSig, made: false, error: null };
   } else if (shown.fix && shown.sig !== lastSig) {
     // A build started or ended: maybe one of the fix's rounds.
     shown.sig = lastSig;
@@ -447,12 +537,13 @@ async function renderBuild() {
   const d = shown.detail;
   $("build-heading").textContent = r.build ? "Build" : local && local.running ? "Building now" : "Last build";
   $("build-current").hidden = !(r.build && currentId() && r.build !== currentId());
+  $("build-current").href = at("");
   if (!v) {
     $("build-title").textContent = `#${id}: ` + (d.error || "not found");
     $("build-meta").replaceChildren();
     $("jobs").replaceChildren();
     $("log").replaceChildren();
-    $("report").hidden = true;
+    $("report").hidden = $("files").hidden = true;
     $("build-cancel").hidden = $("build-rerun").hidden = $("build-fix").hidden = $("fix").hidden = true;
     logState = null;
     return;
@@ -473,6 +564,7 @@ async function renderBuild() {
   // Only a failure: a cancelled, timed-out or never-started build says nothing to fix.
   $("build-fix").hidden = v.state !== "failure";
   renderFix(id, v);
+  renderFiles(id, d.dist);
 
   // The job asked for; else a finished build's failed job opens.
   const failed = !running && (v.jobs || []).find((j) => j.state === "failure");
@@ -482,13 +574,13 @@ async function renderBuild() {
   const links = chips.map(([key, label, state, step]) => {
     const a = text("a", label + (step ? " · " + step : ""), "chip " + state + (!report && (key || null) === job ? " sel" : ""));
     a.title = state || "every job's lines";
-    a.href = "#build=" + id + (key ? "&job=" + encodeURIComponent(key) : "");
+    a.href = at("build=" + id + (key ? "&job=" + encodeURIComponent(key) : ""));
     return a;
   });
   if (ended) {
     const a = text("a", "Report", "chip" + (report ? " sel" : ""));
     a.title = "The CI report: checks and tests per standard";
-    a.href = "#build=" + id + "&report=1";
+    a.href = at(`build=${id}&report=1`);
     links.push(a);
   }
   $("jobs").replaceChildren(...links);
@@ -496,6 +588,52 @@ async function renderBuild() {
   $("report").hidden = !report;
   if (report) { logState = null; renderReport(id); }
   else startLog(id, job, running || v.state === "queued");
+}
+
+// What a green build's jobs uploaded (dist/), each to download, and the command that
+// installs them here: bana install <id> runs the project's installer in a terminal,
+// where its hook can ask and use sudo. The page installs nothing itself.
+function renderFiles(id, dist) {
+  const files = dist && !dist.removed ? dist.files || [] : [];
+  $("files").hidden = !dist;
+  if (!dist) return;
+  $("files-note").textContent = dist.removed ? "removed a week after the build" : "kept a week, and the newest of each branch and tier while the branch is there";
+  show("files-problem", dist.problem ? "Not collected: " + dist.problem : "");
+  const size = (n) => n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`;
+  $("files-table").replaceChildren(...files.map((f) => {
+    const tr = document.createElement("tr");
+    const b = text("button", "Download");
+    b.type = "button";
+    b.addEventListener("click", () => download(id, f.name, b));
+    const td = document.createElement("td");
+    td.append(b);
+    tr.append(text("td", f.name, "mono"), text("td", size(Number(f.bytes) || 0)),
+      text("td", f.platform || (f.release ? "" : "not in a release"), "muted"), td);
+    return tr;
+  }));
+  const installer = files.some((f) => f.name === "install.sh");
+  $("files-install").hidden = !installer;
+  if (installer) {
+    $("files-cmd").textContent = `bana install ${id}`;
+    $("files-sh").textContent = dist.dir ? `sh '${dist.dir}/install.sh' --from '${dist.dir}'` : "";
+    $("files-sh").parentElement.hidden = !dist.dir;
+  }
+}
+
+// A download needs the token, so the file comes through fetch, then a blob.
+async function download(id, name, button) {
+  button.disabled = true;
+  try {
+    const r = await fetch(`${apiBase()}/builds/${id}/files/${encodeURIComponent(name)}`, { headers: { authorization: "Bearer " + token } });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(await r.blob());
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    show("fatal", "");
+  } catch (e) { show("fatal", `${name}: ${e.message}`); }
+  button.disabled = false;
 }
 
 // The CI report (report.md, written when the build ended): its table as a
@@ -511,13 +649,10 @@ async function renderReport(id) {
   const lines = md.split("\n"), at = lines.findIndex((l) => l.startsWith("| Standard |"));
   let end = at;
   while (at >= 0 && end < lines.length && lines[end].startsWith("|")) end++;
-  // A row's cells: split at | but not at \|, and without **.
-  const cells = (l) => l.replace(/\\\|/g, "\u0000").slice(1, -1).split("|")
-    .map((c) => c.split("\u0000").join("|").trim().replace(/^\*\*(.*)\*\*$/, "$1"));
   const rows = at < 0 ? [] : [lines[at]].concat(lines.slice(at + 2, end));
   $("report-table").replaceChildren(...rows.map((l, i) => {
     const tr = document.createElement("tr");
-    tr.append(...cells(l).map((c) => text(i ? "td" : "th", c)));
+    tr.append(...mdCells(l).map((c) => text(i ? "td" : "th", c)));
     return tr;
   }));
   const head = at < 0 ? [] : lines.slice(0, at);
@@ -586,7 +721,7 @@ function renderRounds(f) {
     li.append(text("span", shortSha(r.sha), "mono muted"), " ");
     for (const b of r.builds || []) {
       const a = text("a", `${b.job} #${Number(b.id)}`, "chip " + b.state);
-      a.href = "#build=" + Number(b.id);
+      a.href = at("build=" + Number(b.id));
       li.append(a, " ");
     }
     return li;
@@ -722,14 +857,260 @@ function appendLog(s, lines) {
   else if (atEnd) pre.scrollTop = pre.scrollHeight;
 }
 
+// The release bana asks about (or #release=TAG): its files, what was tested, the title
+// and notes with who saved them and what they leave out, and the owner's answer. Publish
+// sends the rev of the notes shown, so what goes on GitHub is what was read here; nothing
+// is published without that click. The notes being edited stay as typed; newer notes
+// saved meanwhile are offered, never swapped in. Notes that changed while the page was
+// open, untouched, are swapped in and flagged, and Publish names them.
+let rel = null, releases = [];
+function releaseTag() {
+  const t = new URLSearchParams(location.hash.slice(1)).get("release");
+  if (t && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(t)) return t;
+  return local && local.release ? local.release.tag : null;
+}
+
+async function renderRelease() {
+  const tag = releaseTag();
+  $("release").hidden = !tag;
+  if (!tag) { rel = null; return; }
+  if (!rel || rel.tag !== tag) rel = { tag, v: null, base: 0, seen: false, swapped: null, yours: null, dirty: false, error: null };
+  const r = rel;
+  let v;
+  try { v = await api("GET", `/releases/${encodeURIComponent(tag)}`); } catch (e) { v = { error: e.message }; }
+  if (rel !== r) return;
+  r.v = v;
+  drawRelease();
+}
+
+function drawRelease() {
+  const r = rel, v = r.v || {};
+  const size = (n) => n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`;
+  show("release-error", r.error);
+  const bad = !!v.error;
+  for (const id of ["release-meta", "release-files", "release-notes", "release-name", "release-check", "release-hint", "release-source"]) $(id).hidden = bad;
+  $("release-new").hidden = $("release-conflict").hidden = true;
+  $("release-yours").hidden = r.yours == null;
+  if (r.yours != null) $("release-yours-text").value = r.yours;
+  $("release-reason").hidden = $("release-url").hidden = $("release-not-built").hidden = $("release-tested-box").hidden = true;
+  $("release-save").hidden = $("release-publish").hidden = $("release-dismiss").hidden = true;
+  if (bad) { $("release-title").textContent = `${r.tag}: ${v.error}`; return; }
+  const b = v.build || {}, id = Number(b.id), prefix = local ? local.prefix : "";
+  $("release-title").textContent = {
+    building: `${v.tag} is building (#${id})`,
+    blocked: `${v.tag} cannot be published`,
+    asking: `${prefix} ${v.tag} passed on ${v.machine} (build #${id}${b.elapsed ? ", " + dur(b.elapsed) : ""}). Publish it on GitHub?`,
+    publishing: `Publishing ${v.tag}: ${v.progress || "…"}`,
+    published: `${prefix} ${v.tag} is published.`,
+    failed: `Publishing ${v.tag} failed. Publish it again?`,
+    dismissed: `${v.tag} passed, not published.`,
+  }[v.state] || `${v.tag}: ${v.state}`;
+  const meta = $("release-meta");
+  meta.replaceChildren();
+  const add = (n) => { if (meta.childNodes.length) meta.append(" · "); meta.append(n); };
+  if (id) { const a = text("a", `build #${id}`); a.href = at("build=" + id); add(a); }
+  add(text("span", shortSha(v.sha), "mono"));
+  const p = v.previous;
+  add(p ? (p.tag ? `since ${p.tag}` : "the first release") + ` (${p.how})` : v.seed_error ? "no changes: " + v.seed_error : "finding the previous release…");
+  const c = v.changes && v.changes.counts;
+  if (c) add(`${c.prs} pull request${c.prs === 1 ? "" : "s"}, ${c.other} other change${c.other === 1 ? "" : "s"}`);
+  if (v.reason) { $("release-reason").hidden = false; $("release-reason").textContent = v.reason; }
+  const url = githubUrl(v.url);
+  if (url) { $("release-url").hidden = false; $("release-link").href = url; $("release-link").textContent = url; }
+  $("release-files").replaceChildren(...(v.files || []).map((f) => {
+    const tr = document.createElement("tr");
+    tr.append(text("td", f.name, "mono"), text("td", size(Number(f.bytes) || 0)), text("td", f.platform || "", "muted"));
+    return tr;
+  }));
+  const nb = v.not_built || [];
+  if (nb.length) { $("release-not-built").hidden = false; $("release-not-built").textContent = "not built: " + nb.join(", "); }
+  const t = (v.tested || "").split("\n"), at = t.findIndex((l) => l.startsWith("|"));
+  if (at >= 0) {
+    $("release-tested-box").hidden = false;
+    $("release-tested-meta").textContent = t.slice(0, at).join(" ").trim();
+    const rows = [t[at]].concat(t.slice(at + 2).filter((l) => l.startsWith("|")));
+    $("release-tested").replaceChildren(...rows.map((l, i) => {
+      const tr = document.createElement("tr");
+      tr.append(...mdCells(l).map((x) => text(i ? "td" : "th", x)));
+      return tr;
+    }));
+  }
+  const n = v.notes || { text: "", rev: 0 }, open = !["publishing", "published"].includes(v.state);
+  const box = $("release-notes"), name = $("release-name"), rev = Number(n.rev);
+  box.readOnly = name.readOnly = !open;
+  name.placeholder = v.default_title || "";
+  if (!r.dirty) {
+    if (r.seen && r.base && rev !== r.base && !r.swapped) r.swapped = { from: r.base };
+    box.value = n.text;
+    name.value = (n.title || "");
+    r.base = rev;
+    r.seen = true;
+  }
+  const who = notesBy(n);
+  $("release-source").textContent = n.rev ? `${who}, ${new Date(n.saved_at * 1000).toLocaleString()} (rev ${rev})`
+    + (r.dirty ? ": not saved" : "") : "none yet";
+  if (r.swapped && open) {
+    $("release-new").hidden = false;
+    $("release-new").textContent = `New notes ${who} (rev ${rev}, were rev ${r.swapped.from}): read them before publishing.`;
+  }
+  if (r.dirty && rev !== r.base) {
+    $("release-conflict").hidden = false;
+    $("release-conflict-text").textContent = `Rev ${rev} was saved ${who} while you edited rev ${r.base}: load it (your text stays below to copy), or save yours over it.`;
+    $("release-load").textContent = `Load rev ${rev}`;
+    $("release-overwrite").textContent = `Save over rev ${rev}`;
+  }
+  const k = v.check || {}, prs = c ? c.prs : 0, miss = k.missing_prs || [];
+  const words = [];
+  if (prs) words.push(`the notes mention ${prs - miss.length} of ${prs} pull request${prs === 1 ? "" : "s"}` + (miss.length ? ` (missing ${miss.map((x) => "#" + x).join(", ")})` : ""));
+  if ((k.outside_range || []).length) words.push("name " + k.outside_range.map((x) => "#" + x).join(", ") + " from outside the range");
+  if ((k.duplicated || []).length) words.push("name " + k.duplicated.map((x) => "#" + x).join(", ") + " twice");
+  const said = words.join("; ") + (r.dirty ? " (as saved)" : "");
+  $("release-check").textContent = words.length ? said[0].toUpperCase() + said.slice(1) + "." : "";
+  $("release-save").hidden = !open;
+  $("release-publish").hidden = !["asking", "failed", "dismissed"].includes(v.state);
+  $("release-publish").textContent = `Publish ${v.tag}`;
+  $("release-dismiss").hidden = !["asking", "failed"].includes(v.state);
+  $("release-hint").textContent = [v.install ? `Install it here: ${v.install}.` : "",
+    open ? `Better notes: ask Claude Code in this checkout to write the release notes for ${v.tag}.` : ""].filter(Boolean).join(" ");
+}
+
+const notesBy = (n) => ({ git: "from git", claude: "by Claude", you: "by you" }[n.source] || n.source);
+
+// Saves the title and notes typed over the rev they started from: the new rev, or null.
+async function saveRelease() {
+  const r = rel;
+  if (!r || !r.v || r.v.error) return null;
+  let rev = null;
+  try {
+    const body = { notes: $("release-notes").value, title: $("release-name").value, rev: r.base };
+    rev = (await api("PUT", `/releases/${encodeURIComponent(r.tag)}/notes`, body)).rev;
+    r.dirty = false;
+    r.base = Number(rev);
+    r.swapped = r.error = null;
+  } catch (e) { r.error = "Save: " + e.message; }
+  await renderRelease();
+  return rev;
+}
+
+// Keeps the page on release TAG after an answer, whatever the summary shows next.
+function keepRelease(tag) {
+  const h = new URLSearchParams(location.hash.slice(1));
+  if (h.get("release") !== tag || h.get("p") !== project) { h.set("p", project); h.set("release", tag); location.hash = h.toString(); }
+}
+
+for (const id of ["release-notes", "release-name"]) {
+  $(id).addEventListener("input", () => { if (rel) { rel.dirty = true; drawRelease(); } });
+  $(id).addEventListener("focus", () => { if (rel && rel.swapped) { rel.swapped = null; drawRelease(); } });
+}
+$("release-save").addEventListener("click", () => saveRelease());
+$("release-load").addEventListener("click", () => {
+  const r = rel;
+  if (!r) return;
+  r.yours = ($("release-name").value ? `Title: ${$("release-name").value}\n\n` : "") + $("release-notes").value;
+  r.dirty = false;
+  r.swapped = null;
+  if (r.v && r.v.notes) r.base = Number(r.v.notes.rev);
+  drawRelease();
+});
+$("release-overwrite").addEventListener("click", () => {
+  const r = rel;
+  if (!r || !r.v || !r.v.notes) return;
+  r.base = Number(r.v.notes.rev);
+  saveRelease();
+});
+$("release-publish").addEventListener("click", async () => {
+  const r = rel;
+  if (!r || !r.v || r.v.error) return;
+  const rev = r.dirty ? await saveRelease() : r.base;
+  if (rev == null || rel !== r || !r.v || r.v.error) return;
+  const k = (r.v.files || []).length, n = r.v.notes || {};
+  const title = $("release-name").value.trim() || r.v.default_title;
+  let ask = `Publish ${r.tag} on GitHub (${local ? local.repo : ""}) as "${title}", with the notes ${notesBy(n)} (rev ${Number(rev)}, `
+    + `saved ${new Date(n.saved_at * 1000).toLocaleString()}) and its ${k} file${k === 1 ? "" : "s"}?`;
+  if (r.swapped) ask = `The notes changed while this page was open: rev ${Number(rev)} (${notesBy(n)}) is not the rev ${r.swapped.from} you had. Read them first.\n\n` + ask;
+  if (!confirm(ask)) return;
+  try { await api("POST", `/releases/${encodeURIComponent(r.tag)}/publish`, { rev }); r.error = null; r.swapped = null; } catch (e) { r.error = "Publish: " + e.message; }
+  keepRelease(r.tag);
+  lastSig = "";
+  refreshLocal();
+});
+$("release-dismiss").addEventListener("click", async () => {
+  const r = rel;
+  if (!r) return;
+  try { await api("POST", `/releases/${encodeURIComponent(r.tag)}/dismiss`); r.error = null; } catch (e) { r.error = "Not now: " + e.message; }
+  keepRelease(r.tag);
+  refreshLocal();
+});
+
 function schedule(ms) { clearTimeout(timer); timer = setTimeout(refreshLocal, ms); }
 
+// The projects: the one in the address, else the one shown, else the one whose
+// build runs, else the first. Another project than the one shown starts afresh.
+async function refreshProjects() {
+  const r = await fetch("/ci/v1/projects", { headers: { authorization: "Bearer " + token } });
+  const j = await r.json().catch(() => null);
+  if (!r.ok || !Array.isArray(j)) throw new Error((j && j.error) || r.statusText);
+  rows = j;
+  const want = hashProject();
+  const row = rows.find((x) => x.prefix === want) || rows.find((x) => x.prefix === project)
+    || rows.find((x) => x.running) || rows[0];
+  const next = row ? row.prefix : "";
+  if (next !== project) {
+    project = next;
+    local = shown = logState = rel = null;
+    builds = releases = [];
+    lastSig = "";
+    buildsAt = 0;
+    $("log").replaceChildren();
+    $("tier").replaceChildren();
+    if ($("pool-box").open) refresh();
+  }
+  drawPicker(row);
+  return row;
+}
+
+// What a project's row says, in the picker.
+const rowState = (r) => !r ? "" : r.error ? "error" : r.running ? "running" : r.paused ? "paused" : r.queue ? "queued" : "idle";
+function rowLabel(r) {
+  const words = { error: "cannot start", running: r.running && `building #${Number(r.running.id)}`, paused: "paused", queued: "", idle: "" }[rowState(r)];
+  return [r.prefix, words, r.queue ? `${Number(r.queue)} queued` : ""].filter(Boolean).join(" · ");
+}
+function drawPicker(row) {
+  const sel = $("project");
+  $("picker").hidden = rows.length < 2;
+  const want = rows.map((r) => r.prefix + "\n" + rowLabel(r)).join("\n");
+  if (sel.dataset.rows !== want) {
+    sel.replaceChildren(...rows.map((r) => { const o = text("option", rowLabel(r)); o.value = r.prefix; return o; }));
+    sel.dataset.rows = want;
+  }
+  sel.value = project;
+  $("project-dot").className = "dot " + rowState(row);
+  document.title = project ? `bana · ${project}` : "bana";
+}
+$("project").addEventListener("change", (e) => { location.hash = "p=" + encodeURIComponent(e.target.value); });
+
+// No project to show, or one that cannot start: why, instead of its builds.
+function noProject(row) {
+  $("ci-body").hidden = true;
+  $("where").textContent = row ? row.repo || "" : "";
+  show("project-error", !row ? "No projects yet: run bana add in a project's checkout."
+    : row.error === "restarting" ? `${row.prefix} is starting again…`
+    : `${row.prefix} cannot start: ${row.error}` + (/bana add/.test(row.error) ? `, or bana remove ${row.prefix}.`
+      : `. Run bana add in its checkout, or bana remove ${row.prefix}.`));
+}
+
+let again = false;
 async function refreshLocal() {
-  if (localBusy) return;
+  if (localBusy) { again = true; return; }
   localBusy = true;
   try {
+    const row = await refreshProjects();
+    if (!row || row.error) { local = null; noProject(row); show("fatal", ""); return; }
+    $("ci-body").hidden = false;
+    show("project-error", "");
     const l = await api("GET", "/local");
     local = l;
+    showLatest(l);
     const sig = JSON.stringify([l.running && [l.running.id, l.running.state], l.last && l.last.id, l.queue.map((q) => q.id), l.watcher.unposted]);
     if (sig !== lastSig || Date.now() - buildsAt > 30000) {
       builds = (await api("GET", "/builds?limit=100")).builds;
@@ -739,12 +1120,14 @@ async function refreshLocal() {
     $("where").textContent = `${l.machine} · ${l.repo}`;
     $("updated").textContent = "updated " + new Date().toLocaleTimeString();
     $("watcher").textContent = watcherLine(l);
-    $("pause").textContent = l.watcher.paused ? "Resume builds" : "Pause new builds";
+    $("pause").textContent = l.watcher.paused ? "Resume automatic builds" : "Pause automatic builds";
     fillSelect($("run-ref"), l.refs, shortRef);
     fillSelect($("run-tier"), l.tiers, (t) => t);
     $("run-tier-label").hidden = !l.tiers.length;
     $("queue").innerHTML = queueRows(l);
     $("queue-empty").hidden = l.queue.length > 0;
+    try { releases = (await api("GET", "/releases")).releases || []; } catch (e) { releases = []; }
+    await renderRelease();
     await renderBuild();
     $("history").innerHTML = historyRows(l);
     $("history-empty").hidden = builds.length > 0;
@@ -756,7 +1139,9 @@ async function refreshLocal() {
     show("fatal", e.message === "missing or wrong token" ? noToken() : "Cannot reach bana: " + e.message);
   } finally {
     localBusy = false;
-    schedule(document.hidden ? 30000 : local && (local.running || local.queue.length) ? 2000 : 10000);
+    const publishing = local && local.release && local.release.state === "publishing";
+    schedule(again ? 0 : document.hidden ? 30000 : local && (local.running || local.queue.length || publishing) ? 2000 : 10000);
+    again = false;
   }
 }
 
@@ -776,7 +1161,13 @@ $("build-cancel").addEventListener("click", () => { if (shown) actLocal("POST", 
 $("build-rerun").addEventListener("click", async () => {
   if (!shown) return;
   const r = await actLocal("POST", `/builds/${shown.id}/rerun`);
-  if (r && r.build) location.hash = "build=" + Number(r.build);
+  if (r && r.build) location.hash = at("build=" + Number(r.build));
+});
+$("files-copy").addEventListener("click", () => {
+  const cmd = $("files-cmd").textContent;
+  (navigator.clipboard ? navigator.clipboard.writeText(cmd) : Promise.reject()).then(
+    () => { $("files-copy").textContent = "Copied"; setTimeout(() => { $("files-copy").textContent = "Copy"; }, 2000); },
+    () => { getSelection().selectAllChildren($("files-cmd")); });
 });
 $("report-copy").addEventListener("click", () => {
   const md = shown && shown.report && shown.report.markdown;
@@ -804,9 +1195,15 @@ $("run-now").addEventListener("submit", async (e) => {
   const body = { ref: $("run-ref").value };
   if (!$("run-tier-label").hidden) body.tier = $("run-tier").value;
   const r = await actLocal("POST", "/builds", body);
-  if (r && r.build) location.hash = "build=" + Number(r.build);
+  if (r && r.build) location.hash = at("build=" + Number(r.build));
 });
-window.addEventListener("hashchange", () => { if (daemon) { renderBuild(); if (local) $("history").innerHTML = historyRows(local); } });
+window.addEventListener("hashchange", () => {
+  if (!daemon) return;
+  // Another project: its rows first.
+  if (hashProject() && hashProject() !== project) { refreshLocal(); return; }
+  renderRelease(); renderBuild();
+  if (local) $("history").innerHTML = historyRows(local);
+});
 document.addEventListener("visibilitychange", () => { if (!document.hidden && daemon) { refreshLocal(); pumpLog(); } });
 
 // The pool's sections refresh while open; a daemon's page starts them closed.
@@ -814,10 +1211,11 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden && da
   let h = {};
   try { h = await (await fetch("/ci/v1/health")).json(); } catch (e) {}
   daemon = h.daemon === true;
+  runs = h.version || "";
+  showLatest(h);
   if (daemon) {
     $("ci").hidden = false;
     $("pool-box").open = false;
-    document.title = `bana · ${h.prefix}`;
     if (token) { refreshLocal(); setInterval(pumpLog, 2000); }
   }
   if (!token) show("fatal", noToken());

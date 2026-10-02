@@ -1,0 +1,250 @@
+# Installs the build for this machine: its files in PREFIX\TAG, PREFIX\current pointing
+# at them, and PREFIX\current\bin on your user PATH. Run it again to upgrade.
+# PREFIX is %LOCALAPPDATA%\Programs\NAME (-Prefix, or INSTALL_PREFIX).
+#
+#   powershell -ExecutionPolicy Bypass -File install.ps1 [-Yes] [-Force] [-NoHook] [-Prefix DIR] [-From ZIP|DIR]
+#   powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall [-Purge] [-Yes]
+#   (irm URL | iex, or gh release download -p install.ps1 -O - | Out-String | iex, take no
+#   parameters: INSTALL_YES=1, INSTALL_UNINSTALL=1 and INSTALL_PREFIX in the environment instead)
+#
+# Windows PowerShell 5.1 (every Windows 10 and 11) and PowerShell 7.
+param([switch]$Yes, [switch]$Force, [switch]$NoHook, [switch]$Uninstall, [switch]$Purge, [string]$Prefix, [string]$From)
+# All in a script block of its own: under iex, its variables and $ErrorActionPreference stay
+# out of your session, and a failure returns to your prompt ($LASTEXITCODE 1) instead of
+# closing it; as a file (-File), it exits 1.
+& {
+#@BUILD@
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue' # Windows PowerShell's progress bar slows downloads down many times
+if ($env:INSTALL_YES -eq '1') { $Yes = [switch]$true }
+if ($env:INSTALL_UNINSTALL -eq '1') { $Uninstall = [switch]$true }
+if (-not $Prefix -and $env:INSTALL_PREFIX) { $Prefix = $env:INSTALL_PREFIX }
+
+function Die([string]$m) { throw $m }
+
+# $IsWindows does not exist in Windows PowerShell 5.1.
+$OnWindows = [Environment]::OSVersion.Platform -eq 'Win32NT'
+if (-not $Prefix) {
+  $Prefix = if ($env:LOCALAPPDATA) { Join-Path (Join-Path $env:LOCALAPPDATA 'Programs') $Name } else { Join-Path $HOME ".local/share/$Name" }
+}
+# Relative to where you are (.NET's current directory is not PowerShell's).
+$Prefix = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Prefix)
+$Config = if ($env:APPDATA) { Join-Path $env:APPDATA $Name } else { Join-Path $HOME ".config/$Name" }
+$Current = Join-Path $Prefix 'current'
+$BinDir = Join-Path $Current 'bin'
+$Receipt = Join-Path $Prefix 'receipt'
+
+function Get-Arch {
+  $a = $null
+  try { $a = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() } catch { $a = $null }
+  if (-not $a) { $a = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE } }
+  switch -Regex ($a) { '^(X64|AMD64)$' { 'x64' } '^(Arm64|ARM64)$' { 'arm64' } default { Die "no build for $a" } }
+}
+
+# The receipt: KEY=VALUE lines, as install.sh writes them.
+function Get-Receipt([string]$key) {
+  if (-not (Test-Path -LiteralPath $Receipt)) { return '' }
+  foreach ($l in [IO.File]::ReadAllLines($Receipt)) { if ($l.StartsWith("$key=")) { return $l.Substring($key.Length + 1) } }
+  ''
+}
+# The version directories in PREFIX that are ours (version= lines): only those are ever
+# removed (PREFIX may be a directory with other things in it).
+function Get-VersionDir {
+  if (-not (Test-Path -LiteralPath $Receipt)) { return @() }
+  @([IO.File]::ReadAllLines($Receipt) | Where-Object { $_.StartsWith('version=') } | ForEach-Object { $_.Substring(8) } |
+    Where-Object { $_ -and $_ -notin @('.', '..', 'current', 'receipt') -and $_.IndexOfAny([char[]]'/\:') -lt 0 })
+}
+
+# The user PATH in the registry, as it is (REG_EXPAND_SZ, %VARS% unexpanded).
+function Get-UserPath {
+  $k = Get-Item -LiteralPath 'registry::HKEY_CURRENT_USER\Environment'
+  @($k.GetValue('Path', '', 'DoNotExpandEnvironmentNames') -split ';' | Where-Object { $_ })
+}
+function Set-UserPath([string[]]$dirs) {
+  $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+  $k.SetValue('Path', ($dirs -join ';'), [Microsoft.Win32.RegistryValueKind]::ExpandString)
+  $k.Close()
+  # Tell Explorer (and new terminals) the environment changed: a set and unset through .NET broadcasts it.
+  $d = "bana-" + [guid]::NewGuid()
+  [Environment]::SetEnvironmentVariable($d, '1', 'User')
+  [Environment]::SetEnvironmentVariable($d, [NullString]::Value, 'User')
+}
+
+# A directory link without admin rights: a junction on Windows. Removing it with
+# [IO.Directory]::Delete leaves its target alone (Remove-Item -Recurse would not, in 5.1).
+function Set-Current([string]$target) {
+  if (Test-Path -LiteralPath $Current) { [IO.Directory]::Delete($Current, $false) }
+  if ($OnWindows) { $null = New-Item -ItemType Junction -Path $Current -Target $target }
+  else { $null = New-Item -ItemType SymbolicLink -Path $Current -Target $target }
+}
+
+# A leading ~ in bana.conf's install.env.* values is your home.
+function Get-HomePath([string]$p) {
+  if ($p -eq '~') { return $HOME }
+  if ($p.StartsWith('~/') -or $p.StartsWith('~\')) { return (Join-Path $HOME $p.Substring(2)) }
+  $p
+}
+
+# The project's hook: HOOK STAGE, with INSTALL_* and bana.conf's install.env.* in the
+# environment. Run as a script block, not a file, so that Windows' default execution
+# policy (Restricted) does not stop it.
+function Invoke-Hook([string]$stage, [string]$file, [string]$dir, [string]$tag) {
+  if ($NoHook -or -not $file -or -not (Test-Path -LiteralPath $file)) { return }
+  foreach ($k in $HookEnv.Keys) { Set-Item -LiteralPath "env:$k" -Value (Get-HomePath $HookEnv[$k]) }
+  $env:INSTALL_STAGE = $stage; $env:INSTALL_DIR = $dir; $env:INSTALL_TAG = $tag
+  $env:INSTALL_PREVIOUS = $Was; $env:INSTALL_PREVIOUS_DIR = $(if ($Was) { Join-Path $Prefix $Was } else { '' })
+  $env:INSTALL_PREFIX = $Prefix; $env:INSTALL_BIN = $BinDir; $env:INSTALL_CONFIG = $Config; $env:INSTALL_NAME = $Name
+  $env:INSTALL_YES = $(if ($Yes) { '1' } else { '0' }); $env:INSTALL_OS = 'windows'; $env:INSTALL_ARCH = $Arch
+  $block = [ScriptBlock]::Create([IO.File]::ReadAllText($file))
+  # Its output goes to the screen, so that only $true or $false comes back from here.
+  try { & $block $stage | Out-Host } catch { Write-Host "$Name $stage hook: $_" -ForegroundColor Red; return $false }
+  $true
+}
+
+function Get-Asset([string]$asset, [string]$dir) {
+  $gh = Get-Command gh -ErrorAction SilentlyContinue
+  if ($gh -and -not $env:INSTALL_URL) {
+    & gh auth token *> $null
+    if ($LASTEXITCODE -eq 0) {
+      & gh release download $Tag -R $Repo -p $asset -D $dir --clobber
+      if ($LASTEXITCODE -ne 0) { Die "gh release download $Tag -R $Repo -p $asset failed" }
+      return
+    }
+  }
+  if ($OnWindows -and $PSVersionTable.PSVersion.Major -lt 6) {
+    # Windows PowerShell 5.1 on an old .NET may not offer TLS 1.2 by default; github.com needs it.
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+  }
+  $base = if ($env:INSTALL_URL) { $env:INSTALL_URL } else { "https://github.com/$Repo/releases/download/$Tag" }
+  try { Invoke-WebRequest -UseBasicParsing -Uri "$base/$asset" -OutFile (Join-Path $dir $asset) }
+  catch { Die "could not download $base/$asset ($Repo may be private: install the GitHub CLI (winget install GitHub.cli) and run 'gh auth login')" }
+}
+
+try {
+$Arch = Get-Arch
+$Was = Get-Receipt 'tag'
+
+if ($Uninstall) {
+  if (-not $Was) { Die "not installed in $Prefix (no receipt)" }
+  $dir = Join-Path $Prefix $Was
+  $hook = Get-Receipt 'hook'
+  $wasConfig = Get-Receipt 'config'
+  if ($wasConfig) { $Config = $wasConfig }
+  $keep = Join-Path ([IO.Path]::GetTempPath()) ("$Name-hook-" + [guid]::NewGuid().ToString('N') + '.ps1')
+  $hookFile = if ($hook) { Join-Path $dir $hook } else { '' }
+  if ($hookFile -and (Test-Path -LiteralPath $hookFile)) { Copy-Item -LiteralPath $hookFile -Destination $keep }
+  if ((Invoke-Hook 'pre-uninstall' $hookFile $dir $Was) -eq $false) { Die "the pre-uninstall hook failed; nothing removed" }
+  if ($OnWindows) { Set-UserPath @(Get-UserPath | Where-Object { $_ -ne $BinDir }) }
+  if (Test-Path -LiteralPath $Current) { [IO.Directory]::Delete($Current, $false) }
+  foreach ($v in Get-VersionDir) { $p = Join-Path $Prefix $v; if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force } }
+  Remove-Item -LiteralPath $Receipt -Force
+  # Not when something else is in it.
+  if (-not @(Get-ChildItem -LiteralPath $Prefix -Force).Count) { Remove-Item -LiteralPath $Prefix -Force }
+  if ($Purge -and (Test-Path -LiteralPath $Config)) {
+    if ($Config.TrimEnd('\', '/') -eq ([string]$HOME).TrimEnd('\', '/')) { Write-Host "warning: not removing $Config (your home)" }
+    else { Remove-Item -LiteralPath $Config -Recurse -Force }
+  }
+  Write-Host "$Name $Was is uninstalled"
+  $ok = Invoke-Hook 'post-uninstall' $keep $dir $Was
+  if (Test-Path -LiteralPath $keep) { Remove-Item -LiteralPath $keep -Force }
+  if ($ok -eq $false) { Die "the post-uninstall hook failed (the files are gone)" }
+  return
+}
+
+# A build on bana's daemon is no release: nothing to download it from.
+if ($Local -and -not $From) { Die "$Tag is a build on bana's daemon, not a release: install.ps1 -From DIR (its files)" }
+
+# No arm64 build: Windows 11 on ARM runs x64 ones.
+$pick = $Assets[$Arch]
+if (-not $pick -and $Arch -eq 'arm64') { $pick = $Assets['x64'] }
+if (-not $pick) { Die "$Tag has no Windows build for $Arch" }
+$asset, $want = $pick
+if ($From) {
+  $From = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($From)
+  if (Test-Path -LiteralPath $From -PathType Container) {
+    $f = Join-Path $From $asset
+    if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { Die "$From has no $asset ($Tag for windows-$Arch)" }
+    $From = $f
+  } elseif (-not (Test-Path -LiteralPath $From -PathType Leaf)) { Die "no file $From" }
+}
+
+# The same tag with the same archive (a build on bana's daemon keeps its label when built
+# again, with other bytes): nothing to do.
+if ($Was -eq $Tag -and -not $Force -and (Get-Receipt 'sha256') -eq $want) {
+  Write-Host "$Name $Tag is installed already ($Prefix\$Tag); -Force installs it again"
+  return
+}
+
+$dest = Join-Path $Prefix $Tag
+# PREFIX may hold other things; this installer only touches TAG, current and receipt.
+if (-not $Was -and ((Test-Path -LiteralPath $Current) -or (Test-Path -LiteralPath $Receipt))) {
+  Die "$Prefix has a current or receipt that is not $Name's installer's: another -Prefix"
+}
+$old = @(Get-VersionDir)
+if ((Test-Path -LiteralPath $dest) -and $Tag -notin $old) { Die "$dest is not $Name's installer's: another -Prefix" }
+$null = New-Item -ItemType Directory -Force -Path $Prefix
+$tmp = Join-Path $Prefix (".install." + [guid]::NewGuid().ToString('N').Substring(0, 8))
+$null = New-Item -ItemType Directory -Path $tmp
+try {
+  if ($From) { Copy-Item -LiteralPath $From -Destination (Join-Path $tmp $asset) }
+  else { Write-Host "Downloading $Name $Tag for windows-$Arch"; Get-Asset $asset $tmp }
+  $got = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $tmp $asset)).Hash.ToLowerInvariant()
+  if ($got -ne $want) { Die "${asset}: sha256 $got, but the release says $want" }
+
+  # .NET's ZipFile, not Expand-Archive: that one lives in a script module, which a Restricted
+  # execution policy will not load even under irm | iex. ZipFile refuses entries outside the
+  # directory; the zip must hold one directory.
+  $x = Join-Path $tmp 'x'
+  Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+  [System.IO.Compression.ZipFile]::ExtractToDirectory((Join-Path $tmp $asset), $x)
+  $top = @(Get-ChildItem -LiteralPath $x -Force)
+  if ($top.Count -ne 1 -or -not $top[0].PSIsContainer) { Die "$asset should hold one directory, and has: $(($top | ForEach-Object { $_.Name }) -join ' ')" }
+  $src = $top[0].FullName
+  # Downloads from a browser carry the web's mark (Zone.Identifier) and SmartScreen asks about each exe.
+  if ($OnWindows) { Get-ChildItem -LiteralPath $src -Recurse -File | Unblock-File }
+
+  $h = if ($HookPs1) { Join-Path $src $HookPs1 } else { '' }
+  if ((Invoke-Hook 'pre-install' $h $src $Tag) -eq $false) { Die "the pre-install hook failed; nothing changed" }
+
+  # A running exe cannot be overwritten, but its directory can be moved aside.
+  if (Test-Path -LiteralPath $dest) { Move-Item -LiteralPath $dest -Destination (Join-Path $tmp 'replaced') }
+  Move-Item -LiteralPath $src -Destination $dest
+  Set-Current $dest
+  $lines = @("name=$Name", "repo=$Repo", "tag=$Tag", "platform=windows-$Arch", "asset=$asset", "sha256=$want",
+    "bin=$BinDir", "config=$Config", "hook=$HookPs1", "version=$Tag")
+  # The versions kept: this one and the previous; the same tag again keeps them all.
+  $kept = if ($Was -eq $Tag) { $old } else { @($Was) }
+  $lines += @($kept | Where-Object { $_ -and $_ -ne $Tag } | ForEach-Object { "version=$_" })
+  [IO.File]::WriteAllLines($Receipt, [string[]]$lines)
+} finally {
+  if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+# Older versions of ours go.
+if ($Was -ne $Tag) {
+  foreach ($v in $old) {
+    $p = Join-Path $Prefix $v
+    if ($v -notin @($Tag, $Was) -and (Test-Path -LiteralPath $p)) { Remove-Item -LiteralPath $p -Recurse -Force }
+  }
+}
+
+Write-Host "$Name $Tag is in $dest; its commands in $BinDir"
+if ($env:GITHUB_PATH) { Add-Content -LiteralPath $env:GITHUB_PATH -Value $BinDir }
+if ($OnWindows) {
+  $p = Get-UserPath
+  if ($p -notcontains $BinDir) {
+    Set-UserPath (@($BinDir) + $p)
+    Write-Host "Added $BinDir to your PATH: new terminals have it"
+  }
+} else {
+  Write-Host "(not Windows: PATH left alone)"
+}
+
+$h = if ($HookPs1) { Join-Path $dest $HookPs1 } else { '' }
+if ((Invoke-Hook 'post-install' $h $dest $Tag) -eq $false) { Die "the post-install hook failed; $Tag is installed. Again: this installer with -Force" }
+} catch {
+  Write-Host "$Name installer: $($_.Exception.Message)" -ForegroundColor Red
+  $global:LASTEXITCODE = 1
+  if ({}.File) { exit 1 } # run as a file; under iex, back to the prompt
+}
+}

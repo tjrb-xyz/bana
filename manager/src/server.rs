@@ -2,16 +2,21 @@
 //! the token guard. Everything it runs goes through [`Tools`]: `bana` and the
 //! GitHub CLI, with arguments checked here first.
 //!
-//! In daemon mode ([`daemon_router`]) the same page and pool routes, plus the
-//! daemon's: its summary, the builds and their logs, what the page's buttons
-//! do, the fixes Fix with Claude makes, and their rounds (run_jobs). Those
-//! call [`Daemon`]'s methods, with numeric ids, refs among the heads fetched,
-//! tiers from the settings, fixes by their commit's hex digits and jobs by
-//! their ids.
+//! In daemon mode ([`daemon_router`]) the same page; its health and the
+//! projects ([`Registry`]); and under `/ci/v1/p/<prefix>/` each project's
+//! routes ([`project_router`]): the pool's, and the daemon's: its summary,
+//! the builds and their logs, what the page's buttons do, the fixes Fix with
+//! Claude makes, and their rounds (run_jobs), and the releases bana asks
+//! about. Those call [`Daemon`]'s methods, with numeric ids, refs among the
+//! heads fetched, tiers from the settings, fixes by their commit's hex
+//! digits, jobs by their ids and releases by their tags.
 
 use crate::daemon::{Daemon, RoundError, ROUND_WAIT};
 use crate::fix;
 use crate::guard::{err, guarded, health, Access};
+use crate::registry::Registry;
+use crate::release;
+use crate::upgrade;
 use crate::{
     attach_jobs, parse_local, parse_pool, parse_runs, runs_to_detail, valid_ref, valid_runner,
     valid_tier, Local, PoolRunner, RunView,
@@ -20,7 +25,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
+    routing::{any, get, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -486,17 +491,40 @@ async fn page() -> Response {
 
 /// The page at `/`, the API at `/ci/v1`, behind the guard.
 pub fn router(m: Arc<Manager>, access: Arc<Access>) -> Router {
-    app(m, None, access)
+    let api = pool_routes(m).merge(health("ci", 1));
+    guarded(
+        Router::new().route("/", get(page)).nest("/ci/v1", api),
+        access,
+    )
 }
 
-/// The daemon's: the manager's routes, the daemon's, and a health that says
-/// which project's daemon answers.
-pub fn daemon_router(m: Arc<Manager>, d: Daemon, access: Arc<Access>) -> Router {
-    app(m, Some(d), access)
-}
-
-fn app(m: Arc<Manager>, d: Option<Daemon>, access: Arc<Access>) -> Router {
+/// The one daemon's: the page, a health that says it serves the machine,
+/// the projects, and each project's routes under `/ci/v1/p/<prefix>/`.
+pub fn daemon_router(r: Arc<Registry>, access: Arc<Access>) -> Router {
     let api = Router::new()
+        .route("/health", get(daemon_health))
+        .route("/projects", get(projects).post(rescan))
+        .route("/p/{prefix}/local", get(project_local))
+        .route("/p/{prefix}/{*rest}", any(forward))
+        .with_state(r);
+    guarded(
+        Router::new().route("/", get(page)).nest("/ci/v1", api),
+        access,
+    )
+}
+
+/// A project's routes, as `/ci/v1/p/<prefix>/…` reaches them: the pool's
+/// (its repo's runners and runs) and its daemon's.
+pub fn project_router(d: Daemon) -> Router {
+    let m = Manager::new(
+        Tools::from_settings(d.settings()),
+        d.settings().machine.clone(),
+    );
+    pool_routes(m).merge(local_routes(d))
+}
+
+fn pool_routes(m: Arc<Manager>) -> Router {
+    Router::new()
         .route("/state", get(state))
         .route("/pool/join", post(join))
         .route("/pool/leave", post(leave))
@@ -504,27 +532,118 @@ fn app(m: Arc<Manager>, d: Option<Daemon>, access: Arc<Access>) -> Router {
         .route("/runs", post(start_run))
         .route("/runs/{id}/cancel", post(cancel_run))
         .route("/tasks/{id}", get(task))
-        .with_state(m);
-    let api = match d {
-        None => api.merge(health("ci", 1)),
-        Some(d) => api.merge(local_routes(d)),
+        .with_state(m)
+}
+
+type R = State<Arc<Registry>>;
+
+/// Open: `bana` looks for it, and a daemon starting asks it.
+/// Its version and pid tell `bana daemon install` that the new daemon runs.
+/// "latest": a newer bana's tag, when one is out.
+async fn daemon_health(State(r): R) -> Json<Value> {
+    let m = r.machine();
+    let mut h = json!({"ok": true, "service": "ci", "api": 1, "daemon": true, "global": true,
+        "version": env!("CARGO_PKG_VERSION"), "pid": std::process::id(),
+        "port": m.port, "machine": m.machine, "projects": r.prefixes()});
+    latest(&r, &mut h);
+    Json(h)
+}
+
+/// A newer bana's tag, and its release page, when one is out.
+fn latest(r: &Registry, v: &mut Value) {
+    if let Some(l) = r.latest() {
+        let env = std::env::var("BANA_RELEASES").ok();
+        let releases =
+            upgrade::releases(env.as_deref()).unwrap_or_else(|| upgrade::RELEASES.into());
+        v["latest_url"] = json!(format!("{releases}/tag/{l}"));
+        v["latest"] = json!(l);
+    }
+}
+
+/// The projects as JSON, one a line: the shell reads it with sed.
+fn rows(rows: Vec<Value>) -> Response {
+    let lines: Vec<String> = rows.iter().map(Value::to_string).collect();
+    let body = match lines.is_empty() {
+        true => "[]\n".to_string(),
+        false => format!("[\n{}\n]\n", lines.join(",\n")),
     };
-    guarded(
-        Router::new().route("/", get(page)).nest("/ci/v1", api),
-        access,
-    )
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+/// Each project: its repo, checkout, pause, error, queue, running and last build.
+async fn projects(State(r): R) -> Response {
+    rows(r.rows())
+}
+
+/// Reads the projects' files again (bana add, remove, pause and resume),
+/// once that is done: the projects.
+async fn rescan(State(r): R) -> Response {
+    r.scan().await;
+    rows(r.rows())
+}
+
+/// `/ci/v1/p/<prefix>/<rest>`: project `prefix`'s `/<rest>`, as a request
+/// of its own (its handlers see their own path, and nothing of this one's).
+async fn forward(State(r): R, req: axum::extract::Request) -> Response {
+    use tower::ServiceExt;
+    let path = req.uri().path();
+    let Some((prefix, rest)) = path
+        .strip_prefix("/ci/v1")
+        .unwrap_or(path)
+        .strip_prefix("/p/")
+        .and_then(|p| p.split_once('/'))
+    else {
+        return err(StatusCode::NOT_FOUND, "no such route");
+    };
+    let routes = match r.routes(prefix) {
+        None => return err(StatusCode::NOT_FOUND, format!("no project {prefix}")),
+        Some(Err(why)) => return err(StatusCode::SERVICE_UNAVAILABLE, format!("{prefix}: {why}")),
+        Some(Ok(routes)) => routes,
+    };
+    let uri = match req.uri().query() {
+        Some(q) => format!("/{rest}?{q}"),
+        None => format!("/{rest}"),
+    };
+    let Ok(uri) = uri.parse::<axum::http::Uri>() else {
+        return err(StatusCode::BAD_REQUEST, "a bad path");
+    };
+    let (parts, body) = req.into_parts();
+    let mut inner = axum::extract::Request::new(body);
+    *inner.method_mut() = parts.method;
+    *inner.uri_mut() = uri;
+    *inner.version_mut() = parts.version;
+    *inner.headers_mut() = parts.headers;
+    match routes.oneshot(inner).await {
+        Ok(res) => res,
+        Err(e) => match e {},
+    }
+}
+
+/// A project's summary ([`local`]), with a newer bana's tag when one is out.
+async fn project_local(
+    State(r): R,
+    Path(prefix): Path<String>,
+    req: axum::extract::Request,
+) -> Response {
+    let Some(d) = r.daemon(&prefix) else {
+        return forward(State(r), req).await;
+    };
+    let mut v = local_view(&d);
+    latest(&r, &mut v);
+    Json(v).into_response()
 }
 
 type D = State<Daemon>;
 
 fn local_routes(d: Daemon) -> Router {
     Router::new()
-        .route("/health", get(daemon_health))
+        .route("/health", get(project_health))
         .route("/local", get(local))
         .route("/builds", get(builds).post(run_now))
         .route("/builds/{id}", get(build))
         .route("/builds/{id}/log", get(build_log))
         .route("/builds/{id}/report", get(build_report))
+        .route("/builds/{id}/files/{name}", get(build_file))
         .route("/builds/{id}/cancel", post(cancel_build))
         .route("/builds/{id}/rerun", post(rerun))
         .route("/builds/{id}/fix", post(fix_build))
@@ -540,11 +659,100 @@ fn local_routes(d: Daemon) -> Router {
         .route("/daemon", post(set_daemon))
         .route("/daemon/poll", post(poll))
         .route("/queue/clear", post(clear_queue))
+        .route("/releases", get(releases))
+        .route("/releases/{tag}", get(release_state))
+        .route("/releases/{tag}/notes", put(release_notes))
+        .route("/releases/{tag}/publish", post(publish_release))
+        .route("/releases/{tag}/dismiss", post(dismiss_release))
         .with_state(d)
 }
 
-/// Open, like the manager's: `bana manager` and `bana daemon` look for it.
-async fn daemon_health(State(d): D) -> Json<Value> {
+/// The releases, the newest first.
+async fn releases(State(d): D) -> Json<Value> {
+    Json(json!({ "releases": d.releases() }))
+}
+
+fn no_release(tag: &str) -> Response {
+    err(StatusCode::NOT_FOUND, format!("no release {tag}"))
+}
+
+fn release_error(e: release::Error) -> Response {
+    match e {
+        release::Error::Missing(m) => err(StatusCode::NOT_FOUND, m),
+        release::Error::Refused(m) => err(StatusCode::CONFLICT, m),
+        release::Error::Bad(m) => err(StatusCode::BAD_REQUEST, m),
+    }
+}
+
+/// One release: its record, its build's files and CI report table, the
+/// changes since the previous release, the notes with their rev and check.
+async fn release_state(State(d): D, Path(tag): Path<String>) -> Response {
+    if !release::valid_tag(&tag) {
+        return no_release(&tag);
+    }
+    match d.release(&tag) {
+        Some(v) => Json(v).into_response(),
+        None => no_release(&tag),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SaveNotes {
+    notes: String,
+    #[serde(default)]
+    title: Option<String>,
+    rev: u64,
+    /// `you` (the page), or `claude` (the MCP).
+    #[serde(default)]
+    source: Option<String>,
+}
+
+/// Saves the notes over those at `rev`: {rev, missing_prs, outside_range,
+/// duplicated}. 409 for a stale rev, or a release publishing or published.
+async fn release_notes(State(d): D, Path(tag): Path<String>, Json(b): Json<SaveNotes>) -> Response {
+    if !release::valid_tag(&tag) {
+        return no_release(&tag);
+    }
+    let source = b.source.as_deref().unwrap_or("you");
+    match d.save_notes(&tag, &b.notes, b.title.as_deref(), b.rev, source) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => release_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Publish {
+    rev: u64,
+}
+
+/// The owner's yes: 202, and the publish runs. 409 unless bana asks about
+/// it (or it failed, or was dismissed), the rev is the notes' now, and no
+/// other publish runs.
+async fn publish_release(State(d): D, Path(tag): Path<String>, Json(b): Json<Publish>) -> Response {
+    if !release::valid_tag(&tag) {
+        return no_release(&tag);
+    }
+    match d.publish_release(&tag, b.rev) {
+        Ok(v) => (StatusCode::ACCEPTED, Json(v)).into_response(),
+        Err(e) => release_error(e),
+    }
+}
+
+/// Not now.
+async fn dismiss_release(State(d): D, Path(tag): Path<String>) -> Response {
+    if !release::valid_tag(&tag) {
+        return no_release(&tag);
+    }
+    match d.dismiss_release(&tag) {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => release_error(e),
+    }
+}
+
+/// Which project answers.
+async fn project_health(State(d): D) -> Json<Value> {
     let s = d.settings();
     Json(
         json!({"ok": true, "service": "ci", "api": 1, "daemon": true, "repo": s.repo, "prefix": s.prefix}),
@@ -553,12 +761,16 @@ async fn daemon_health(State(d): D) -> Json<Value> {
 
 /// The summary, and what Run now may offer: the refs fetched and the tiers.
 async fn local(State(d): D) -> Json<Value> {
+    Json(local_view(&d))
+}
+
+fn local_view(d: &Daemon) -> Value {
     let mut v = json!(d.summary());
     v["refs"] = json!(d.heads().keys().collect::<Vec<_>>());
     v["tiers"] = json!(d.settings().tiers);
     v["skipped"] = json!(d.skipped().iter().rev().take(20).collect::<Vec<_>>());
     v["port"] = json!(d.settings().port);
-    Json(v)
+    v
 }
 
 #[derive(Deserialize)]
@@ -629,6 +841,32 @@ async fn build_report(State(d): D, Path(id): Path<u64>) -> Response {
             Json(json!({"build": id, "markdown": r.markdown, "standards": r.standards}))
                 .into_response()
         }
+    }
+}
+
+/// One of a build's collected files, to download: only a name its dist
+/// lists (no path, no `..`).
+async fn build_file(State(d): D, Path((id, name)): Path<(u64, String)>) -> Response {
+    let Some(path) = d.file(id, &name) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            format!("build {id} has no file {name}"),
+        );
+    };
+    match tokio::task::spawn_blocking(move || std::fs::read(path)).await {
+        Ok(Ok(bytes)) => (
+            [
+                (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{name}\""),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, format!("{name}: {e}")),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
@@ -1012,6 +1250,35 @@ mod tests {
 
     const TOKEN: &str = "ci0123456789abcdef0123456789abcd";
 
+    /// The page asks the project it shows (`#p=`), and every link it writes
+    /// keeps it: none goes to a bare `#build=` or `#release=`.
+    #[test]
+    fn the_page_asks_and_links_the_project_it_shows() {
+        let page = include_str!("page.html");
+        let script = &page[page.find("<script>").unwrap()..];
+        assert!(script.contains(r#""/ci/v1/p/" + encodeURIComponent(project)"#));
+        assert!(script.contains(r#"get("p")"#));
+        assert!(
+            script.contains(r#"h.set("p", project)"#),
+            "Publish keeps it"
+        );
+        assert!(
+            script.contains(r#"fetch("/ci/v1/projects""#),
+            "the picker's rows"
+        );
+        for bare in [
+            r##""#build="##,
+            r##"href="#build"##,
+            r##"href="#release"##,
+            r#"hash = "build="#,
+        ] {
+            assert!(!script.contains(bare), "{bare}");
+        }
+        assert!(page.contains("Pause automatic builds") && !page.contains("Pause new builds"));
+        assert!(page.contains("No projects yet: run bana add in a project's checkout."));
+        assert!(page.contains("Run bana add in its checkout, or bana remove"));
+    }
+
     /// A manager over stand-in programs: a `bana` that reports one busy runner
     /// and a USB audio device, and a GitHub CLI that is not signed in, or one
     /// that echoes what it was asked (`gh_echo`).
@@ -1290,9 +1557,8 @@ esac"#,
     async fn daemon_app(name: &str) -> (Project, Daemon, Router) {
         let p = Project::new(name);
         let d = start_daemon(&p, "").await;
-        let m = Manager::new(Tools::from_settings(d.settings()), "t".into());
         let access = Arc::new(Access::loopback(TOKEN, 8470, &["/ci/v1/"]));
-        let app = daemon_router(m, d.clone(), access);
+        let app = daemon_router(Registry::of(vec![d.clone()]), access);
         (p, d, app)
     }
 
@@ -1327,39 +1593,324 @@ esac"#,
             .collect()
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_builds_files_are_served_by_their_names_only() {
+        let (p, d, app) = daemon_app("srv-files").await;
+        p.commit("files", "packages");
+        p.push("main");
+        assert_eq!(
+            call(&app, "POST", "/ci/v1/p/p/daemon/poll", None, true)
+                .await
+                .0,
+            200
+        );
+        let rec = built(&d, 1).await;
+        assert_eq!(rec.dist.map(|d| d.files.len()), Some(4));
+        let get = |path: String, token: bool| {
+            let app = app.clone();
+            async move {
+                let mut b = axum::http::Request::builder()
+                    .uri(path)
+                    .header(header::HOST, "127.0.0.1:8470");
+                if token {
+                    b = b.header(header::AUTHORIZATION, format!("Bearer {TOKEN}"));
+                }
+                let r = app.oneshot(b.body(Body::empty()).unwrap()).await.unwrap();
+                let code = r.status().as_u16();
+                let h = r.headers().clone();
+                let bytes = r.into_body().collect().await.unwrap().to_bytes();
+                (code, h, bytes.to_vec())
+            }
+        };
+        let (code, h, body) = get("/ci/v1/p/p/builds/1/files/install.sh".into(), true).await;
+        assert_eq!((code, body), (200, b"#!/bin/sh\n".to_vec()));
+        assert_eq!(h[header::CONTENT_TYPE], "application/octet-stream");
+        assert_eq!(
+            h[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"install.sh\""
+        );
+        let (code, v) = call(&app, "GET", "/ci/v1/p/p/builds/1", None, true).await;
+        assert_eq!(code, 200);
+        assert_eq!(v["dist"]["files"][1]["platform"], "linux-x64", "{v}");
+        assert_eq!(
+            get("/ci/v1/p/p/builds/1/files/install.sh".into(), false)
+                .await
+                .0,
+            401
+        );
+        for name in [
+            "..%2Fbuild.json",
+            "..",
+            "%2E%2E%2Fact.jsonl",
+            "act.jsonl",
+            "install.sh%00",
+            "INSTALL.SH",
+        ] {
+            let (code, ..) = get(format!("/ci/v1/p/p/builds/1/files/{name}"), true).await;
+            assert_eq!(code, 404, "{name}");
+        }
+        assert_eq!(
+            get("/ci/v1/p/p/builds/1/files/../build.json".into(), true)
+                .await
+                .0,
+            404
+        );
+        assert_eq!(
+            get("/ci/v1/p/p/builds/9/files/install.sh".into(), true)
+                .await
+                .0,
+            404
+        );
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_release_is_read_edited_answered_and_published_through_its_routes() {
+        let p = Project::new("srv-release");
+        let d = start_daemon(&p, "daemon.tags = v*\n").await;
+        let access = Arc::new(Access::loopback(TOKEN, 8470, &["/ci/v1/"]));
+        let app = daemon_router(Registry::of(vec![d.clone()]), access);
+        p.commit("files", "packages");
+        p.tag("v0.1.0");
+        assert_eq!(
+            call(&app, "POST", "/ci/v1/p/p/daemon/poll", None, true)
+                .await
+                .0,
+            200
+        );
+        until("its release to ask", || {
+            d.release("v0.1.0")
+                .is_some_and(|v| v["state"] == "asking" && v["seeded"] == true)
+        })
+        .await;
+        let (code, v) = call(&app, "GET", "/ci/v1/p/p/releases", None, true).await;
+        assert_eq!(
+            (code, &v["releases"][0]["tag"]),
+            (200, &json!("v0.1.0")),
+            "{v}"
+        );
+        let (code, v) = call(&app, "GET", "/ci/v1/p/p/releases/v0.1.0", None, true).await;
+        assert_eq!(
+            (code, &v["state"], &v["notes"]["rev"]),
+            (200, &json!("asking"), &json!(1))
+        );
+        let page = format!("http://127.0.0.1:8470/#p={}&release=v0.1.0", p.prefix);
+        assert_eq!(v["page_url"], json!(page));
+        let (code, l) = call(&app, "GET", "/ci/v1/p/p/local", None, true).await;
+        assert_eq!(
+            (code, &l["release"]["state"]),
+            (200, &json!("asking")),
+            "{l}"
+        );
+        for bad in ["..", "v1%2Fx", "-v1", "v1%5E%7B%7D", "nope"] {
+            let (code, _) = call(
+                &app,
+                "GET",
+                &format!("/ci/v1/p/p/releases/{bad}"),
+                None,
+                true,
+            )
+            .await;
+            assert_eq!(code, 404, "{bad}");
+        }
+        let put = |body: Value| {
+            let app = app.clone();
+            async move {
+                call(
+                    &app,
+                    "PUT",
+                    "/ci/v1/p/p/releases/v0.1.0/notes",
+                    Some(body),
+                    true,
+                )
+                .await
+            }
+        };
+        let (code, v) = put(json!({"notes": "- Faster (#7)", "rev": 0})).await;
+        assert_eq!(code, 409, "a stale rev: {v}");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("read it, then save over it"),
+            "{v}"
+        );
+        let big = "x".repeat(release::NOTES_MAX + 1);
+        assert_eq!(put(json!({"notes": big, "rev": 1})).await.0, 400);
+        assert_eq!(
+            put(json!({"notes": "x", "rev": 1, "source": "gh"})).await.0,
+            400
+        );
+        assert_eq!(
+            put(json!({"notes": "x", "rev": 1, "extra": 1})).await.0,
+            422
+        );
+        let (code, v) =
+            put(json!({"notes": "- Faster (#7)\n- #7 again", "rev": 1, "source": "claude"})).await;
+        assert_eq!(code, 200, "{v}");
+        assert_eq!(
+            (
+                &v["rev"],
+                &v["missing_prs"],
+                &v["outside_range"],
+                &v["duplicated"]
+            ),
+            (&json!(2), &json!([]), &json!([7]), &json!([7]))
+        );
+        let (_, v) = call(&app, "GET", "/ci/v1/p/p/releases/v0.1.0", None, true).await;
+        assert_eq!(
+            (&v["notes"]["source"], &v["check"]["outside_range"]),
+            (&json!("claude"), &json!([7]))
+        );
+        assert_eq!(v["notes"]["text"], "- Faster (#7)\n- #7 again");
+        // The title Publish gives: the notes', else `<install.name> <tag>`.
+        let default = format!("{} v0.1.0", d.settings().prefix);
+        assert_eq!(
+            (&v["title"], &v["default_title"]),
+            (&json!(default), &json!(default))
+        );
+
+        // Not now, then Publish after all: 409 for a stale rev, 202 with the one seen.
+        let post = |path: &'static str, body: Option<Value>| {
+            let app = app.clone();
+            async move { call(&app, "POST", path, body, true).await }
+        };
+        assert_eq!(
+            post("/ci/v1/p/p/releases/v0.1.0/dismiss", None).await.0,
+            200
+        );
+        assert_eq!(
+            post("/ci/v1/p/p/releases/v0.1.0/dismiss", None).await.0,
+            409
+        );
+        assert_eq!(
+            call(&app, "GET", "/ci/v1/p/p/local", None, true).await.1["release"],
+            Value::Null
+        );
+        assert_eq!(
+            post(
+                "/ci/v1/p/p/releases/v0.9.0/publish",
+                Some(json!({"rev": 2}))
+            )
+            .await
+            .0,
+            404
+        );
+        assert_eq!(
+            post(
+                "/ci/v1/p/p/releases/v0.1.0/publish",
+                Some(json!({"rev": 1}))
+            )
+            .await
+            .0,
+            409
+        );
+        let (code, v) = post(
+            "/ci/v1/p/p/releases/v0.1.0/publish",
+            Some(json!({"rev": 2})),
+        )
+        .await;
+        assert_eq!((code, &v["state"]), (202, &json!("publishing")), "{v}");
+        until("published", || {
+            d.release("v0.1.0")
+                .is_some_and(|v| v["state"] == "published")
+        })
+        .await;
+        let (code, v) = post(
+            "/ci/v1/p/p/releases/v0.1.0/publish",
+            Some(json!({"rev": 2})),
+        )
+        .await;
+        assert_eq!(code, 409, "{v}");
+        assert_eq!(put(json!({"notes": "late", "rev": 2})).await.0, 409);
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test]
+    async fn health_reports_version_and_pid() {
+        let (p, d, app) = daemon_app("srv-health").await;
+        let (code, h) = call(&app, "GET", "/ci/v1/health", None, false).await;
+        assert_eq!(code, 200, "{h}");
+        assert_eq!(h["version"], env!("CARGO_PKG_VERSION"), "{h}");
+        assert_eq!(h["pid"], std::process::id(), "{h}");
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test]
+    async fn health_has_latest_when_set() {
+        let p = Project::new("srv-latest");
+        let d = start_daemon(&p, "").await;
+        let r = Registry::of(vec![d.clone()]);
+        let access = Arc::new(Access::loopback(TOKEN, 8470, &["/ci/v1/"]));
+        let app = daemon_router(r.clone(), access);
+        let (_, h) = call(&app, "GET", "/ci/v1/health", None, false).await;
+        assert!(h.get("latest").is_none(), "{h}");
+        let (_, l) = call(&app, "GET", "/ci/v1/p/p/local", None, true).await;
+        assert!(l.get("latest").is_none() && l["tiers"].is_array(), "{l}");
+        r.found_latest(&Ok(Some("v9.9.9".into())));
+        let (_, h) = call(&app, "GET", "/ci/v1/health", None, false).await;
+        assert_eq!(h["latest"], "v9.9.9", "{h}");
+        assert!(
+            h["latest_url"].as_str().unwrap().ends_with("/tag/v9.9.9"),
+            "{h}"
+        );
+        let (code, l) = call(&app, "GET", "/ci/v1/p/p/local", None, true).await;
+        assert_eq!((code, &l["latest"]), (200, &json!("v9.9.9")), "{l}");
+        assert!(l["tiers"].is_array(), "the summary still: {l}");
+        r.found_latest(&Err("offline".into()));
+        let (_, h) = call(&app, "GET", "/ci/v1/health", None, false).await;
+        assert_eq!(h["latest"], "v9.9.9", "a failed check keeps it: {h}");
+        let (code, _) = call(&app, "GET", "/ci/v1/p/nope/local", None, true).await;
+        assert_eq!(code, 404);
+        d.shutdown().await;
+        p.remove();
+    }
+
     #[tokio::test]
     async fn daemon_routes_need_the_token_a_known_host_and_no_foreign_origin() {
         let (p, d, app) = daemon_app("srv-guard").await;
         let (code, h) = call(&app, "GET", "/ci/v1/health", None, false).await;
         assert_eq!(code, 200, "{h}");
         assert_eq!(
-            (&h["daemon"], &h["repo"], &h["prefix"]),
-            (&json!(true), &json!("o/r"), &json!(d.settings().prefix))
+            (&h["daemon"], &h["global"], &h["projects"]),
+            (&json!(true), &json!(true), &json!(["p"]))
         );
         for (method, path) in [
-            ("GET", "/ci/v1/local"),
-            ("GET", "/ci/v1/builds"),
-            ("GET", "/ci/v1/builds/1"),
-            ("GET", "/ci/v1/builds/1/log?from=0"),
-            ("GET", "/ci/v1/builds/1/report"),
-            ("POST", "/ci/v1/builds"),
-            ("POST", "/ci/v1/builds/1/cancel"),
-            ("POST", "/ci/v1/builds/1/rerun"),
-            ("POST", "/ci/v1/builds/1/fix"),
-            ("GET", "/ci/v1/fixes"),
-            ("GET", "/ci/v1/fixes/abcd123"),
-            ("POST", "/ci/v1/fixes"),
-            ("POST", "/ci/v1/fixes/abcd123/rounds"),
-            ("GET", "/ci/v1/fixes/abcd123/rounds/0?wait=55"),
-            ("POST", "/ci/v1/fixes/abcd123/more"),
-            ("POST", "/ci/v1/fixes/abcd123/keep"),
-            ("POST", "/ci/v1/fixes/abcd123/push"),
-            ("POST", "/ci/v1/fixes/abcd123/drop"),
-            ("POST", "/ci/v1/fixes/abcd123/forget"),
-            ("POST", "/ci/v1/daemon"),
-            ("POST", "/ci/v1/daemon/poll"),
-            ("POST", "/ci/v1/queue/clear"),
-            ("GET", "/ci/v1/state"),
+            ("GET", "/ci/v1/projects"),
+            ("POST", "/ci/v1/projects"),
+            ("GET", "/ci/v1/p/p/health"),
+            ("GET", "/ci/v1/p/p/local"),
+            ("GET", "/ci/v1/p/p/builds"),
+            ("GET", "/ci/v1/p/p/builds/1"),
+            ("GET", "/ci/v1/p/p/builds/1/log?from=0"),
+            ("GET", "/ci/v1/p/p/builds/1/report"),
+            ("GET", "/ci/v1/p/p/builds/1/files/install.sh"),
+            ("POST", "/ci/v1/p/p/builds"),
+            ("POST", "/ci/v1/p/p/builds/1/cancel"),
+            ("POST", "/ci/v1/p/p/builds/1/rerun"),
+            ("POST", "/ci/v1/p/p/builds/1/fix"),
+            ("GET", "/ci/v1/p/p/fixes"),
+            ("GET", "/ci/v1/p/p/fixes/abcd123"),
+            ("POST", "/ci/v1/p/p/fixes"),
+            ("POST", "/ci/v1/p/p/fixes/abcd123/rounds"),
+            ("GET", "/ci/v1/p/p/fixes/abcd123/rounds/0?wait=55"),
+            ("POST", "/ci/v1/p/p/fixes/abcd123/more"),
+            ("POST", "/ci/v1/p/p/fixes/abcd123/keep"),
+            ("POST", "/ci/v1/p/p/fixes/abcd123/push"),
+            ("POST", "/ci/v1/p/p/fixes/abcd123/drop"),
+            ("POST", "/ci/v1/p/p/fixes/abcd123/forget"),
+            ("POST", "/ci/v1/p/p/daemon"),
+            ("POST", "/ci/v1/p/p/daemon/poll"),
+            ("POST", "/ci/v1/p/p/queue/clear"),
+            ("GET", "/ci/v1/p/p/releases"),
+            ("GET", "/ci/v1/p/p/releases/v0.1.0"),
+            ("PUT", "/ci/v1/p/p/releases/v0.1.0/notes"),
+            ("POST", "/ci/v1/p/p/releases/v0.1.0/publish"),
+            ("POST", "/ci/v1/p/p/releases/v0.1.0/dismiss"),
+            ("GET", "/ci/v1/p/p/state"),
         ] {
             let what = format!("{method} {path}");
             assert_eq!(call(&app, method, path, None, false).await.0, 401, "{what}");
@@ -1368,7 +1919,7 @@ esac"#,
             assert_eq!(from("127.0.0.1:8470", evil).await, 403, "{what}");
             assert_eq!(from("evil.example:8470", None).await, 421, "{what}");
         }
-        let (code, v) = call(&app, "GET", "/ci/v1/local", None, true).await;
+        let (code, v) = call(&app, "GET", "/ci/v1/p/p/local", None, true).await;
         assert_eq!(code, 200, "{v}");
         assert_eq!(v["repo"], "o/r");
         assert_eq!(v["tiers"], json!(["quick", "nightly"]));
@@ -1383,12 +1934,11 @@ esac"#,
         // Over a real socket, as a second daemon asks before it takes the port.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let m = Manager::new(Tools::from_settings(d.settings()), "t".into());
         let access = Arc::new(Access::loopback(TOKEN, port, &["/ci/v1/"]));
-        let served = daemon_router(m, d.clone(), access);
+        let served = daemon_router(Registry::of(vec![d.clone()]), access);
         let server = tokio::spawn(async move { axum::serve(listener, served).await });
         let h = health_at(port).await.expect("health");
-        assert_eq!((&h["daemon"], &h["repo"]), (&json!(true), &json!("o/r")));
+        assert_eq!((&h["daemon"], &h["global"]), (&json!(true), &json!(true)));
         server.abort();
         let _ = server.await;
         assert_eq!(health_at(port).await, None, "nobody answers");
@@ -1403,8 +1953,11 @@ esac"#,
             let app = app.clone();
             async move { call(&app, "POST", path, body, true).await }
         };
-        let (code, v) = post("/ci/v1/daemon", Some(json!({"paused": true}))).await;
+        let (code, v) = post("/ci/v1/p/p/daemon", Some(json!({"paused": true}))).await;
         assert_eq!((code, &v["paused"]), (200, &json!(true)), "{v}");
+        // A pause holds pushes only: Docker holds the rest.
+        let docker_down = p.flag("docker-down");
+        std::fs::write(&docker_down, "").unwrap();
 
         // Run now takes a head fetched and a tier from the settings, nothing else.
         for (body, why) in [
@@ -1414,32 +1967,33 @@ esac"#,
             (json!({"ref": "--help", "tier": "quick"}), "ref"),
             (json!({"ref": "main", "tier": "a b"}), "tier"),
         ] {
-            let (code, v) = post("/ci/v1/builds", Some(body.clone())).await;
+            let (code, v) = post("/ci/v1/p/p/builds", Some(body.clone())).await;
             assert_eq!(code, 400, "{body}: {v}");
             assert!(v["error"].as_str().unwrap().contains(why), "{body}: {v}");
         }
         let (code, v) = post(
-            "/ci/v1/builds",
+            "/ci/v1/p/p/builds",
             Some(json!({"ref": "main", "tier": "quick"})),
         )
         .await;
         assert_eq!(code, 200, "{v}");
         let queued = v["build"].as_u64().unwrap();
-        let (_, l) = call(&app, "GET", "/ci/v1/local", None, true).await;
+        let (_, l) = call(&app, "GET", "/ci/v1/p/p/local", None, true).await;
         assert_eq!(l["watcher"]["paused"], true);
         assert_eq!(l["queue"][0]["id"], queued, "{l}");
         assert_eq!(l["queue"][0]["trigger"], "manual");
-        until("the queue to wait for the pause", || {
-            d.summary().queue.first().and_then(|q| q.waiting.clone()) == Some("paused".into())
+        until("the queue to wait for Docker", || {
+            d.summary().queue.first().and_then(|q| q.waiting.clone())
+                == Some("waiting for Docker".into())
         })
         .await;
-        let cancel = format!("/ci/v1/builds/{queued}/cancel");
+        let cancel = format!("/ci/v1/p/p/builds/{queued}/cancel");
         assert_eq!(call(&app, "POST", &cancel, None, true).await.0, 200);
-        let (_, l) = call(&app, "GET", "/ci/v1/local", None, true).await;
+        let (_, l) = call(&app, "GET", "/ci/v1/p/p/local", None, true).await;
         assert_eq!(l["queue"], json!([]), "removed");
         assert_eq!(call(&app, "POST", &cancel, None, true).await.0, 409);
         assert_eq!(
-            call(&app, "POST", "/ci/v1/builds/x/cancel", None, true)
+            call(&app, "POST", "/ci/v1/p/p/builds/x/cancel", None, true)
                 .await
                 .0,
             400
@@ -1447,35 +2001,40 @@ esac"#,
 
         for _ in 0..2 {
             post(
-                "/ci/v1/builds",
+                "/ci/v1/p/p/builds",
                 Some(json!({"ref": "refs/heads/main", "tier": "nightly"})),
             )
             .await;
         }
-        let (code, v) = post("/ci/v1/queue/clear", None).await;
+        let (code, v) = post("/ci/v1/p/p/queue/clear", None).await;
         assert_eq!((code, &v["cleared"]), (200, &json!(2)), "{v}");
 
         // A push of a two-entry matrix, built once resumed.
         p.commit("matrix", "two entries");
         p.push("main");
-        assert_eq!(post("/ci/v1/daemon/poll", None).await.0, 200);
+        assert_eq!(post("/ci/v1/p/p/daemon/poll", None).await.0, 200);
         until("the push to be queued", || d.summary().queue.len() == 1).await;
         let id = d.summary().queue[0].id;
-        post("/ci/v1/daemon", Some(json!({"paused": false}))).await;
+        std::fs::remove_file(&docker_down).unwrap();
+        until("the push to wait for the pause", || {
+            d.summary().queue.first().and_then(|q| q.waiting.clone()) == Some("paused".into())
+        })
+        .await;
+        post("/ci/v1/p/p/daemon", Some(json!({"paused": false}))).await;
         built(&d, id).await;
 
         until("statuses posted", || d.summary().watcher.unposted == 0).await;
-        let (_, v) = call(&app, "GET", "/ci/v1/builds", None, true).await;
+        let (_, v) = call(&app, "GET", "/ci/v1/p/p/builds", None, true).await;
         assert_eq!(v["builds"][0]["id"], id, "newest first: {v}");
         assert!(v["builds"][0]["posted"].as_u64() > Some(0), "{v}");
         assert_eq!(v["builds"][0]["unposted"], 0);
         assert_eq!(v["builds"][0]["trigger"], "push");
-        let (_, v) = call(&app, "GET", "/ci/v1/builds?limit=1", None, true).await;
+        let (_, v) = call(&app, "GET", "/ci/v1/p/p/builds?limit=1", None, true).await;
         assert_eq!(v["builds"].as_array().unwrap().len(), 1);
         let (_, v) = call(
             &app,
             "GET",
-            &format!("/ci/v1/builds?before={id}"),
+            &format!("/ci/v1/p/p/builds?before={id}"),
             None,
             true,
         )
@@ -1485,11 +2044,13 @@ esac"#,
             .unwrap()
             .iter()
             .all(|b| b["id"].as_u64() < Some(id)));
-        let (code, b) = call(&app, "GET", &format!("/ci/v1/builds/{id}"), None, true).await;
+        let (code, b) = call(&app, "GET", &format!("/ci/v1/p/p/builds/{id}"), None, true).await;
         assert_eq!(code, 200, "{b}");
         assert!(!b["listed"].as_array().unwrap().is_empty(), "{b}");
         assert_eq!(
-            call(&app, "GET", "/ci/v1/builds/999", None, true).await.0,
+            call(&app, "GET", "/ci/v1/p/p/builds/999", None, true)
+                .await
+                .0,
             404
         );
 
@@ -1497,7 +2058,7 @@ esac"#,
         let (code, r) = call(
             &app,
             "GET",
-            &format!("/ci/v1/builds/{id}/report"),
+            &format!("/ci/v1/p/p/builds/{id}/report"),
             None,
             true,
         )
@@ -1524,21 +2085,21 @@ esac"#,
         let (code, again) = call(
             &app,
             "GET",
-            &format!("/ci/v1/builds/{id}/report"),
+            &format!("/ci/v1/p/p/builds/{id}/report"),
             None,
             true,
         )
         .await;
         assert_eq!((code, &again["markdown"]), (200, &r["markdown"]), "{again}");
         assert!(kept.exists());
-        let (code, v) = call(&app, "GET", "/ci/v1/builds/999/report", None, true).await;
+        let (code, v) = call(&app, "GET", "/ci/v1/p/p/builds/999/report", None, true).await;
         assert_eq!(code, 404, "{v}");
         assert!(
             v["error"].as_str().unwrap().starts_with("no build 999"),
             "{v}"
         );
         assert_eq!(
-            call(&app, "GET", "/ci/v1/builds/999/log", None, true)
+            call(&app, "GET", "/ci/v1/p/p/builds/999/log", None, true)
                 .await
                 .0,
             404
@@ -1551,7 +2112,7 @@ esac"#,
                 let (code, v) = call(
                     &app,
                     "GET",
-                    &format!("/ci/v1/builds/{id}/log{q}"),
+                    &format!("/ci/v1/p/p/builds/{id}/log{q}"),
                     None,
                     true,
                 )
@@ -1597,7 +2158,7 @@ esac"#,
         let (code, v) = call(
             &app,
             "POST",
-            &format!("/ci/v1/builds/{id}/rerun"),
+            &format!("/ci/v1/p/p/builds/{id}/rerun"),
             None,
             true,
         )
@@ -1606,7 +2167,7 @@ esac"#,
         let again = v["build"].as_u64().unwrap();
         assert!(again > id);
         assert_eq!(
-            call(&app, "POST", "/ci/v1/builds/999/rerun", None, true)
+            call(&app, "POST", "/ci/v1/p/p/builds/999/rerun", None, true)
                 .await
                 .0,
             404
@@ -1615,7 +2176,7 @@ esac"#,
         let (code, v) = call(
             &app,
             "POST",
-            &format!("/ci/v1/builds/{again}/rerun"),
+            &format!("/ci/v1/p/p/builds/{again}/rerun"),
             None,
             true,
         )
@@ -1644,21 +2205,20 @@ esac"#,
         let p = Project::new("srv-fix");
         let extra = format!("checkout = {}\n", p.checkout().display());
         let d = start_daemon(&p, &extra).await;
-        let m = Manager::new(Tools::from_settings(d.settings()), "t".into());
         let access = Arc::new(Access::loopback(TOKEN, 8470, &["/ci/v1/"]));
-        let app = daemon_router(m, d.clone(), access);
+        let app = daemon_router(Registry::of(vec![d.clone()]), access);
         let mut shas = Vec::new();
         for (id, fixture) in [(1, "pass"), (2, "fail"), (3, "syntax")] {
             shas.push(p.commit(fixture, fixture));
             p.push("main");
-            call(&app, "POST", "/ci/v1/daemon/poll", None, true).await;
+            call(&app, "POST", "/ci/v1/p/p/daemon/poll", None, true).await;
             built(&d, id).await;
         }
         let (sha, sha7) = (&shas[1], &shas[1][..7]);
-        let (_, l) = call(&app, "GET", "/ci/v1/local", None, true).await;
+        let (_, l) = call(&app, "GET", "/ci/v1/p/p/local", None, true).await;
         assert_eq!(l["failed"], 2, "{l}");
 
-        let (code, v) = call(&app, "POST", "/ci/v1/builds/2/fix", None, true).await;
+        let (code, v) = call(&app, "POST", "/ci/v1/p/p/builds/2/fix", None, true).await;
         assert_eq!(code, 200, "{v}");
         assert_eq!(
             (&v["fix"], &v["branch"], &v["reused"]),
@@ -1686,7 +2246,7 @@ esac"#,
                 .starts_with(&format!("cd '{wt}' && claude -n 'bana fix {sha7}' ")),
             "{v}"
         );
-        let (code, again) = call(&app, "POST", "/ci/v1/builds/2/fix", None, true).await;
+        let (code, again) = call(&app, "POST", "/ci/v1/p/p/builds/2/fix", None, true).await;
         assert_eq!(code, 200, "{again}");
         assert_eq!(
             (&again["fix"], &again["worktree"], &again["reused"]),
@@ -1696,26 +2256,26 @@ esac"#,
 
         // Only a failed build has one.
         for (path, code, why) in [
-            ("/ci/v1/builds/1/fix", 409, "build 1 passed"),
+            ("/ci/v1/p/p/builds/1/fix", 409, "build 1 passed"),
             (
-                "/ci/v1/builds/3/fix",
+                "/ci/v1/p/p/builds/3/fix",
                 409,
                 "build 3 did not fail: could not start",
             ),
-            ("/ci/v1/builds/99/fix", 404, "no build 99"),
+            ("/ci/v1/p/p/builds/99/fix", 404, "no build 99"),
         ] {
             let (c, e) = call(&app, "POST", path, None, true).await;
             assert_eq!(c, code, "{path}: {e}");
             assert!(e["error"].as_str().unwrap().starts_with(why), "{path}: {e}");
         }
         assert_eq!(
-            call(&app, "POST", "/ci/v1/builds/x/fix", None, true)
+            call(&app, "POST", "/ci/v1/p/p/builds/x/fix", None, true)
                 .await
                 .0,
             400
         );
 
-        let (code, all) = call(&app, "GET", "/ci/v1/fixes", None, true).await;
+        let (code, all) = call(&app, "GET", "/ci/v1/p/p/fixes", None, true).await;
         assert_eq!(code, 200, "{all}");
         let f = &all["fixes"][0];
         assert_eq!(
@@ -1724,7 +2284,8 @@ esac"#,
             "{all}"
         );
         for name in [sha7, sha.as_str()] {
-            let (code, one) = call(&app, "GET", &format!("/ci/v1/fixes/{name}"), None, true).await;
+            let (code, one) =
+                call(&app, "GET", &format!("/ci/v1/p/p/fixes/{name}"), None, true).await;
             assert_eq!(code, 200, "{name}: {one}");
             assert_eq!((&one["fix"], &one["ahead"]), (&json!(sha7), &json!(0)));
             assert_eq!(one["link"], again["link"]);
@@ -1739,21 +2300,21 @@ esac"#,
             "ffff"
         };
         for (name, code) in [(other, 404), ("xyz1", 400), ("..%2Fx", 400), ("abc", 400)] {
-            let (c, e) = call(&app, "GET", &format!("/ci/v1/fixes/{name}"), None, true).await;
+            let (c, e) = call(&app, "GET", &format!("/ci/v1/p/p/fixes/{name}"), None, true).await;
             assert_eq!(c, code, "{name}: {e}");
         }
 
         // Round 0 ran at the failing commit; its long poll gives the result.
-        let path = format!("/ci/v1/fixes/{sha7}/rounds/0?wait=30");
+        let path = format!("/ci/v1/p/p/fixes/{sha7}/rounds/0?wait=30");
         let (code, r0) = call(&app, "GET", &path, None, true).await;
         assert_eq!(code, 200, "{r0}");
         assert_eq!((&r0["state"], &r0["sha"]), (&json!("failure"), &json!(sha)));
-        let (code, one) = call(&app, "GET", &format!("/ci/v1/fixes/{sha7}"), None, true).await;
+        let (code, one) = call(&app, "GET", &format!("/ci/v1/p/p/fixes/{sha7}"), None, true).await;
         assert_eq!(
             (code, &one["recheck"]["n"], &one["rounds_left"]),
             (200, &json!(0), &json!(5))
         );
-        let (_, b) = call(&app, "GET", "/ci/v1/builds", None, true).await;
+        let (_, b) = call(&app, "GET", "/ci/v1/p/p/builds", None, true).await;
         let round0 = b["builds"]
             .as_array()
             .unwrap()
@@ -1767,24 +2328,24 @@ esac"#,
 
         // Registered again, it has rounds: no second round 0.
         let reg = Some(json!({"fix": sha7}));
-        let (code, v) = call(&app, "POST", "/ci/v1/fixes", reg, true).await;
+        let (code, v) = call(&app, "POST", "/ci/v1/p/p/fixes", reg, true).await;
         assert_eq!((code, &v["recheck"]), (200, &Value::Null), "{v}");
         for (path, body, code) in [
-            ("/ci/v1/fixes", json!({"fix": other}), 404),
-            ("/ci/v1/fixes", json!({"fix": "x/y"}), 400),
-            ("/ci/v1/fixes", json!({"fix": sha7, "more": 1}), 422),
+            ("/ci/v1/p/p/fixes", json!({"fix": other}), 404),
+            ("/ci/v1/p/p/fixes", json!({"fix": "x/y"}), 400),
+            ("/ci/v1/p/p/fixes", json!({"fix": sha7, "more": 1}), 422),
             (
-                &format!("/ci/v1/fixes/{sha7}/rounds") as &str,
+                &format!("/ci/v1/p/p/fixes/{sha7}/rounds") as &str,
                 json!({"sha": "abc"}),
                 400,
             ),
             (
-                &format!("/ci/v1/fixes/{sha7}/rounds"),
+                &format!("/ci/v1/p/p/fixes/{sha7}/rounds"),
                 json!({"sha": "a".repeat(40)}),
                 409,
             ),
             (
-                &format!("/ci/v1/fixes/{other}/rounds"),
+                &format!("/ci/v1/p/p/fixes/{other}/rounds"),
                 json!({"sha": "a".repeat(40)}),
                 404,
             ),
@@ -1795,7 +2356,7 @@ esac"#,
         let (code, e) = call(
             &app,
             "GET",
-            &format!("/ci/v1/fixes/{sha7}/rounds/7"),
+            &format!("/ci/v1/p/p/fixes/{sha7}/rounds/7"),
             None,
             true,
         )
@@ -1804,7 +2365,7 @@ esac"#,
         let (code, m) = call(
             &app,
             "POST",
-            &format!("/ci/v1/fixes/{sha7}/more"),
+            &format!("/ci/v1/p/p/fixes/{sha7}/more"),
             None,
             true,
         )
@@ -1825,7 +2386,7 @@ esac"#,
                 .unwrap();
             assert!(ok.success());
         }
-        let keep = format!("/ci/v1/fixes/{sha7}/keep");
+        let keep = format!("/ci/v1/p/p/fixes/{sha7}/keep");
         let (code, e) = call(&app, "POST", &keep, Some(json!({"message": "why"})), true).await;
         assert_eq!(code, 409, "round 0 failed: {e}");
         std::fs::write(wt.join("fixture"), "pass").unwrap();
@@ -1841,13 +2402,13 @@ esac"#,
             .unwrap();
         assert!(ok.success());
         let body = Some(json!({"sha": snap.commit}));
-        let rounds = format!("/ci/v1/fixes/{sha7}/rounds");
+        let rounds = format!("/ci/v1/p/p/fixes/{sha7}/rounds");
         let (code, r1) = call(&app, "POST", &rounds, body, true).await;
         assert_eq!((code, &r1["round"]), (200, &json!(1)), "{r1}");
-        let path = format!("/ci/v1/fixes/{sha7}/rounds/1?wait=30");
+        let path = format!("/ci/v1/p/p/fixes/{sha7}/rounds/1?wait=30");
         let (_, r1) = call(&app, "GET", &path, None, true).await;
         assert_eq!(r1["state"], "success", "{r1}");
-        let (_, one) = call(&app, "GET", &format!("/ci/v1/fixes/{sha7}"), None, true).await;
+        let (_, one) = call(&app, "GET", &format!("/ci/v1/p/p/fixes/{sha7}"), None, true).await;
         assert_eq!(
             (&one["new_files"], &one["pushed"], &one["worktree_there"]),
             (&json!(["notes.txt"]), &json!(false), &json!(true)),
@@ -1871,7 +2432,7 @@ esac"#,
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&tree.stdout).trim(), snap.tree);
 
-        let push = format!("/ci/v1/fixes/{sha7}/push");
+        let push = format!("/ci/v1/p/p/fixes/{sha7}/push");
         let (code, pushed) = call(&app, "POST", &push, None, true).await;
         assert_eq!(code, 200, "{pushed}");
         assert_eq!(
@@ -1883,10 +2444,10 @@ esac"#,
                 ))
             )
         );
-        let (_, one) = call(&app, "GET", &format!("/ci/v1/fixes/{sha7}"), None, true).await;
+        let (_, one) = call(&app, "GET", &format!("/ci/v1/p/p/fixes/{sha7}"), None, true).await;
         assert_eq!((&one["pushed"], &one["ahead"]), (&json!(true), &json!(1)));
 
-        let drop = format!("/ci/v1/fixes/{sha7}/drop");
+        let drop = format!("/ci/v1/p/p/fixes/{sha7}/drop");
         std::fs::write(wt.join("scratch.txt"), "x").unwrap();
         let (code, e) = call(&app, "POST", &drop, Some(json!({})), true).await;
         assert_eq!(code, 409, "{e}");
@@ -1905,7 +2466,7 @@ esac"#,
             "the round builds go"
         );
         assert!(!wt.exists());
-        let (_, b) = call(&app, "GET", "/ci/v1/builds", None, true).await;
+        let (_, b) = call(&app, "GET", "/ci/v1/p/p/builds", None, true).await;
         assert!(
             b["builds"]
                 .as_array()
@@ -1931,7 +2492,7 @@ esac"#,
         let (code, _) = call(
             &app,
             "POST",
-            "/ci/v1/fixes/xyz1/drop",
+            "/ci/v1/p/p/fixes/xyz1/drop",
             Some(json!({})),
             true,
         )

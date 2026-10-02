@@ -1,0 +1,3 @@
+#!/bin/sh
+# Stand-in: logs itself only.
+echo "killall $*" >>"${FAKE_LOG:-/dev/null}"

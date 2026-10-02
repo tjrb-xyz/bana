@@ -1,11 +1,12 @@
-//! The daemon: bana's CI on push, on this machine. `bana-manager daemon --dir
-//! ~/.bana/<prefix>` fetches the project's own clone, queues the pushes the
-//! rules take ([`crate::watch`]), runs each through `bana ci` (act), one build
-//! at a time, folds act's log into the build ([`crate::actlog`]) and posts the
-//! commit statuses that say so through the GitHub CLI.
+//! The daemon: bana's CI on push, on this machine. A project's [`Daemon`]
+//! (in `~/.bana/<prefix>`) fetches the project's own clone, queues the pushes
+//! the rules take ([`crate::watch`]), runs each through `bana ci` (act), one
+//! build at a time, folds act's log into the build ([`crate::actlog`]) and
+//! posts the commit statuses that say so through the GitHub CLI.
 //!
 //! Three tasks share one state: the watcher (fetch, list the heads, decide),
-//! the runner (the gates, then one build) and the poster (statuses, in order,
+//! the runner (the gates, then one build; the registry's, for all the
+//! projects, under `bana-manager daemon`) and the poster (statuses, in order,
 //! the newest state per context). The page and the menu bar call [`Daemon`]'s
 //! methods and read its [`Summary`] from a watch channel.
 //!
@@ -17,6 +18,11 @@
 //! the job containers too. A build the daemon left running (a stop, a crash) is
 //! ended at the next start, and run again once if nothing moved on.
 //!
+//! A build of a tag at `daemon.tag_tier` makes the tag's release: bana finds
+//! the previous release and the changes since ([`crate::notes`]), asks when
+//! the build passed with files, and publishes on the owner's yes, never
+//! before ([`crate::release`]).
+//!
 //! A fix's rounds ([`crate::rounds`]) are builds too: one per failed job
 //! (`bana ci <tier> -j <job>`), with the fix's ref and before, at the failing
 //! commit (round 0, queued when the fix is made or registered) or at a
@@ -27,26 +33,42 @@
 //! since Claude's code runs in them. They are kept apart from the 100 builds,
 //! until their fix goes or 14 days after its last round.
 //!
+//! One daemon serves every project on the machine ([`crate::registry`]):
+//! each project added is one [`Daemon`], in `~/.bana/<prefix>`, and one
+//! runner runs their builds, one at a time.
+//!
 //! Under the directory:
-//! - `daemon/settings`: written by `bana daemon install` (below);
+//! - `daemon/settings`: written by `bana add` (below); while it is there, the
+//!   project is added;
+//! - `daemon/paused`: there while the owner has paused the project's
+//!   automatic builds (pushes);
 //! - `src/`: the clone builds check out, with `refs/bana/green/*` pins;
 //! - `state.json`: paused, the next id, the heads last seen, each ref's last
 //!   green head, the queue (ids), whether GitHub takes our target_url, and the
 //!   pushes not built;
 //! - `builds/<id>/`: `build.json` ([`Record`]), `jobs.txt` (`act -l`),
 //!   `event.json`, `act.jsonl` (act's lines, and bana's), `artifacts/`, and
-//!   `secrets` (0600) while act runs;
+//!   `secrets` (0600) while act runs; after a green build, `dist/`: what its
+//!   jobs uploaded ([`crate::artifacts`]) with the project's installer;
 //! - `act-cache/`: act's action cache;
 //! - `daemon.lock`: locked (flock) while a daemon runs here;
 //! - `vars`: optional, the owner's `KEY=value` lines for `vars.*`;
 //! - `fix/`: the fixes Fix with Claude made in the owner's checkout
 //!   ([`crate::fix`]): `<sha7>/`, the worktree, and `<sha7>.d/`, where the
 //!   daemon keeps `rounds.json`.
+//! - `releases/`: `<tag>.json`, a release a tag's build at the tag tier made
+//!   ([`crate::release`]); `<tag>.log`, what gh said when it was published,
+//!   and `<tag>.notes.md`, what went on GitHub.
 //!
 //! JSON goes to a temporary file, is synced, then renamed over the old one.
 //!
-//! The settings file has `key = value` lines; `#` starts a comment. A key not
-//! below is an error.
+//! The settings are `key = value` lines; `#` starts a comment. A key not
+//! below is an error. A project runs with the machine's file,
+//! `~/.bana/daemon.d/settings` (`bana daemon install` writes it), then its
+//! own, whose machine keys (port to bana_commit, but path) are left out
+//! ([`settings_text`]).
+//!
+//! The project's:
 //!
 //!   repo              owner/repo (required)
 //!   prefix            bana.conf's prefix (required)
@@ -63,6 +85,12 @@
 //!   daemon.token      gh (the jobs' GITHUB_TOKEN is gh's), or none (empty)
 //!   fix.rounds        5: rounds a fix may run after round 0 (More rounds adds as many)
 //!   fix.token         none (rounds get an empty token and act's offline mode), or gh
+//!   checkout          the owner's checkout (absolute), where Fix with Claude
+//!                     makes its worktrees and branches (none: it cannot)
+//!   path              PATH for its builds, when bana.conf sets one
+//!
+//! The machine's:
+//!
 //!   port              8470: the page's port, which target_url links to
 //!   host              this machine's name in descriptions (hostname -s)
 //!   login             the GitHub user the daemon runs for (the event's sender)
@@ -70,15 +98,21 @@
 //!   tray              yes or no: the menu bar (yes on macOS)
 //!   home              bana's home, where act.lock is (${BANA_HOME:-$HOME/.bana})
 //!   git gh docker caffeinate bash   the programs (default: found on path)
-//!   script            the bin/bana builds run (daemon/bin/bana)
-//!   checkout          the owner's checkout (absolute), where Fix with Claude
-//!                     makes its worktrees and branches (none: it cannot)
+//!   script            the bin/bana builds run (daemon.d/bin/bana)
 //!   bana_commit       the bana commit the snapshot is of, for a fix's brief
+//!   retry recheck grace publish_timeout   seconds (`500ms`: milliseconds):
+//!                     the first wait after a failed post (5), how often a held
+//!                     queue looks again (10), between SIGTERM and SIGKILL (5),
+//!                     and for `gh release create` (1800)
+//!   ladder ladder_short   the cancel ladder's two waits (60 30; 20 10 when
+//!                     the daemon stops)
 
 use crate::actlog::{
     self, Build, BuildState, BuildView, Event, Report, Status, StatusState, Summary, Watcher,
 };
 use crate::fix;
+use crate::notes;
+use crate::release::{self, Release};
 use crate::rounds::{self, Ask, Round, RoundBuild, Rounds};
 use crate::sweep;
 use crate::watch::{
@@ -87,7 +121,7 @@ use crate::watch::{
 use crate::{valid_repo, valid_tier, valid_workflow};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -106,8 +140,11 @@ const KEEP_BUILDS: usize = 100;
 const KEEP_ROUNDS: i64 = 14 * 86_400;
 /// A round's long poll waits at most this long (seconds).
 pub const ROUND_WAIT: u64 = 55;
-/// A build's artifacts are kept this long (seconds).
+/// A build's artifacts and files are kept this long (seconds), but for the
+/// newest files of each branch and tier.
 const KEEP_ARTIFACTS: i64 = 7 * 86_400;
+/// How long `bana installer` may take.
+const INSTALLER_TIMEOUT: u64 = 120;
 /// The longest wait between tries to post statuses.
 const RETRY_MAX: Duration = Duration::from_secs(300);
 /// Pushes not built that state.json remembers.
@@ -118,10 +155,12 @@ const LOG_PAGE: u64 = 256 * 1024;
 pub const LABEL: &str = "xyz.tjrb.bana";
 /// Why a build stopped when the daemon did. The next start retries it once.
 pub const INTERRUPTED: &str = "interrupted (bana restarted)";
-/// Why the queue waits while the owner has paused the daemon.
+/// Why the queue waits while the owner has paused the project's automatic
+/// builds (and nothing else is queued).
 pub const PAUSED: &str = "paused";
 
-const KEYS: &[&str] = &[
+/// The project's keys, in `<prefix>/daemon/settings` (`bana add`).
+pub const PROJECT_KEYS: &[&str] = &[
     "repo",
     "prefix",
     "workflow",
@@ -137,6 +176,12 @@ const KEYS: &[&str] = &[
     "daemon.token",
     "fix.rounds",
     "fix.token",
+    "checkout",
+    "path",
+];
+
+/// The machine's keys, in `daemon.d/settings` (`bana daemon install`).
+pub const MACHINE_KEYS: &[&str] = &[
     "port",
     "host",
     "login",
@@ -149,9 +194,47 @@ const KEYS: &[&str] = &[
     "caffeinate",
     "bash",
     "script",
-    "checkout",
     "bana_commit",
+    "retry",
+    "recheck",
+    "ladder",
+    "ladder_short",
+    "grace",
+    "publish_timeout",
 ];
+
+/// Where the one daemon keeps its files, under bana's home: its settings,
+/// its snapshot (`bana-manager`, `bin/`, `lib/`) and its daemon.lock. The dot
+/// keeps it apart from the projects' prefixes.
+pub const MACHINE_DIR: &str = "daemon.d";
+
+/// The settings project `prefix` in `home` runs with: the machine's
+/// (`daemon.d/settings`, none when missing), then the project's own without
+/// the machine's keys (an older bana wrote them there), so its keys win.
+pub fn settings_text(home: &Path, prefix: &str) -> Result<String, String> {
+    let file = home.join(prefix).join("daemon/settings");
+    let own = std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let machine =
+        std::fs::read_to_string(home.join(MACHINE_DIR).join("settings")).unwrap_or_default();
+    Ok(merge_settings(&machine, &own))
+}
+
+/// `machine`'s lines, then `project`'s but those with a machine-only key.
+pub fn merge_settings(machine: &str, project: &str) -> String {
+    let mut text = machine.to_string();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    for line in project.lines() {
+        let key = line.split_once('=').map(|(k, _)| k.trim());
+        if key.is_some_and(|k| MACHINE_KEYS.contains(&k) && !PROJECT_KEYS.contains(&k)) {
+            continue;
+        }
+        text.push_str(line);
+        text.push('\n');
+    }
+    text
+}
 
 /// The jobs' GITHUB_TOKEN (`daemon.token`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,34 +336,27 @@ pub struct Settings {
     pub ladder_short: [Duration; 2],
     /// How long the marker's processes have between SIGTERM and SIGKILL.
     pub grace: Duration,
+    /// How long `gh release create` may take (it uploads every file).
+    pub publish_timeout: Duration,
 }
 
 impl Settings {
-    /// `<dir>/daemon/settings`, with the daemon's own environment.
-    pub fn load(dir: &Path) -> Result<Self, String> {
-        let file = dir.join("daemon/settings");
-        let text =
-            std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
-        Self::parse(&text, dir, std::env::vars().collect())
+    /// Project `prefix` in `home` (`~/.bana`): its settings on the machine's
+    /// ([`settings_text`]), with the daemon's own environment.
+    pub fn load(home: &Path, prefix: &str) -> Result<Self, String> {
+        let text = settings_text(home, prefix)?;
+        let s = Self::parse(&text, &home.join(prefix), std::env::vars().collect())?;
+        if s.prefix != prefix {
+            return Err(format!(
+                "settings: prefix = {}, but the project is {prefix}",
+                s.prefix
+            ));
+        }
+        Ok(s)
     }
 
     pub fn parse(text: &str, dir: &Path, env: BTreeMap<String, String>) -> Result<Self, String> {
-        let mut kv: BTreeMap<&str, &str> = BTreeMap::new();
-        for (n, line) in text.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let at = |what: String| format!("settings, line {}: {what}", n + 1);
-            let (k, v) = line
-                .split_once('=')
-                .ok_or_else(|| at("not key = value".into()))?;
-            let k = KEYS
-                .iter()
-                .find(|x| **x == k.trim())
-                .ok_or_else(|| at(format!("unknown key {}", k.trim())))?;
-            kv.insert(*k, v.trim());
-        }
+        let kv = pairs(text)?;
         let get = |k: &str| kv.get(k).copied();
         let or = |k: &str, d: &str| get(k).unwrap_or(d).to_string();
         let bad = |k: &str, what: &str| format!("settings: {k} = {what}");
@@ -343,25 +419,27 @@ impl Settings {
             "none" => JobToken::Empty,
             _ => return Err(bad("fix.token", "gh or none")),
         };
-        let port = match get("port").unwrap_or("8470").parse::<u16>() {
-            Ok(p) if p > 0 => p,
-            _ => return Err(bad("port", "a port number")),
+        let Machine {
+            port,
+            machine,
+            tray,
+            home,
+            home_set,
+            recheck,
+            path: _,
+        } = Machine::from(&kv, &env)?;
+        let wait = |k: &str, d: u64| {
+            get(k)
+                .map_or(Some(Duration::from_secs(d)), duration)
+                .ok_or_else(|| bad(k, "seconds, or milliseconds with ms"))
         };
-        let tray = match get("tray").unwrap_or(if cfg!(target_os = "macos") {
-            "yes"
-        } else {
-            "no"
-        }) {
-            "yes" | "true" | "1" => true,
-            "no" | "false" | "0" => false,
-            _ => return Err(bad("tray", "yes or no")),
+        let ladder = |k: &str, d: [u64; 2]| {
+            let v: Vec<Duration> = match get(k) {
+                Some(v) => v.split_whitespace().filter_map(duration).collect(),
+                None => d.iter().map(|s| Duration::from_secs(*s)).collect(),
+            };
+            <[Duration; 2]>::try_from(v).map_err(|_| bad(k, "two waits, in seconds"))
         };
-        let home_set = get("home").is_some() || env.contains_key("BANA_HOME");
-        let home = get("home")
-            .map(PathBuf::from)
-            .or_else(|| env.get("BANA_HOME").map(PathBuf::from))
-            .or_else(|| env.get("HOME").map(|h| Path::new(h).join(".bana")))
-            .ok_or_else(|| bad("home", "a directory (no HOME here)"))?;
         let checkout = get("checkout").filter(|c| !c.is_empty()).map(PathBuf::from);
         if checkout.as_ref().is_some_and(|c| !c.is_absolute()) {
             return Err(bad("checkout", "an absolute path"));
@@ -386,7 +464,7 @@ impl Settings {
             fix_rounds,
             fix_token,
             port,
-            machine: get("host").map(String::from).unwrap_or_else(machine_name),
+            machine,
             login: or("login", ""),
             path: get("path")
                 .map(String::from)
@@ -400,17 +478,21 @@ impl Settings {
             docker: or("docker", "docker"),
             caffeinate: or("caffeinate", "caffeinate"),
             bash: or("bash", "bash"),
-            script: get("script")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| dir.join("daemon/bin/bana")),
+            script: get("script").map(PathBuf::from).unwrap_or_else(|| {
+                dir.parent()
+                    .unwrap_or(dir)
+                    .join(MACHINE_DIR)
+                    .join("bin/bana")
+            }),
             checkout,
             bana_commit: bana_commit.map(String::from),
             env,
-            retry: Duration::from_secs(5),
-            recheck: Duration::from_secs(10),
-            ladder: [Duration::from_secs(60), Duration::from_secs(30)],
-            ladder_short: [Duration::from_secs(20), Duration::from_secs(10)],
-            grace: Duration::from_secs(5),
+            retry: wait("retry", 5)?,
+            recheck,
+            ladder: ladder("ladder", [60, 30])?,
+            ladder_short: ladder("ladder_short", [20, 10])?,
+            grace: wait("grace", 5)?,
+            publish_timeout: wait("publish_timeout", 30 * 60)?,
         })
     }
 
@@ -494,6 +576,110 @@ fn seconds(s: &str, unit: u64) -> Option<Duration> {
         .map(|n| Duration::from_secs(n * unit))
 }
 
+/// `30` (seconds), or `500ms`.
+fn duration(s: &str) -> Option<Duration> {
+    match s.trim().strip_suffix("ms") {
+        Some(ms) => ms
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .map(Duration::from_millis),
+        None => seconds(s, 1),
+    }
+}
+
+/// The settings' `key = value` lines, the last of a key winning.
+fn pairs(text: &str) -> Result<BTreeMap<&'static str, &str>, String> {
+    let mut kv = BTreeMap::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let at = |what: String| format!("settings, line {}: {what}", n + 1);
+        let (k, v) = line
+            .split_once('=')
+            .ok_or_else(|| at("not key = value".into()))?;
+        let k = PROJECT_KEYS
+            .iter()
+            .chain(MACHINE_KEYS)
+            .find(|x| **x == k.trim())
+            .ok_or_else(|| at(format!("unknown key {}", k.trim())))?;
+        kv.insert(*k, v.trim());
+    }
+    Ok(kv)
+}
+
+/// What the one daemon needs before any project: `daemon.d/settings`.
+#[derive(Debug, Clone)]
+pub struct Machine {
+    pub port: u16,
+    pub machine: String,
+    pub tray: bool,
+    /// bana's home: act.lock and the token are here.
+    pub home: PathBuf,
+    pub home_set: bool,
+    /// How often a held queue looks again.
+    pub recheck: Duration,
+    /// PATH for what the daemon runs itself (the release check's curl).
+    pub path: String,
+}
+
+impl Machine {
+    /// `<home>/daemon.d/settings` (none: the defaults), with the daemon's
+    /// own environment.
+    pub fn load(home: &Path) -> Result<Self, String> {
+        let file = home.join(MACHINE_DIR).join("settings");
+        let text = match std::fs::read_to_string(&file) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("{}: {e}", file.display())),
+        };
+        let kv = pairs(&text).map_err(|e| format!("{}: {e}", file.display()))?;
+        Self::from(&kv, &std::env::vars().collect())
+    }
+
+    fn from(kv: &BTreeMap<&str, &str>, env: &BTreeMap<String, String>) -> Result<Self, String> {
+        let get = |k: &str| kv.get(k).copied();
+        let bad = |k: &str, what: &str| format!("settings: {k} = {what}");
+        let port = match get("port").unwrap_or("8470").parse::<u16>() {
+            Ok(p) if p > 0 => p,
+            _ => return Err(bad("port", "a port number")),
+        };
+        let tray = match get("tray").unwrap_or(if cfg!(target_os = "macos") {
+            "yes"
+        } else {
+            "no"
+        }) {
+            "yes" | "true" | "1" => true,
+            "no" | "false" | "0" => false,
+            _ => return Err(bad("tray", "yes or no")),
+        };
+        let home_set = get("home").is_some() || env.contains_key("BANA_HOME");
+        let home = get("home")
+            .map(PathBuf::from)
+            .or_else(|| env.get("BANA_HOME").map(PathBuf::from))
+            .or_else(|| env.get("HOME").map(|h| Path::new(h).join(".bana")))
+            .ok_or_else(|| bad("home", "a directory (no HOME here)"))?;
+        let recheck = match get("recheck") {
+            Some(r) => duration(r).ok_or_else(|| bad("recheck", "seconds"))?,
+            None => Duration::from_secs(10),
+        };
+        Ok(Self {
+            port,
+            machine: get("host").map(String::from).unwrap_or_else(machine_name),
+            tray,
+            home,
+            home_set,
+            recheck,
+            path: get("path")
+                .map(String::from)
+                .or_else(|| env.get("PATH").cloned())
+                .unwrap_or_else(|| "/usr/bin:/bin".into()),
+        })
+    }
+}
+
 /// This machine's short name, as descriptions say it (`mbp`).
 pub fn machine_name() -> String {
     std::process::Command::new("hostname")
@@ -505,11 +691,20 @@ pub fn machine_name() -> String {
         .unwrap_or_else(|| "this machine".into())
 }
 
+/// state.json's version: a change to it comes with a new one. A daemon
+/// refuses a state.json of a newer bana (a downgrade) rather than drop what
+/// it does not know.
+pub const STATE_VERSION: u32 = 1;
+
 /// state.json.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct State {
+    /// [`STATE_VERSION`] when written.
     pub version: u32,
+    /// The owner paused automatic builds: `daemon/paused` says so, and this
+    /// mirrors it. Never written here; an older bana's is moved there.
+    #[serde(skip_serializing)]
     pub paused: bool,
     pub next_id: u64,
     /// The heads last seen.
@@ -529,7 +724,7 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: STATE_VERSION,
             paused: false,
             next_id: 1,
             heads: Heads::new(),
@@ -586,6 +781,46 @@ pub struct Record {
     /// The CI report's rows (report.md's table), once the build ended.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub standards: Vec<crate::report::Row>,
+    /// What a green build's jobs uploaded, in `dist/`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dist: Option<Dist>,
+}
+
+/// A build's `dist/`: the files its jobs uploaded, and the project's
+/// installer for them. A problem never changes the build's result.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Dist {
+    pub files: Vec<DistEntry>,
+    /// Why nothing was collected, or why the installer is missing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
+    /// Pruned: the build is more than a week old.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub removed: bool,
+}
+
+impl Dist {
+    /// Files there to download: none once removed.
+    pub fn available(&self) -> &[DistEntry] {
+        if self.removed {
+            &[]
+        } else {
+            &self.files
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DistEntry {
+    pub name: String,
+    pub bytes: u64,
+    /// `linux-x64`…: an archive the installer installs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    /// In SHA256SUMS: a release's file (release.files, and the installer).
+    pub release: bool,
 }
 
 /// Lines of one build's log, from a byte offset in act.jsonl.
@@ -626,6 +861,8 @@ struct Inner {
     /// Polls done, for tests.
     polls: u64,
     stopping: bool,
+    /// releases/<tag>.json, by tag ([`crate::release`]).
+    releases: BTreeMap<String, Release>,
 }
 
 struct Shared {
@@ -633,11 +870,20 @@ struct Shared {
     inner: Mutex<Inner>,
     summary: tokio::sync::watch::Sender<Summary>,
     poll: Notify,
-    run: Notify,
+    /// Wakes the runner: this daemon's own, or the registry's, which all
+    /// the projects share.
+    run: Arc<Notify>,
+    /// Counts the summaries published, the registry's across its projects
+    /// (the menu bar follows it).
+    changed: tokio::sync::watch::Sender<u64>,
+    /// The first fetch waits this long (the registry staggers its projects').
+    first_poll: Duration,
     post: Notify,
     post_now: Notify,
     /// Counts the changes to rounds.json files: a round's long poll waits on it.
     rounds: tokio::sync::watch::Sender<u64>,
+    /// A release's previous release and changes are to be found.
+    seed: Notify,
     stop: tokio::sync::watch::Sender<bool>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     /// daemon.lock, locked while this daemon runs ([`claim`]).
@@ -650,12 +896,36 @@ pub struct Daemon(Arc<Shared>);
 
 impl Daemon {
     /// Reads state.json and the builds, then starts the watcher, the runner and
-    /// the poster. The clone (`src`) must exist: `bana daemon install` makes it.
+    /// the poster. The clone (`src`) must exist: `bana add` makes it.
     pub async fn start(settings: Settings) -> Result<Self, String> {
+        let d = Self::start_in(
+            settings,
+            Arc::new(Notify::new()),
+            tokio::sync::watch::Sender::new(0),
+            Duration::ZERO,
+        )
+        .await?;
+        let runner = tokio::spawn(d.0.clone().runner());
+        d.0.tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(runner);
+        Ok(d)
+    }
+
+    /// As [`Self::start`], but with no runner of its own: the registry's
+    /// runs its builds ([`Self::next_build`]), and `run` wakes it. `changed`
+    /// counts its summaries; its first fetch waits `first_poll`.
+    pub async fn start_in(
+        settings: Settings,
+        run: Arc<Notify>,
+        changed: tokio::sync::watch::Sender<u64>,
+        first_poll: Duration,
+    ) -> Result<Self, String> {
         let dir = settings.dir.clone();
         if !dir.join("src/.git").exists() {
             return Err(format!(
-                "no clone at {}: run bana daemon install",
+                "no clone at {}: run bana add in the project's checkout",
                 dir.join("src").display()
             ));
         }
@@ -667,6 +937,20 @@ impl Daemon {
             Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("state.json: {e}"))?,
             Err(_) => State::default(),
         };
+        if state.version > STATE_VERSION {
+            return Err(format!(
+                "state.json is a newer bana's (version {}, this bana reads {STATE_VERSION}): bana upgrade",
+                state.version
+            ));
+        }
+        // The pause is daemon/paused's; an older bana kept it in state.json.
+        let flag = dir.join("daemon/paused");
+        if state.paused && !flag.exists() {
+            if let Err(e) = std::fs::write(&flag, "") {
+                eprintln!("bana daemon: {}: {e}", flag.display());
+            }
+        }
+        state.paused = flag.exists();
         let mut records = BTreeMap::new();
         for e in std::fs::read_dir(dir.join("builds"))
             .into_iter()
@@ -696,6 +980,14 @@ impl Daemon {
             .flat_map(|r| r.statuses.values().map(|p| p.seq))
             .max()
             .unwrap_or(0);
+        // A publish the last daemon ran did not finish: Publish again cleans up.
+        let mut releases = release::load(&dir);
+        for r in releases.values_mut() {
+            if release::interrupted(r) {
+                eprintln!("bana daemon: publishing {} was interrupted", r.tag);
+                release::save(&dir, r);
+            }
+        }
         let summary = tokio::sync::watch::Sender::new(Summary::default());
         let (stop, _) = tokio::sync::watch::channel(false);
         let shared = Arc::new(Shared {
@@ -712,13 +1004,17 @@ impl Daemon {
                 seq,
                 polls: 0,
                 stopping: false,
+                releases,
             }),
             summary,
             poll: Notify::new(),
-            run: Notify::new(),
+            run,
+            changed,
+            first_poll,
             post: Notify::new(),
             post_now: Notify::new(),
             rounds: tokio::sync::watch::Sender::new(0),
+            seed: Notify::new(),
             stop,
             tasks: Mutex::new(Vec::new()),
             claimed: Mutex::new(Some(claimed)),
@@ -731,8 +1027,8 @@ impl Daemon {
         shared.post.notify_one();
         let tasks = vec![
             tokio::spawn(shared.clone().watcher()),
-            tokio::spawn(shared.clone().runner()),
             tokio::spawn(shared.clone().poster()),
+            tokio::spawn(shared.clone().seeder()),
         ];
         *shared.tasks.lock().unwrap_or_else(|e| e.into_inner()) = tasks;
         Ok(Self(shared))
@@ -745,6 +1041,11 @@ impl Daemon {
     /// The summary as it changes (the menu bar).
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Summary> {
         self.0.summary.subscribe()
+    }
+
+    /// The summary last published (`GET /ci/v1/projects`).
+    pub fn published(&self) -> Summary {
+        self.0.summary.borrow().clone()
     }
 
     /// The summary now (`GET /ci/v1/local`).
@@ -789,7 +1090,21 @@ impl Daemon {
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or(Value::Null);
         v["compare"] = event["compare"].clone();
+        if v["dist"].is_object() {
+            v["dist"]["dir"] = json!(dir.join("dist"));
+        }
         Some(v)
+    }
+
+    /// A file of build `id`'s dist/, when its record lists it and it is
+    /// still there; none for anything else.
+    pub fn file(&self, id: u64, name: &str) -> Option<PathBuf> {
+        let inner = self.0.lock();
+        let dist = inner.records.get(&id)?.dist.as_ref()?;
+        dist.available().iter().find(|f| f.name == name)?;
+        let path = self.0.build_dir(id).join("dist").join(name);
+        let meta = std::fs::symlink_metadata(&path).ok()?;
+        meta.file_type().is_file().then_some(path)
     }
 
     /// A build's CI report, as its end wrote it: report.md and its rows.
@@ -981,14 +1296,47 @@ impl Daemon {
         }
     }
 
-    /// Pause or resume starting builds; fetching goes on.
+    /// Pause or resume automatic builds (pushes, and their retries): they
+    /// queue, and wait. Fetching goes on, and Run now, reruns and a fix's
+    /// rounds still build. `daemon/paused` says so, for `bana pause`.
     pub fn set_paused(&self, paused: bool) {
+        let flag = self.0.paused_flag();
+        // The file and the state change together: a scan's read is not between.
         let mut inner = self.0.lock();
+        let written = if paused {
+            flag.parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|_| std::fs::write(&flag, ""))
+        } else {
+            std::fs::remove_file(&flag).or_else(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(e),
+            })
+        };
+        if let Err(e) = written {
+            eprintln!("bana daemon: {}: {e}", flag.display());
+        }
         inner.state.paused = paused;
-        self.0.save_state(&inner.state);
         self.0.publish(&inner);
         drop(inner);
         self.0.run.notify_one();
+    }
+
+    /// Reads `daemon/paused` again: `bana pause` and `bana resume` change it.
+    pub fn reload_paused(&self) {
+        let mut inner = self.0.lock();
+        let paused = self.0.paused_flag().exists();
+        if inner.state.paused != paused {
+            inner.state.paused = paused;
+            self.0.publish(&inner);
+            drop(inner);
+            self.0.run.notify_one();
+        }
+    }
+
+    /// Whether the owner paused automatic builds.
+    pub fn paused(&self) -> bool {
+        self.0.lock().state.paused
     }
 
     /// Fetch now, and try posting again now.
@@ -1025,6 +1373,171 @@ impl Daemon {
                 )
             })
             .collect()
+    }
+
+    /// The releases, the newest first: `GET /ci/v1/releases`.
+    pub fn releases(&self) -> Vec<Value> {
+        let inner = self.0.lock();
+        let mut all: Vec<&Release> = inner.releases.values().collect();
+        all.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
+        all.into_iter()
+            .map(|r| {
+                json!({"tag": r.tag, "state": r.state, "build": r.build, "sha": r.sha,
+                    "reason": r.reason, "url": r.url, "updated_at": r.updated_at})
+            })
+            .collect()
+    }
+
+    /// All bana knows of release `tag`, without asking GitHub: the page's
+    /// card, and Claude's release_context. `previous` is null until found,
+    /// and its `tag` null for a first release; `files` are those a release
+    /// uploads (SHA256SUMS lists them); `tested` is the build's CI report
+    /// table, as `## Tested` will have it; `title` is the one Publish gives.
+    /// When git could not read the changes, or local tags stood in for gh,
+    /// a read asks for them again (at most once a minute).
+    pub fn release(&self, tag: &str) -> Option<Value> {
+        let s = &self.0.settings;
+        let (mut v, build) = {
+            let mut inner = self.0.lock();
+            let r = inner.releases.get_mut(tag)?;
+            let guessed = r
+                .previous
+                .as_ref()
+                .is_some_and(|p| p.how.starts_with("tags"));
+            let open = !matches!(
+                r.state,
+                release::State::Publishing | release::State::Published
+            );
+            if open && !r.seed && (r.seed_error.is_some() || guessed) && now() - r.retried_at >= 60
+            {
+                (r.seed, r.retried_at) = (true, now());
+                self.0.seed.notify_one();
+            }
+            let r = inner.releases.get(tag)?;
+            let rec = inner.records.get(&r.build);
+            let files: Vec<&DistEntry> = rec
+                .and_then(|b| b.dist.as_ref())
+                .map(|d| d.available().iter().filter(|f| f.release).collect())
+                .unwrap_or_default();
+            let mut platforms: Vec<String> =
+                files.iter().filter_map(|f| f.platform.clone()).collect();
+            platforms.sort();
+            platforms.dedup();
+            let changes = r.changes.as_ref().map(|c| {
+                let mut v = json!(c);
+                let n = c.prs.len() + c.other.len();
+                v["counts"] = json!({"commits": n as u64 + c.more, "prs": c.prs.len(), "other": c.other.len()});
+                v
+            });
+            let check = r.check();
+            let v = json!({
+                "repo": s.repo, "tag": r.tag, "sha": r.sha, "state": r.state,
+                "reason": r.reason, "progress": r.progress, "url": r.url,
+                "answered_at": r.answered_at, "updated_at": r.updated_at,
+                "build": rec.map(|b| self.0.view(&inner, b)), "machine": s.machine,
+                "previous": r.previous, "seeded": !r.seed, "seed_error": r.seed_error,
+                "files": files, "not_built": release::not_built(&r.platforms, &platforms),
+                "changes": changes, "notes": r.notes.clone().unwrap_or_default(),
+                "title": r.notes.as_ref().and_then(|n| n.title.clone())
+                    .or_else(|| r.title.clone())
+                    .unwrap_or_else(|| format!("{} {}", s.prefix, r.tag)),
+                "default_title": r.title.clone().unwrap_or_else(|| format!("{} {}", s.prefix, r.tag)),
+                "check": {"missing_prs": check.missing, "outside_range": check.outside_range,
+                    "duplicated": check.duplicated},
+                "install": files.iter().any(|f| f.name == "install.sh")
+                    .then(|| format!("bana install {}", r.build)),
+                "dir": self.0.build_dir(r.build).join("dist"),
+                "page_url": format!("http://127.0.0.1:{}/#p={}&release={}", s.port, s.prefix, r.tag),
+            });
+            (v, r.build)
+        };
+        v["tested"] = json!(
+            std::fs::read_to_string(self.0.build_dir(build).join("report.md"))
+                .ok()
+                .and_then(|m| release::tested(&m))
+        );
+        Some(v)
+    }
+
+    /// Saves release `tag`'s notes over those at `rev` (`source`: `you`, the
+    /// page, or `claude`): the new rev, and what they say of the range's pull
+    /// requests. The page and Claude never write over each other: a save
+    /// with another rev is refused.
+    pub fn save_notes(
+        &self,
+        tag: &str,
+        text: &str,
+        title: Option<&str>,
+        rev: u64,
+        source: &str,
+    ) -> Result<Value, release::Error> {
+        let mut inner = self.0.lock();
+        let inner = &mut *inner;
+        let r = inner
+            .releases
+            .get_mut(tag)
+            .ok_or_else(|| release::Error::Missing(format!("no release {tag}")))?;
+        let rev = release::save_notes(r, text, title, rev, source, now())?;
+        self.0.save_release(r);
+        let check = r.check();
+        self.0.publish(inner);
+        Ok(json!({"tag": tag, "rev": rev, "missing_prs": check.missing,
+            "outside_range": check.outside_range, "duplicated": check.duplicated,
+            "page_url": format!("http://127.0.0.1:{}/#p={}&release={tag}",
+                self.0.settings.port, self.0.settings.prefix)}))
+    }
+
+    /// Not now: bana stops asking about release `tag`.
+    pub fn dismiss_release(&self, tag: &str) -> Result<Value, release::Error> {
+        let mut inner = self.0.lock();
+        let inner = &mut *inner;
+        let r = inner
+            .releases
+            .get_mut(tag)
+            .ok_or_else(|| release::Error::Missing(format!("no release {tag}")))?;
+        release::dismiss(r, now())?;
+        self.0.save_release(r);
+        self.0.publish(inner);
+        Ok(json!({"tag": tag, "state": "dismissed"}))
+    }
+
+    /// The owner's yes, with the rev of the notes they saw: the publish runs
+    /// ([`Shared::publish_task`]), one at a time.
+    pub fn publish_release(&self, tag: &str, rev: u64) -> Result<Value, release::Error> {
+        let mut inner = self.0.lock();
+        let inner = &mut *inner;
+        if let Some(p) = inner
+            .releases
+            .values()
+            .find(|r| r.state == release::State::Publishing)
+        {
+            return Err(release::Error::Refused(format!(
+                "{} is publishing: one publish at a time",
+                p.tag
+            )));
+        }
+        let r = inner
+            .releases
+            .get_mut(tag)
+            .ok_or_else(|| release::Error::Missing(format!("no release {tag}")))?;
+        release::can_publish(r, rev)?;
+        let files = inner
+            .records
+            .get(&r.build)
+            .and_then(|b| b.dist.as_ref())
+            .is_some_and(|d| d.available().iter().any(|f| f.name == "SHA256SUMS"));
+        if !files {
+            return Err(release::Error::Refused(format!(
+                "build #{}'s files are gone: re-run it",
+                r.build
+            )));
+        }
+        (r.state, r.reason, r.updated_at) = (release::State::Publishing, None, now());
+        r.progress = Some("starting".into());
+        self.0.save_release(r);
+        self.0.publish(inner);
+        tokio::spawn(self.0.clone().publish_task(tag.to_string()));
+        Ok(json!({"tag": tag, "state": "publishing", "rev": rev}))
     }
 
     /// Fix with Claude (the page, the menu bar): makes, or goes on with, the
@@ -1228,7 +1741,7 @@ impl Daemon {
         let mut rs = rounds::load(&path)
             .map_err(RoundError::Failed)?
             .unwrap_or_else(|| Rounds::new(s.settings.fix_rounds));
-        match rs.ask(&tree, &want, repeat, inner.state.paused) {
+        match rs.ask(&tree, &want, repeat, false) {
             Err(r) => Err(RoundError::Refused {
                 why: r.why,
                 running: r.running,
@@ -1264,11 +1777,10 @@ impl Daemon {
             return Err(RoundError::Bad("tree: a snapshot's full tree".into()));
         }
         let want = wanted(&f, jobs)?;
-        let paused = s.lock().state.paused;
         let rs = rounds::load(&rounds::path(&s.settings.dir, &f.fix))
             .map_err(RoundError::Failed)?
             .unwrap_or_else(|| Rounds::new(s.settings.fix_rounds));
-        match rs.ask(tree, &want, repeat, paused) {
+        match rs.ask(tree, &want, repeat, false) {
             Err(r) => Err(RoundError::Refused {
                 why: r.why,
                 running: r.running,
@@ -1283,9 +1795,8 @@ impl Daemon {
     }
 
     /// One round: its builds, and once it ended, what failed in the brief's
-    /// shape. It waits up to `wait` for the round to end (a long poll), but
-    /// not for a round the paused daemon holds back (`waiting` says why a
-    /// queued round waits).
+    /// shape. It waits up to `wait` for the round to end (a long poll);
+    /// `waiting` says why a queued round waits.
     pub async fn round(&self, name: &str, n: u32, wait: Duration) -> Result<Value, RoundError> {
         let fix = self.find_fix(name)?.fix;
         let path = rounds::path(&self.0.settings.dir, &fix);
@@ -1300,8 +1811,7 @@ impl Daemon {
                 .get(n)
                 .cloned()
                 .ok_or_else(|| RoundError::Missing(format!("fix {fix} has no round {n}")))?;
-            let held = self.0.round_waits(&round).as_deref() == Some(PAUSED);
-            if round.state.finished() || held || tokio::time::Instant::now() >= deadline {
+            if round.state.finished() || tokio::time::Instant::now() >= deadline {
                 return Ok(self.0.round_view(&fix, &rs, &round).await);
             }
             let _ = tokio::time::timeout_at(deadline, changed.changed()).await;
@@ -1421,20 +1931,92 @@ impl Daemon {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
+        // And its pid dies: act.lock, if still the daemon's (act's only once
+        // act() has read act's start time), is stale to the next start. This
+        // process lives on, so it would be held for good: it goes here.
+        self.0.release_lock(&[std::process::id()]);
     }
 
+    /// The registry's runner: the next build here, once its gates are open;
+    /// it is now the running one ([`Shared::next_build`]).
+    pub(crate) async fn next_build(&self) -> Option<(u64, mpsc::UnboundedReceiver<String>)> {
+        self.0.next_build().await
+    }
+
+    /// The registry's runner: runs build `id` ([`Self::next_build`]'s) to its end.
+    pub(crate) async fn run_build(&self, id: u64, cancel: mpsc::UnboundedReceiver<String>) {
+        self.0.run_build(id, cancel).await
+    }
+
+    /// The registry's runner runs another project's build (`why`: `after
+    /// <prefix> #N`): a queue here that could start says it waits for it.
+    pub(crate) fn hold_for(&self, why: &str) {
+        let mut inner = self.0.lock();
+        if inner.running.is_none() && next_up(&inner).is_some() {
+            inner.waiting = Some(why.to_string());
+            self.0.publish(&inner);
+        }
+    }
+
+    /// The build that runs now, if any: its id and ref.
+    pub fn running(&self) -> Option<(u64, String)> {
+        let inner = self.0.lock();
+        let id = inner.running.as_ref()?.id;
+        let r = inner.records.get(&id)?;
+        Some((id, watch::short_ref(&r.request.git_ref).to_string()))
+    }
+
+    /// Whether `other` is this same daemon (not one started again).
+    pub fn same(&self, other: &Daemon) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Stops: a running build ends (and runs again once at the next start),
+    /// waiting two minutes at most for it, as the process exits after.
     pub async fn shutdown(&self) {
+        self.stop(Some(Duration::from_secs(120)), INTERRUPTED).await
+    }
+
+    /// Stops, and waits for the running build to end however long its
+    /// checkout takes: a daemon started again in this process only then
+    /// takes its daemon.lock, state.json and builds.
+    pub async fn stop_fully(&self) {
+        self.stop(None, INTERRUPTED).await
+    }
+
+    /// Stops for good, as [`Daemon::stop_fully`], but a running build ends
+    /// with `why`: under the same lock as the stop, so a build the runner
+    /// starts meanwhile gets it too.
+    pub async fn stop_with(&self, why: &str) {
+        self.stop(None, why).await
+    }
+
+    async fn stop(&self, most: Option<Duration>, why: &str) {
         {
             let mut inner = self.0.lock();
             inner.stopping = true;
             if let Some(r) = &inner.running {
-                let _ = r.cancel.send(INTERRUPTED.into());
+                let _ = r.cancel.send(why.into());
             }
         }
         let _ = self.0.stop.send(true);
         let tasks = std::mem::take(&mut *self.0.tasks.lock().unwrap_or_else(|e| e.into_inner()));
         for t in tasks {
             let _ = tokio::time::timeout(Duration::from_secs(120), t).await;
+        }
+        // The registry's runner ends the build it runs here (the short ladder),
+        // and a publish ends on its own (publish_timeout): a daemon started
+        // again in this process would otherwise mark it interrupted under it.
+        let since = Instant::now();
+        let busy = |inner: &Inner| {
+            inner.running.is_some()
+                || inner
+                    .releases
+                    .values()
+                    .any(|r| r.state == release::State::Publishing)
+        };
+        while busy(&self.0.lock()) && most.is_none_or(|m| since.elapsed() < m) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         self.0
             .claimed
@@ -1455,6 +2037,11 @@ impl Shared {
 
     fn build_dir(&self, id: u64) -> PathBuf {
         self.settings.dir.join("builds").join(id.to_string())
+    }
+
+    /// `daemon/paused`: there while the owner has paused automatic builds.
+    fn paused_flag(&self) -> PathBuf {
+        self.settings.dir.join("daemon/paused")
     }
 
     fn lock_dir(&self) -> PathBuf {
@@ -1512,6 +2099,8 @@ impl Shared {
                 .unwrap_or_default(),
             jobs: b.chips(),
             tests: crate::report::chip(&r.standards),
+            files: r.dist.as_ref().map_or(0, |d| d.available().len()),
+            files_problem: r.dist.as_ref().is_some_and(|d| d.problem.is_some()),
         }
     }
 
@@ -1552,8 +2141,15 @@ impl Shared {
                 .find(|r| r.build.state.finished() && !r.request.is_fix())
                 .map(|r| self.view(inner, r)),
             failed: newest_failed(&inner.records),
+            release: release::shown(&inner.releases, now()).map(|r| actlog::ReleaseAsk {
+                tag: r.tag.clone(),
+                state: r.state.as_str().into(),
+                build: r.build,
+                reason: r.reason.clone(),
+            }),
         };
         self.summary.send_replace(summary);
+        self.changed.send_modify(|n| *n = n.wrapping_add(1));
     }
 
     /// Queues a build: at the back, or at the front (after the other builds
@@ -1594,6 +2190,7 @@ impl Shared {
         };
         inner.state.queue.insert(at, id);
         self.save_state(&inner.state);
+        self.release_queued(inner, id);
         self.publish(inner);
         id
     }
@@ -1614,6 +2211,7 @@ impl Shared {
         let fix = rec.request.fix.clone();
         inner.records.remove(&id);
         let _ = std::fs::remove_dir_all(self.build_dir(id));
+        self.release_sync(inner, id);
         if let Some(req) = retry {
             self.settle_interrupted(inner, &req);
         }
@@ -1721,6 +2319,9 @@ impl Shared {
             if !retry && rec.request.trigger == Trigger::Retry {
                 self.settle_interrupted(inner, &rec.request);
             }
+            if !retry {
+                self.release_sync(inner, id);
+            }
             if retry {
                 let req = Request {
                     trigger: Trigger::Retry,
@@ -1742,7 +2343,7 @@ impl Shared {
         }
         self.clear_stale_lock().await;
         let inner = self.lock();
-        let fixes: std::collections::BTreeSet<String> = inner
+        let fixes: BTreeSet<String> = inner
             .records
             .values()
             .filter_map(|r| r.request.fix.clone())
@@ -1751,6 +2352,491 @@ impl Shared {
             self.sync_rounds(&inner, &fix);
         }
         self.save_state(&inner.state);
+    }
+
+    // ---- releases --------------------------------------------------------------
+
+    fn save_release(&self, r: &Release) {
+        release::save(&self.settings.dir, r);
+    }
+
+    /// Build `id` was queued, or its tag moved while it waits: a build of a
+    /// tag at the tag tier makes, or takes over, the tag's release, whose
+    /// previous release and changes are then found ([`Self::seeder`]).
+    fn release_queued(&self, inner: &mut Inner, id: u64) {
+        let Some(q) = inner.records.get(&id).map(|r| &r.request) else {
+            return;
+        };
+        if q.is_fix() || q.tier != self.settings.rules.tag_tier {
+            return;
+        }
+        let Some(tag) = q
+            .git_ref
+            .strip_prefix("refs/tags/")
+            .filter(|t| release::valid_tag(t))
+        else {
+            return;
+        };
+        let (tag, sha) = (tag.to_string(), q.sha.clone());
+        if let Some(r) = release::queued(inner.releases.get(&tag), &tag, &sha, id, now()) {
+            self.save_release(&r);
+            inner.releases.insert(tag, r);
+            self.seed.notify_one();
+        }
+    }
+
+    /// Build `id` ended (its files collected, its report written), or left
+    /// the queue: the release it builds asks, or says why it cannot.
+    fn release_sync(&self, inner: &mut Inner, id: u64) {
+        let Some(tag) = inner
+            .releases
+            .values()
+            .find(|r| r.build == id && r.state == release::State::Building)
+            .map(|r| r.tag.clone())
+        else {
+            return;
+        };
+        let outcome = match inner.records.get(&id) {
+            None => Err(format!("build #{id} was taken off the queue")),
+            Some(rec) => match release_outcome(rec) {
+                Some(o) => o,
+                None => return,
+            },
+        };
+        if let Some(r) = inner.releases.get_mut(&tag) {
+            if release::ended(r, id, outcome, now()) {
+                match &r.reason {
+                    None => {
+                        eprintln!("bana daemon: {tag} passed with its files: asking to publish it")
+                    }
+                    Some(why) => eprintln!("bana daemon: {tag} cannot be published: {why}"),
+                }
+                self.save_release(r);
+            }
+        }
+        self.publish(inner);
+    }
+
+    /// Finds each queued release's previous release and the changes since
+    /// it, one at a time.
+    async fn seeder(self: Arc<Self>) {
+        let mut stop = self.stop.subscribe();
+        loop {
+            if *stop.borrow() {
+                return;
+            }
+            let due: Vec<(String, String)> = self
+                .lock()
+                .releases
+                .values()
+                .filter(|r| r.seed)
+                .map(|r| (r.tag.clone(), r.sha.clone()))
+                .collect();
+            for (tag, sha) in due {
+                let found = self.find_changes(&tag, &sha).await;
+                if let Err(e) = &found {
+                    eprintln!("bana daemon: {tag}: the changes: {e}");
+                }
+                let conf = self.conf_at(&sha).await;
+                let title = Some(release::title(&conf, &self.settings.prefix, &tag));
+                let platforms = release::platforms(&conf);
+                let mut inner = self.lock();
+                let inner = &mut *inner;
+                if let Some(r) = inner.releases.get_mut(&tag) {
+                    let mut changed = release::seeded(r, &sha, found, &self.settings.repo, now());
+                    if r.sha == sha && (r.title != title || r.platforms != platforms) {
+                        (r.title, r.platforms, changed) = (title, platforms, true);
+                    }
+                    if changed {
+                        self.save_release(r);
+                    }
+                }
+                self.publish(inner);
+            }
+            tokio::select! {
+                _ = self.seed.notified() => {}
+                _ = stop.changed() => return,
+            }
+        }
+    }
+
+    /// Release `tag`'s previous release (one `gh release list`, then the
+    /// tags in src; [`notes::previous_release`]) and the first-parent
+    /// commits since it up to `sha`.
+    async fn find_changes(
+        &self,
+        tag: &str,
+        sha: &str,
+    ) -> Result<(notes::Previous, notes::Changes), String> {
+        let s = &self.settings;
+        let args = notes::list_args(&s.repo);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let list = match self.output(&s.gh, &args, &self.src(), 30).await {
+            Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
+            Ok(o) => Err(format!("gh release list: {}", failure(&o))),
+            Err(e) => Err(e),
+        };
+        let tags: Vec<String> = self
+            .git(&["tag", "-l"], 30)
+            .await
+            .map_err(|e| format!("git tag: {e}"))?
+            .lines()
+            .filter(|t| !t.is_empty())
+            .map(String::from)
+            .collect();
+        let (git, path, src) = (s.git.clone(), s.path.clone(), self.src());
+        let (tag_, sha_) = (tag.to_string(), sha.to_string());
+        let previous = tokio::task::spawn_blocking(move || {
+            let run = |args: &[&str]| {
+                std::process::Command::new(&git)
+                    .args(args)
+                    .current_dir(&src)
+                    .env("PATH", &path)
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .stdin(Stdio::null())
+                    .stderr(Stdio::null())
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+            };
+            notes::previous_release(
+                list.as_deref().map_err(String::as_str),
+                &tags,
+                &tag_,
+                |t| {
+                    run(&[
+                        "merge-base",
+                        "--is-ancestor",
+                        &format!("refs/tags/{t}"),
+                        &sha_,
+                    ])
+                    .is_some()
+                },
+                |t| {
+                    run(&["rev-list", "--count", &format!("refs/tags/{t}..{sha_}")])
+                        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+                },
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        let args = notes::log_args(previous.tag.as_deref(), sha);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let log = self
+            .git(&args, 60)
+            .await
+            .map_err(|e| format!("git log: {e}"))?;
+        let mut changes = notes::parse_range(&log);
+        if changes.more > 0 {
+            let range = match &previous.tag {
+                Some(p) => format!("refs/tags/{p}..{sha}"),
+                None => sha.to_string(),
+            };
+            let n = self
+                .git(&["rev-list", "--first-parent", "--count", &range], 60)
+                .await
+                .ok()
+                .and_then(|n| n.trim().parse::<u64>().ok());
+            if let Some(n) = n {
+                changes.more = n.saturating_sub(notes::LOG_LIMIT as u64).max(changes.more);
+            }
+        }
+        Ok((previous, changes))
+    }
+
+    /// What the publish of `tag` does now, on its record and the page.
+    fn progress(&self, tag: &str, what: &str) {
+        let mut inner = self.lock();
+        if let Some(r) = inner.releases.get_mut(tag) {
+            r.progress = Some(what.to_string());
+            self.save_release(r);
+        }
+        self.publish(&inner);
+    }
+
+    /// Publishes release `tag` ([`Self::publish_steps`]): published, with its
+    /// URL, or failed, with why, and bana asks again.
+    async fn publish_task(self: Arc<Self>, tag: String) {
+        let end = self.publish_steps(&tag).await;
+        let mut inner = self.lock();
+        let inner = &mut *inner;
+        if let Some(r) = inner.releases.get_mut(&tag) {
+            match end {
+                Ok(url) => {
+                    eprintln!("bana daemon: {tag} is published: {url}");
+                    (r.state, r.url, r.reason) = (release::State::Published, Some(url), None);
+                    r.answered_at = Some(now());
+                }
+                Err(e) => {
+                    eprintln!("bana daemon: publishing {tag} failed: {e}");
+                    (r.state, r.reason) = (release::State::Failed, Some(e));
+                }
+            }
+            (r.progress, r.updated_at) = (None, now());
+            self.save_release(r);
+        }
+        self.publish(inner);
+    }
+
+    /// The publish: every file still as SHA256SUMS says; the tag on origin
+    /// still at the built commit; the previous release still the notes' one
+    /// ([`release::rebased`]); on GitHub, a release already published with
+    /// these files (by their digests) is taken as this one, and a draft a
+    /// killed gh left is deleted (never with --cleanup-tag), but no other
+    /// draft; then `gh release create --verify-tag` from dist/ with the
+    /// notes, `## Tested` and `## Install`, the files and SHA256SUMS. The
+    /// release's URL, or why not.
+    async fn publish_steps(&self, tag: &str) -> Result<String, String> {
+        let s = &self.settings;
+        let (sha, build, text, title) = {
+            let inner = self.lock();
+            let r = inner.releases.get(tag).ok_or("the release is gone")?;
+            let n = r.notes.clone().unwrap_or_default();
+            (r.sha.clone(), r.build, n.text, n.title)
+        };
+        let dist = self.build_dir(build).join("dist");
+        let log = s.dir.join("releases").join(format!("{tag}.log"));
+
+        self.progress(tag, "checking the files against SHA256SUMS");
+        let at = dist.clone();
+        let manifest =
+            tokio::task::spawn_blocking(move || -> Result<Vec<(String, String)>, String> {
+                let sums = std::fs::read_to_string(at.join("SHA256SUMS"))
+                    .map_err(|e| format!("SHA256SUMS: {e}"))?;
+                let mut manifest = release::manifest(&sums)?;
+                for (hash, name) in &manifest {
+                    let got = crate::artifacts::sha256(&at.join(name))
+                        .map_err(|e| format!("{name}: {e}"))?;
+                    if got != *hash {
+                        return Err(format!(
+                            "{name} changed since build #{build}: nothing was published"
+                        ));
+                    }
+                }
+                let own = crate::artifacts::sha256(&at.join("SHA256SUMS"))
+                    .map_err(|e| format!("SHA256SUMS: {e}"))?;
+                manifest.push((own, "SHA256SUMS".into()));
+                Ok(manifest)
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+        let upload: Vec<String> = manifest.iter().map(|(_, n)| n.clone()).collect();
+        let files = &upload[..upload.len() - 1];
+
+        self.progress(tag, "checking the tag on origin");
+        let cred = self.credentials();
+        let (plain, deref) = (format!("refs/tags/{tag}"), format!("refs/tags/{tag}^{{}}"));
+        let mut args: Vec<&str> = cred.iter().map(String::as_str).collect();
+        args.extend(["ls-remote", "origin", &plain, &deref]);
+        let listed = self
+            .git(&args, 60)
+            .await
+            .map_err(|e| format!("git ls-remote: {e}"))?;
+        match release::peeled(&listed, tag) {
+            Some(at) if at == sha => {}
+            Some(_) => {
+                return Err(format!(
+                    "{tag} moved since build #{build}: nothing was published"
+                ))
+            }
+            None => return Err(format!("{tag} is not on origin: nothing was published")),
+        }
+
+        self.progress(tag, "checking the previous release");
+        match self.find_changes(tag, &sha).await {
+            Ok(found) => {
+                let mut inner = self.lock();
+                let inner = &mut *inner;
+                if let Some(r) = inner.releases.get_mut(tag) {
+                    let why = release::rebased(r, &sha, found, &s.repo, now());
+                    self.save_release(r);
+                    if let Some(why) = why {
+                        return Err(why);
+                    }
+                }
+            }
+            Err(e) => eprintln!("bana daemon: {tag}: the previous release: {e}"),
+        }
+
+        // What a killed gh release create of bana's left: the notes it sent.
+        let notes_file = s.dir.join("releases").join(format!("{tag}.notes.md"));
+        let sent = std::fs::read_to_string(&notes_file).ok();
+        let mut deleted = 0;
+        loop {
+            self.progress(tag, "looking for the release on GitHub");
+            let view = self
+                .gh(
+                    &log,
+                    &[
+                        "release",
+                        "view",
+                        tag,
+                        "-R",
+                        &s.repo,
+                        "--json",
+                        release::VIEW_FIELDS,
+                    ],
+                    60,
+                )
+                .await;
+            match release::existing(view.as_deref().map_err(String::as_str))? {
+                release::Existing::None => break,
+                release::Existing::Draft { body, assets }
+                    if !release::orphan(&body, &assets, sent.as_deref(), &upload) =>
+                {
+                    return Err(format!(
+                        "a draft {tag} is on GitHub (not bana's): publish or delete it there; nothing was published"
+                    ))
+                }
+                release::Existing::Draft { .. } if deleted < 5 => {
+                    self.progress(tag, "deleting a draft an earlier publish left");
+                    self.gh(
+                        &log,
+                        &["release", "delete", tag, "-R", &s.repo, "--yes"],
+                        60,
+                    )
+                    .await
+                    .map_err(|e| format!("gh release delete: {e}"))?;
+                    deleted += 1;
+                }
+                release::Existing::Draft { .. } => {
+                    return Err(format!(
+                        "drafts of {tag} are still on GitHub after 5 deletes"
+                    ))
+                }
+                release::Existing::Published { url, assets } => {
+                    return if release::same_files(&assets, &manifest) {
+                        Ok(url)
+                    } else {
+                        Err(format!(
+                            "a release {tag} is on GitHub already, with other files: {url}"
+                        ))
+                    };
+                }
+            }
+        }
+
+        let flags = if notes::is_prerelease(tag) || notes::version(tag).is_none() {
+            release::flags(tag, Err(""))
+        } else {
+            let args = release::finals_args(&s.repo);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let finals = self.gh(&log, &args, 60).await;
+            release::flags(tag, finals.as_deref().map_err(String::as_str))
+        };
+        let conf = self.conf_at(&sha).await;
+        let title = title.unwrap_or_else(|| release::title(&conf, &s.prefix, tag));
+        let tested = std::fs::read_to_string(self.build_dir(build).join("report.md"))
+            .ok()
+            .and_then(|m| release::tested(&m));
+        let mut platforms: Vec<String> = files
+            .iter()
+            .filter_map(|f| crate::artifacts::platform(f))
+            .collect();
+        platforms.sort();
+        let install = release::install(&s.repo, tag, files, &platforms);
+        std::fs::write(
+            &notes_file,
+            release::body(&text, tested.as_deref(), install.as_deref()),
+        )
+        .map_err(|e| format!("{}: {e}", notes_file.display()))?;
+        let args = release::create_args(&s.repo, tag, &title, &notes_file, &flags, &upload);
+        self.progress(
+            tag,
+            &format!("gh release create: uploading {} files", upload.len()),
+        );
+        let out = self.create(&args, &dist, &log).await?;
+        Ok(out
+            .lines()
+            .map(str::trim)
+            .rfind(|l| l.starts_with("https://"))
+            .map(String::from)
+            .unwrap_or_else(|| format!("https://github.com/{}/releases/tag/{tag}", s.repo)))
+    }
+
+    /// gh in src, its words in the release's log: its stdout, or its last
+    /// lines when it failed.
+    async fn gh(&self, log: &Path, args: &[&str], secs: u64) -> Result<String, String> {
+        let o = self
+            .output(&self.settings.gh, args, &self.src(), secs)
+            .await;
+        let o = match o {
+            Ok(o) => o,
+            Err(e) => {
+                append(log, &format!("$ gh {}\n{e}\n", args.join(" ")));
+                return Err(e);
+            }
+        };
+        let (out, err) = (
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+        );
+        append(log, &format!("$ gh {}\n{out}{err}", args.join(" ")));
+        if o.status.success() {
+            Ok(out)
+        } else {
+            Err(match release::tail(&err) {
+                t if t.is_empty() => format!("gh exited with {}", o.status.code().unwrap_or(-1)),
+                t => t,
+            })
+        }
+    }
+
+    /// `gh release create` from dist/, kept awake on macOS, stopped after
+    /// the publish timeout (Publish again cleans up the draft it leaves).
+    async fn create(&self, args: &[String], dist: &Path, log: &Path) -> Result<String, String> {
+        let s = &self.settings;
+        append(log, &format!("$ gh {}\n", args.join(" ")));
+        let child = Command::new(&s.gh)
+            .args(args)
+            .current_dir(dist)
+            .env("PATH", &s.path)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| format!("{}: {e}", s.gh))?;
+        if cfg!(target_os = "macos") {
+            if let Some(pid) = child.id() {
+                let _ = Command::new(&s.caffeinate)
+                    .args(["-i", "-w", &pid.to_string()])
+                    .env("PATH", &s.path)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+            }
+        }
+        let o = match tokio::time::timeout(s.publish_timeout, child.wait_with_output()).await {
+            Err(_) => {
+                let why = format!(
+                    "gh release create took longer than {}: it was stopped (Publish again deletes the draft it left)",
+                    minutes(s.publish_timeout)
+                );
+                append(log, &format!("{why}\n"));
+                return Err(why);
+            }
+            Ok(Err(e)) => return Err(format!("{}: {e}", s.gh)),
+            Ok(Ok(o)) => o,
+        };
+        let (out, err) = (
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+        );
+        append(log, &format!("{out}{err}"));
+        if o.status.success() {
+            Ok(out)
+        } else {
+            Err(match release::tail(&err) {
+                t if t.is_empty() => format!(
+                    "gh release create exited with {}",
+                    o.status.code().unwrap_or(-1)
+                ),
+                t => t,
+            })
+        }
     }
 
     // ---- fix rounds ----------------------------------------------------------
@@ -1923,20 +3009,11 @@ impl Shared {
 
     /// Why a round that has not started waits, when nothing runs ahead of
     /// it: the paused daemon, Docker, or the owner's `bana ci` (its lock).
-    fn round_waits(&self, r: &Round) -> Option<String> {
-        let inner = self.lock();
-        self.round_waiting(&inner, r)
-    }
-
     fn round_waiting(&self, inner: &Inner, r: &Round) -> Option<String> {
-        if r.state != BuildState::Queued {
-            None
-        } else if inner.state.paused {
-            Some(PAUSED.into())
-        } else if inner.running.is_some() {
+        // A pause holds pushes only: never a round.
+        if r.state != BuildState::Queued || inner.running.is_some() {
             None
         } else {
-            // Not an older "paused": the daemon was resumed since.
             inner.waiting.clone().filter(|w| w != PAUSED)
         }
     }
@@ -2055,7 +3132,8 @@ impl Shared {
     // ---- the watcher -----------------------------------------------------------
 
     async fn watcher(self: Arc<Self>) {
-        let mut tick = tokio::time::interval(self.settings.poll);
+        let first = tokio::time::Instant::now() + self.first_poll;
+        let mut tick = tokio::time::interval_at(first, self.settings.poll);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut stop = self.stop.subscribe();
         loop {
@@ -2185,6 +3263,8 @@ impl Shared {
                             r.request.sha = sha;
                             self.save(r);
                         }
+                        // A tag pushed again while its build waits: its release follows.
+                        self.release_queued(inner, id);
                     }
                     Action::Drop { id, why } => {
                         eprintln!("bana daemon: build {id} dropped: {why}");
@@ -2258,8 +3338,9 @@ impl Shared {
         self.publish(&inner);
     }
 
-    /// The next build, once its gates are open (not paused, Docker up, the lock
-    /// ours): it is now the running one, and the lock is held for it.
+    /// The next build, once its gates are open (not a push while paused,
+    /// Docker up, the lock ours): it is now the running one, and the lock is
+    /// held for it. The registry's runner calls it for each project in turn.
     async fn next_build(&self) -> Option<(u64, mpsc::UnboundedReceiver<String>)> {
         let id = {
             let mut inner = self.lock();
@@ -2282,19 +3363,20 @@ impl Shared {
             if !done.is_empty() {
                 self.save_state(&inner.state);
             }
-            let Some(&id) = inner.state.queue.first() else {
+            if inner.state.queue.is_empty() {
                 (inner.waiting, inner.watcher.lock_holder) = (None, None);
                 self.publish(&inner);
                 return None;
-            };
+            }
             if inner.stopping {
                 return None;
             }
-            if inner.state.paused {
+            // Paused: the pushes wait, the rest may pass them.
+            let Some(id) = next_up(&inner) else {
                 inner.waiting = Some(PAUSED.into());
                 self.publish(&inner);
                 return None;
-            }
+            };
             id
         };
         let docker = self
@@ -2324,15 +3406,15 @@ impl Shared {
         let mut inner = self.lock();
         inner.watcher.lock_holder = None;
         inner.waiting = None;
-        // It may have been cancelled, or the daemon paused, meanwhile.
-        if inner.state.queue.first() != Some(&id) || inner.state.paused || inner.stopping {
+        // It may have been cancelled, or the project paused, meanwhile.
+        if next_up(&inner) != Some(id) || inner.stopping {
             drop(inner);
             self.release_lock(&[std::process::id()]);
             self.run.notify_one();
             return None;
         }
         let (tx, rx) = mpsc::unbounded_channel();
-        inner.state.queue.remove(0);
+        inner.state.queue.retain(|q| *q != id);
         inner.running = Some(Running {
             id,
             since: Instant::now(),
@@ -2367,6 +3449,8 @@ impl Shared {
                 self.settle_interrupted(&mut inner, &req);
             }
             self.sync_rounds_of(&inner, id);
+            // Its files are collected and its report written: its release may ask.
+            self.release_sync(&mut inner, id);
             let forgotten = self.prune(&mut inner);
             self.save_state(&inner.state);
             self.publish(&inner);
@@ -2630,7 +3714,7 @@ impl Shared {
             let old = rec.build.clone();
             rec.build = Build::new(&list, now());
             if let Ok(reason) = cancel.try_recv() {
-                if inner.stopping {
+                if inner.stopping && reason == INTERRUPTED {
                     // The daemon stops before act ran: it is queued again as it was.
                     rec.build = Build::default();
                     self.save(rec);
@@ -2638,7 +3722,8 @@ impl Shared {
                     self.save_state(&inner.state);
                     return;
                 }
-                // Cancelled while it was being checked out: nothing ran, nothing is posted.
+                // Cancelled while it was being checked out (or its project
+                // removed): nothing ran, nothing is posted.
                 rec.build.finish(None, Some(&reason), now());
                 self.save(rec);
                 return;
@@ -2809,7 +3894,7 @@ impl Shared {
         // Containers are left behind only when act did not end on its own.
         self.sweep(id, ladder.is_some() || code.is_none()).await;
 
-        let pin = {
+        let (pin, green) = {
             let mut inner = self.lock();
             let inner = &mut *inner;
             let Some(rec) = inner.records.get_mut(&id) else {
@@ -2835,13 +3920,26 @@ impl Shared {
                 &rules.tier
             };
             let green = state == BuildState::Success && !rec.request.is_fix();
-            (green && rec.request.tier == *push_tier).then(|| {
+            let pin = (green && rec.request.tier == *push_tier).then(|| {
                 inner.state.green.insert(git_ref.clone(), sha.clone());
                 self.save_state(&inner.state);
                 (git_ref, sha)
-            })
+            });
+            (pin, green)
         };
-        // src is still at the built commit: the next build checks out its own.
+        // src is still at the built commit: the next build checks out its own,
+        // and the installer is made from this one's bana.conf.
+        if green {
+            self.collect(id).await;
+        } else if self
+            .lock()
+            .records
+            .get(&id)
+            .is_some_and(|r| r.request.is_fix())
+        {
+            // A fix's round keeps nothing it uploaded.
+            let _ = std::fs::remove_dir_all(dir.join("artifacts"));
+        }
         self.write_report(id).await;
         if let Some((git_ref, sha)) = pin {
             if let Err(e) = self
@@ -2850,6 +3948,104 @@ impl Shared {
             {
                 eprintln!("bana daemon: pin {git_ref}: {e}");
             }
+        }
+    }
+
+    /// A green build's uploads into its `dist/` ([`crate::artifacts`]), then
+    /// the project's installer for them (`bana installer dist --label
+    /// <tier>-<sha10>`, or `--tag` for a tag), from the built commit's
+    /// bana.conf. Once that is made, the zips go: each file is kept once.
+    /// A problem is the build's `dist.problem`, never its result.
+    async fn collect(&self, id: u64) {
+        let dir = self.build_dir(id);
+        if !dir.join("artifacts").join(id.to_string()).is_dir() {
+            return;
+        }
+        let Some(req) = self.lock().records.get(&id).map(|r| r.request.clone()) else {
+            return;
+        };
+        let at = dir.clone();
+        let c = match tokio::task::spawn_blocking(move || crate::artifacts::collect(&at, id)).await
+        {
+            Ok(c) => c,
+            Err(e) => crate::artifacts::Collection {
+                problem: Some(e.to_string()),
+                ..Default::default()
+            },
+        };
+        if c.artifacts.is_empty() && c.problem.is_none() {
+            return;
+        }
+        let mut dist = Dist {
+            problem: c.problem.clone(),
+            ..Dist::default()
+        };
+        if c.problem.is_none() && !c.files.is_empty() {
+            // Archives an installer can install: else the files are just files.
+            if c.files.iter().any(|f| f.platform.is_some()) {
+                if let Err(e) = self.installer(id, &req).await {
+                    eprintln!("bana daemon: build {id}: {e}");
+                    dist.problem = Some(e);
+                }
+            }
+            dist.files = dist_entries(&dir.join("dist"));
+            if dist.problem.is_none() {
+                let zips = dir.join("artifacts").join(id.to_string());
+                for a in c.artifacts.iter().filter(|a| a.problem.is_none()) {
+                    let _ = std::fs::remove_dir_all(zips.join(&a.name));
+                }
+                let _ = std::fs::remove_dir(&zips);
+                let _ = std::fs::remove_dir(dir.join("artifacts"));
+            }
+        }
+        if let Some(p) = &c.problem {
+            eprintln!("bana daemon: build {id}: files not collected: {p}");
+        }
+        if let Err(e) = crate::artifacts::record(&dir, &c.artifacts) {
+            eprintln!("bana daemon: build {id}: {e}");
+        }
+        if dist.files.is_empty() && dist.problem.is_none() {
+            return;
+        }
+        let mut inner = self.lock();
+        if let Some(rec) = inner.records.get_mut(&id) {
+            rec.dist = Some(dist);
+            self.save(rec);
+        }
+        self.publish(&inner);
+    }
+
+    /// `bana installer dist …` in the build's directory, as `bana ci` runs.
+    async fn installer(&self, id: u64, req: &Request) -> Result<(), String> {
+        let s = &self.settings;
+        let how = match req.git_ref.strip_prefix("refs/tags/") {
+            Some(tag) => ["--tag".to_string(), tag.to_string()],
+            None => {
+                let sha: String = req.sha.chars().take(10).collect();
+                let label = match req.tier.as_str() {
+                    "" => sha,
+                    t => format!("{t}-{sha}"),
+                };
+                ["--label".to_string(), label]
+            }
+        };
+        let run = Command::new(&s.bash)
+            .arg(&s.script)
+            .args(["installer", "dist"])
+            .args(&how)
+            .env_clear()
+            .envs(s.child_env(id))
+            .current_dir(self.build_dir(id))
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        match tokio::time::timeout(Duration::from_secs(INSTALLER_TIMEOUT), run).await {
+            Err(_) => Err(format!(
+                "bana installer took longer than {INSTALLER_TIMEOUT} s"
+            )),
+            Ok(Err(e)) => Err(format!("{}: {e}", s.bash)),
+            Ok(Ok(o)) if o.status.success() => Ok(()),
+            Ok(Ok(o)) => Err(failure(&o)),
         }
     }
 
@@ -3131,7 +4327,9 @@ impl Shared {
                     let rec = inner.records.get(id)?;
                     let p = rec.statuses.get(context)?.clone();
                     let url = inner.state.target_url_ok.then(|| {
-                        let mut u = format!("http://127.0.0.1:{}/#build={id}", self.settings.port);
+                        let s = &self.settings;
+                        let mut u =
+                            format!("http://127.0.0.1:{}/#p={}&build={id}", s.port, s.prefix);
                         if let Some(key) = context
                             .strip_prefix(&rec.context_prefix)
                             .and_then(|k| k.strip_prefix('/'))
@@ -3216,16 +4414,19 @@ impl Shared {
 
     // ---- pruning ------------------------------------------------------------------
 
-    /// Keeps the newest builds, a fix's rounds while it lasts, and a week of
-    /// artifacts. Says which fixes lost their last round build: their
-    /// snapshots' refs in src go too ([`Self::forget_refs`]).
+    /// Keeps the newest builds, a fix's rounds while it lasts, a week of
+    /// artifacts and files, and the newest files of each branch and tier.
+    /// Says which fixes lost their last round build: their snapshots' refs in
+    /// src go too ([`Self::forget_refs`]).
     fn prune(&self, inner: &mut Inner) -> Vec<String> {
         let busy = |id: u64| {
             inner.state.queue.contains(&id) || inner.running.as_ref().is_some_and(|r| r.id == id)
         };
         let fixes = self.settings.dir.join("fix");
         let gone = |fix: &str| !fixes.join(format!("{fix}.d/fix.json")).exists();
-        let old = to_prune(&inner.records, busy, gone, now());
+        let mut keep = kept_files(&inner.records, &inner.state.heads);
+        keep.extend(release::kept_builds(&inner.releases, now()));
+        let old = to_prune(&inner.records, &keep, busy, gone, now());
         let mut forgotten: Vec<String> = Vec::new();
         for id in old {
             if let Some(fix) = inner.records.remove(&id).and_then(|r| r.request.fix) {
@@ -3241,21 +4442,62 @@ impl Shared {
                 .values()
                 .any(|r| r.request.fix.as_deref() == Some(fix.as_str()))
         });
-        let week_ago = now() - KEEP_ARTIFACTS;
-        for r in inner.records.values() {
-            if r.build.ended_at.is_some_and(|t| t < week_ago) {
-                let _ = std::fs::remove_dir_all(self.build_dir(r.request.id).join("artifacts"));
+        for id in stale_files(&inner.records, &keep, now()) {
+            let dir = self.build_dir(id);
+            let _ = std::fs::remove_dir_all(dir.join("artifacts"));
+            let _ = std::fs::remove_dir_all(dir.join("dist"));
+            if let Some(d) = inner.records.get_mut(&id).and_then(|r| r.dist.as_mut()) {
+                if !d.removed && !d.files.is_empty() {
+                    d.removed = true;
+                    let rec = &inner.records[&id];
+                    self.save(rec);
+                }
             }
         }
         forgotten
     }
 }
 
+/// The builds whose files are kept past the week: the newest that can be
+/// installed (its installer made, no problem) of each branch (or tag) and
+/// tier, while the branch is there, so the latest nightly of main can always
+/// be installed.
+fn kept_files(records: &BTreeMap<u64, Record>, heads: &Heads) -> BTreeSet<u64> {
+    let mut seen = BTreeSet::new();
+    let mut keep = BTreeSet::new();
+    for r in records.values().rev() {
+        let has = r.dist.as_ref().is_some_and(|d| {
+            d.problem.is_none()
+                && d.available()
+                    .iter()
+                    .any(|f| f.name == "install.sh" || f.name == "install.ps1")
+        });
+        let key = (r.request.git_ref.as_str(), r.request.tier.as_str());
+        if has && heads.contains_key(&r.request.git_ref) && seen.insert(key) {
+            keep.insert(r.request.id);
+        }
+    }
+    keep
+}
+
+/// The ended builds whose artifacts and files go: those that ended
+/// [`KEEP_ARTIFACTS`] ago, but for `keep`.
+fn stale_files(records: &BTreeMap<u64, Record>, keep: &BTreeSet<u64>, now: i64) -> Vec<u64> {
+    records
+        .values()
+        .filter(|r| r.build.ended_at.is_some_and(|t| t < now - KEEP_ARTIFACTS))
+        .filter(|r| !keep.contains(&r.request.id))
+        .map(|r| r.request.id)
+        .collect()
+}
+
 /// The builds pruning removes: those past the newest [`KEEP_BUILDS`], not
-/// counting fix rounds, and a fix's rounds once the fix is `gone` or its last
-/// round ended [`KEEP_ROUNDS`] ago. A `busy` build (queued, running) stays.
+/// counting fix rounds or those whose files are kept (`keep`), and a fix's
+/// rounds once the fix is `gone` or its last round ended [`KEEP_ROUNDS`] ago.
+/// A `busy` build (queued, running) stays.
 fn to_prune(
     records: &BTreeMap<u64, Record>,
+    keep: &BTreeSet<u64>,
     busy: impl Fn(u64) -> bool,
     gone: impl Fn(&str) -> bool,
     now: i64,
@@ -3263,7 +4505,7 @@ fn to_prune(
     let mut out: Vec<u64> = records
         .values()
         .rev()
-        .filter(|r| !r.request.is_fix() && !busy(r.request.id))
+        .filter(|r| !r.request.is_fix() && !busy(r.request.id) && !keep.contains(&r.request.id))
         .skip(KEEP_BUILDS)
         .map(|r| r.request.id)
         .collect();
@@ -3283,6 +4525,35 @@ fn to_prune(
             out.push(r.request.id);
         }
     }
+    out
+}
+
+/// What `dir` (a build's dist/) holds, by name: a file named in its
+/// SHA256SUMS is the release's.
+fn dist_entries(dir: &Path) -> Vec<DistEntry> {
+    let sums = std::fs::read_to_string(dir.join("SHA256SUMS")).unwrap_or_default();
+    let listed: Vec<&str> = sums
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .map(|n| n.trim_start_matches('*'))
+        .collect();
+    let mut out: Vec<DistEntry> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| {
+            let name = e.file_name().to_str()?.to_string();
+            Some(DistEntry {
+                bytes: e.metadata().map(|m| m.len()).unwrap_or(0),
+                platform: crate::artifacts::platform(&name),
+                release: name == "SHA256SUMS" || listed.contains(&name.as_str()),
+                name,
+            })
+        })
+        .filter(|f| !f.name.starts_with('.') && !f.name.ends_with(".part"))
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 
@@ -3351,6 +4622,62 @@ fn newest_failed(records: &BTreeMap<u64, Record>) -> Option<u64> {
         .find(|r| matches!(r.build.state, BuildState::Success | BuildState::Failure))
         .filter(|r| r.build.state == BuildState::Failure)
         .map(|r| r.request.id)
+}
+
+/// What a build of a release's tag says for it, once it has ended: Ok when
+/// it passed with files for a release (SHA256SUMS lists them), else why not.
+fn release_outcome(rec: &Record) -> Option<Result<(), String>> {
+    let id = rec.request.id;
+    Some(match rec.build.state {
+        BuildState::Queued | BuildState::Running => return None,
+        BuildState::Success => match &rec.dist {
+            None => Err("no files: the workflow uploads no v4 artifacts".into()),
+            Some(d) if d.removed => Err(format!("build #{id}'s files were removed")),
+            Some(d) if d.problem.is_some() => Err(format!(
+                "files not collected: {}",
+                d.problem.as_deref().unwrap_or_default()
+            )),
+            Some(d)
+                if d.files.iter().any(|f| f.name == "SHA256SUMS")
+                    && d.files.iter().any(|f| f.release && f.name != "SHA256SUMS") =>
+            {
+                Ok(())
+            }
+            Some(_) => Err(
+                "no files for a release: no SHA256SUMS (an archive per platform, release.files)"
+                    .into(),
+            ),
+        },
+        BuildState::Failure => {
+            let at = rec
+                .build
+                .chips()
+                .into_iter()
+                .find(|j| j.state == actlog::JobState::Failure)
+                .map(|j| format!(" at {}", j.key))
+                .unwrap_or_default();
+            Err(format!("build #{id} failed{at}"))
+        }
+        BuildState::Error => Err(format!(
+            "build #{id}: {}",
+            rec.build
+                .reason
+                .as_deref()
+                .or(rec.build.last_error.as_deref())
+                .unwrap_or("ended in error")
+        )),
+    })
+}
+
+/// Appends to a log file; a log that cannot be written is left out.
+fn append(path: &Path, text: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(text.as_bytes());
+    }
 }
 
 fn built(records: &BTreeMap<u64, Record>) -> Built {
@@ -3438,7 +4765,10 @@ async fn claim(dir: &Path) -> Result<std::fs::File, String> {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    Err(format!("another bana daemon runs in {}", dir.display()))
+    Err(format!(
+        "another bana daemon runs in {} (an older bana's? bana daemon install stops it)",
+        dir.display()
+    ))
 }
 
 /// A build interrupted by a restart runs again when nothing moved on: its
@@ -3449,6 +4779,17 @@ fn retry_eligible(r: &Request, heads: &Heads) -> bool {
         && (matches!(r.trigger, Trigger::Manual | Trigger::Rerun | Trigger::Fix)
             || watch::is_tag(&r.git_ref)
             || heads.get(&r.git_ref) == Some(&r.sha))
+}
+
+/// The queued build to start next: the first, or while the owner has paused
+/// automatic builds, the first that is not a push (or a push's retry).
+fn next_up(inner: &Inner) -> Option<u64> {
+    inner.state.queue.iter().copied().find(|id| {
+        !inner.state.paused
+            || inner.records.get(id).is_some_and(|r| {
+                r.request.is_fix() || matches!(r.request.trigger, Trigger::Manual | Trigger::Rerun)
+            })
+    })
 }
 
 /// A full commit or tree id: 40 or 64 hex digits.
@@ -3636,7 +4977,9 @@ pub(crate) mod tests {
     use super::*;
     use std::process::Command as Std;
 
-    const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/act");
+    pub(crate) const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/act");
+    /// tests/stand-ins/gh, whose release store the daemon's gh uses.
+    const STANDIN_GH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/stand-ins/gh");
 
     /// Stand-in `bana`: `ci --list` prints the fixture's `act -l`; `ci …`
     /// records its arguments, environment, secrets and pid, waits while `hold`
@@ -3645,8 +4988,20 @@ pub(crate) mod tests {
     /// file says `stubborn` (the first SIGINT is ignored) or `deaf` (all are).
     /// With `orphans`, it first leaves two sleeps that are not its children
     /// (setsid, nohup), carrying the marker, and records their pids. While
-    /// `stall` exists, it stops after a job's first line.
+    /// `stall` exists, it stops after a job's first line. The `files` fixture
+    /// (build 10 of the artifacts fixtures) leaves that build's uploads in
+    /// `artifacts/<id>/`, as does any fixture while `artifacts` exists.
+    /// `installer` records its arguments, then writes an install.sh and a
+    /// SHA256SUMS of it and the tar.gz, or fails while `installer-fails` exists.
     const BANA: &str = r#"ctl='CTL'; fx='FX'
+if [[ $1 == installer ]]; then
+  b=${BANA_BUILD##*-}
+  printf '%s\n' "$@" "$BANA_PROJECT_ROOT" "$PWD" >"$ctl/installer.$b"
+  [[ ! -e $ctl/installer-fails ]] || { echo "bana installer: install.name: not 'a b'" >&2; exit 1; }
+  echo '#!/bin/sh' >"$2/install.sh"
+  (cd "$2" && { sha256sum install.sh *.tar.gz 2>/dev/null || shasum -a 256 install.sh *.tar.gz; }) >"$2/SHA256SUMS"
+  exit 0
+fi
 [[ $1 == ci ]] || exit 2
 shift
 f=$(cat "$BANA_PROJECT_ROOT/fixture")
@@ -3681,6 +5036,10 @@ while IFS= read -r line; do
   case $line in *'"jobID"'*) while [[ -e $ctl/stall ]]; do sleep 0.05; done ;; esac
   sleep 0.01
 done <"$fx/$f.jsonl"
+if [[ $f == files || -e $ctl/artifacts ]]; then
+  mkdir -p "artifacts/$b"
+  cp -R "$fx/../artifacts/b10/artifacts/10/." "artifacts/$b/"
+fi
 case $f in fail | syntax) exit 1 ;; esac
 exit 0
 "#;
@@ -3688,11 +5047,18 @@ exit 0
     /// Stand-in `gh`: answers `auth token` and logs each `api` call (its
     /// arguments, tab-separated). `gh-down` makes calls fail; `gh-no-url`
     /// refuses a target_url as GitHub would (422); `gh-422` refuses statuses
-    /// for the commit it names.
+    /// for the commit it names. `release …` goes to tests/stand-ins/gh, with
+    /// its releases in `releases/` and its log in `gh-release.log`; `gh-fail-at`
+    /// and `gh-slow` say its FAKE_GH_FAIL_AT and FAKE_GH_SLOW.
     const GH: &str = "#!/bin/sh
 ctl='CTL'
 if [ \"$1 $2\" = 'auth token' ]; then echo gho_fromgh; exit 0; fi
 if [ -e \"$ctl/gh-down\" ]; then echo 'error connecting to api.github.com' >&2; exit 1; fi
+if [ \"$1\" = release ]; then
+  FAKE_LOG=\"$ctl/gh-release.log\" FAKE_RELEASE_STORE=\"$ctl/releases\" \\
+    FAKE_GH_FAIL_AT=$(cat \"$ctl/gh-fail-at\" 2>/dev/null) FAKE_GH_SLOW=$(cat \"$ctl/gh-slow\" 2>/dev/null) \\
+    exec 'STANDIN' \"$@\"
+fi
 if [ -e \"$ctl/gh-422\" ]; then case \"$*\" in *\"$(cat \"$ctl/gh-422\")\"*)
   echo 'gh: No commit found for SHA: x (HTTP 422)' >&2; exit 1 ;; esac; fi
 case \"$*\" in *target_url=*)
@@ -3728,11 +5094,11 @@ exec git \"$@\"
     /// one (`<dir>/src`), and the stand-ins.
     pub(crate) struct Project {
         /// Its own, so one test's sweep never meets another's builds.
-        prefix: String,
-        root: PathBuf,
-        ctl: PathBuf,
-        work: PathBuf,
-        dir: PathBuf,
+        pub(crate) prefix: String,
+        pub(crate) root: PathBuf,
+        pub(crate) ctl: PathBuf,
+        pub(crate) work: PathBuf,
+        pub(crate) dir: PathBuf,
     }
 
     fn git(cwd: &Path, args: &[&str]) -> String {
@@ -3757,6 +5123,16 @@ exec git \"$@\"
 
     impl Project {
         pub(crate) fn new(name: &str) -> Self {
+            Self::make(name, None)
+        }
+
+        /// One of the projects in `home`, in `<home>/<prefix>` as bana adds
+        /// them (its settings are the test's to write).
+        pub(crate) fn new_in(name: &str, home: &Path) -> Self {
+            Self::make(name, Some(home))
+        }
+
+        fn make(name: &str, home: Option<&Path>) -> Self {
             let root =
                 std::env::temp_dir().join(format!("bana-daemon-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
@@ -3767,15 +5143,20 @@ exec git \"$@\"
             let ctl_s = ctl.to_string_lossy();
             for (file, body) in [("bana", BANA), ("gh", GH), ("docker", DOCKER), ("git", GIT)] {
                 let path = bin.join(file);
-                std::fs::write(&path, body.replace("CTL", &ctl_s).replace("FX", FIXTURES)).unwrap();
+                let body = body.replace("CTL", &ctl_s).replace("FX", FIXTURES);
+                std::fs::write(&path, body.replace("STANDIN", STANDIN_GH)).unwrap();
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
             git(&root, &["init", "-q", "--bare", "-b", "main", "origin.git"]);
             git(&root, &["clone", "-q", "origin.git", "work"]);
-            let dir = root.join("home/p");
+            let prefix = format!("{name}{}", std::process::id());
+            let dir = match home {
+                Some(h) => h.join(&prefix),
+                None => root.join("home/p"),
+            };
             let p = Self {
-                prefix: format!("{name}{}", std::process::id()),
+                prefix,
                 work: root.join("work"),
                 root,
                 ctl,
@@ -3831,6 +5212,13 @@ exec git \"$@\"
             git(&self.work, &["add", "-A"]);
             git(&self.work, &["commit", "-q", "-m", message]);
             git(&self.work, &["rev-parse", "HEAD"])
+        }
+
+        /// Tags the checkout's HEAD (annotated), or moves the tag there, and pushes it.
+        pub(crate) fn tag(&self, name: &str) {
+            git(&self.work, &["tag", "-f", "-a", "-m", name, name]);
+            let to = format!("refs/tags/{name}");
+            git(&self.work, &["push", "-q", "--force", "origin", &to]);
         }
 
         pub(crate) fn push(&self, branch: &str) {
@@ -3907,7 +5295,7 @@ exec git \"$@\"
         panic!("waited 30 s for {what}");
     }
 
-    async fn poll(d: &Daemon) {
+    pub(crate) async fn poll(d: &Daemon) {
         let n = d.0.lock().polls;
         d.poll_now();
         until("a poll", || d.0.lock().polls > n).await;
@@ -3996,8 +5384,33 @@ exec git \"$@\"
             (s.path.as_str(), s.git.as_str(), s.gh.as_str()),
             ("/usr/bin", "git", "gh")
         );
-        assert_eq!(s.script, Path::new("/x/wid/daemon/bin/bana"));
+        assert_eq!(s.script, Path::new("/x/daemon.d/bin/bana"));
         assert!(s.checkout.is_none() && s.bana_commit.is_none(), "{s:?}");
+        assert_eq!(
+            (s.retry, s.recheck, s.grace, s.publish_timeout),
+            (
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                Duration::from_secs(5),
+                Duration::from_secs(1800)
+            )
+        );
+        assert_eq!(
+            (s.ladder, s.ladder_short),
+            (
+                [Duration::from_secs(60), Duration::from_secs(30)],
+                [Duration::from_secs(20), Duration::from_secs(10)]
+            )
+        );
+        let text = "repo = o/r\nprefix = wid\nrecheck = 50ms\nladder = 1 500ms\n";
+        let s = Settings::parse(text, dir, env.clone()).unwrap();
+        assert_eq!(
+            (s.recheck, s.ladder),
+            (
+                Duration::from_millis(50),
+                [Duration::from_secs(1), Duration::from_millis(500)]
+            )
+        );
 
         // What Fix with Claude needs, as install writes it.
         let text =
@@ -4079,10 +5492,67 @@ exec git \"$@\"
                 "repo = o/r\nprefix = w\nbana_commit = b1df\n",
                 "bana_commit",
             ),
+            ("repo = o/r\nprefix = w\nladder = 60\n", "ladder"),
+            ("repo = o/r\nprefix = w\ngrace = 0\n", "grace"),
         ] {
             let e = Settings::parse(text, dir, env.clone()).unwrap_err();
             assert!(e.contains(why), "{text:?}: {e}");
         }
+    }
+
+    #[test]
+    fn a_project_runs_with_the_machines_settings_and_its_own() {
+        let home = std::env::temp_dir().join(format!("bana-daemon-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let put = |file: &str, text: &str| {
+            let path = home.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        // A lone project file (no machine's yet) is read as it is.
+        put(
+            "wid/daemon/settings",
+            "repo = o/r\nprefix = wid\nport = 8471\nhost = old\n",
+        );
+        let s = Settings::load(&home, "wid").unwrap();
+        assert_eq!((s.repo.as_str(), s.port), ("o/r", 8470), "{s:?}");
+        assert_eq!(s.script, home.join("daemon.d/bin/bana"));
+        // The machine's keys are the machine's: an older bana's in the
+        // project's file are left out, but its path wins.
+        put(
+            "daemon.d/settings",
+            "port = 8472\nhost = mbp\npath = /usr/bin\nscript = /s/bana\n",
+        );
+        put(
+            "wid/daemon/settings",
+            "repo = o/r\nprefix = wid\nport = 8471\nhost = old\ndaemon.poll = 7\n",
+        );
+        let s = Settings::load(&home, "wid").unwrap();
+        assert_eq!(
+            (s.port, s.machine.as_str(), s.path.as_str(), s.poll),
+            (8472, "mbp", "/usr/bin", Duration::from_secs(7))
+        );
+        assert_eq!(s.script, Path::new("/s/bana"));
+        put(
+            "wid/daemon/settings",
+            "repo = o/r\nprefix = wid\npath = /opt/bin:/usr/bin\n",
+        );
+        let s = Settings::load(&home, "wid").unwrap();
+        assert_eq!(s.path, "/opt/bin:/usr/bin");
+        let m = Machine::load(&home).unwrap();
+        assert_eq!((m.port, m.machine.as_str()), (8472, "mbp"));
+        // fix and the MCP read the same.
+        let kv = fix::daemon_settings(&home.join("wid"));
+        assert_eq!(
+            (kv["port"].as_str(), kv["path"].as_str()),
+            ("8472", "/opt/bin:/usr/bin")
+        );
+        // The directory is the project: its prefix must say so.
+        put("other/daemon/settings", "repo = o/r\nprefix = wid\n");
+        let e = Settings::load(&home, "other").unwrap_err();
+        assert!(e.contains("the project is other"), "{e}");
+        assert!(Settings::load(&home, "none").is_err());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -4132,6 +5602,7 @@ exec git \"$@\"
             seq: 6,
             polls: 0,
             stopping: false,
+            releases: BTreeMap::new(),
         };
         assert_eq!(
             to_post(&inner),
@@ -4191,7 +5662,8 @@ exec git \"$@\"
             ),
             ("bana", "pending", "running on t (quick)")
         );
-        assert_eq!(first.url.as_deref(), Some("http://127.0.0.1:8470/#build=1"));
+        let page = format!("http://127.0.0.1:8470/#p={}&build=1", p.prefix);
+        assert_eq!(first.url.as_deref(), Some(page.as_str()));
         let last = posts.last().unwrap();
         assert_eq!(
             (last.context.as_str(), last.state.as_str()),
@@ -4207,7 +5679,7 @@ exec git \"$@\"
                 states[..states.len() - 1].iter().all(|s| *s == "pending"),
                 "{states:?}"
             );
-            let url = format!("http://127.0.0.1:8470/#build=1&job={job}");
+            let url = format!("{page}&job={job}");
             assert_eq!(mine[0].url.as_deref(), Some(url.as_str()));
         }
 
@@ -4409,6 +5881,127 @@ exec git \"$@\"
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_green_builds_files_are_kept_with_their_installer() {
+        let p = Project::new("files");
+        let d = start(&p, "").await;
+        let a = p.commit("files", "packages");
+        p.push("main");
+        poll(&d).await;
+        let rec = finished(&d, 1).await;
+        assert_eq!(rec.build.state, BuildState::Success);
+        let dir = p.dir.join("builds/1");
+        let dist = rec.dist.clone().expect("collected");
+        assert_eq!(dist.problem, None);
+        let names: Vec<(&str, Option<&str>, bool)> = dist
+            .files
+            .iter()
+            .map(|f| (f.name.as_str(), f.platform.as_deref(), f.release))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("SHA256SUMS", None, true),
+                (
+                    "demo-nightly-abc123-linux-x64.tar.gz",
+                    Some("linux-x64"),
+                    true
+                ),
+                (
+                    "demo_0.0.0.nightly202609290728.gabc123_amd64.deb",
+                    None,
+                    false
+                ),
+                ("install.sh", None, true),
+            ],
+            "{dist:?}"
+        );
+        // The installer of the built commit's bana.conf, labelled for the build.
+        let src = p.dir.join("src");
+        assert_eq!(
+            p.read("installer.1"),
+            format!(
+                "installer\ndist\n--label\nquick-{}\n{}\n{}\n",
+                &a[..10],
+                src.display(),
+                // $PWD, which bash reads with getcwd: resolved (on a Mac /var is /private/var).
+                std::fs::canonicalize(&dir).unwrap().display()
+            )
+        );
+        // The zips it took are gone; the upload-artifact@v3 one is not a zip.
+        assert!(!dir.join("artifacts/1/demo-nightly-linux-x64").exists());
+        assert!(dir.join("artifacts/1/old-style/a.txt").exists());
+        let md = std::fs::read_to_string(dir.join("report.md")).unwrap();
+        assert!(
+            md.contains(
+                "\n## Artifacts\n\n- `demo-nightly-linux-x64` (package (linux-x64), 1.1 KB): "
+            ),
+            "{md}"
+        );
+        let view = d.builds(None, 1).remove(0);
+        assert_eq!((view.files, view.files_problem), (4, false));
+        let tar = "demo-nightly-abc123-linux-x64.tar.gz";
+        assert_eq!(d.file(1, tar), Some(dir.join("dist").join(tar)));
+        for name in ["../build.json", "dist", "", "a.txt", "SHA256SUMS.part"] {
+            assert_eq!(d.file(1, name), None, "{name}");
+        }
+        let detail = d.build(1).unwrap();
+        assert_eq!(detail["dist"]["dir"], json!(dir.join("dist")));
+        let said = |id: u64| {
+            d.0.lock().records[&id]
+                .statuses
+                .iter()
+                .map(|(c, s)| (c.clone(), s.state, s.description.clone()))
+                .collect::<Vec<_>>()
+        };
+        let green = said(1);
+
+        // A failed build's uploads stay where act put them.
+        p.set("artifacts", true);
+        p.commit("fail", "fails");
+        p.push("main");
+        poll(&d).await;
+        let rec = finished(&d, 2).await;
+        assert_eq!((rec.build.state, rec.dist), (BuildState::Failure, None));
+        let two = p.dir.join("builds/2");
+        assert!(two.join("artifacts/2/demo-nightly-linux-x64").is_dir());
+        assert!(!two.join("dist").exists() && !p.flag("installer.2").exists());
+
+        // An installer that fails: the files stay, with the problem; the build
+        // stays green, and says the same as build 1.
+        p.set("artifacts", false);
+        p.set("installer-fails", true);
+        p.commit("files", "packages again");
+        p.push("main");
+        poll(&d).await;
+        let rec = finished(&d, 3).await;
+        assert_eq!(rec.build.state, BuildState::Success);
+        let dist = rec.dist.clone().unwrap();
+        assert_eq!(
+            dist.problem.as_deref(),
+            Some("bana installer: install.name: not 'a b'")
+        );
+        assert_eq!(dist.files.len(), 2, "{dist:?}");
+        let three = p.dir.join("builds/3");
+        assert!(three.join("artifacts/3/demo-nightly-linux-x64").is_dir());
+        let view = d.builds(None, 1).remove(0);
+        assert_eq!((view.files, view.files_problem), (2, true));
+        posted(&d).await;
+        let strip = |v: Vec<(String, StatusState, String)>| {
+            v.into_iter().map(|(c, s, _)| (c, s)).collect::<Vec<_>>()
+        };
+        assert_eq!(strip(said(3)), strip(green));
+        assert!(said(3).iter().all(|(_, _, d)| !d.contains("install")));
+        // Past the week, build 1's files are the ones kept: 3 has no installer.
+        let keep = {
+            let inner = d.0.lock();
+            kept_files(&inner.records, &inner.state.heads)
+        };
+        assert!(keep.contains(&1) && !keep.contains(&3), "{keep:?}");
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_ref_keeps_one_queued_build_and_green_moves_only_on_success() {
         let p = Project::new("queue");
         let d = start(&p, "").await;
@@ -4534,7 +6127,7 @@ exec git \"$@\"
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(d.summary().running.is_none() && p.read("pid.1").is_empty());
         assert_eq!(
-            actlog::tray_view(&d.summary()).title,
+            actlog::tray_view(&[d.summary()], &[]).title,
             format!("{} paused", actlog::BRICK)
         );
 
@@ -4579,6 +6172,83 @@ exec git \"$@\"
         assert_eq!(finished(&d, 1).await.build.state, BuildState::Success);
         assert!(d.summary().watcher.lock_holder.is_none());
         assert!(!p.lock().exists());
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pause_holds_pushes_and_tags_but_not_what_the_owner_asks_for() {
+        let p = Project::new("pause");
+        let s = p.settings("daemon.tags = v*\n");
+        let d = start_with(s.clone()).await;
+        p.commit("pass", "side");
+        p.push("side");
+        poll(&d).await;
+        assert_eq!(finished(&d, 1).await.build.state, BuildState::Success);
+
+        // Paused: a push and a tag queue, and wait.
+        let flag = p.dir.join("daemon/paused");
+        d.set_paused(true);
+        assert!(d.paused() && flag.exists());
+        p.commit("pass", "a");
+        p.push("main");
+        p.tag("v1.0.0");
+        poll(&d).await;
+        let pushes: Vec<u64> = d.summary().queue.iter().map(|q| q.id).collect();
+        assert_eq!(pushes.len(), 2, "{:?}", d.summary().queue);
+        until("paused", || waiting(&d).as_deref() == Some(PAUSED)).await;
+        // Run now and a rerun pass them.
+        let manual = d.run_now("side", "nightly").unwrap();
+        assert_eq!(finished(&d, manual).await.build.state, BuildState::Success);
+        let rerun = d.rerun(1).unwrap();
+        assert_eq!(finished(&d, rerun).await.build.state, BuildState::Success);
+        let queue: Vec<u64> = d.summary().queue.iter().map(|q| q.id).collect();
+        assert_eq!(queue, pushes, "the push and the tag still wait");
+        assert_eq!(waiting(&d).as_deref(), Some(PAUSED));
+        assert!(p.read(&format!("pid.{}", pushes[0])).is_empty());
+
+        // bana resume takes the file away; the rescan reads it.
+        std::fs::remove_file(&flag).unwrap();
+        d.reload_paused();
+        assert!(!d.paused());
+        for id in &pushes {
+            assert_eq!(finished(&d, *id).await.build.state, BuildState::Success);
+        }
+        d.shutdown().await;
+
+        // A newer bana's state.json is refused, and left as it is.
+        let file = p.dir.join("state.json");
+        let kept = std::fs::read(&file).unwrap();
+        let mut newer: Value = serde_json::from_slice(&kept).unwrap();
+        assert_eq!(newer["version"], json!(STATE_VERSION));
+        newer["version"] = json!(STATE_VERSION + 1);
+        newer["later"] = json!("a newer bana's");
+        write_json(&file, &newer).unwrap();
+        let newer = std::fs::read(&file).unwrap();
+        let e = Daemon::start(s.clone()).await.err().unwrap();
+        assert!(
+            e.contains("state.json is a newer bana's") && e.ends_with("bana upgrade"),
+            "{e}"
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), newer);
+        std::fs::write(&file, &kept).unwrap();
+
+        // An older bana kept the pause in state.json: it moves to the file.
+        let mut state: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert!(state.get("paused").is_none(), "{state}");
+        state["paused"] = json!(true);
+        write_json(&file, &state).unwrap();
+        let d = start_with(s.clone()).await;
+        assert!(d.paused() && flag.exists());
+        let state: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert!(state.get("paused").is_none(), "{state}");
+        d.set_paused(false);
+        assert!(!flag.exists() && !d.paused());
+        // bana pause while the daemon is down.
+        d.shutdown().await;
+        std::fs::write(&flag, "").unwrap();
+        let d = start_with(s).await;
+        assert!(d.paused());
         d.shutdown().await;
         p.remove();
     }
@@ -4701,7 +6371,9 @@ exec git \"$@\"
             3,
             "bana, bana/plan, bana/rust"
         );
-        assert!(actlog::tray_view(&d.summary()).title.ends_with("!gh"));
+        assert!(actlog::tray_view(&[d.summary()], &[])
+            .title
+            .ends_with("!gh"));
 
         // GitHub is back, but refuses a loopback link: the statuses go without one.
         p.set("gh-down", false);
@@ -5168,8 +6840,9 @@ exec git \"$@\"
         d.crash();
         let file = p.dir.join("state.json");
         let mut state: State = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-        (state.queue, state.paused) = (vec![], false);
+        state.queue = vec![];
         write_json(&file, &state).unwrap();
+        std::fs::remove_file(p.dir.join("daemon/paused")).unwrap();
         // GitHub refuses build 1's statuses for good; the ones after still go.
         std::fs::write(p.ctl.join("gh-422"), &a).unwrap();
         let d = start_with(s.clone()).await;
@@ -5242,7 +6915,7 @@ exec git \"$@\"
         assert_eq!(finished(&d, 2).await.build.state, BuildState::Failure);
         assert_eq!(d.summary().failed, Some(2));
         assert_eq!(
-            actlog::tray_view(&d.summary()).fix_line.as_deref(),
+            actlog::project_view(&d.summary()).fix_line.as_deref(),
             Some("Fix #2 with Claude…")
         );
         // The owner goes on working: the fix is at the failing commit anyway.
@@ -5381,11 +7054,11 @@ exec git \"$@\"
             Err(fix::Error::NotFailed(why)) => assert!(why.contains("a round of fix"), "{why}"),
             other => panic!("{other:?}"),
         }
-        assert_eq!(actlog::tray_view(&d.summary()).fix_line, None);
+        assert_eq!(actlog::project_view(&d.summary()).fix_line, None);
 
         // A daemon installed before fixes names no checkout.
         let e = fix::Prepare::for_daemon(&p.settings(""), fix::Source::Build(2)).unwrap_err();
-        assert!(e.to_string().contains("bana daemon install again"), "{e}");
+        assert!(e.to_string().contains("bana add in it again"), "{e}");
         d.shutdown().await;
         p.remove();
     }
@@ -5433,11 +7106,26 @@ exec git \"$@\"
         let p = Project::new("rounds");
         let extra = format!("checkout = {}\nfix.rounds = 2\n", p.checkout().display());
         let d = start(&p, &extra).await;
+        // Every build uploads: a fix's round keeps nothing, a failed build all.
+        p.set("artifacts", true);
         let (c, made) = failed_and_fixed(&p, &d).await;
         let sha7 = &c[..7];
         let wt = PathBuf::from(&made.worktree);
         let r0 = finished(&d, 3).await;
         assert_eq!(r0.request.round, Some(0));
+        assert!(!p.dir.join("builds/3/artifacts").exists());
+        assert!(p.dir.join("builds/2/artifacts/2").is_dir());
+        // Build 1's log has no upload step for them: refused, and still green.
+        let one = d.0.lock().records[&1].clone();
+        assert_eq!(one.build.state, BuildState::Success);
+        assert!(
+            one.dist
+                .and_then(|d| d.problem)
+                .is_some_and(|p| p.contains("no upload-artifact step")),
+            "{:?}",
+            d.0.lock().records[&1].dist
+        );
+        p.set("artifacts", false);
         posted(&d).await;
         let posts = p.posts().len();
 
@@ -5587,7 +7275,7 @@ exec git \"$@\"
             ["quick", "-j", "web"]
         );
 
-        // Rounds run out, and the owner gives more; none while paused.
+        // Rounds run out, and the owner gives more; a pause holds pushes only.
         let other = snapshot(&p, &wt, sha7, "fail");
         let (why, running) = refused(d.ask_round(sha7, &other, None, false).await);
         assert!(
@@ -5601,33 +7289,11 @@ exec git \"$@\"
             (&json!(4), &json!(2))
         );
         d.set_paused(true);
-        let (why, _) = refused(d.ask_round(sha7, &other, None, false).await);
-        assert!(why.contains("paused"), "{why}");
-        d.set_paused(false);
-        // Queued behind a held build, then paused: the long poll says so at
-        // once rather than wait.
-        p.set("hold", true);
         p.commit("pass", "h");
         p.push("fourth");
         poll(&d).await;
-        let held = *d.0.lock().records.keys().last().unwrap();
-        until("the held build", || {
-            !p.read(&format!("pid.{held}")).is_empty()
-        })
-        .await;
+        let push = *d.0.lock().records.keys().last().unwrap();
         let r3 = d.ask_round(sha7, &other, None, false).await.unwrap();
-        let n3 = r3["round"].as_u64().unwrap() as u32;
-        d.set_paused(true);
-        let t = std::time::Instant::now();
-        let v = d.round(sha7, n3, Duration::from_secs(30)).await.unwrap();
-        assert_eq!(
-            (&v["state"], &v["waiting"]),
-            (&json!("queued"), &json!(PAUSED)),
-            "{v}"
-        );
-        assert!(t.elapsed() < Duration::from_secs(5));
-        d.set_paused(false);
-        p.set("hold", false);
         let v = d.round(
             sha7,
             r3["round"].as_u64().unwrap() as u32,
@@ -5635,6 +7301,14 @@ exec git \"$@\"
         );
         let v = v.await.unwrap();
         assert_eq!(v["state"], "failure", "{v}");
+        assert_eq!(d.summary().queue[0].id, push, "the push waits");
+        // The runner says why once it looks again, after the round's build.
+        until("the push waits, paused", || {
+            d.summary().queue[0].waiting.as_deref() == Some(PAUSED)
+        })
+        .await;
+        d.set_paused(false);
+        assert_eq!(finished(&d, push).await.build.state, BuildState::Success);
         assert_eq!(d.fix_state(sha7).await.unwrap()["rounds_left"], 1);
         let on_disk = rounds::load(&rounds::path(&p.dir, sha7)).unwrap().unwrap();
         assert_eq!(
@@ -5795,14 +7469,625 @@ exec git \"$@\"
             records.insert(id, rec(id, None, now));
         }
         let idle = |_: u64| false;
-        let mut out = to_prune(&records, idle, |f| f == "ccccccc", now);
+        let none = BTreeSet::new();
+        let mut out = to_prune(&records, &none, idle, |f| f == "ccccccc", now);
         out.sort();
         // a's last round is recent; b's is old; c's fix is gone; two pushes are past the cap.
         assert_eq!(out, [3, 4, 10, 11]);
-        let out = to_prune(&records, |id| id == 4 || id == 10, |f| f == "ccccccc", now);
+        let busy = |id: u64| id == 4 || id == 10;
+        let out = to_prune(&records, &none, busy, |f| f == "ccccccc", now);
         assert!(
             !out.contains(&4) && !out.contains(&10),
             "busy builds stay: {out:?}"
         );
+    }
+
+    #[test]
+    fn the_newest_files_of_each_branch_and_tier_are_kept() {
+        let rec = |id: u64, git_ref: &str, tier: &str, ended: i64, files: bool| Record {
+            request: Request {
+                id,
+                git_ref: git_ref.into(),
+                tier: tier.into(),
+                ..Request::default()
+            },
+            build: Build {
+                ended_at: Some(ended),
+                ..Build::default()
+            },
+            dist: files.then(|| Dist {
+                files: ["demo-linux-x64.tar.gz", "install.sh"]
+                    .map(|name| DistEntry {
+                        name: name.into(),
+                        ..DistEntry::default()
+                    })
+                    .to_vec(),
+                ..Dist::default()
+            }),
+            ..Record::default()
+        };
+        let now = 1_790_000_000;
+        let old = now - KEEP_ARTIFACTS - 10;
+        let mut records = BTreeMap::new();
+        // Two nightlies of main with files, a month ago; one of a branch since
+        // deleted; then 105 quick builds of main, the first with files.
+        records.insert(1, rec(1, "refs/heads/main", "nightly", old, true));
+        records.insert(2, rec(2, "refs/heads/main", "nightly", old, true));
+        records.insert(3, rec(3, "refs/heads/gone", "nightly", old, true));
+        for id in 10..115 {
+            records.insert(id, rec(id, "refs/heads/main", "quick", old, id == 10));
+        }
+        let heads: Heads = [("refs/heads/main".to_string(), "a".repeat(40))].into();
+        let keep = kept_files(&records, &heads);
+        assert_eq!(keep, [2, 10].into(), "the newest per (branch, tier)");
+        let mut out = to_prune(&records, &keep, |_| false, |_| false, now);
+        out.sort();
+        // The kept two are not counted: 100 of the other 106 stay.
+        assert_eq!(out, [1, 3, 11, 12, 13, 14]);
+        let stale = stale_files(&records, &keep, now);
+        assert!(!stale.contains(&2) && !stale.contains(&10), "{stale:?}");
+        assert!(stale.contains(&1) && stale.contains(&3) && stale.contains(&50));
+        // A removed dist has nothing to keep: the next newest is kept.
+        records.get_mut(&2).unwrap().dist.as_mut().unwrap().removed = true;
+        assert_eq!(kept_files(&records, &heads), [1, 10].into());
+        assert!(stale_files(&records, &keep, old + 10).is_empty(), "a week");
+        // Files the installer could not use (it failed, or no archive): not
+        // the kept ones; the newest that installs is.
+        let mut failed = rec(4, "refs/heads/main", "nightly", old, true);
+        failed.dist.as_mut().unwrap().problem = Some("no".into());
+        let mut no_installer = rec(5, "refs/heads/main", "nightly", old, true);
+        no_installer.dist.as_mut().unwrap().files.pop();
+        records.insert(4, failed);
+        records.insert(5, no_installer);
+        assert_eq!(kept_files(&records, &heads), [1, 10].into());
+    }
+
+    // ---- releases ----------------------------------------------------------
+
+    fn rel(d: &Daemon, tag: &str) -> Option<Release> {
+        d.0.lock().releases.get(tag).cloned()
+    }
+
+    /// The newest build of `tag`.
+    fn tag_build(d: &Daemon, tag: &str) -> Option<u64> {
+        let want = format!("refs/tags/{tag}");
+        let inner = d.0.lock();
+        let found = inner
+            .records
+            .values()
+            .rev()
+            .find(|r| r.request.git_ref == want);
+        found.map(|r| r.request.id)
+    }
+
+    async fn rel_in(d: &Daemon, tag: &str, state: release::State) -> Release {
+        until(&format!("{tag} {}", state.as_str()), || {
+            rel(d, tag).is_some_and(|r| r.state == state && !r.seed)
+        })
+        .await;
+        rel(d, tag).unwrap()
+    }
+
+    /// Publish, with `rev`, until it has ended.
+    async fn publish_now(d: &Daemon, tag: &str, rev: u64) -> Release {
+        d.publish_release(tag, rev).unwrap();
+        until(&format!("{tag}'s publish"), || {
+            rel(d, tag).is_some_and(|r| r.state != release::State::Publishing)
+        })
+        .await;
+        rel(d, tag).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tag_build_asks_and_is_published_only_on_the_owners_yes() {
+        use release::State;
+        let p = Project::new("release");
+        let d = start(&p, "daemon.tags = v*\n").await;
+        p.set("hold", true);
+        let first = git(&p.work, &["rev-parse", "HEAD"]);
+        std::fs::write(
+            p.work.join(".github/bana.conf"),
+            "install.name = example\nrelease.platforms = linux-arm64, linux-x64 macos-arm64\n",
+        )
+        .unwrap();
+        let a = p.commit("files", "packages");
+        p.push("main");
+        p.tag("v0.1.0");
+        poll(&d).await;
+        let id = tag_build(&d, "v0.1.0").expect("the tag is queued");
+        let r = rel(&d, "v0.1.0").expect("its release");
+        assert_eq!(
+            (r.state, r.build, r.sha.as_str()),
+            (State::Building, id, a.as_str())
+        );
+        assert!(p.dir.join("releases/v0.1.0.json").is_file());
+        let ask = d.summary().release.unwrap();
+        assert_eq!((ask.state.as_str(), ask.build), ("building", id));
+        // While it builds: the previous release (none: the first) and bana's notes.
+        let r = rel_in(&d, "v0.1.0", State::Building).await;
+        assert_eq!(
+            r.previous,
+            Some(notes::Previous {
+                tag: None,
+                how: "gh release list".into()
+            })
+        );
+        let n = r.notes.unwrap();
+        assert_eq!((n.rev, n.source.as_str()), (1, "git"));
+        assert_eq!(
+            n.text,
+            format!(
+                "## Other changes\n\n- packages ({})\n- the start ({})\n\n**Full changelog**: https://github.com/o/r/commits/v0.1.0\n",
+                &a[..7],
+                &first[..7]
+            )
+        );
+        p.set("hold", false);
+        assert_eq!(finished(&d, id).await.build.state, BuildState::Success);
+        let r = rel_in(&d, "v0.1.0", State::Asking).await;
+        assert_eq!((r.build, r.reason), (id, None));
+        let ask = d.summary().release.unwrap();
+        assert_eq!((ask.tag.as_str(), ask.state.as_str()), ("v0.1.0", "asking"));
+        assert_eq!(actlog::tray_view(&[d.summary()], &[]).title, "🧱 v0.1.0?");
+        // Nothing was written on GitHub: one list, for the previous release.
+        assert_eq!(
+            p.read("gh-release.log"),
+            "gh release list -R o/r --exclude-drafts -L 100 --json tagName,isPrerelease\n"
+        );
+
+        let v = d.release("v0.1.0").unwrap();
+        let tar = "demo-nightly-abc123-linux-x64.tar.gz";
+        let names: Vec<&str> = v["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["SHA256SUMS", tar, "install.sh"], "{v}");
+        assert_eq!(v["not_built"], json!(["linux-arm64", "macos-arm64"]));
+        assert_eq!(
+            (&v["title"], &v["default_title"]),
+            (&json!("example v0.1.0"), &json!("example v0.1.0"))
+        );
+        assert_eq!(v["install"], json!(format!("bana install {id}")));
+        assert!(
+            v["tested"].as_str().unwrap().contains("| Standard |"),
+            "{v}"
+        );
+        assert_eq!(
+            v["changes"]["counts"],
+            json!({"commits": 2, "prs": 0, "other": 2})
+        );
+        assert_eq!(
+            (&v["build"]["id"], &v["notes"]["rev"]),
+            (&json!(id), &json!(1))
+        );
+
+        // The owner's edit over the rev they saw; then their yes, with that rev.
+        let stale = d.save_notes("v0.1.0", "x", None, 0, "you");
+        assert!(
+            matches!(stale, Err(release::Error::Refused(_))),
+            "{stale:?}"
+        );
+        let saved = d.save_notes(
+            "v0.1.0",
+            "Packages for everyone.\n",
+            Some("Example 0.1"),
+            1,
+            "you",
+        );
+        assert_eq!(saved.unwrap()["rev"], 2);
+        assert_eq!(d.release("v0.1.0").unwrap()["title"], "Example 0.1");
+        assert!(matches!(
+            d.publish_release("v0.1.0", 1),
+            Err(release::Error::Refused(_))
+        ));
+        assert!(matches!(
+            d.publish_release("v9", 2),
+            Err(release::Error::Missing(_))
+        ));
+        let r = publish_now(&d, "v0.1.0", 2).await;
+        assert_eq!((r.state, r.reason.as_deref()), (State::Published, None));
+        assert_eq!(
+            r.url.as_deref(),
+            Some("https://github.com/o/r/releases/tag/v0.1.0")
+        );
+        let store = p.flag("releases/v0.1.0");
+        let notes_file = p.dir.join("releases/v0.1.0.notes.md");
+        assert_eq!(
+            std::fs::read_to_string(store.join("argv")).unwrap(),
+            format!(
+                "release\ncreate\nv0.1.0\n-R\no/r\n--verify-tag\n--title\nExample 0.1\n--notes-file\n{}\n--latest\ninstall.sh\n{tar}\nSHA256SUMS\n",
+                notes_file.display()
+            )
+        );
+        // Every file SHA256SUMS lists, and SHA256SUMS.
+        let sums =
+            std::fs::read_to_string(p.dir.join(format!("builds/{id}/dist/SHA256SUMS"))).unwrap();
+        let mut listed: Vec<&str> = sums
+            .lines()
+            .filter_map(|l| l.split_whitespace().nth(1))
+            .collect();
+        listed.push("SHA256SUMS");
+        let assets = std::fs::read_to_string(store.join("assets")).unwrap();
+        assert_eq!(assets.lines().collect::<Vec<_>>(), listed);
+        let body = std::fs::read_to_string(store.join("notes")).unwrap();
+        assert!(
+            body.starts_with("Packages for everyone.\n\n## Tested\n\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("\n| Standard | Checks | Tests | Not run here |\n"),
+            "{body}"
+        );
+        assert!(
+            body.ends_with(
+                "\n\n## Install\n\n```sh\ncurl -fsSL https://github.com/o/r/releases/download/v0.1.0/install.sh | sh\n\
+                 gh release download v0.1.0 -R o/r -p install.sh -O - | sh   # a private repository\n```\n\n\
+                 Platforms: linux-x64. SHA256SUMS lists every file.\n"
+            ),
+            "{body}"
+        );
+        let log = p.read("gh-release.log");
+        assert!(
+            log.contains("gh release view v0.1.0 -R o/r --json isDraft,url,body,assets\n"),
+            "{log}"
+        );
+        assert!(log.contains("gh release list -R o/r --exclude-drafts --exclude-pre-releases -L 100 --json tagName\n"));
+        assert_eq!(
+            (
+                log.matches("release create").count(),
+                log.contains("release delete")
+            ),
+            (1, false)
+        );
+        assert!(std::fs::read_to_string(p.dir.join("releases/v0.1.0.log"))
+            .unwrap()
+            .contains("$ gh release create v0.1.0"));
+        // The ask is over; the release stays as it is.
+        assert_eq!(d.summary().release, None);
+        assert!(matches!(
+            d.publish_release("v0.1.0", 2),
+            Err(release::Error::Refused(_))
+        ));
+        assert!(matches!(
+            d.save_notes("v0.1.0", "y", None, 2, "claude"),
+            Err(release::Error::Refused(_))
+        ));
+        let again = d.rerun(id).unwrap();
+        finished(&d, again).await;
+        let r = rel(&d, "v0.1.0").unwrap();
+        assert_eq!(
+            (r.state, r.build),
+            (State::Published, id),
+            "a re-run leaves it"
+        );
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_publish_checks_before_it_writes_and_asks_again_when_it_fails() {
+        use release::State;
+        let p = Project::new("publish");
+        let mut s = p.settings("daemon.tags = v*\n");
+        s.publish_timeout = Duration::from_secs(1);
+        let d = start_with(s).await;
+        let a = p.commit("files", "packages");
+        p.tag("v0.1.0");
+        poll(&d).await;
+        let id = tag_build(&d, "v0.1.0").unwrap();
+        finished(&d, id).await;
+        rel_in(&d, "v0.1.0", State::Asking).await;
+        let lines = || p.read("gh-release.log").lines().count();
+        let creates = || p.read("gh-release.log").matches("release create").count();
+
+        // A file changed since the build: nothing reaches GitHub, and bana asks again.
+        let sh = p.dir.join(format!("builds/{id}/dist/install.sh"));
+        let original = std::fs::read(&sh).unwrap();
+        std::fs::write(&sh, "#!/bin/sh\necho other\n").unwrap();
+        let r = publish_now(&d, "v0.1.0", 1).await;
+        let why = format!("install.sh changed since build #{id}: nothing was published");
+        assert_eq!(
+            (r.state, r.reason.as_deref()),
+            (State::Failed, Some(why.as_str()))
+        );
+        assert_eq!(lines(), 1, "the list only");
+        assert_eq!(actlog::tray_view(&[d.summary()], &[]).title, "🧱 v0.1.0?");
+        std::fs::write(&sh, &original).unwrap();
+
+        // The tag moved on origin since the build.
+        p.commit("pass", "later");
+        p.tag("v0.1.0");
+        let r = publish_now(&d, "v0.1.0", 1).await;
+        let why = format!("v0.1.0 moved since build #{id}: nothing was published");
+        assert_eq!(r.reason.as_deref(), Some(why.as_str()));
+        assert_eq!(lines(), 1);
+        git(&p.work, &["tag", "-f", "-a", "-m", "back", "v0.1.0", &a]);
+        git(
+            &p.work,
+            &["push", "-q", "--force", "origin", "refs/tags/v0.1.0"],
+        );
+
+        // A draft that is not bana's (written on GitHub, release-drafter's)
+        // stays, and nothing is published.
+        std::fs::create_dir_all(p.flag("releases/v0.1.0")).unwrap();
+        p.set("releases/v0.1.0/draft", true);
+        std::fs::write(p.flag("releases/v0.1.0/notes"), "## Next\n\n- drafted\n").unwrap();
+        let r = publish_now(&d, "v0.1.0", 1).await;
+        assert_eq!(
+            r.reason.as_deref(),
+            Some("a draft v0.1.0 is on GitHub (not bana's): publish or delete it there; nothing was published")
+        );
+        assert!(p.flag("releases/v0.1.0/draft").exists());
+        assert!(!p.read("gh-release.log").contains("release delete"));
+        std::fs::remove_dir_all(p.flag("releases/v0.1.0")).unwrap();
+
+        // A create that fails: gh's words, and bana asks again.
+        std::fs::write(p.flag("gh-fail-at"), "create").unwrap();
+        let r = publish_now(&d, "v0.1.0", 1).await;
+        assert_eq!(r.state, State::Failed);
+        assert!(
+            r.reason
+                .as_deref()
+                .unwrap()
+                .ends_with("\ngh auth refresh -h github.com -s workflow"),
+            "{r:?}"
+        );
+        assert_eq!(d.summary().release.map(|r| r.state), Some("failed".into()));
+
+        // One publish at a time; a create that takes too long is stopped.
+        p.set("gh-fail-at", false);
+        std::fs::write(p.flag("gh-slow"), "3").unwrap();
+        d.publish_release("v0.1.0", 1).unwrap();
+        assert_eq!(
+            actlog::tray_view(&[d.summary()], &[]).title,
+            "🧱 publishing"
+        );
+        let second = d.publish_release("v0.1.0", 1);
+        assert!(
+            matches!(&second, Err(release::Error::Refused(m)) if m.contains("one publish at a time")),
+            "{second:?}"
+        );
+        until("the timeout", || {
+            rel(&d, "v0.1.0").is_some_and(|r| r.state == State::Failed)
+        })
+        .await;
+        assert_eq!(
+            rel(&d, "v0.1.0").unwrap().reason.as_deref(),
+            Some("gh release create took longer than 1s: it was stopped (Publish again deletes the draft it left)")
+        );
+        p.set("gh-slow", false);
+        // The killed gh left its draft, as gh would; Publish again deletes it,
+        // never with the tag (here, then a create that fails).
+        assert!(p.flag("releases/v0.1.0/draft").exists());
+        std::fs::write(p.flag("gh-fail-at"), "create").unwrap();
+        let r = publish_now(&d, "v0.1.0", 1).await;
+        assert_eq!(r.state, State::Failed);
+        let log = p.read("gh-release.log");
+        assert!(
+            log.contains("gh release delete v0.1.0 -R o/r --yes\n"),
+            "{log}"
+        );
+        assert!(!log.contains("cleanup-tag") && !p.flag("releases/v0.1.0").exists());
+        p.set("gh-fail-at", false);
+
+        // On GitHub already with other files: refused; with these names but
+        // other bytes (or no digests), too. With these files: it is this one,
+        // published by a run that was never recorded; no create.
+        std::fs::create_dir_all(p.flag("releases/v0.1.0")).unwrap();
+        std::fs::write(p.flag("releases/v0.1.0/assets"), "other.tar.gz\n").unwrap();
+        let r = publish_now(&d, "v0.1.0", 1).await;
+        let url = "https://github.com/o/r/releases/tag/v0.1.0";
+        let why = format!("a release v0.1.0 is on GitHub already, with other files: {url}");
+        assert_eq!(r.reason.as_deref(), Some(why.as_str()));
+        let n = creates();
+        let tar = "demo-nightly-abc123-linux-x64.tar.gz";
+        std::fs::write(
+            p.flag("releases/v0.1.0/assets"),
+            format!("SHA256SUMS\n{tar}\ninstall.sh\n"),
+        )
+        .unwrap();
+        let r = publish_now(&d, "v0.1.0", 1).await;
+        assert_eq!(r.reason.as_deref(), Some(why.as_str()), "no digests");
+        let dist = p.dir.join(format!("builds/{id}/dist"));
+        let digest = |name: &str| {
+            let h = crate::artifacts::sha256(&dist.join(name)).unwrap();
+            format!("{name} sha256:{h}\n")
+        };
+        let other = format!("{tar} sha256:{}\n", "0".repeat(64));
+        let right = [digest("SHA256SUMS"), digest(tar), digest("install.sh")];
+        std::fs::write(
+            p.flag("releases/v0.1.0/digests"),
+            format!("{}{}{other}", right[0], right[2]),
+        )
+        .unwrap();
+        let r = publish_now(&d, "v0.1.0", 1).await;
+        assert_eq!(r.reason.as_deref(), Some(why.as_str()), "other bytes");
+        std::fs::write(p.flag("releases/v0.1.0/digests"), right.concat()).unwrap();
+        let r = publish_now(&d, "v0.1.0", 1).await;
+        assert_eq!((r.state, r.url.as_deref()), (State::Published, Some(url)));
+        assert_eq!(creates(), n, "no create");
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn latest_goes_to_the_newest_final_and_blocked_releases_say_why() {
+        use release::State;
+        let p = Project::new("latest");
+        let d = start(&p, "daemon.tags = v*\n").await;
+        // v0.2.0 is on GitHub (published elsewhere): v0.1.1 is a hotfix below it.
+        std::fs::create_dir_all(p.flag("releases/v0.2.0")).unwrap();
+        p.commit("files", "packages");
+        p.tag("v0.1.1");
+        poll(&d).await;
+        let id = tag_build(&d, "v0.1.1").unwrap();
+        finished(&d, id).await;
+        rel_in(&d, "v0.1.1", State::Asking).await;
+        // An empty draft someone made on GitHub stays: no body is bana's.
+        std::fs::create_dir_all(p.flag("releases/v0.1.1")).unwrap();
+        p.set("releases/v0.1.1/draft", true);
+        let r = publish_now(&d, "v0.1.1", 1).await;
+        assert_eq!(r.state, State::Failed, "{r:?}");
+        assert!(p.flag("releases/v0.1.1/draft").exists());
+        std::fs::remove_dir_all(p.flag("releases/v0.1.1")).unwrap();
+        let r = publish_now(&d, "v0.1.1", 1).await;
+        assert_eq!(r.state, State::Published, "{r:?}");
+        assert!(!p.read("gh-release.log").contains("release delete"));
+        let argv = std::fs::read_to_string(p.flag("releases/v0.1.1/argv")).unwrap();
+        assert!(
+            argv.contains(&format!("\n--title\n{} v0.1.1\n", p.prefix)),
+            "{argv}"
+        );
+        assert!(
+            argv.contains("\n--latest=false\n") && !argv.contains("\n--latest\n"),
+            "{argv}"
+        );
+
+        // A prerelease of the same commit: --prerelease, no latest; its notes
+        // start from v0.1.1, published and an ancestor.
+        p.tag("v0.3.0-rc1");
+        poll(&d).await;
+        let id = tag_build(&d, "v0.3.0-rc1").unwrap();
+        finished(&d, id).await;
+        let r = rel_in(&d, "v0.3.0-rc1", State::Asking).await;
+        assert_eq!(r.previous.unwrap().tag.as_deref(), Some("v0.1.1"));
+        assert_eq!(
+            r.notes.unwrap().text,
+            "**Full changelog**: https://github.com/o/r/compare/v0.1.1...v0.3.0-rc1\n"
+        );
+        publish_now(&d, "v0.3.0-rc1", 1).await;
+        let argv = std::fs::read_to_string(p.flag("releases/v0.3.0-rc1/argv")).unwrap();
+        assert!(
+            argv.contains("\n--prerelease\n") && !argv.contains("--latest"),
+            "{argv}"
+        );
+        assert!(p.flag("releases/v0.3.0-rc1/prerelease").exists());
+
+        // A green build with no files, and a failed one: blocked, and why.
+        p.commit("pass", "no files");
+        p.tag("v0.4.0");
+        poll(&d).await;
+        let id = tag_build(&d, "v0.4.0").unwrap();
+        finished(&d, id).await;
+        let r = rel_in(&d, "v0.4.0", State::Blocked).await;
+        assert_eq!(
+            r.reason.as_deref(),
+            Some("no files: the workflow uploads no v4 artifacts")
+        );
+        assert_eq!(d.summary().release.map(|r| r.state), Some("blocked".into()));
+        assert_eq!(
+            actlog::tray_view(&[d.summary()], &[]).title,
+            actlog::BRICK,
+            "bana does not ask"
+        );
+        p.commit("fail", "broken");
+        p.tag("v0.5.0");
+        poll(&d).await;
+        let id = tag_build(&d, "v0.5.0").unwrap();
+        finished(&d, id).await;
+        let r = rel_in(&d, "v0.5.0", State::Blocked).await;
+        assert!(r
+            .reason
+            .unwrap()
+            .starts_with(&format!("build #{id} failed at ")));
+        // A re-run takes over.
+        let again = d.rerun(id).unwrap();
+        assert_eq!(
+            rel(&d, "v0.5.0").map(|r| (r.state, r.build)),
+            Some((State::Building, again))
+        );
+        finished(&d, again).await;
+        let r = rel_in(&d, "v0.5.0", State::Blocked).await;
+        assert!(r
+            .reason
+            .unwrap()
+            .starts_with(&format!("build #{again} failed")));
+        // A queued build taken off the queue says so.
+        p.set("hold", true);
+        let held = d.rerun(id).unwrap();
+        let queued = d.rerun(id).unwrap();
+        until("the held build", || {
+            d.0.lock().running.as_ref().is_some_and(|r| r.id == held)
+        })
+        .await;
+        d.cancel(queued, "cancelled from the page").unwrap();
+        let why = format!("build #{queued} was taken off the queue");
+        assert_eq!(
+            rel(&d, "v0.5.0").unwrap().reason.as_deref(),
+            Some(why.as_str())
+        );
+        p.set("hold", false);
+        finished(&d, held).await;
+        let lines = p.read("gh-release.log");
+        assert_eq!(lines.matches("release create").count(), 2, "{lines}");
+
+        // While gh fails, local tags stand in for the previous release: v0.5.0
+        // was never published. A read asks gh again, and gives v0.1.1.
+        std::fs::write(p.flag("gh-fail-at"), "list").unwrap();
+        p.commit("files", "more packages");
+        p.tag("v0.6.0");
+        poll(&d).await;
+        let id = tag_build(&d, "v0.6.0").unwrap();
+        finished(&d, id).await;
+        let r = rel_in(&d, "v0.6.0", State::Asking).await;
+        let prev = r.previous.unwrap();
+        assert!(
+            prev.tag.as_deref() == Some("v0.5.0") && prev.how.starts_with("tags (gh failed"),
+            "{prev:?}"
+        );
+        p.set("gh-fail-at", false);
+        d.release("v0.6.0").unwrap();
+        until("gh's previous release", || {
+            rel(&d, "v0.6.0").is_some_and(|r| {
+                !r.seed
+                    && r.previous
+                        .is_some_and(|p| p.tag.as_deref() == Some("v0.1.1"))
+            })
+        })
+        .await;
+        assert_eq!(rel(&d, "v0.6.0").unwrap().rev(), 2, "git's notes again");
+        // v0.5.0 is published elsewhere before the owner's yes: Publish stops,
+        // and the notes start from it.
+        std::fs::create_dir_all(p.flag("releases/v0.5.0")).unwrap();
+        let r = publish_now(&d, "v0.6.0", 2).await;
+        assert_eq!(
+            (r.state, r.reason.as_deref()),
+            (State::Failed, Some("the previous release is now v0.5.0 (the notes started from v0.1.1): bana wrote them again from it, read them, then Publish again; nothing was published"))
+        );
+        assert!(r.notes.unwrap().text.contains("/compare/v0.5.0...v0.6.0"));
+        assert!(!p.read("gh-release.log").contains("create v0.6.0"));
+        let r = publish_now(&d, "v0.6.0", 3).await;
+        assert_eq!(r.state, State::Published, "{r:?}");
+
+        // A publish the daemon did not see end fails at the next start.
+        d.shutdown().await;
+        let path = p.dir.join("releases/v0.4.0.json");
+        let mut r: Release = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        r.state = State::Publishing;
+        write_json(&path, &r).unwrap();
+        let d = start(&p, "daemon.tags = v*\n").await;
+        let r = rel(&d, "v0.4.0").unwrap();
+        assert_eq!(
+            (r.state, r.reason.as_deref()),
+            (State::Failed, Some(release::INTERRUPTED))
+        );
+
+        // A daemon stopped for a restart in this process waits for a publish
+        // to end: the new one would mark it interrupted while it runs.
+        d.0.lock().releases.get_mut("v0.4.0").unwrap().state = State::Publishing;
+        let stopping = tokio::spawn({
+            let d = d.clone();
+            async move { d.stop_fully().await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!stopping.is_finished(), "it waits for the publish");
+        d.0.lock().releases.get_mut("v0.4.0").unwrap().state = State::Published;
+        tokio::time::timeout(Duration::from_secs(5), stopping)
+            .await
+            .expect("it stops once the publish ended")
+            .unwrap();
+        p.remove();
     }
 }

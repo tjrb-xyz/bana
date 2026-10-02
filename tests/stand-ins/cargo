@@ -1,6 +1,8 @@
 #!/bin/sh
 # Stand-in cargo: a build leaves a fake bana-manager in $CARGO_TARGET_DIR/release.
+# FAKE_CARGO_FAIL=1: it fails, loudly (a release must not need cargo).
 echo "cargo $*" >>"$FAKE_LOG"
+if [ -n "${FAKE_CARGO_FAIL:-}" ]; then echo "cargo: FAKE_CARGO_FAIL: nothing may run cargo here" >&2; exit 101; fi
 if [ "$1" = build ] && [ -n "${CARGO_TARGET_DIR:-}" ]; then
   mkdir -p "$CARGO_TARGET_DIR/release"
   # shellcheck disable=SC2016 # the fake binary expands these when it runs

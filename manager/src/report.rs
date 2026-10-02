@@ -572,6 +572,7 @@ fn render(v: &View, meta: &Meta, rows: &[Row], not_run: &[NotRun]) -> String {
             }
         }
     }
+    artifacts(v, &mut md);
     let summaries: Vec<(&Job, &Step)> = v
         .steps()
         .filter(|(_, _, _, s)| !s.summaries.is_empty())
@@ -762,6 +763,47 @@ fn not_ours(v: &View, md: &mut String) {
     *md += "\n## Not the project's\n\n";
     for i in items {
         *md += &format!("- {i}\n");
+    }
+}
+
+/// `## Artifacts`: what the jobs uploaded, and the files each gave the
+/// build's dist/, or why it gave none.
+fn artifacts(v: &View, md: &mut String) {
+    if v.r.artifacts.is_empty() {
+        return;
+    }
+    *md += "\n## Artifacts\n\n";
+    for a in &v.r.artifacts {
+        let from = [a.key.clone(), (a.bytes > 0).then(|| size(a.bytes))]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let from = if from.is_empty() {
+            String::new()
+        } else {
+            format!(" ({from})")
+        };
+        let what = match &a.problem {
+            Some(p) => first_line(p),
+            None => a
+                .files
+                .iter()
+                .map(|f| code(f))
+                .collect::<Vec<_>>()
+                .join(", "),
+        };
+        *md += &format!("- {}{from}: {what}\n", code(&a.name));
+    }
+}
+
+/// `830 B`, `1.2 KB`, `14.0 MB`.
+fn size(n: u64) -> String {
+    match n {
+        n if n < 1024 => format!("{n} B"),
+        n if n < 1024 * 1024 => format!("{:.1} KB", n as f64 / 1024.0),
+        n if n < 1024 * 1024 * 1024 => format!("{:.1} MB", n as f64 / 1048576.0),
+        n => format!("{:.1} GB", n as f64 / 1073741824.0),
     }
 }
 
@@ -1467,6 +1509,41 @@ mod tests {
             "the project's own, not act's:\n{md}"
         );
         assert!(!md.contains("Not the project's"), "{md}");
+    }
+
+    #[test]
+    fn artifacts_with_their_files_or_why_not() {
+        let mut r = fold_text(PASTE);
+        r.artifacts = vec![
+            crate::results::Artifact {
+                name: "demo-nightly-linux-x64".into(),
+                key: Some("package (linux-x64)".into()),
+                bytes: 1160,
+                files: vec!["demo-linux-x64.tar.gz".into(), "demo_1.0.deb".into()],
+                ..Default::default()
+            },
+            crate::results::Artifact {
+                name: "old-style".into(),
+                problem: Some("an upload-artifact@v3 layout (no zip): not collected".into()),
+                ..Default::default()
+            },
+        ];
+        let md = report(&r, &Conf::default(), &Meta::default()).markdown;
+        assert!(
+            md.contains(
+                "\n## Artifacts\n\n\
+                 - `demo-nightly-linux-x64` (package (linux-x64), 1.1 KB): `demo-linux-x64.tar.gz`, `demo_1.0.deb`\n\
+                 - `old-style`: an upload-artifact@v3 layout (no zip): not collected\n"
+            ),
+            "{md}"
+        );
+        assert_eq!(
+            (size(830), size(14 << 20)),
+            ("830 B".into(), "14.0 MB".into())
+        );
+        r.artifacts.clear();
+        let md = report(&r, &Conf::default(), &Meta::default()).markdown;
+        assert!(!md.contains("## Artifacts"), "{md}");
     }
 
     #[test]

@@ -1,0 +1,57 @@
+name: installer
+# The installer bana compiles (bana installer) on real Windows, which nothing here can stand
+# in for: install.ps1 under Windows PowerShell 5.1 and PowerShell 7, from a release served
+# over HTTP (INSTALL_URL) and from a browser's download. The junction, the user PATH in the
+# registry, Unblock-File, the hook under a Restricted policy, uninstall. Only when the
+# installer changes.
+on:
+  push:
+    paths:
+      - lib/install.ps1.in
+      - lib/installer.sh
+      - tests/install-ps1.sh
+      - tests/install-windows.ps1
+      - tests/install.sh
+      - .github/workflows/installer.yml
+  pull_request:
+    paths:
+      - lib/install.ps1.in
+      - lib/installer.sh
+      - tests/install-ps1.sh
+      - tests/install-windows.ps1
+      - tests/install.sh
+      - .github/workflows/installer.yml
+permissions:
+  contents: read
+jobs:
+  # The releases tests/install.sh makes (example's archives, a Windows zip with a .ps1 hook,
+  # rendered by bana installer): bana is bash, so on Linux.
+  fixtures:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: tests/install.sh --fixtures "$RUNNER_TEMP/fixtures"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-fixtures
+          path: ${{ runner.temp }}/fixtures
+          retention-days: 1
+
+  windows:
+    needs: fixtures
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: installer-fixtures
+          path: ${{ runner.temp }}/fixtures
+      - name: Windows PowerShell 5.1
+        shell: powershell
+        run: ./tests/install-windows.ps1 -Fixtures "$env:RUNNER_TEMP/fixtures"
+      - name: PowerShell 7
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: ./tests/install-windows.ps1 -Fixtures "$env:RUNNER_TEMP/fixtures"

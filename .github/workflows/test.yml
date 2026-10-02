@@ -1,10 +1,19 @@
 name: test
 # bana's own tests, on GitHub's runners (bana should not need itself to be
 # tested). macOS: its stock bash 3.2 and BSD tools, where bana has to work.
-# macOS minutes cost 10x on a private repo: its jobs are few and short.
 on:
+  # Branches only: a tag's tests run once, in release.yml, which calls this with called: true.
   push:
+    branches: ['**']
   pull_request:
+  # By hand (Actions, test, Run workflow): release-selftest only.
+  workflow_dispatch:
+  # From release.yml: the four suites, never the self-tests (whatever started the release).
+  workflow_call:
+    inputs:
+      called:
+        type: boolean
+        default: false
 permissions:
   contents: read
 env:
@@ -14,6 +23,7 @@ env:
   ACT_SHA256_DARWIN_ARM64: 48ae218af96725f7635a66de2b87e1e346893b02add0f16b92f560296b2151fc
 jobs:
   scripts:
+    if: inputs.called || github.event_name != 'workflow_dispatch'
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -22,14 +32,26 @@ jobs:
       - uses: actions/checkout@v4
       - name: shellcheck
         if: runner.os == 'Linux'
-        run: shellcheck -x bin/bana lib/*.sh install.sh tests/run.sh tests/e2e-daemon.sh tests/stand-ins/* tests/fixtures/runner/*.sh examples/example/*.sh
+        run: shellcheck -x bin/bana lib/*.sh install.sh tests/*.sh tests/stand-ins/* tests/fixtures/runner/*.sh examples/example/*.sh .github/*.sh
+      - name: one version (bin/bana, manager/Cargo.toml and Cargo.lock agree)
+        if: runner.os == 'Linux'
+        run: .github/release.sh check
       - name: tests (macOS's /bin/bash 3.2 and awk)
         if: runner.os == 'macOS'
         run: BASH_UNDER_TEST=/bin/bash tests/run.sh
       - name: "tests (as root, so a Proxmox container's path too)"
         if: runner.os == 'Linux'
         run: sudo -E env PATH="$PATH" tests/run.sh
+      - name: the compiled installer (dash and bash; install.ps1 on pwsh)
+        if: runner.os == 'Linux'
+        run: SH=dash tests/install.sh && SH=bash tests/install.sh && SH=dash tests/install-real.sh && tests/install-ps1.sh
+      # The Mac's own: BSD tar, /sbin/sha256sum, sysctl (and Rosetta, when the runner has
+      # it), and a quarantined download installed with --from, which leaves no mark behind.
+      - name: the compiled installer on the Mac's own tools (/bin/sh)
+        if: runner.os == 'macOS'
+        run: SH=/bin/sh tests/install.sh && SH=/bin/sh tests/install-real.sh
   manager:
+    if: inputs.called || github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -41,11 +63,13 @@ jobs:
       - run: cargo test --locked
 
   # The daemon end to end: real act and Docker, pushes to a local origin, statuses
-  # through the gh stand-in, a cancel from the API, kill -9 and a restart, and the fix
-  # loop with the test as Claude Code (bana's MCP server over stdio).
+  # through the gh stand-in, a cancel from the API, kill -9 and a restart, the fix
+  # loop with the test as Claude Code (bana's MCP server over stdio), and a second
+  # project: one build at a time, bana pause and resume, bana remove.
   e2e:
+    if: inputs.called || github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: act ${{ env.ACT_VERSION }}
@@ -62,8 +86,9 @@ jobs:
   # the daemon end to end with host jobs only (no Docker on GitHub's Macs). One job,
   # so one build of the manager.
   macos-daemon:
+    if: inputs.called || github.event_name != 'workflow_dispatch'
     runs-on: macos-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - name: cargo clippy (with the tray)
@@ -77,7 +102,7 @@ jobs:
         if: ${{ !cancelled() }}
         working-directory: manager
         run: cargo build --locked && echo "BANA_DAEMON_BIN=$PWD/target/debug/bana-manager" >>"$GITHUB_ENV"
-      - name: bana daemon install, as a LaunchAgent, in a temporary home
+      - name: bana daemon install, as a LaunchAgent, in a temporary home; then bana add
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
@@ -103,21 +128,68 @@ jobs:
           printf 'on:\n  workflow_dispatch:\njobs:\n  a:\n    runs-on: [self-hosted, wid-macos]\n    steps:\n      - run: "true"\n' >.github/workflows/ci.yml
           git add -A && git commit -q -m one && git push -q origin HEAD:main
 
-          bash "$bana" daemon install --no-tray --no-open
-          plist=$HOME/Library/LaunchAgents/xyz.tjrb.bana.wid.plist
+          # Once a machine, anywhere: the one daemon, with no project yet.
+          (cd "$T" && bash "$bana" daemon install --no-tray --no-open)
+          plist=$HOME/Library/LaunchAgents/xyz.tjrb.bana.plist
           plutil -lint "$plist"
-          launchctl print "gui/$(id -u)/xyz.tjrb.bana.wid" | tee "$T/print" | head -n 40
+          launchctl print "gui/$(id -u)/xyz.tjrb.bana" | tee "$T/print" | head -n 40
           grep -q 'state = running' "$T/print"
+          # Then the project, in its checkout: the daemon starts it without a restart.
+          bash "$bana" add </dev/null
           curl -fsS --noproxy '*' http://127.0.0.1:8470/ci/v1/health | tee "$T/health"
           echo
-          grep -q '"prefix":"wid"' "$T/health"
+          grep -q '"global":true' "$T/health"
+          grep -q '"projects":\["wid"\]' "$T/health"
+          bash "$bana" list | tee "$T/list"
+          grep -q '^wid  *acme/wid  *active' "$T/list"
           bash "$bana" daemon status
           bash "$bana" daemon uninstall --purge
-          if launchctl print "gui/$(id -u)/xyz.tjrb.bana.wid" >/dev/null 2>&1; then
+          if launchctl print "gui/$(id -u)/xyz.tjrb.bana" >/dev/null 2>&1; then
             echo "still loaded after uninstall" >&2
             exit 1
           fi
           test ! -e "$plist"
+          test ! -e "$HOME/.bana/wid/daemon"
+      # bana's own release (this manager, packed), installed over a running daemon and then
+      # again with --force: each time its hook moves the real LaunchAgent to the release's
+      # bana-manager, a new process, and keeps the snapshot before.
+      - name: bana's release through its install.sh and hook, twice, over a LaunchAgent
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          V=$(.github/release.sh check | sed 's/^bana //')
+          bana=$PWD/bin/bana
+          T=$(cd "$(mktemp -d)" && pwd -P)
+          export HOME=$T/home BANA_HOME=$T/home/.bana
+          mkdir -p "$HOME" "$T/bin"
+          ln -s "$PWD/tests/stand-ins/gh" "$T/bin/gh"
+          ln -s "$PWD/tests/stand-ins/act" "$T/bin/act"
+          # shellcheck disable=SC2016 # the stub's own $1
+          printf '#!/bin/sh\ncase $1 in info) exit 0 ;; esac\n' >"$T/bin/docker"
+          chmod +x "$T/bin/docker"
+          export PATH=$T/bin:$PATH
+          .github/release.sh pack manager/target/debug/bana-manager "$V" macos-arm64 "$T/dist"
+          .github/release.sh dist "$T/dist" "$V"
+          health() { curl -fsS --noproxy '*' http://127.0.0.1:8470/ci/v1/health | tee "$T/$1"; echo; }
+          pid() { sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "$T/$1"; }
+          inst() { (cd "$T" && sh "$T/dist/install.sh" --from "$T/dist" --prefix "$T/p" --bin-dir "$T/b" --yes "$@"); }
+          # The checkout's daemon first (BANA_DAEMON_BIN: this manager); then the release's own.
+          (cd "$T" && bash "$bana" daemon install --no-tray --no-open)
+          health h0
+          unset BANA_DAEMON_BIN
+          for i in 1 2; do
+            if [ "$i" = 1 ]; then inst; else inst --force; fi
+            health "h$i"
+            grep -q "\"version\":\"$V\"" "$T/h$i"
+            test -n "$(pid "h$i")" && test "$(pid "h$i")" != "$(pid "h$((i - 1))")"
+            test -d "$BANA_HOME/daemon.d.prev"
+            cmp "$T/p/v$V/bin/bana-manager" "$BANA_HOME/daemon.d/bana-manager"
+          done
+          "$T/b/bana" version
+          grep -qx 'tray = no' "$BANA_HOME/daemon.d/settings"
+          "$T/b/bana" daemon uninstall --purge
+          inst --uninstall
+          test ! -e "$T/p"
       - name: act ${{ env.ACT_VERSION }}
         if: ${{ !cancelled() }}
         run: |
@@ -134,7 +206,7 @@ jobs:
   # The daemon's own poster posts to this commit, with one and then without, and reads
   # both back. Not on pull requests from forks: their token cannot write statuses.
   status-selftest:
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && !inputs.called
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -174,3 +246,50 @@ jobs:
           got=$(back)
           echo "read back: $got"
           test "$got" = "success none"
+
+  # What bana's publish relies on, against the real GitHub, which bana's tests cannot
+  # reach: a draft release found by its tag, an asset named with ~ and + read back with
+  # its name and digest, generate-notes with previous_tag_name, and deleting the draft
+  # leaves no tag. By hand only: it writes a draft on this repository, then deletes it.
+  release-selftest:
+    if: github.event_name == 'workflow_dispatch' && !inputs.called
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: bana-selftest-${{ github.run_id }}
+    steps:
+      - name: a draft release, read back, generate-notes, deleted
+        run: |
+          set -euo pipefail
+          R=$GITHUB_REPOSITORY
+          say() { echo "$*"; echo "- $*" >>"$GITHUB_STEP_SUMMARY"; }
+          gh --version | head -1
+          gh release create --help | grep -q -- --verify-tag
+          gh release create --help | grep -q -- '--latest'
+          gh release list -R "$R" --exclude-drafts -L 100 --json tagName,isPrerelease >/dev/null
+          asset='a_0.1~rc1+g1.deb'
+          printf 'bana self-test\n' >"$RUNNER_TEMP/$asset"
+          want=sha256:$(sha256sum "$RUNNER_TEMP/$asset" | cut -d' ' -f1)
+          trap 'gh release delete "$TAG" -R "$R" --yes >/dev/null 2>&1 || true' EXIT
+          (cd "$RUNNER_TEMP" && gh release create "$TAG" -R "$R" --draft --target "$GITHUB_SHA" \
+            --title "bana self-test" --notes "bana's self-test: deleted at once" "$asset")
+          view=$(gh release view "$TAG" -R "$R" --json isDraft,url,assets)
+          echo "$view"
+          test "$(jq -r .isDraft <<<"$view")" = true
+          say "gh release view finds a draft by its tag"
+          say "an asset uploaded as $asset reads back as $(jq -r '.assets[0].name' <<<"$view")"
+          got=$(jq -r '.assets[0].digest // "none"' <<<"$view")
+          test "$got" = "$want" || { say "its digest reads back as $got, not $want"; exit 1; }
+          say "its digest reads back as the file's sha256"
+          prev=$(gh api "repos/$R/tags" --jq '.[0].name // ""')
+          args=(-f "tag_name=$TAG" -f "target_commitish=$GITHUB_SHA")
+          [ -z "$prev" ] || args+=(-f "previous_tag_name=$prev")
+          notes=$(gh api -X POST "repos/$R/releases/generate-notes" "${args[@]}")
+          jq -e '.name and .body' <<<"$notes" >/dev/null
+          say "generate-notes answers (previous_tag_name: ${prev:-none}): $(jq -r '.body' <<<"$notes" | tail -1)"
+          gh release delete "$TAG" -R "$R" --yes
+          if gh api "repos/$R/git/ref/tags/$TAG" >/dev/null 2>&1; then say "deleting the draft left the tag $TAG"; exit 1; fi
+          say "deleting the draft leaves no tag"

@@ -1,11 +1,21 @@
 #!/bin/sh
 # Stand-in systemd (systemctl --user): remembers the units started, as systemd-UNIT in $FAKE_STATE.
+# Each start counts in $FAKE_STATE/pid (the fake health's pid). A file $FAKE_STATE/start-fail:
+# the next start fails, once.
+started() {
+  if [ -e "$FAKE_STATE/start-fail" ]; then
+    rm -f "$FAKE_STATE/start-fail"
+    echo "Job for $1 failed because the control process exited with error code." >&2
+    exit 1
+  fi
+  touch "$FAKE_STATE/systemd-$1"; echo $(($(cat "$FAKE_STATE/pid" 2>/dev/null || echo 1) + 1)) >"$FAKE_STATE/pid"
+}
 echo "systemctl $*" >>"$FAKE_LOG"
 [ "$1" = --user ] && shift
 case $1 in
-enable) [ "$2" = --now ] && touch "$FAKE_STATE/systemd-$3" ;;
+enable) [ "$2" = --now ] && started "$3" ;;
 disable) [ "$2" = --now ] && rm -f "$FAKE_STATE/systemd-$3" ;;
-start | restart) touch "$FAKE_STATE/systemd-$2" ;;
+start | restart) started "$2" ;;
 stop) rm -f "$FAKE_STATE/systemd-$2" ;;
 is-active)
   u=$2

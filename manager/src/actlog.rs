@@ -866,6 +866,21 @@ pub struct Summary {
     /// The newest build that failed, unless one since passed (builds that
     /// ended in error are passed over): the menu bar's "Fix #N with Claude…".
     pub failed: Option<u64>,
+    /// The release bana asks about, or publishes; else one that builds, or
+    /// was blocked, this week ([`crate::release::shown`]).
+    pub release: Option<ReleaseAsk>,
+}
+
+/// A release, as the menu bar and `bana daemon status` show it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ReleaseAsk {
+    pub tag: String,
+    /// building, blocked, asking, publishing or failed.
+    pub state: String,
+    pub build: u64,
+    /// Why it is blocked, or why the publish failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// The daemon's view of GitHub and of this machine.
@@ -910,6 +925,16 @@ pub struct BuildView {
     /// The history's chip from its CI report (`tests 95%`), once it ended.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tests: Option<String>,
+    /// The files its dist/ has to download ([`crate::daemon::Dist`]).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub files: usize,
+    /// Its files were refused, or have no installer.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub files_problem: bool,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -937,28 +962,166 @@ pub struct QueuedView {
 /// The menu bar's icon: a brick, as the status item's title (no image).
 pub const BRICK: &str = "🧱";
 
-/// The menu bar's title, tooltip and menu.
+/// The menu bar's title, tooltip and menu: the machine's line, then one
+/// submenu per project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrayView {
     /// The status item's whole title: the brick, then what it is doing
-    /// (`🧱 4m +2`, `🧱 paused`); the brick alone when idle.
+    /// (`🧱 4m +2`, `🧱 paused`, and `🧱 a 4m +2` with more than one
+    /// project); the brick alone when idle.
     pub title: String,
     pub tooltip: String,
     /// The menu's first line (disabled).
     pub status_line: String,
+    /// One per project, in the projects' order.
+    pub projects: Vec<ProjectView>,
+    /// What a left click (and Open bana) opens: the project whose build
+    /// runs, else the first, and its build.
+    pub open: Option<(String, Option<u64>)>,
+    /// `bana v0.2.0 is out…`, while a newer bana is: it opens the release.
+    pub latest_line: Option<String>,
+    pub latest: Option<String>,
+}
+
+impl TrayView {
+    /// A newer bana is out (`v0.2.0`): the machine's line says so, and the
+    /// menu has an item for it.
+    pub fn with_latest(mut self, latest: Option<&str>) -> Self {
+        if let Some(l) = latest {
+            self.status_line += &format!(" · {l} is out");
+            self.latest_line = Some(format!("bana {l} is out…"));
+            self.latest = Some(l.to_string());
+        }
+        self
+    }
+}
+
+/// One project's submenu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectView {
+    pub prefix: String,
+    /// What it is doing, for the title (`4m +2`, `paused`, `v0.1.0?`, `!`);
+    /// empty when idle.
+    pub doing: String,
+    /// How much `doing` asks for the owner's eye, the most first: 0 a
+    /// release, 1 cannot start, 2 a failure, 3 a wait, 4 paused, 5 idle.
+    pub rank: u8,
+    /// The submenu's label: `example: building main 1a2b3c4 · rust`.
+    pub status_line: String,
+    pub tooltip: String,
     /// `Last: passed main 1a2b3c4 · 12 min ago`, once a build has finished.
     pub last_line: Option<String>,
-    pub cancel_enabled: bool,
-    /// The check mark on "Pause new builds".
+    pub last_build: Option<u64>,
+    /// The build Cancel #N cancels: the running one.
+    pub cancel_build: Option<u64>,
+    /// The check mark on "Pause automatic builds".
     pub paused: bool,
-    /// The build a left click opens: the running one, else the latest.
+    /// The build Open opens: the running one, else the latest.
     pub open_build: Option<u64>,
     /// `Fix #41 with Claude…`, and its build, while the last build failed.
     pub fix_line: Option<String>,
     pub fix_build: Option<u64>,
+    /// `Publish v0.1.0…` while bana asks, and its tag; `Publishing v0.1.0…`
+    /// (not enabled) while it publishes. It opens the page on the release.
+    pub release_line: Option<String>,
+    pub release_tag: Option<String>,
+    pub release_enabled: bool,
+    /// Why it could not start: its submenu says so, and how to mend it.
+    pub error: Option<String>,
 }
 
-pub fn tray_view(s: &Summary) -> TrayView {
+/// The menu bar over every project: `all` the projects that run, `errors`
+/// those that could not start, with why.
+pub fn tray_view(all: &[Summary], errors: &[(String, String)]) -> TrayView {
+    let mut projects: Vec<ProjectView> = all
+        .iter()
+        .map(project_view)
+        .chain(errors.iter().map(|(p, why)| failed_view(p, why)))
+        .collect();
+    projects.sort_by(|a, b| a.prefix.cmp(&b.prefix));
+    let queued: usize = all.iter().map(|s| s.queue.len()).sum();
+    let running = all.iter().find_map(|s| Some((s, s.running.as_ref()?)));
+    let one = projects.len() == 1;
+    let named = |p: &str, d: &str| match (d, one) {
+        ("", _) => BRICK.to_string(),
+        (d, true) => format!("{BRICK} {d}"),
+        (d, false) => format!("{BRICK} {p} {d}"),
+    };
+    let title = match running {
+        Some((s, b)) if queued > 0 => {
+            named(&s.prefix, &format!("{} +{queued}", minutes(b.elapsed)))
+        }
+        Some((s, b)) => named(&s.prefix, &minutes(b.elapsed)),
+        None => match projects
+            .iter()
+            .filter(|v| !v.doing.is_empty())
+            .min_by_key(|v| v.rank)
+        {
+            Some(v) => named(&v.prefix, &v.doing),
+            None if queued > 0 => format!("{BRICK} +{queued}"),
+            None => BRICK.to_string(),
+        },
+    };
+    let tooltip = match projects.len() {
+        0 => "bana: no projects yet".to_string(),
+        _ => projects
+            .iter()
+            .map(|v| v.tooltip.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    };
+    let mut status_line = match (running, queued) {
+        _ if projects.is_empty() => "bana: no projects yet (bana add in a checkout)".to_string(),
+        (Some((s, b)), _) => format!("bana: building {} #{}", s.prefix, b.id),
+        (None, 0) => "bana: idle".to_string(),
+        (None, n) => format!("bana: {n} queued"),
+    };
+    if !errors.is_empty() {
+        let n = errors.len();
+        status_line += &format!(
+            " · {n} project{} cannot start",
+            if n == 1 { "" } else { "s" }
+        );
+    }
+    let open = match running {
+        Some((s, b)) => Some((s.prefix.clone(), Some(b.id))),
+        None => projects.first().map(|v| (v.prefix.clone(), v.open_build)),
+    };
+    TrayView {
+        title,
+        tooltip,
+        status_line,
+        projects,
+        open,
+        latest_line: None,
+        latest: None,
+    }
+}
+
+/// A project that could not start.
+fn failed_view(prefix: &str, why: &str) -> ProjectView {
+    ProjectView {
+        prefix: prefix.to_string(),
+        doing: "!".into(),
+        rank: 1,
+        status_line: format!("{prefix}: cannot start"),
+        tooltip: format!("bana: {prefix} cannot start: {why}"),
+        last_line: None,
+        last_build: None,
+        cancel_build: None,
+        paused: false,
+        open_build: None,
+        fix_line: None,
+        fix_build: None,
+        release_line: None,
+        release_tag: None,
+        release_enabled: false,
+        error: Some(why.to_string()),
+    }
+}
+
+/// One project's submenu, and its words for the title and the tooltip.
+pub fn project_view(s: &Summary) -> ProjectView {
     let w = &s.watcher;
     let n = s.queue.len();
     let gate = if w.paused {
@@ -974,19 +1137,23 @@ pub fn tray_view(s: &Summary) -> TrayView {
         .last
         .as_ref()
         .is_some_and(|b| matches!(b.state, BuildState::Failure | BuildState::Error));
-    let doing = match &s.running {
-        Some(b) if n > 0 => format!("{} +{n}", minutes(b.elapsed)),
-        Some(b) => minutes(b.elapsed),
-        None if w.paused => "paused".into(),
-        None if n > 0 && !w.docker => "no Docker".into(),
-        None if n > 0 && w.lock_holder.is_some() => "busy".into(),
-        None if w.post_error.is_some() => "!gh".into(),
-        None if last_failed => "!".into(),
-        None => String::new(),
-    };
-    let title = match doing.as_str() {
-        "" => BRICK.to_string(),
-        d => format!("{BRICK} {d}"),
+    let rel = s
+        .release
+        .as_ref()
+        .filter(|r| matches!(r.state.as_str(), "asking" | "failed" | "publishing"));
+    let publishing = rel.filter(|r| r.state == "publishing");
+    let asking = rel.filter(|r| r.state != "publishing");
+    let (doing, rank) = match &s.running {
+        Some(b) if n > 0 => (format!("{} +{n}", minutes(b.elapsed)), 0),
+        Some(b) => (minutes(b.elapsed), 0),
+        None if w.paused => ("paused".into(), 4),
+        None if n > 0 && !w.docker => ("no Docker".into(), 3),
+        None if n > 0 && w.lock_holder.is_some() => ("busy".into(), 3),
+        None if publishing.is_some() => ("publishing".into(), 0),
+        None if asking.is_some() => (format!("{}?", asking.map_or("", |r| &r.tag)), 0),
+        None if w.post_error.is_some() => ("!gh".into(), 2),
+        None if last_failed => ("!".into(), 2),
+        None => (String::new(), 5),
     };
     let queued = (n > 0).then(|| format!("{n} queued"));
     let mut tip: Vec<String> = Vec::new();
@@ -1005,7 +1172,7 @@ pub fn tray_view(s: &Summary) -> TrayView {
             tip.push(minutes(b.elapsed));
             tip.extend(queued);
             if w.paused {
-                tip.push("new builds paused".into());
+                tip.push("automatic builds paused".into());
             }
             let mut line = format!("{}: building {at}", s.prefix);
             if let Some(j) = jobs {
@@ -1033,14 +1200,25 @@ pub fn tray_view(s: &Summary) -> TrayView {
             }
         }
     };
+    match (publishing, asking) {
+        (Some(r), _) => tip.push(format!("publishing {} {}", s.prefix, r.tag)),
+        (_, Some(r)) if r.state == "failed" => tip.push(format!(
+            "publishing {} {} failed: publish it again?",
+            s.prefix, r.tag
+        )),
+        (_, Some(r)) => tip.push(format!("{} {} passed: publish it?", s.prefix, r.tag)),
+        _ => {}
+    }
     if let Some(e) = &w.post_error {
         tip.push(format!("statuses not posted: {e}"));
     }
     if let Some(e) = &w.fetch_error {
         tip.push(format!("fetch failed: {e}"));
     }
-    TrayView {
-        title,
+    ProjectView {
+        prefix: s.prefix.clone(),
+        doing,
+        rank,
         tooltip: tip.join(" · "),
         status_line,
         last_line: s.last.as_ref().map(|b| {
@@ -1052,12 +1230,35 @@ pub fn tray_view(s: &Summary) -> TrayView {
                 ago(s.now, b.ended_at)
             )
         }),
-        cancel_enabled: s.running.is_some(),
+        last_build: s.last.as_ref().map(|b| b.id),
+        cancel_build: s.running.as_ref().map(|b| b.id),
         paused: w.paused,
         open_build: s.running.as_ref().or(s.last.as_ref()).map(|b| b.id),
         fix_line: s.failed.map(|id| format!("Fix #{id} with Claude…")),
         fix_build: s.failed,
+        release_line: rel.map(|r| match r.state.as_str() {
+            "publishing" => format!("Publishing {}…", r.tag),
+            _ => format!("Publish {}…", r.tag),
+        }),
+        release_tag: rel.map(|r| r.tag.clone()),
+        release_enabled: asking.is_some(),
+        error: None,
     }
+}
+
+/// What a project's menu item does: its id is `<prefix>:<action>`.
+pub const MENU_ACTIONS: [&str; 6] = ["open", "last", "release", "fix", "cancel", "pause"];
+
+/// A project's menu item's id.
+pub fn menu_id(prefix: &str, action: &str) -> String {
+    format!("{prefix}:{action}")
+}
+
+/// The project and the action of a menu item's id; none for the items of
+/// the whole menu (Open bana, Quit).
+pub fn menu_action(id: &str) -> Option<(&str, &str)> {
+    let (p, a) = id.split_once(':')?;
+    (!p.is_empty() && MENU_ACTIONS.contains(&a)).then_some((p, a))
 }
 
 fn outcome(b: &BuildView) -> &'static str {
@@ -1990,6 +2191,15 @@ mod tests {
         }
     }
 
+    fn ask(state: &str) -> Option<ReleaseAsk> {
+        Some(ReleaseAsk {
+            tag: "v0.1.0".into(),
+            state: state.into(),
+            build: 9,
+            reason: None,
+        })
+    }
+
     fn queued(n: usize) -> Vec<QueuedView> {
         (0..n)
             .map(|i| QueuedView {
@@ -1998,6 +2208,11 @@ mod tests {
                 ..QueuedView::default()
             })
             .collect()
+    }
+
+    /// The menu bar with this one project.
+    fn one(s: &Summary) -> TrayView {
+        tray_view(std::slice::from_ref(s), &[])
     }
 
     #[test]
@@ -2089,26 +2304,81 @@ mod tests {
                 },
                 "🧱 0m",
             ),
+            ("bana asks", |s| s.release = ask("asking"), "🧱 v0.1.0?"),
+            (
+                "bana asks, and gh is signed out",
+                |s| {
+                    s.release = ask("asking");
+                    s.watcher.post_error = Some("gh is signed out".into());
+                },
+                "🧱 v0.1.0?",
+            ),
+            (
+                "bana asks after a failure",
+                |s| {
+                    s.release = ask("asking");
+                    (s.last, s.failed) = (Some(build(3, BuildState::Failure, Some(0))), Some(3));
+                },
+                "🧱 v0.1.0?",
+            ),
+            (
+                "a build runs while bana asks",
+                |s| {
+                    (s.running, s.release) =
+                        (Some(build(4, BuildState::Running, None)), ask("asking"))
+                },
+                "🧱 0m",
+            ),
+            (
+                "paused while bana asks",
+                |s| (s.watcher.paused, s.release) = (true, ask("asking")),
+                "🧱 paused",
+            ),
+            (
+                "publishing",
+                |s| s.release = ask("publishing"),
+                "🧱 publishing",
+            ),
+            (
+                "a publish failed: bana asks again",
+                |s| s.release = ask("failed"),
+                "🧱 v0.1.0?",
+            ),
+            ("a release building", |s| s.release = ask("building"), "🧱"),
+            ("a release blocked", |s| s.release = ask("blocked"), "🧱"),
         ];
         for (name, tweak, title) in rows {
             let mut s = summary();
             tweak(&mut s);
-            let v = tray_view(&s);
-            assert_eq!(v.title, title, "{name}");
-            assert_eq!(v.cancel_enabled, s.running.is_some(), "{name}");
+            assert_eq!(one(&s).title, title, "{name}");
+            let v = project_view(&s);
+            assert_eq!(v.cancel_build, s.running.as_ref().map(|b| b.id), "{name}");
             assert_eq!(v.paused, s.watcher.paused, "{name}");
             // Fix with Claude: offered for the summary's newest failed build.
             let fix = s.failed.map(|id| (format!("Fix #{id} with Claude…"), id));
             assert_eq!(v.fix_line.zip(v.fix_build), fix, "{name}");
+            // Publish v0.1.0…: while bana asks; not enabled while it publishes.
+            let rel = s.release.as_ref().map(|r| r.state.as_str());
+            let line = match rel {
+                Some("asking" | "failed") => Some(("Publish v0.1.0…".to_string(), true)),
+                Some("publishing") => Some(("Publishing v0.1.0…".to_string(), false)),
+                _ => None,
+            };
+            assert_eq!(
+                v.release_line.map(|l| (l, v.release_enabled)),
+                line,
+                "{name}"
+            );
+            assert_eq!(v.release_tag.is_some(), line.is_some(), "{name}");
         }
 
         // The words, building and idle.
         let mut s = summary();
         (s.running, s.queue, s.last) = (Some(running), queued(2), passed.clone());
-        let v = tray_view(&s);
-        assert_eq!(v.title, "🧱 4m +2");
+        let v = project_view(&s);
+        assert_eq!(one(&s).title, "🧱 4m +2");
         assert_eq!(
-            v.tooltip,
+            one(&s).tooltip,
             "bana: building example main 1a2b3c4 (quick) · rust, macos · 4m · 2 queued"
         );
         assert_eq!(
@@ -2123,8 +2393,8 @@ mod tests {
 
         let mut s = summary();
         s.last = passed;
-        let v = tray_view(&s);
-        assert_eq!(v.title, BRICK);
+        let v = project_view(&s);
+        assert_eq!(one(&s).title, BRICK);
         assert_eq!(
             v.tooltip,
             "bana: example idle · last: passed main 1a2b3c4, 12 min ago"
@@ -2137,8 +2407,8 @@ mod tests {
         (s.watcher.docker, s.queue) = (false, queued(1));
         s.watcher.post_error = Some("gh is signed out".into());
         s.watcher.fetch_error = Some("could not resolve host".into());
-        let v = tray_view(&s);
-        assert_eq!(v.title, "🧱 no Docker");
+        let v = project_view(&s);
+        assert_eq!(one(&s).title, "🧱 no Docker");
         assert_eq!(
             v.tooltip,
             "bana: example waiting for Docker · 1 queued · last: failed main 1a2b3c4, 16 min ago · statuses not posted: gh is signed out · fetch failed: could not resolve host"
@@ -2149,17 +2419,140 @@ mod tests {
             Some("Last: failed main 1a2b3c4 · 16 min ago")
         );
 
-        let v = tray_view(&summary());
+        let mut s = summary();
+        s.release = ask("asking");
         assert_eq!(
-            (v.title.as_str(), v.last_line, v.open_build, v.fix_line),
+            one(&s).tooltip,
+            "bana: example idle · example v0.1.0 passed: publish it?"
+        );
+        s.release = ask("failed");
+        assert_eq!(
+            one(&s).tooltip,
+            "bana: example idle · publishing example v0.1.0 failed: publish it again?"
+        );
+        s.release = ask("publishing");
+        assert_eq!(
+            one(&s).tooltip,
+            "bana: example idle · publishing example v0.1.0"
+        );
+
+        let (t, v) = (one(&summary()), project_view(&summary()));
+        assert_eq!(
+            (t.title.as_str(), v.last_line, v.open_build, v.fix_line),
             (BRICK, None, None, None)
         );
-        assert_eq!(v.tooltip, "bana: example idle");
+        assert_eq!(t.tooltip, "bana: example idle");
         let mut s = summary();
         s.queue = queued(3);
-        assert_eq!(tray_view(&s).status_line, "example: 3 queued");
+        assert_eq!(project_view(&s).status_line, "example: 3 queued");
         s.watcher.paused = true;
-        assert_eq!(tray_view(&s).status_line, "example: paused (3 queued)");
+        assert_eq!(project_view(&s).status_line, "example: paused (3 queued)");
+    }
+
+    #[test]
+    fn the_menu_bar_over_no_one_or_two_projects() {
+        let none = tray_view(&[], &[]);
+        assert_eq!(
+            (none.title.as_str(), none.tooltip.as_str(), none.open),
+            (BRICK, "bana: no projects yet", None)
+        );
+        assert_eq!(
+            none.status_line,
+            "bana: no projects yet (bana add in a checkout)"
+        );
+        assert!(none.projects.is_empty());
+
+        // One project: its words, as before; its submenu under the machine's line.
+        let mut a = summary();
+        a.prefix = "a".into();
+        a.last = Some(build(3, BuildState::Success, Some(0)));
+        let v = tray_view(std::slice::from_ref(&a), &[]);
+        assert_eq!(v.title, BRICK);
+        assert_eq!(v.status_line, "bana: idle");
+        assert_eq!(v.open, Some(("a".into(), Some(3))));
+        assert_eq!(v.projects, vec![project_view(&a)]);
+
+        // Two: the running build names its project, and counts every queue.
+        let mut b = summary();
+        b.prefix = "b".into();
+        let mut run = build(7, BuildState::Running, None);
+        run.elapsed = 300;
+        (b.running, b.queue) = (Some(run), queued(1));
+        a.queue = queued(2);
+        a.queue[0].waiting = Some("after b #7".into());
+        let v = tray_view(&[b.clone(), a.clone()], &[]);
+        assert_eq!(v.title, "🧱 b 5m +3");
+        assert_eq!(v.status_line, "bana: building b #7");
+        assert_eq!(v.open, Some(("b".into(), Some(7))));
+        let names: Vec<&str> = v.projects.iter().map(|p| p.prefix.as_str()).collect();
+        assert_eq!(names, ["a", "b"], "in the projects' order");
+        assert_eq!(v.projects[0].status_line, "a: 2 queued");
+        assert_eq!(v.projects[1].cancel_build, Some(7));
+        assert_eq!(
+            v.tooltip,
+            "bana: a idle · 2 queued · last: passed main 1a2b3c4, 2 h ago\n\
+             bana: building b main 1a2b3c4 (quick) · 5m · 1 queued"
+        );
+
+        // Nothing runs: the project that most wants the owner's eye names
+        // itself; a pause is the least of them.
+        b.running = None;
+        b.queue.clear();
+        (a.queue, a.watcher.paused) = (Vec::new(), true);
+        let v = tray_view(&[a.clone(), b.clone()], &[]);
+        assert_eq!(v.title, "🧱 a paused");
+        assert!(v.projects[0].paused && !v.projects[1].paused);
+        assert_eq!(v.projects[0].status_line, "a: paused");
+        b.release = ask("asking");
+        assert_eq!(
+            tray_view(&[a.clone(), b.clone()], &[]).title,
+            "🧱 b v0.1.0?"
+        );
+
+        // One that cannot start: its own submenu says why.
+        b.release = None;
+        let errors = [("c".to_string(), "no clone in ~/.bana/c/src".to_string())];
+        let v = tray_view(&[a.clone(), b.clone()], &errors);
+        assert_eq!(v.title, "🧱 c !");
+        assert_eq!(v.status_line, "bana: idle · 1 project cannot start");
+        let c = &v.projects[2];
+        assert_eq!(c.status_line, "c: cannot start");
+        assert_eq!(c.error.as_deref(), Some("no clone in ~/.bana/c/src"));
+        assert_eq!(
+            (c.open_build, c.cancel_build, c.fix_line.clone()),
+            (None, None, None)
+        );
+        assert!(v
+            .tooltip
+            .ends_with("bana: c cannot start: no clone in ~/.bana/c/src"));
+        assert_eq!(v.open, Some(("a".into(), Some(3))), "the first project");
+        let only = tray_view(&[], &errors);
+        assert_eq!(
+            (only.title.as_str(), only.open),
+            ("🧱 !", Some(("c".into(), None)))
+        );
+    }
+
+    #[test]
+    fn tray_view_machine_line_shows_newer() {
+        let v = tray_view(&[summary()], &[]);
+        assert_eq!(v.clone().with_latest(None), v, "none out: as it was");
+        let n = v.with_latest(Some("v0.2.0"));
+        assert_eq!(n.status_line, "bana: idle · v0.2.0 is out");
+        assert_eq!(n.latest_line.as_deref(), Some("bana v0.2.0 is out…"));
+        assert_eq!(n.latest.as_deref(), Some("v0.2.0"));
+        assert_eq!(n.title, BRICK, "the title stays");
+    }
+
+    #[test]
+    fn a_menu_items_id_names_its_project() {
+        for a in MENU_ACTIONS {
+            let id = menu_id("my-app", a);
+            assert_eq!(menu_action(&id), Some(("my-app", a)), "{id}");
+        }
+        for id in ["quit", "open", ":pause", "a:quit", "a:", ""] {
+            assert_eq!(menu_action(id), None, "{id}");
+        }
     }
 
     #[test]
@@ -2185,5 +2578,10 @@ mod tests {
         assert!(v["last"].is_null() && v["failed"].is_null());
         s.failed = Some(3);
         assert_eq!(serde_json::to_value(&s).unwrap()["failed"], 3);
+        s.release = ask("asking");
+        assert_eq!(
+            serde_json::to_value(&s).unwrap()["release"],
+            serde_json::json!({"tag": "v0.1.0", "state": "asking", "build": 9})
+        );
     }
 }

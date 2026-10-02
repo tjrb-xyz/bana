@@ -157,7 +157,11 @@ impl Prepare {
     pub fn new(dir: &Path, checkout: &Path, source: Source) -> Self {
         let kv = daemon_settings(dir);
         let get = |k: &str| kv.get(k).filter(|v| !v.is_empty()).cloned();
-        let snapshot = dir.join("daemon/bin/bana");
+        let snapshot = dir
+            .parent()
+            .unwrap_or(dir)
+            .join(crate::daemon::MACHINE_DIR)
+            .join("bin/bana");
         Self {
             dir: dir.to_path_buf(),
             checkout: checkout.to_path_buf(),
@@ -187,13 +191,11 @@ impl Prepare {
         }
     }
 
-    /// For the daemon's page: its settings, and the checkout `bana daemon
-    /// install` wrote there.
+    /// For the daemon's page: its settings, and the checkout `bana add`
+    /// wrote there.
     pub fn for_daemon(s: &Settings, source: Source) -> Result<Self, Error> {
         let checkout = s.checkout.clone().ok_or_else(|| {
-            Error::Failed(
-                "the daemon's settings name no checkout: run bana daemon install again".into(),
-            )
+            Error::Failed("the daemon's settings name no checkout: run bana add in it again".into())
         })?;
         Ok(Self {
             dir: s.dir.clone(),
@@ -1728,16 +1730,22 @@ fn unquote_names(s: &str) -> Vec<String> {
     out
 }
 
-/// The daemon's settings file, read leniently: the keys bana fix wants from it.
+/// The daemon's settings for the project in `dir` (`<home>/<prefix>`), read
+/// leniently: the machine's, then the project's ([`crate::daemon::settings_text`]),
+/// either of them missing.
 pub(crate) fn daemon_settings(dir: &Path) -> BTreeMap<String, String> {
-    std::fs::read_to_string(dir.join("daemon/settings"))
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.starts_with('#'))
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-        .collect()
+    let home = dir.parent().unwrap_or(dir);
+    let read = |p: PathBuf| std::fs::read_to_string(p).unwrap_or_default();
+    crate::daemon::merge_settings(
+        &read(home.join(crate::daemon::MACHINE_DIR).join("settings")),
+        &read(dir.join("daemon/settings")),
+    )
+    .lines()
+    .map(str::trim)
+    .filter(|l| !l.starts_with('#'))
+    .filter_map(|l| l.split_once('='))
+    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+    .collect()
 }
 
 // ---- git -----------------------------------------------------------------------
@@ -2128,7 +2136,10 @@ fn git_command(git: &str, path: Option<&str>, cwd: &Path, hooks: bool) -> Comman
 }
 
 /// A child's output, or none when it took longer than `secs` (it is killed).
-fn wait(child: std::process::Child, secs: u64) -> Option<std::io::Result<std::process::Output>> {
+pub(crate) fn wait(
+    child: std::process::Child,
+    secs: u64,
+) -> Option<std::io::Result<std::process::Output>> {
     let pid = child.id();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -4968,10 +4979,18 @@ Error: {say} /Users/l/.cache/act/x-bana-actions-plan@1/y
             Gate::Block(UNTESTED.into()),
             Gate::Pass("blocked once for this tree"),
         ] {
+            // Under a second, or, on a machine this suite keeps busy, within
+            // ten plain `git status`es of this tree timed just before.
+            let t = std::time::Instant::now();
+            git(&wt, &["status", "--porcelain"]);
+            let one = t.elapsed();
             let t = std::time::Instant::now();
             assert_eq!(gate(&r.dir, &wt, "git", None), want);
             let took = t.elapsed();
-            assert!(took < Duration::from_secs(1), "{took:?}");
+            assert!(
+                took < Duration::from_secs(1).max(one * 10),
+                "{took:?} (git status: {one:?})"
+            );
         }
     }
 
