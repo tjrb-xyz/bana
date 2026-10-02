@@ -1,0 +1,30 @@
+[ci/sd  ] bana: next, in a systemd container
+time="2026-10-02T18:07:48Z" level=info msg="Using docker host 'unix:///var/run/docker.sock', and daemon socket '-'"
+time="2026-10-02T18:07:48Z" level=info msg="Start server on http://192.0.2.2:0"
+[ci/plan] ⭐ Run Set up job
+[ci/plan] 🚀  Start image=catthehacker/ubuntu:act-24.04
+[ci/plan]   🐳  docker pull image=catthehacker/ubuntu:act-24.04 platform=linux/amd64 username= forcePull=false
+[ci/plan]   🐳  docker create image=catthehacker/ubuntu:act-24.04 platform=linux/amd64 entrypoint=["tail" "-f" "/dev/null"] cmd=[] network="bridge"
+[ci/plan]   🐳  docker run image=catthehacker/ubuntu:act-24.04 platform=linux/amd64 entrypoint=["tail" "-f" "/dev/null"] cmd=[] network="bridge"
+[ci/plan]   🐳  docker exec cmd=[node --no-warnings -e console.log(process.execPath)] user= workdir=
+[ci/plan]   ✅  Success - Set up job
+[ci/plan] ⭐ Run Main plan
+[ci/plan]   🐳  docker exec cmd=[bash -e /var/run/act/workflow/0] user= workdir=
+[ci/plan]   | plan ok
+[ci/plan]   ✅  Success - Main plan [95.060438ms]
+[ci/plan] ⭐ Run Complete job
+[ci/plan] Cleaning up container for job plan
+[ci/plan]   ✅  Success - Complete job
+[ci/plan] 🏁  Job succeeded
+[ci/sd  ] 🚧  Skipping unsupported platform -- Try running with `-P self-hosted=...`
+[ci/sd  ] 🚧  Skipping unsupported platform -- Try running with `-P wid-systemd=...`
+[ci/after] bana: not run here: needs sd, a systemd job
+[ci/sd  ] ⭐ Run Set up job
+[ci/sd  ]   ✅  Success - Set up job
+[ci/sd  ] ⭐ Run Main linger
+[ci/sd  ]   | running
+[ci/sd  ]   ✅  Success - Main linger [27.832322ms]
+[ci/sd  ] ⭐ Run Complete job
+[ci/sd  ] Cleaning up container for job sd
+[ci/sd  ]   ✅  Success - Complete job
+[ci/sd  ] 🏁  Job succeeded

@@ -10,10 +10,11 @@
 //! cargo's rerun target, other tools' summary lines (vitest, jest, node, pytest,
 //! unittest, go), annotations (`::error file=…::…`), step summaries
 //! (GITHUB_STEP_SUMMARY, which act logs as `⚙  Summary - …`), and its last lines.
-//! A job that never ran is `skipped`, `unsupported` (no platform here), or
-//! `not_planned`: the jobs `act -l` listed ([`fold_json_listed`]) that the
-//! plan job set false (`::set-output:: web=false` in a job `plan`, or bana
-//! plan's `json={"tier":"quick","web":false}`).
+//! A job that never ran is `skipped`, `unsupported` (not run here: no platform
+//! for it, or bana says why, as `elsewhere`), or `not_planned`: the jobs
+//! `act -l` listed ([`fold_json_listed`]) that the plan job set false
+//! (`::set-output:: web=false` in a job `plan`, or bana plan's
+//! `json={"tier":"quick","web":false}`).
 //!
 //! act's plain text (0.2.89) has `[ci/rust   ] ⭐ Run Main cargo test`, the
 //! step's output as `[ci/rust   ]   | …` (or `| …` alone, the bar in the job's
@@ -129,7 +130,8 @@ pub struct Job {
     pub result: String,
     pub ms: Option<u64>,
     pub steps: Vec<Step>,
-    /// An unsupported job's place, when act's skip says ([`actlog::ELSEWHERE_SYSTEMD`]).
+    /// Why an unsupported job did not run here, when bana says
+    /// ([`actlog::BANA_NOT_RUN`]) or act's skip does ([`actlog::ELSEWHERE_SYSTEMD`]).
     pub elsewhere: Option<String>,
 }
 
@@ -2761,6 +2763,7 @@ mod tests {
             act!("sigint-container"),
             act!("sigkill"),
             act!("syntax"),
+            act!("systemd"),
             ("run1", RUN1),
             ("paste", PASTE_JSON),
         ];

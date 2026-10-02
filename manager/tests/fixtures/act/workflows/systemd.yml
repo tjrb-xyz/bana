@@ -1,0 +1,25 @@
+name: ci
+on:
+  workflow_dispatch:
+    inputs:
+      tier: {type: string, default: quick}
+jobs:
+  plan:
+    runs-on: [self-hosted, wid-linux]
+    steps:
+      - name: plan
+        run: echo plan ok
+  sd:
+    needs: plan
+    runs-on: [self-hosted, wid-systemd]
+    steps:
+      - name: linger
+        run: |
+          sudo loginctl enable-linger "$USER"
+          systemctl --user is-system-running
+  after:
+    needs: sd
+    runs-on: [self-hosted, wid-linux]
+    steps:
+      - name: test
+        run: echo after

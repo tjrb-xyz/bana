@@ -263,7 +263,7 @@ it has none. An ended build without a report (one from before bana wrote them) g
 | `kind` | Fields |
 |---|---|
 | `build` | `schema`, `builder` (`act 0.2.89`), `bana`, `repo`, `ref`, `sha`, `tier`, `machine`, `network`, `trigger`, `started`, `ended` (Unix seconds), `result`: `success`, `failure`, `error` or `unknown` |
-| `job` | `key` (`package (linux-arm64)`), `job` (its id), `matrix`, `result`: `success`, `failure`, `skipped`, `unsupported` (no platform here), `not_planned` (the plan left it out), `cancelled` or `unknown`; `ms` |
+| `job` | `key` (`package (linux-arm64)`), `job` (its id), `matrix`, `result`: `success`, `failure`, `skipped`, `unsupported` (not run here), `not_planned` (the plan left it out), `cancelled` or `unknown`; `ms`; `elsewhere`: why an unsupported job did not run here, when bana or act's skip says (`needs sd, a systemd job`) |
 | `step` | `key`, `step` (its name), `stage` (`Pre`, `Main`, `Post`; empty for Set up job and Complete job), `result`, `ms`, `owner`: `project`, `bana` or `act`, `continued` (continue-on-error) |
 | `tests` | `key`, `step`, `tool` (`cargo`, `nextest`, `vitest`, `jest`, `node`, `pytest`, `unittest`, `go`, whose counts are packages and are shown apart), `passed`, `failed`, `skipped`, `incomplete` (not every test ran: the tool stopped early, or the step never ended) |
 | `test` | `key`, `step`, `name`, `result` (`passed`, `failed`, `skipped`), `binary`, `at` (FILE:LINE:COL), `message` |
@@ -278,7 +278,12 @@ it has none. An ended build without a report (one from before bana wrote them) g
 Lines come in that order, a job's steps after it, a step's lines after it; unknown kinds and fields are skipped.
 act's `--json` lines that the daemon reads: `jobID`, `matrix`, `step`, `stepID` (`stepid` for Set up job),
 `stage`, `msg` with `raw_output` (a step's output), `stepResult` with `executionTime` (ns), `jobResult`, and
-optionally `command` (`summary`, `error`, `warning`, `notice`); `actlog.rs` has the details.
+optionally `command` (`summary`, `error`, `warning`, `notice`); `actlog.rs` has the details. bana's own lines
+come in the same shape, for jobs act skips that need systemd: `"msg":"bana: next, in a systemd container"`
+before act starts (the job's own lines, from act in its container, come later and make it run), or
+`"msg":"bana: not run here: WHY"`. A job act skipped runs again only after bana's `next`, and a job's result,
+once it has one, stays. A line of the build's that is an object with a key `bana` (but bana split's
+`"bana":"remote"`) is kept as text: only the daemon writes its marks (a cancel's) into `act.jsonl`.
 
 ## A build's files
 

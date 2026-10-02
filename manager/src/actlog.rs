@@ -19,6 +19,14 @@
 //! - "Skipping unsupported platform" for a job whose `runs-on` has no platform;
 //! - nothing for a job skipped by `if:` or blocked by a failed `needs`: only
 //!   `act -l` knows those;
+//! - bana's own lines among act's, in act's shape (`jobID`, `matrix`, and a
+//!   `msg` of bana's), for the jobs act skips that need systemd (lib/systemd.sh,
+//!   tests/fixtures/act/systemd): [`BANA_NEXT`] before act starts, for a job
+//!   bana runs next, in a container of its own, whose own lines (act's, in that
+//!   container) come after act's and make it run; or [`BANA_NOT_RUN`] and why,
+//!   for a job bana does not run (one that needs a systemd job: act runs a job
+//!   with the jobs it needs). Only a job bana named next comes back from act's
+//!   skip, and no job's result changes once it has one;
 //! - with `-v`, `debug` lines as well, some from jobs that never run (one
 //!   skipped by `if:` gets a `jobResult` of `skipped`);
 //! - plain text on stderr at the end: `Error: Job 'lint' failed`,
@@ -37,7 +45,8 @@
 //! - `build`: schema, builder (`act 0.2.89`), bana, repo, ref, sha, tier,
 //!   machine, network, trigger, started, ended, result;
 //! - `job`: key, job (its id), matrix, result (success, failure, skipped,
-//!   unsupported, not_planned, cancelled, unknown), ms;
+//!   unsupported, not_planned, cancelled, unknown), ms, elsewhere (why an
+//!   unsupported job did not run here);
 //! - `step`: key, step, stage, result, ms, owner (project, bana, act), continued;
 //! - `tests`: key, step, tool, passed, failed, skipped, incomplete (go's
 //!   counts are packages, shown apart);
@@ -92,10 +101,22 @@ pub enum JobState {
     Failure,
     /// It never ran: skipped by `if:`, or a job it needs failed.
     Skipped,
-    /// Its `runs-on` has no platform here (a macOS job on Linux): not run here.
+    /// Its `runs-on` has no platform here (a macOS job on Linux), or bana says
+    /// it does not run here: not run here. A job bana runs next is one too
+    /// ([`Job::apart`]) until its own lines come.
     Unsupported,
     /// Stopped by a cancel, or by act's end.
     Cancelled,
+}
+
+impl JobState {
+    /// It has its result: no line after changes it.
+    pub fn is_final(self) -> bool {
+        matches!(
+            self,
+            Self::Success | Self::Failure | Self::Skipped | Self::Cancelled
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -140,14 +161,32 @@ pub struct Job {
     pub steps: Vec<Step>,
     /// The step that failed it.
     pub failed_step: Option<String>,
-    /// Why it did not run here, when act's skip says ([`ELSEWHERE_SYSTEMD`]).
+    /// Why it did not run here: bana's word ([`BANA_NOT_RUN`]), or act's skip's
+    /// ([`ELSEWHERE_SYSTEMD`]). While it waits for its systemd container,
+    /// `next, in a systemd container`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elsewhere: Option<String>,
+    /// act skipped it here, and bana runs it next, in a systemd container of its
+    /// own ([`BANA_NEXT`]): its own lines, when they come, make it run. The one
+    /// way back from act's skip.
+    #[serde(skip_serializing_if = "is_false")]
+    pub apart: bool,
 }
 
-/// A `<prefix>-systemd` job that a remote build (`bana split`) left out: no
-/// job runs on GitHub's runner's own machine, which holds the deploy key.
-pub const ELSEWHERE_SYSTEMD: &str = "runs locally, needs systemd";
+/// A `<prefix>-systemd` job act skipped with no word from bana on it: a remote
+/// build's bana.yml from before bana split ran systemd jobs (`bana split sync`
+/// renders it again).
+pub const ELSEWHERE_SYSTEMD: &str =
+    "needs systemd, which this bana.yml does not run: bana split sync";
+
+/// bana's line, before act starts, for a job act will skip that bana runs
+/// next, in a container whose PID 1 is systemd (lib/systemd.sh's sd_next).
+pub const BANA_NEXT: &str = "bana: next, in a systemd container";
+/// What a job bana runs next says while it waits (its [`Job::elsewhere`]).
+const NEXT: &str = "next, in a systemd container";
+/// bana's line for a job it does not run here, then why: `bana: not run here:
+/// needs sd, a systemd job`.
+pub const BANA_NOT_RUN: &str = "bana: not run here: ";
 
 impl Job {
     /// The step it runs now.
@@ -220,6 +259,16 @@ impl JobLine {
     pub fn unsupported(&self) -> bool {
         self.msg.contains("Skipping unsupported platform")
     }
+
+    /// bana's own line on the job (`bana: …`, [`BANA_NEXT`], [`BANA_NOT_RUN`]):
+    /// never a step's output, nor a line with a result.
+    pub fn bana(&self) -> Option<&str> {
+        if self.output || self.step_result.is_some() || self.job_result.is_some() {
+            return None;
+        }
+        let msg = self.msg.trim_end();
+        msg.starts_with("bana: ").then_some(msg)
+    }
 }
 
 /// One line of act's `--json` output, or a line the daemon wrote beside them in
@@ -287,11 +336,13 @@ pub fn parse_line(line: &str) -> Event {
 }
 
 /// What act.jsonl keeps of one line act (or bana) printed: act's JSON as it is,
-/// anything else wrapped as `{"msg": …, "bana": "stderr"}`.
+/// anything else wrapped as `{"msg": …, "bana": "stderr"}`. So is an object
+/// with a key `bana` (but bana split's `{"bana":"remote",…}`): only the daemon
+/// writes its marks there ([`cancel_mark`]), never a line of the build's.
 pub fn log_line(raw: &str) -> String {
     let raw = raw.trim_end_matches(['\r', '\n']);
     match serde_json::from_str::<Value>(raw) {
-        Ok(Value::Object(_)) => raw.to_string(),
+        Ok(Value::Object(o)) if o.get("bana").is_none_or(|k| k == "remote") => raw.to_string(),
         _ => serde_json::json!({"msg": raw, "bana": "stderr"}).to_string(),
     }
 }
@@ -440,18 +491,52 @@ impl Build {
         let cancelling = self.cancel_requested.is_some();
         let i = self.job_index(l);
         let job = &mut self.jobs[i];
+        // Its result stands: a line after it (a job of act's host mode can
+        // write act's lines) changes nothing.
+        if job.state.is_final() {
+            return;
+        }
+        // bana's word on a job that has not started: it runs next, in a
+        // systemd container of its own, or it does not run here, and why. A job
+        // that started has run (it ends as act ends).
+        if let Some(said) = l.bana() {
+            if matches!(job.state, JobState::Waiting | JobState::Unsupported) {
+                if said == BANA_NEXT {
+                    (job.state, job.apart) = (JobState::Unsupported, true);
+                    job.elsewhere = Some(NEXT.into());
+                } else if let Some(why) = said.strip_prefix(BANA_NOT_RUN) {
+                    (job.state, job.apart) = (JobState::Unsupported, false);
+                    let why: String = why.chars().filter(|c| !c.is_control()).collect();
+                    job.elsewhere = Some(why.trim().to_string()).filter(|w| !w.is_empty());
+                }
+            }
+            return;
+        }
         if l.unsupported() {
             if job.state == JobState::Waiting {
                 job.state = JobState::Unsupported;
             }
-            // act names each of the job's labels: `-P wid-systemd=...`.
-            if l.msg.contains("-systemd=...`") {
+            // act names each of the job's labels: `-P wid-systemd=...`. bana's
+            // own word, said before act's (it runs the job next, or why not),
+            // stays; a job that runs has no other place.
+            if job.state == JobState::Unsupported
+                && job.elsewhere.is_none()
+                && l.msg.contains("-systemd=...`")
+            {
                 job.elsewhere = Some(ELSEWHERE_SYSTEMD.into());
             }
             return;
         }
-        if job.state == JobState::Waiting {
-            job.state = JobState::Running;
+        match job.state {
+            JobState::Waiting => job.state = JobState::Running,
+            // Its systemd container's act: it runs.
+            JobState::Unsupported if job.apart => {
+                (job.state, job.apart, job.elsewhere) = (JobState::Running, false, None);
+            }
+            // act skipped it, and bana runs it nowhere: a line that says
+            // otherwise is no line of its.
+            JobState::Unsupported => return,
+            _ => {}
         }
         job.started.get_or_insert(at);
         if let (Some(id), Some(name)) = (&l.step_id, &l.step) {
@@ -536,8 +621,8 @@ impl Build {
     /// for now or earlier), the build ends in error with its reason; otherwise
     /// it failed if a job failed, passed if act exited 0, and else ended in
     /// error with act's last error. Jobs that never printed a line were skipped
-    /// (or, when the build ended in error, cancelled); jobs still running were
-    /// cancelled.
+    /// (or, when the build ended in error, cancelled), and so were jobs bana was
+    /// to run next and did not; jobs still running were cancelled.
     pub fn finish(&mut self, exit: Option<i32>, cancel: Option<&str>, at: i64) -> BuildState {
         if let Some(r) = cancel {
             self.cancel(r);
@@ -564,6 +649,11 @@ impl Build {
             (BuildState::Error, Some(why))
         };
         for j in &mut self.jobs {
+            // bana did not get to run it (a stop, or its if: on a job act ran):
+            // it ends as a job that never started does.
+            if j.apart {
+                (j.state, j.apart, j.elsewhere) = (JobState::Waiting, false, None);
+            }
             match j.state {
                 JobState::Waiting if state == BuildState::Error => j.state = JobState::Cancelled,
                 JobState::Waiting => j.state = JobState::Skipped,
@@ -589,13 +679,14 @@ impl Build {
             .unwrap_or("stopped before it finished")
     }
 
-    /// Each job's state for the page, with the step a running one is at.
+    /// Each job's state for the page, with the step a running one is at. A job
+    /// bana runs next waits for its container.
     pub fn chips(&self) -> Vec<JobChip> {
         self.jobs
             .iter()
             .map(|j| JobChip {
                 key: j.key.clone(),
-                state: j.state,
+                state: if j.apart { JobState::Waiting } else { j.state },
                 step: j.current_step().map(String::from),
             })
             .collect()
@@ -1412,15 +1503,21 @@ mod tests {
         post(&Build::default(), &b);
         let mut log = String::new();
         let mut lines: Vec<String> = jsonl.lines().map(String::from).collect();
-        if let Some((after, why)) = cancel {
+        let mark = cancel.map(|(_, why)| cancel_mark(why));
+        if let (Some((after, _)), Some(m)) = (cancel, &mark) {
             let at = lines.iter().position(|l| l.contains(after)).unwrap();
-            lines.insert(at + 1, cancel_mark(why));
+            lines.insert(at + 1, m.clone());
         }
         for line in &lines {
             let before = b.clone();
             b.fold(&parse_line(line), t0);
             post(&before, &b);
-            log += &log_line(line);
+            // The daemon writes its mark itself; act's lines go through log_line.
+            if Some(line) == mark.as_ref() {
+                log += line;
+            } else {
+                log += &log_line(line);
+            }
             log.push('\n');
         }
         let before = b.clone();
@@ -1699,6 +1796,30 @@ mod tests {
                 ],
             },
             Case {
+                name: "a systemd job, run next in its container; the job that needs it, not run",
+                run: fixture!("systemd"),
+                cancel: None,
+                exit: Some(0),
+                reason: None,
+                state: BuildState::Success,
+                jobs: &[
+                    ("plan", Success, None),
+                    ("sd", Success, None),
+                    ("after", Unsupported, None),
+                ],
+                statuses: &[
+                    (
+                        "bana",
+                        &[
+                            RUNNING,
+                            "success: passed on mbp in 2s · 2 jobs; not run here: after (needs sd, a systemd job)",
+                        ],
+                    ),
+                    ("bana/plan", &[JOB_RUNNING, "success: passed in 0s"]),
+                    ("bana/sd", &[JOB_RUNNING, "success: passed in 0s"]),
+                ],
+            },
+            Case {
                 name: "a composite action, and a step that may fail",
                 run: fixture!("composite"),
                 cancel: None,
@@ -1741,7 +1862,9 @@ mod tests {
     }
 
     #[test]
-    fn a_systemd_job_a_remote_build_left_out_says_where_it_runs() {
+    fn a_systemd_job_an_old_bana_yml_left_out_says_bana_split_sync() {
+        // A remote build's bana.yml from before bana split ran systemd jobs:
+        // act's skips alone, no word from bana.
         let list = [(0, "host".to_string()), (0, "linux".to_string())];
         let mut b = Build::new(&list, 1);
         let log = r#"{"jobID":"host","matrix":{},"msg":"🚧  Skipping unsupported platform -- Try running with `-P self-hosted=...`"}
@@ -1754,7 +1877,7 @@ mod tests {
         let r = Report::new("quick", "quick", "mbp");
         assert_eq!(
             r.describe(&b).map(|d| d.1).as_deref(),
-            Some("passed on mbp in 1s · 1 job; not run here: host (runs locally, needs systemd)")
+            Some("passed on mbp in 1s · 1 job; not run here: host (needs systemd, which this bana.yml does not run: bana split sync)")
         );
         let res = crate::results::fold_json_listed(log, &list);
         let back = crate::results::Results::from_jsonl(&res.to_jsonl());
@@ -1763,6 +1886,524 @@ mod tests {
         let mut m = Build::new(&[(0, "mac".to_string())], 1);
         m.fold_lines(r#"{"jobID":"mac","matrix":{},"msg":"🚧  Skipping unsupported platform -- Try running with `-P wid-macos=...`"}"#, 1);
         assert_eq!(m.jobs[0].elsewhere, None);
+    }
+
+    /// A line of job `id`, in act's shape: `extra` its other keys.
+    fn job_line(id: &str, extra: &str) -> String {
+        format!(r#"{{"jobID":"{id}","matrix":{{}},"time":"2026-10-02T18:07:50Z",{extra}}}"#)
+    }
+
+    /// act's skip of a job on wid-systemd, which act's run maps to no place.
+    const SKIP_SYSTEMD: &str =
+        r#""msg":"🚧  Skipping unsupported platform -- Try running with `-P wid-systemd=...`""#;
+
+    fn keys_states(b: &Build) -> Vec<(&str, JobState, bool, Option<&str>)> {
+        b.jobs
+            .iter()
+            .map(|j| (j.key.as_str(), j.state, j.apart, j.elsewhere.as_deref()))
+            .collect()
+    }
+
+    fn step_names(j: &Job) -> Vec<&str> {
+        j.steps.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    #[test]
+    fn a_systemd_job_run_in_its_container_passes() {
+        // tests/fixtures/act/systemd: bana's line, act's run (sd on wid-systemd
+        // skipped), bana's line for after, then sd's own lines from act in its
+        // container (plan's run again there left out by bana).
+        let (jsonl, list) = fixture!("systemd");
+        let (b, posted, _) = play(fixture!("systemd"), None, Some(0), None);
+        assert_eq!(
+            posted["bana/sd"],
+            ["pending: running", "success: passed in 0s"]
+        );
+        assert_eq!(
+            posted["bana"],
+            [
+                "pending: running on mbp (quick)",
+                "success: passed on mbp in 2s · 2 jobs; not run here: after (needs sd, a systemd job)"
+            ]
+        );
+        assert_eq!(
+            step_names(&b.jobs[0]),
+            ["Set up job", "plan", "Complete job"],
+            "plan once: act's run of it"
+        );
+        assert_eq!(
+            step_names(&b.jobs[1]),
+            ["Set up job", "linger", "Complete job"]
+        );
+        assert_eq!(
+            (b.jobs[1].apart, b.jobs[1].elsewhere.as_deref()),
+            (false, None)
+        );
+
+        // As it comes: sd waits from bana's first line, act's skip changes
+        // nothing, and its own first line makes it run.
+        let r = Report::new("quick", "quick", "mbp");
+        let lines: Vec<&str> = jsonl.lines().collect();
+        let mut b = Build::new(&parse_list(list), 0);
+        b.fold(&parse_line(lines[0]), 0);
+        let waiting = (
+            "sd",
+            Unsupported,
+            true,
+            Some("next, in a systemd container"),
+        );
+        assert_eq!(keys_states(&b)[1], waiting);
+        assert_eq!(b.chips()[1].state, JobState::Waiting, "the page: it waits");
+        let skipped = lines.iter().rposition(|l| l.contains("Skipping")).unwrap();
+        for l in &lines[1..=skipped] {
+            b.fold(&parse_line(l), 0);
+        }
+        assert_eq!(keys_states(&b)[1], waiting, "act's skip, as bana asked");
+        assert_eq!(b.jobs[1].started, None);
+        assert!(statuses(&b, &r).iter().all(|s| s.context != "bana/sd"));
+        let own = lines.iter().position(|l| l.contains(r#""job":"ci/sd  ","jobID":"sd","level":"info","matrix":{},"msg":"⭐ Run Set up job""#)).unwrap();
+        for l in &lines[skipped + 1..=own] {
+            b.fold(&parse_line(l), 0);
+        }
+        assert_eq!(keys_states(&b)[1], ("sd", JobState::Running, false, None));
+        assert_eq!(b.chips()[1].step.as_deref(), Some("Set up job"));
+        let running = b.clone();
+        b.fold(&parse_line(&job_line("sd", SKIP_SYSTEMD)), 0);
+        assert_eq!(b, running, "a skip of a job that runs is no skip");
+        assert!(statuses(&b, &r).contains(&Status {
+            context: "bana/sd".into(),
+            state: StatusState::Pending,
+            description: "running".into()
+        }));
+    }
+
+    #[test]
+    fn a_job_needing_a_systemd_job_is_not_run_here_with_why() {
+        let (jsonl, list) = fixture!("systemd");
+        let (b, posted, _) = play(fixture!("systemd"), None, Some(0), None);
+        assert_eq!(
+            keys_states(&b)[2],
+            ("after", Unsupported, false, Some("needs sd, a systemd job"))
+        );
+        assert_eq!(b.jobs[2].started, None);
+        assert!(!posted.contains_key("bana/after"), "no status of its own");
+        assert!(
+            posted["bana"][1].ends_with("; not run here: after (needs sd, a systemd job)"),
+            "{:?}",
+            posted["bana"]
+        );
+        // results.jsonl, the brief's and the CI report's, say why too.
+        let res = crate::results::fold_json_listed(jsonl, &parse_list(list));
+        let after = &res.jobs[2];
+        assert_eq!(
+            (
+                after.key.as_str(),
+                after.result.as_str(),
+                after.elsewhere.as_deref()
+            ),
+            ("after", "unsupported", Some("needs sd, a systemd job"))
+        );
+
+        // Each of bana's reasons, as it says them; no control character gets in.
+        for (said, why) in [
+            ("needs plan, which failed", "needs plan, which failed"),
+            (
+                "needs mac, which is not run here",
+                "needs mac, which is not run here",
+            ),
+            (
+                "its systemd container did not start",
+                "its systemd container did not start",
+            ),
+            (
+                "needs Docker 28 or later (writable cgroups)",
+                "needs Docker 28 or later (writable cgroups)",
+            ),
+            (
+                "a job it needs\\u001b[31m failed ",
+                "a job it needs[31m failed",
+            ),
+        ] {
+            let mut b = Build::new(&[(0, "sd".into())], 0);
+            b.fold(
+                &parse_line(&job_line(
+                    "sd",
+                    &format!(r#""msg":"bana: not run here: {said}""#),
+                )),
+                0,
+            );
+            assert_eq!(
+                keys_states(&b)[0],
+                ("sd", Unsupported, false, Some(why)),
+                "{said}"
+            );
+        }
+        // A job that started has run: bana's word changes nothing (it ends as
+        // act ends: a container that died mid-job, and bana's red error).
+        let mut b = Build::new(&[(0, "sd".into())], 0);
+        b.fold(
+            &parse_line(&job_line(
+                "sd",
+                r#""msg":"⭐ Run Set up job","step":"Set up job","stepid":["--setup-job"]"#,
+            )),
+            0,
+        );
+        let before = b.clone();
+        b.fold(&parse_line(&job_line("sd", r#""msg":"bana: not run here: a job it needs failed in its systemd container (its output: /x)""#)), 0);
+        b.fold(
+            &parse_line(&job_line("sd", &format!(r#""msg":"{BANA_NEXT}""#))),
+            0,
+        );
+        assert_eq!(b, before);
+        b.fold(&parse_line(r#"{"msg":"\u001b[31mError: systemd job sd did not run: its act ended with 1\u001b[0m","bana":"stderr"}"#), 0);
+        assert_eq!(b.finish(Some(1), None, 5), BuildState::Error);
+        assert_eq!(b.jobs[0].state, Cancelled);
+        assert_eq!(
+            b.reason.as_deref(),
+            Some("systemd job sd did not run: its act ended with 1")
+        );
+        // A step's output that reads like bana's is the step's.
+        let mut b = Build::new(&[(0, "x".into())], 0);
+        b.fold(&parse_line(&job_line("x", r#""msg":"bana: not run here: x\n","raw_output":true,"stage":"Main","step":"s","stepID":["0"]"#)), 0);
+        assert_eq!(keys_states(&b)[0], ("x", JobState::Running, false, None));
+    }
+
+    #[test]
+    fn the_same_from_a_text_log() {
+        // The same project by hand, its log as bana ci keeps it (last.log): bana's
+        // lines, act's text, then the container's act's lines.
+        let text = include_str!("../tests/fixtures/results/systemd.txt");
+        assert!(text.contains("\n[ci/after] bana: not run here: needs sd, a systemd job\n"));
+        let r = crate::results::fold_text(text);
+        let jobs: Vec<(&str, &str, Option<&str>, Vec<&str>)> = r
+            .jobs
+            .iter()
+            .map(|j| {
+                let steps = j.steps.iter().map(|s| s.name.as_str()).collect();
+                (
+                    j.key.as_str(),
+                    j.result.as_str(),
+                    j.elsewhere.as_deref(),
+                    steps,
+                )
+            })
+            .collect();
+        assert_eq!(
+            jobs,
+            [
+                (
+                    "sd",
+                    "success",
+                    None,
+                    vec!["Set up job", "linger", "Complete job"]
+                ),
+                (
+                    "plan",
+                    "success",
+                    None,
+                    vec!["Set up job", "plan", "Complete job"]
+                ),
+                (
+                    "after",
+                    "unsupported",
+                    Some("needs sd, a systemd job"),
+                    vec![]
+                ),
+            ]
+        );
+        assert_eq!(r.build.result, "success");
+        // As act's JSON says it.
+        let json = crate::results::fold_json(fixture!("systemd").0);
+        let keys = |r: &crate::results::Results| -> Vec<(String, String, Option<String>)> {
+            r.jobs
+                .iter()
+                .map(|j| (j.key.clone(), j.result.clone(), j.elsewhere.clone()))
+                .collect()
+        };
+        assert_eq!(keys(&r), keys(&json));
+        // A dependent's line as bana prints it, alone.
+        let r =
+            crate::results::fold_text("[ci/after] bana: not run here: needs sd, a systemd job\n");
+        assert_eq!(
+            (
+                r.jobs[0].key.as_str(),
+                r.jobs[0].result.as_str(),
+                r.jobs[0].elsewhere.as_deref()
+            ),
+            ("after", "unsupported", Some("needs sd, a systemd job"))
+        );
+    }
+
+    #[test]
+    fn a_gate_reason_wins_over_the_skips_guess() {
+        let linux = [
+            job_line(
+                "linux",
+                r#""msg":"ok","stage":"Main","step":"t","stepID":["0"],"stepResult":"success""#,
+            ),
+            job_line(
+                "linux",
+                r#""msg":"🏁  Job succeeded","jobResult":"success""#,
+            ),
+        ]
+        .join("\n");
+        let gate = job_line(
+            "sd",
+            r#""msg":"bana: not run here: needs Docker 28 or later (writable cgroups)""#,
+        );
+        let skip = job_line("sd", SKIP_SYSTEMD);
+        let r = Report::new("quick", "quick", "mbp");
+        // bana's word before act starts, then act's skip.
+        let mut b = Build::new(&[(0, "sd".into()), (0, "linux".into())], 0);
+        b.fold_lines(&format!("{gate}\n{skip}\n{linux}"), 0);
+        b.started_at = parse_time("2026-10-02T18:07:49Z");
+        b.finish(Some(0), None, parse_time("2026-10-02T18:07:50Z").unwrap());
+        assert_eq!(
+            r.describe(&b).unwrap().1,
+            "passed on mbp in 1s · 1 job; not run here: sd (needs Docker 28 or later (writable cgroups))"
+        );
+        // bana's word after act's skip (a need that failed): bana's too.
+        let mut b = Build::new(&[(0, "sd".into())], 0);
+        let failed = job_line(
+            "sd",
+            r#""msg":"bana: not run here: needs plan, which failed""#,
+        );
+        b.fold_lines(&format!("{skip}\n{failed}"), 0);
+        assert_eq!(
+            b.jobs[0].elsewhere.as_deref(),
+            Some("needs plan, which failed")
+        );
+        // In text as well.
+        let r = crate::results::fold_text(
+            "[ci/sd] bana: not run here: needs Docker 28 or later (writable cgroups)\n[ci/sd] 🚧  Skipping unsupported platform -- Try running with `-P wid-systemd=...`\n",
+        );
+        assert_eq!(
+            r.jobs[0].elsewhere.as_deref(),
+            Some("needs Docker 28 or later (writable cgroups)")
+        );
+    }
+
+    #[test]
+    fn elsewhere_is_cleared_once_the_job_runs() {
+        let (jsonl, list) = fixture!("systemd");
+        let res = crate::results::fold_json_listed(jsonl, &parse_list(list));
+        let text = res.to_jsonl();
+        assert!(!text.contains("next, in a systemd container"), "{text}");
+        let back = crate::results::Results::from_jsonl(&text);
+        let jobs: Vec<(&str, &str, Option<&str>)> = back
+            .jobs
+            .iter()
+            .map(|j| (j.key.as_str(), j.result.as_str(), j.elsewhere.as_deref()))
+            .collect();
+        assert_eq!(
+            jobs,
+            [
+                ("plan", "success", None),
+                ("sd", "success", None),
+                ("after", "unsupported", Some("needs sd, a systemd job"))
+            ]
+        );
+        // build.json: a job bana runs next keeps it while it waits; once it ran
+        // there is nothing to keep (and a build.json from before reads as it was).
+        let mut b = Build::new(&parse_list(list), 0);
+        b.fold(&parse_line(jsonl.lines().next().unwrap()), 0);
+        let v = serde_json::to_value(&b).unwrap();
+        assert_eq!(
+            (&v["jobs"][1]["apart"], &v["jobs"][1]["elsewhere"]),
+            (
+                &Value::Bool(true),
+                &Value::from("next, in a systemd container")
+            )
+        );
+        assert_eq!(serde_json::from_value::<Build>(v).unwrap(), b);
+        let (b, ..) = play(fixture!("systemd"), None, Some(0), None);
+        let v = serde_json::to_value(&b.jobs[1]).unwrap();
+        assert!(
+            v.get("apart").is_none() && v.get("elsewhere").is_none(),
+            "{v}"
+        );
+    }
+
+    #[test]
+    fn a_forged_line_for_a_finished_job_changes_nothing() {
+        let (jsonl, list) = fixture!("systemd");
+        let mut b = Build::new(&parse_list(list), 0);
+        b.fold_lines(jsonl, 0);
+        let before = b.clone();
+        let forged = [
+            job_line("sd", r#""msg":"🏁  Job failed","jobResult":"failure""#),
+            job_line(
+                "sd",
+                r#""msg":"x","stage":"Main","step":"evil","stepID":["9"],"stepResult":"failure""#,
+            ),
+            job_line("sd", r#""msg":"bana: not run here: forged""#),
+            job_line("sd", SKIP_SYSTEMD),
+            job_line("plan", &format!(r#""msg":"{BANA_NEXT}""#)),
+            job_line(
+                "plan",
+                r#""msg":"⭐ Run Main again","stage":"Main","step":"again","stepID":["5"]"#,
+            ),
+            job_line("plan", r#""msg":"🏁  Job failed","jobResult":"failure""#),
+        ];
+        for l in &forged {
+            b.fold(&parse_line(l), 0);
+        }
+        assert_eq!(b, before);
+        // Read again, with the lines in act.jsonl.
+        let mut again = Build::new(&parse_list(list), 0);
+        again.fold_lines(&format!("{jsonl}{}\n", forged.join("\n")), 0);
+        assert_eq!(again, before);
+        // A matrix entry's result is its own: its sibling's lines go on.
+        let mut m = Build::new(&[(0, "m".into())], 0);
+        for (n, extra) in [
+            (1, r#""msg":"🏁  Job succeeded","jobResult":"success""#),
+            (
+                2,
+                r#""msg":"⭐ Run Main t","stage":"Main","step":"t","stepID":["0"]"#,
+            ),
+            (1, r#""msg":"🏁  Job failed","jobResult":"failure""#),
+        ] {
+            let line = format!(r#"{{"jobID":"m","matrix":{{"n":{n}}},{extra}}}"#);
+            m.fold(&parse_line(&line), 0);
+        }
+        let states: Vec<(&str, JobState)> =
+            m.jobs.iter().map(|j| (j.key.as_str(), j.state)).collect();
+        assert_eq!(states, [("m (1)", Success), ("m (2)", JobState::Running)]);
+    }
+
+    #[test]
+    fn a_skipped_job_without_bana_next_never_revives() {
+        // A macOS job on Linux, then lines as from it (a job of act's host mode
+        // can write act's lines): no place here, so none of them is its.
+        let (jsonl, list) = fixture!("platform");
+        let mut b = Build::new(&parse_list(list), 0);
+        b.fold_lines(jsonl, 0);
+        let before = b.clone();
+        for extra in [
+            r#""msg":"⭐ Run Main test","stage":"Main","step":"test","stepID":["0"]"#,
+            r#""msg":"ok\n","raw_output":true,"stage":"Main","step":"test","stepID":["0"]"#,
+            r#""msg":"  ✅  Success - Main test","stage":"Main","step":"test","stepID":["0"],"stepResult":"success""#,
+            r#""msg":"🏁  Job succeeded","jobResult":"success""#,
+            r#""msg":"bana: next, in a systemd container","raw_output":true"#,
+            r#""msg":"bana: next, in a systemd containers""#,
+            r#""msg":"bana: anything else""#,
+        ] {
+            b.fold(&parse_line(&job_line("macos", extra)), 0);
+        }
+        assert_eq!(b, before);
+        b.finish(Some(0), None, 9);
+        assert_eq!(b.jobs[0].state, Unsupported);
+        assert!(statuses(&b, &Report::new("quick", "quick", "mbp"))
+            .iter()
+            .all(|s| s.context != "bana/macos"));
+        // A job act skipped that bana named next comes back (once).
+        let mut b = Build::new(&[(0, "sd".into())], 0);
+        for l in [
+            job_line("sd", SKIP_SYSTEMD),
+            job_line("sd", &format!(r#""msg":"{BANA_NEXT}""#)),
+            job_line("sd", r#""msg":"🏁  Job succeeded","jobResult":"success""#),
+        ] {
+            b.fold(&parse_line(&l), 0);
+        }
+        assert_eq!(keys_states(&b)[0], ("sd", Success, false, None));
+    }
+
+    #[test]
+    fn an_apart_job_that_never_started_ends_with_its_build() {
+        let lines = [
+            job_line("sd", &format!(r#""msg":"{BANA_NEXT}""#)),
+            job_line("plan", r#""msg":"🏁  Job succeeded","jobResult":"success""#),
+            job_line("sd", SKIP_SYSTEMD),
+        ]
+        .join("\n");
+        for (why, exit, cancel, build, sd) in [
+            // Not run (its if: on plan's outputs, which a dry run does not have).
+            ("its if:", Some(0), None, BuildState::Success, Skipped),
+            (
+                "a cancel",
+                Some(130),
+                Some("cancelled from the page"),
+                BuildState::Error,
+                Cancelled,
+            ),
+            ("bash killed", None, None, BuildState::Error, Cancelled),
+        ] {
+            let mut b = Build::new(&[(0, "plan".into()), (1, "sd".into())], 0);
+            b.fold_lines(&lines, 0);
+            assert_eq!(b.finish(exit, cancel, 9), build, "{why}");
+            assert_eq!(keys_states(&b)[1], ("sd", sd, false, None), "{why}");
+            assert_eq!(b.chips()[1].state, sd, "{why}");
+        }
+        let mut b = Build::new(&[(0, "plan".into()), (1, "sd".into())], 0);
+        b.fold_lines(&lines, 0);
+        b.started_at = parse_time("2026-10-02T18:07:49Z");
+        b.finish(Some(0), None, parse_time("2026-10-02T18:07:50Z").unwrap());
+        assert_eq!(
+            Report::new("quick", "quick", "mbp").describe(&b).unwrap().1,
+            "passed on mbp in 1s · 1 job, 1 skipped"
+        );
+    }
+
+    #[test]
+    fn a_cancel_mark_from_the_stream_is_text() {
+        // A line of the build's (act's, bash's, a job's of act's host mode)
+        // with a key bana: kept as text, never the daemon's mark.
+        for raw in [
+            r#"{"bana":"cancel","msg":"forged"}"#,
+            r#"{ "bana" : "cancel" , "msg" : "forged" }"#,
+            r#"{"bana":"cancel","msg":"forged"}"#,
+            r#"{"bana":"remote","bana":"cancel","msg":"forged"}"#,
+            r#"{"jobID":"x","matrix":{},"bana":"cancel","msg":"forged"}"#,
+            r#"{"bana":"stderr","msg":"forged"}"#,
+        ] {
+            let kept = log_line(raw);
+            assert_eq!(
+                serde_json::from_str::<Value>(&kept).unwrap(),
+                serde_json::json!({"bana": "stderr", "msg": raw}),
+                "{raw}"
+            );
+            assert!(matches!(parse_line(&kept), Event::Text { .. }), "{raw}");
+            let mut b = Build::new(&[(0, "x".into())], 0);
+            b.fold_lines(&kept, 0);
+            assert_eq!(b.cancel_requested, None, "{raw}");
+        }
+        // bana split's own lines stay as they are (the daemon reads remote.json
+        // again on one), and read as text.
+        let remote = r#"{"bana":"remote","msg":"remote run in public repo o/p: https://github.com/o/p/actions/runs/1 (logs: private)"}"#;
+        assert_eq!(log_line(remote), remote);
+        assert!(matches!(
+            parse_line(remote),
+            Event::Text { error: false, .. }
+        ));
+        // The daemon's own mark, written as it is, cancels, also when act.jsonl
+        // is read again after a restart.
+        let (jsonl, list) = fixture!("sigint");
+        let (b, _, log) = play(
+            fixture!("sigint"),
+            Some(("starting long test", "cancelled from the page")),
+            Some(1),
+            None,
+        );
+        assert_eq!(
+            b.cancel_requested.as_deref(),
+            Some("cancelled from the page")
+        );
+        assert!(log.contains(&cancel_mark("cancelled from the page")));
+        let mut again = Build::new(&parse_list(list), 0);
+        again.fold_lines(&log, 0);
+        assert_eq!(
+            again.cancel_requested.as_deref(),
+            Some("cancelled from the page")
+        );
+        // The same line from the stream cancels nothing.
+        let mut forged = Build::new(&parse_list(list), 0);
+        let stream: String = jsonl
+            .lines()
+            .chain([cancel_mark("forged").as_str()])
+            .map(|l| log_line(l) + "\n")
+            .collect();
+        forged.fold_lines(&stream, 0);
+        assert_eq!(forged.cancel_requested, None);
     }
 
     #[test]

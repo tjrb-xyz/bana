@@ -6218,6 +6218,75 @@ exec git \"$@\"
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_systemd_job_run_in_its_container_through_the_daemon() {
+        // bana ci's lines for a systemd job (tests/fixtures/act/systemd): bana's
+        // next, act's run that skips it, bana's line for the job that needs it,
+        // then its own lines from act in its container.
+        let p = Project::new("systemd");
+        let d = start(&p, "").await;
+        let a = p.commit("systemd", "a systemd job");
+        p.push("main");
+        poll(&d).await;
+        let rec = finished(&d, 1).await;
+        assert_eq!(rec.build.state, BuildState::Success);
+        posted(&d).await;
+        let posts: Vec<(String, String, String)> = p
+            .posts()
+            .into_iter()
+            .filter(|x| x.sha == a)
+            .map(|x| (x.context, x.state, x.description))
+            .collect();
+        let last = |c: &str| posts.iter().rfind(|x| x.0 == c).cloned();
+        assert_eq!(
+            last("bana/sd").map(|x| (x.1, x.2)),
+            Some(("success".into(), "passed in 0s".into())),
+            "{posts:?}"
+        );
+        assert_eq!(
+            last("bana/plan").map(|x| x.1),
+            Some("success".into()),
+            "{posts:?}"
+        );
+        assert!(posts.iter().all(|x| x.0 != "bana/after"), "{posts:?}");
+        let own = last("bana").unwrap();
+        assert_eq!(own.1, "success");
+        assert!(
+            own.2
+                .ends_with(" · 2 jobs; not run here: after (needs sd, a systemd job)"),
+            "{own:?}"
+        );
+        let read =
+            |name: &str| std::fs::read_to_string(p.dir.join(format!("builds/1/{name}"))).unwrap();
+        // act.jsonl keeps bana's lines as they came, in act's shape.
+        let log = read("act.jsonl");
+        assert!(
+            log.lines().any(|l| l.starts_with(r#"{"level":"info","job":"ci/after","jobID":"after","matrix":{},"msg":"bana: not run here: needs sd, a systemd job""#)),
+            "{log}"
+        );
+        let r = crate::results::Results::from_jsonl(&read("results.jsonl"));
+        let jobs: Vec<(&str, &str, Option<&str>)> = r
+            .jobs
+            .iter()
+            .map(|j| (j.key.as_str(), j.result.as_str(), j.elsewhere.as_deref()))
+            .collect();
+        assert_eq!(
+            jobs,
+            [
+                ("plan", "success", None),
+                ("sd", "success", None),
+                ("after", "unsupported", Some("needs sd, a systemd job"))
+            ]
+        );
+        assert!(
+            read("report.md").contains("\n## Not run here\n\n- after: needs sd, a systemd job\n"),
+            "{}",
+            read("report.md")
+        );
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_build_ends_with_its_ci_report() {
         let p = Project::new("report");
         let d = start(&p, "bana_commit = b1df450\n").await;

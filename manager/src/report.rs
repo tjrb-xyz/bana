@@ -1260,6 +1260,30 @@ mod tests {
     }
 
     #[test]
+    fn a_job_that_needs_a_systemd_job_says_why_it_did_not_run() {
+        // tests/fixtures/act/systemd: sd ran next, in its systemd container;
+        // after, which needs it, did not run (act runs a job with its needs).
+        let (jsonl, list) = (
+            include_str!("../tests/fixtures/act/systemd.jsonl"),
+            include_str!("../tests/fixtures/act/systemd.list"),
+        );
+        let r = fold_json_listed(jsonl, &crate::actlog::parse_list(list));
+        let rep = report(&r, &Conf::default(), &Meta::default());
+        assert_eq!(checks_cell(&row(&rep, "sd").checks), "100% (1/1)");
+        assert!(row(&rep, "sd").not_run.is_empty());
+        assert_eq!(
+            row(&rep, "after").not_run,
+            ["after (needs sd, a systemd job)"]
+        );
+        assert!(
+            rep.markdown
+                .contains("\n## Not run here\n\n- after: needs sd, a systemd job\n"),
+            "{}",
+            rep.markdown
+        );
+    }
+
+    #[test]
     fn the_example_with_its_standards() {
         // results.jsonl as a builder writes it: the example's jobs by hand.
         let r = Results::from_jsonl(EXAMPLE);

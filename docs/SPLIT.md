@@ -118,7 +118,8 @@ The public workflow takes `workflow_dispatch` alone, with the inputs id, sha, re
   `act.platform.*` image runs only when pinned. No job runs on the runner's own machine (act's host mode):
   GitHub's runner holds the deploy key in its memory and has passwordless sudo. So `<prefix>-systemd` jobs
   are not run there, nor are macOS jobs: a remote build reports them as not run here (a systemd job as
-  "runs locally, needs systemd"). A split project's systemd jobs run on your machine;
+  "needs systemd, which this bana.yml does not run: bana split sync"). A split project's systemd jobs run on
+  your machine;
 - **summary**: the table of steps;
 - **seal**: act's output and the jobs' uploads, as a tar, encrypted with AES-256-CBC (pbkdf2) under a fresh
   key; that key, the ciphertext's sha256, the run's id and bana's build, commit and nonce are encrypted with

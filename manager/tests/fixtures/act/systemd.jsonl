@@ -1,0 +1,30 @@
+{"level":"info","job":"ci/sd  ","jobID":"sd","matrix":{},"msg":"bana: next, in a systemd container","time":"2026-10-02T18:07:45Z"}
+{"level":"info","msg":"Using docker host 'unix:///var/run/docker.sock', and daemon socket '-'","time":"2026-10-02T18:07:45Z"}
+{"level":"info","msg":"Start server on http://192.0.2.2:0","time":"2026-10-02T18:07:45Z"}
+{"dryrun":false,"job":"ci/plan","jobID":"plan","level":"info","matrix":{},"msg":"⭐ Run Set up job","step":"Set up job","stepid":["--setup-job"],"time":"2026-10-02T18:07:45Z"}
+{"dryrun":false,"job":"ci/plan","jobID":"plan","level":"info","matrix":{},"msg":"🚀  Start image=catthehacker/ubuntu:act-24.04","step":"Set up job","stepid":["--setup-job"],"time":"2026-10-02T18:07:45Z"}
+{"dryrun":false,"job":"ci/plan","jobID":"plan","level":"info","matrix":{},"msg":"  🐳  docker pull image=catthehacker/ubuntu:act-24.04 platform=linux/amd64 username= forcePull=false","step":"Set up job","stepid":["--setup-job"],"time":"2026-10-02T18:07:45Z"}
+{"dryrun":false,"job":"ci/plan","jobID":"plan","level":"info","matrix":{},"msg":"  🐳  docker create image=catthehacker/ubuntu:act-24.04 platform=linux/amd64 entrypoint=[\"tail\" \"-f\" \"/dev/null\"] cmd=[] network=\"bridge\"","step":"Set up job","stepid":["--setup-job"],"time":"2026-10-02T18:07:45Z"}
+{"dryrun":false,"job":"ci/plan","jobID":"plan","level":"info","matrix":{},"msg":"  🐳  docker run image=catthehacker/ubuntu:act-24.04 platform=linux/amd64 entrypoint=[\"tail\" \"-f\" \"/dev/null\"] cmd=[] network=\"bridge\"","step":"Set up job","stepid":["--setup-job"],"time":"2026-10-02T18:07:45Z"}
+{"dryrun":false,"job":"ci/plan","jobID":"plan","level":"info","matrix":{},"msg":"  🐳  docker exec cmd=[node --no-warnings -e console.log(process.execPath)] user= workdir=","step":"Set up job","stepid":["--setup-job"],"time":"2026-10-02T18:07:45Z"}
+{"dryrun":false,"job":"ci/plan","jobID":"plan","level":"info","matrix":{},"msg":"  ✅  Success - Set up job","step":"Set up job","stepResult":"success","stepid":["--setup-job"],"time":"2026-10-02T18:07:45Z"}
+{"dryrun":false,"job":"ci/plan","jobID":"plan","level":"info","matrix":{},"msg":"⭐ Run Main plan","stage":"Main","step":"plan","stepID":["0"],"time":"2026-10-02T18:07:45Z"}
+{"dryrun":false,"job":"ci/plan","jobID":"plan","level":"info","matrix":{},"msg":"  🐳  docker exec cmd=[bash -e /var/run/act/workflow/0] user= workdir=","stage":"Main","step":"plan","stepID":["0"],"time":"2026-10-02T18:07:45Z"}
+{"dryrun":false,"job":"ci/plan","jobID":"plan","level":"info","matrix":{},"msg":"plan ok\n","raw_output":true,"stage":"Main","step":"plan","stepID":["0"],"time":"2026-10-02T18:07:45Z"}
+{"dryrun":false,"executionTime":100416571,"job":"ci/plan","jobID":"plan","level":"info","matrix":{},"msg":"  ✅  Success - Main plan [100.416571ms]","stage":"Main","step":"plan","stepID":["0"],"stepResult":"success","time":"2026-10-02T18:07:45Z"}
+{"dryrun":false,"job":"ci/plan","jobID":"plan","level":"info","matrix":{},"msg":"⭐ Run Complete job","step":"Complete job","stepid":["--complete-job"],"time":"2026-10-02T18:07:45Z"}
+{"dryrun":false,"job":"ci/plan","jobID":"plan","level":"info","matrix":{},"msg":"Cleaning up container for job plan","step":"Complete job","stepid":["--complete-job"],"time":"2026-10-02T18:07:45Z"}
+{"dryrun":false,"job":"ci/plan","jobID":"plan","level":"info","matrix":{},"msg":"  ✅  Success - Complete job","step":"Complete job","stepResult":"success","stepid":["--complete-job"],"time":"2026-10-02T18:07:45Z"}
+{"dryrun":false,"job":"ci/plan","jobID":"plan","jobResult":"success","level":"info","matrix":{},"msg":"🏁  Job succeeded","time":"2026-10-02T18:07:45Z"}
+{"dryrun":false,"job":"ci/sd  ","jobID":"sd","level":"info","matrix":{},"msg":"🚧  Skipping unsupported platform -- Try running with `-P self-hosted=...`","time":"2026-10-02T18:07:45Z"}
+{"dryrun":false,"job":"ci/sd  ","jobID":"sd","level":"info","matrix":{},"msg":"🚧  Skipping unsupported platform -- Try running with `-P wid-systemd=...`","time":"2026-10-02T18:07:45Z"}
+{"level":"info","job":"ci/after","jobID":"after","matrix":{},"msg":"bana: not run here: needs sd, a systemd job","time":"2026-10-02T18:07:46Z"}
+{"dryrun":false,"job":"ci/sd  ","jobID":"sd","level":"info","matrix":{},"msg":"⭐ Run Set up job","step":"Set up job","stepid":["--setup-job"],"time":"2026-10-02T18:07:47Z"}
+{"dryrun":false,"job":"ci/sd  ","jobID":"sd","level":"info","matrix":{},"msg":"  ✅  Success - Set up job","step":"Set up job","stepResult":"success","stepid":["--setup-job"],"time":"2026-10-02T18:07:47Z"}
+{"dryrun":false,"job":"ci/sd  ","jobID":"sd","level":"info","matrix":{},"msg":"⭐ Run Main linger","stage":"Main","step":"linger","stepID":["0"],"time":"2026-10-02T18:07:47Z"}
+{"dryrun":false,"job":"ci/sd  ","jobID":"sd","level":"info","matrix":{},"msg":"running\n","raw_output":true,"stage":"Main","step":"linger","stepID":["0"],"time":"2026-10-02T18:07:47Z"}
+{"dryrun":false,"executionTime":23764962,"job":"ci/sd  ","jobID":"sd","level":"info","matrix":{},"msg":"  ✅  Success - Main linger [23.764962ms]","stage":"Main","step":"linger","stepID":["0"],"stepResult":"success","time":"2026-10-02T18:07:47Z"}
+{"dryrun":false,"job":"ci/sd  ","jobID":"sd","level":"info","matrix":{},"msg":"⭐ Run Complete job","step":"Complete job","stepid":["--complete-job"],"time":"2026-10-02T18:07:47Z"}
+{"dryrun":false,"job":"ci/sd  ","jobID":"sd","level":"info","matrix":{},"msg":"Cleaning up container for job sd","step":"Complete job","stepid":["--complete-job"],"time":"2026-10-02T18:07:47Z"}
+{"dryrun":false,"job":"ci/sd  ","jobID":"sd","level":"info","matrix":{},"msg":"  ✅  Success - Complete job","step":"Complete job","stepResult":"success","stepid":["--complete-job"],"time":"2026-10-02T18:07:47Z"}
+{"dryrun":false,"job":"ci/sd  ","jobID":"sd","jobResult":"success","level":"info","matrix":{},"msg":"🏁  Job succeeded","time":"2026-10-02T18:07:47Z"}
