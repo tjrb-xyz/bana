@@ -1,0 +1,21 @@
+#!/bin/sh
+# Stand-in ssh-keygen: -t ed25519 -N '' -C COMMENT -f FILE writes FILE and FILE.pub, fake keys
+# numbered in $FAKE_STATE/keys (one more each time), as ssh-keygen makes them.
+echo "ssh-keygen $*" >>"$FAKE_LOG"
+f='' c=''
+while [ $# -gt 0 ]; do
+  case $1 in
+  -f) f=$2; shift ;;
+  -C) c=$2; shift ;;
+  -t | -N) shift ;;
+  esac
+  shift
+done
+[ -n "$f" ] || { echo "ssh-keygen: no -f" >&2; exit 1; }
+[ ! -e "$f" ] || { echo "$f already exists." >&2; exit 1; }
+n=$(cat "$FAKE_STATE/keys" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" >"$FAKE_STATE/keys"
+printf '%s\n' "-----BEGIN OPENSSH PRIVATE KEY-----" "FAKE-PRIVATE-KEY-$n" "-----END OPENSSH PRIVATE KEY-----" >"$f"
+chmod 600 "$f"
+echo "ssh-ed25519 AAAAC3FAKEKEY$n $c" >"$f.pub"

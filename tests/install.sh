@@ -359,7 +359,7 @@ unset FAKE_OS FAKE_ARCH
 fresh
 FAKE_GH=0
 fails_with "not signed in to gh, and a release curl cannot reach" env INSTALL_URL=https://127.0.0.1:1/v1.0.0 nosid "$SH" -s <"$T/releases/v1.0.0/install.sh" >"$T/out" 2>&1
-check "... a private repository needs gh" out "(a private repository needs gh: gh auth login)"
+check "... is the release there, or private (gh)" out "(is v1.0.0 published there? A private repository's files need gh: gh auth login)"
 if openssl req -x509 -newkey rsa:2048 -nodes -keyout "$T/key.pem" -out "$T/cert.pem" -days 1 -subj /CN=127.0.0.1 \
   -addext subjectAltName=IP:127.0.0.1 2>/dev/null; then
   port=$((20000 + $$ % 20000))

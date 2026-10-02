@@ -88,6 +88,18 @@
 //!   checkout          the owner's checkout (absolute), where Fix with Claude
 //!                     makes its worktrees and branches (none: it cannot)
 //!   path              PATH for its builds, when bana.conf sets one
+//!   release.repo      owner/repo releases are published to (default: repo)
+//!   split.repo        the public repository of `bana split` (docs/SPLIT.md),
+//!                     which builds and releases a private repo (empty: off)
+//!   split.ci          local (default), or github: builds but fix rounds run
+//!                     on split.repo's GitHub Actions ([`Settings::remote`])
+//!   split.logs        private (default): a remote run's public log has its
+//!                     steps only; or public: its whole output too
+//!   split.workflow    the git blob sha of split.repo's bana.yml
+//!   split.key         the id of the deploy key split.repo reads repo with
+//!
+//! Only `bana split` writes the split.* keys and release.repo (`bana add`
+//! keeps them): a commit's bana.conf never moves CI, logs or releases.
 //!
 //! The machine's:
 //!
@@ -178,6 +190,12 @@ pub const PROJECT_KEYS: &[&str] = &[
     "fix.token",
     "checkout",
     "path",
+    "release.repo",
+    "split.repo",
+    "split.ci",
+    "split.logs",
+    "split.workflow",
+    "split.key",
 ];
 
 /// The machine's keys, in `daemon.d/settings` (`bana daemon install`).
@@ -304,6 +322,18 @@ pub struct Settings {
     pub fix_rounds: u32,
     /// `fix.token`: the rounds' GITHUB_TOKEN; an empty one also runs act offline.
     pub fix_token: JobToken,
+    /// `release.repo`: where releases are published; `repo` when not set.
+    pub release_repo: String,
+    /// `split.repo`: the public repository that builds `repo` remotely.
+    pub split_repo: Option<String>,
+    /// `split.ci = github`: builds but fix rounds run on split.repo.
+    pub split_github: bool,
+    /// `split.logs`: `private` or `public`.
+    pub split_logs: String,
+    /// `split.workflow`: split.repo's bana.yml, as a git blob sha.
+    pub split_workflow: Option<String>,
+    /// `split.key`: the id of the deploy key split.repo reads repo with.
+    pub split_key: Option<String>,
     pub port: u16,
     pub machine: String,
     pub login: String,
@@ -419,6 +449,40 @@ impl Settings {
             "none" => JobToken::Empty,
             _ => return Err(bad("fix.token", "gh or none")),
         };
+        let release_repo = match get("release.repo").unwrap_or("") {
+            "" => repo.clone(),
+            r if valid_repo(r) => r.to_string(),
+            _ => return Err(bad("release.repo", "owner/repo")),
+        };
+        let split_repo = match get("split.repo").unwrap_or("") {
+            "" => None,
+            r if !valid_repo(r) => return Err(bad("split.repo", "owner/repo")),
+            r if r.eq_ignore_ascii_case(&repo) => {
+                return Err(bad("split.repo", "a public repository, not repo itself"))
+            }
+            r => Some(r.to_string()),
+        };
+        let split_github = match get("split.ci").unwrap_or("local") {
+            "local" => false,
+            "github" if split_repo.is_some() => true,
+            "github" => return Err(bad("split.ci", "github needs split.repo")),
+            _ => return Err(bad("split.ci", "local or github")),
+        };
+        let split_logs = match get("split.logs").unwrap_or("private") {
+            l @ ("private" | "public") => l.to_string(),
+            _ => return Err(bad("split.logs", "private or public")),
+        };
+        let hex40 =
+            |v: &str| v.len() == 40 && v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        let split_workflow = match get("split.workflow").unwrap_or("") {
+            "" => None,
+            w if hex40(w) => Some(w.to_string()),
+            _ => return Err(bad("split.workflow", "a git blob sha")),
+        };
+        let split_key = get("split.key").filter(|k| !k.is_empty());
+        if split_key.is_some_and(|k| !k.bytes().all(|b| b.is_ascii_digit())) {
+            return Err(bad("split.key", "a deploy key's id"));
+        }
         let Machine {
             port,
             machine,
@@ -463,6 +527,12 @@ impl Settings {
             token,
             fix_rounds,
             fix_token,
+            release_repo,
+            split_repo,
+            split_github,
+            split_logs,
+            split_workflow,
+            split_key: split_key.map(String::from),
             port,
             machine,
             login: or("login", ""),
@@ -494,6 +564,46 @@ impl Settings {
             grace: wait("grace", 5)?,
             publish_timeout: wait("publish_timeout", 30 * 60)?,
         })
+    }
+
+    /// The repository releases go to when it is not `repo` (`bana split`'s
+    /// public one): their notes link nothing of `repo`.
+    pub fn public_release(&self) -> Option<&str> {
+        (!self.release_repo.eq_ignore_ascii_case(&self.repo)).then_some(self.release_repo.as_str())
+    }
+
+    /// Whether `req` builds on split.repo's GitHub Actions: `split.ci =
+    /// github`, and not a fix round (Claude's snapshots build here alone).
+    pub fn remote(&self, req: &Request) -> bool {
+        self.split_github && self.split_repo.is_some() && !req.is_fix()
+    }
+
+    /// What `bana ci` needs to build `req` remotely (lib/split.sh
+    /// split_remote): the repositories, the logs, what the guard checks,
+    /// the seal key's directory, and the commit. None for a build here.
+    fn split_env(&self, req: &Request) -> Vec<(String, String)> {
+        let Some(public) = self.split_repo.as_ref().filter(|_| self.remote(req)) else {
+            return Vec::new();
+        };
+        [
+            ("BANA_SPLIT_REPO", public.clone()),
+            ("BANA_SPLIT_PRIVATE", self.repo.clone()),
+            ("BANA_SPLIT_LOGS", self.split_logs.clone()),
+            (
+                "BANA_SPLIT_WORKFLOW",
+                self.split_workflow.clone().unwrap_or_default(),
+            ),
+            ("BANA_SPLIT_KEY", self.split_key.clone().unwrap_or_default()),
+            (
+                "BANA_SPLIT_HOME",
+                self.dir.join("split").to_string_lossy().into_owned(),
+            ),
+            ("BANA_SPLIT_SHA", req.sha.clone()),
+            ("BANA_SPLIT_REF", req.git_ref.clone()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
     }
 
     /// What a build's `bana` runs with: nothing of the daemon's environment
@@ -784,6 +894,10 @@ pub struct Record {
     /// What a green build's jobs uploaded, in `dist/`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dist: Option<Dist>,
+    /// It built on `bana split`'s public repository: the run, from the
+    /// builder's `remote.json`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote: Option<actlog::Remote>,
 }
 
 /// A build's `dist/`: the files its jobs uploaded, and the project's
@@ -985,6 +1099,23 @@ impl Daemon {
         for r in releases.values_mut() {
             if release::interrupted(r) {
                 eprintln!("bana daemon: publishing {} was interrupted", r.tag);
+                release::save(&dir, r);
+            }
+            // bana split moved the releases since: bana's own notes are written again
+            // for the repository they go to now (the owner's wait for Publish).
+            let open = !matches!(
+                r.state,
+                release::State::Publishing | release::State::Published
+            );
+            let git = r.notes.as_ref().is_none_or(|n| n.source == "git");
+            if open
+                && git
+                && release::moved(r, settings.public_release(), &settings.repo, now()).is_some()
+            {
+                eprintln!(
+                    "bana daemon: {}'s notes are for {} now",
+                    r.tag, settings.release_repo
+                );
                 release::save(&dir, r);
             }
         }
@@ -1431,7 +1562,7 @@ impl Daemon {
             });
             let check = r.check();
             let v = json!({
-                "repo": s.repo, "tag": r.tag, "sha": r.sha, "state": r.state,
+                "repo": s.repo, "public_repo": s.public_release(), "tag": r.tag, "sha": r.sha, "state": r.state,
                 "reason": r.reason, "progress": r.progress, "url": r.url,
                 "answered_at": r.answered_at, "updated_at": r.updated_at,
                 "build": rec.map(|b| self.0.view(&inner, b)), "machine": s.machine,
@@ -1454,7 +1585,7 @@ impl Daemon {
         v["tested"] = json!(
             std::fs::read_to_string(self.0.build_dir(build).join("report.md"))
                 .ok()
-                .and_then(|m| release::tested(&m))
+                .and_then(|m| release::tested(&m, s.public_release().is_some()))
         );
         Some(v)
     }
@@ -2066,7 +2197,11 @@ impl Shared {
     fn report(&self, rec: &Record) -> Report {
         Report {
             context: rec.context_prefix.clone(),
-            machine: self.settings.machine.clone(),
+            // A remote build runs on GitHub's machines (the status says which repo).
+            machine: match &rec.remote {
+                Some(_) => "GitHub".into(),
+                None => self.settings.machine.clone(),
+            },
             tier: rec.request.tier.clone(),
         }
     }
@@ -2101,6 +2236,7 @@ impl Shared {
             tests: crate::report::chip(&r.standards),
             files: r.dist.as_ref().map_or(0, |d| d.available().len()),
             files_problem: r.dist.as_ref().is_some_and(|d| d.problem.is_some()),
+            remote: r.remote.clone(),
         }
     }
 
@@ -2378,7 +2514,8 @@ impl Shared {
             return;
         };
         let (tag, sha) = (tag.to_string(), q.sha.clone());
-        if let Some(r) = release::queued(inner.releases.get(&tag), &tag, &sha, id, now()) {
+        if let Some(mut r) = release::queued(inner.releases.get(&tag), &tag, &sha, id, now()) {
+            r.public_repo = self.settings.public_release().map(String::from);
             self.save_release(&r);
             inner.releases.insert(tag, r);
             self.seed.notify_one();
@@ -2443,6 +2580,8 @@ impl Shared {
                 let mut inner = self.lock();
                 let inner = &mut *inner;
                 if let Some(r) = inner.releases.get_mut(&tag) {
+                    // bana split may have moved the releases since it was queued.
+                    r.public_repo = self.settings.public_release().map(String::from);
                     let mut changed = release::seeded(r, &sha, found, &self.settings.repo, now());
                     if r.sha == sha && (r.title != title || r.platforms != platforms) {
                         (r.title, r.platforms, changed) = (title, platforms, true);
@@ -2469,7 +2608,7 @@ impl Shared {
         sha: &str,
     ) -> Result<(notes::Previous, notes::Changes), String> {
         let s = &self.settings;
-        let args = notes::list_args(&s.repo);
+        let args = notes::list_args(&s.release_repo);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let list = match self.output(&s.gh, &args, &self.src(), 30).await {
             Ok(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
@@ -2589,8 +2728,13 @@ impl Shared {
     async fn publish_steps(&self, tag: &str) -> Result<String, String> {
         let s = &self.settings;
         let (sha, build, text, title) = {
-            let inner = self.lock();
-            let r = inner.releases.get(tag).ok_or("the release is gone")?;
+            let mut inner = self.lock();
+            let r = inner.releases.get_mut(tag).ok_or("the release is gone")?;
+            // bana split moved the releases since it was made: its notes were for the other.
+            if let Some(why) = release::moved(r, s.public_release(), &s.repo, now()) {
+                self.save_release(r);
+                return Err(why);
+            }
             let n = r.notes.clone().unwrap_or_default();
             (r.sha.clone(), r.build, n.text, n.title)
         };
@@ -2622,6 +2766,28 @@ impl Shared {
             .map_err(|e| e.to_string())??;
         let upload: Vec<String> = manifest.iter().map(|(_, n)| n.clone()).collect();
         let files = &upload[..upload.len() - 1];
+
+        if let Some(public) = s.public_release() {
+            // bana split: the private repo's name, or a build's paths, in a file
+            // stop a publish to the public repo.
+            self.progress(
+                tag,
+                "looking in the files for the private repo's name and paths",
+            );
+            let needles = self.needles();
+            let (at, names, path) = (dist.clone(), upload.clone(), s.path.clone());
+            let scratch = self.build_dir(build).join("scan.tmp");
+            let found = tokio::task::spawn_blocking(move || {
+                crate::scan::scan(&at, &names, &needles, &path, &scratch)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+            if let Some((name, what)) = found {
+                return Err(format!(
+                    "{name} holds {what}, and {public} is public: nothing was published (docs/SPLIT.md: Releases)"
+                ));
+            }
+        }
 
         self.progress(tag, "checking the tag on origin");
         let cred = self.credentials();
@@ -2672,7 +2838,7 @@ impl Shared {
                         "view",
                         tag,
                         "-R",
-                        &s.repo,
+                        &s.release_repo,
                         "--json",
                         release::VIEW_FIELDS,
                     ],
@@ -2692,7 +2858,7 @@ impl Shared {
                     self.progress(tag, "deleting a draft an earlier publish left");
                     self.gh(
                         &log,
-                        &["release", "delete", tag, "-R", &s.repo, "--yes"],
+                        &["release", "delete", tag, "-R", &s.release_repo, "--yes"],
                         60,
                     )
                     .await
@@ -2719,7 +2885,7 @@ impl Shared {
         let flags = if notes::is_prerelease(tag) || notes::version(tag).is_none() {
             release::flags(tag, Err(""))
         } else {
-            let args = release::finals_args(&s.repo);
+            let args = release::finals_args(&s.release_repo);
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             let finals = self.gh(&log, &args, 60).await;
             release::flags(tag, finals.as_deref().map_err(String::as_str))
@@ -2728,19 +2894,35 @@ impl Shared {
         let title = title.unwrap_or_else(|| release::title(&conf, &s.prefix, tag));
         let tested = std::fs::read_to_string(self.build_dir(build).join("report.md"))
             .ok()
-            .and_then(|m| release::tested(&m));
+            .and_then(|m| release::tested(&m, s.public_release().is_some()));
         let mut platforms: Vec<String> = files
             .iter()
             .filter_map(|f| crate::artifacts::platform(f))
             .collect();
         platforms.sort();
-        let install = release::install(&s.repo, tag, files, &platforms);
-        std::fs::write(
+        let install = release::install(&s.release_repo, tag, files, &platforms);
+        let body = release::body(&text, tested.as_deref(), install.as_deref());
+        if let Some(public) = s.public_release() {
+            // What the release's page says: its title and its notes, as gh sends them.
+            for (what, t) in [("title holds", &title), ("notes hold", &body)] {
+                if let Some(found) = release::leak(t.as_bytes(), &self.needles()) {
+                    return Err(format!(
+                        "the release's {what} {found}, and {public} is public: nothing was published (edit them on bana's page)"
+                    ));
+                }
+            }
+        }
+        std::fs::write(&notes_file, body).map_err(|e| format!("{}: {e}", notes_file.display()))?;
+        let public = s.public_release().is_some();
+        let args = release::create_args(
+            &s.release_repo,
+            public,
+            tag,
+            &title,
             &notes_file,
-            release::body(&text, tested.as_deref(), install.as_deref()),
-        )
-        .map_err(|e| format!("{}: {e}", notes_file.display()))?;
-        let args = release::create_args(&s.repo, tag, &title, &notes_file, &flags, &upload);
+            &flags,
+            &upload,
+        );
         self.progress(
             tag,
             &format!("gh release create: uploading {} files", upload.len()),
@@ -2751,7 +2933,22 @@ impl Shared {
             .map(str::trim)
             .rfind(|l| l.starts_with("https://"))
             .map(String::from)
-            .unwrap_or_else(|| format!("https://github.com/{}/releases/tag/{tag}", s.repo)))
+            .unwrap_or_else(|| format!("https://github.com/{}/releases/tag/{tag}", s.release_repo)))
+    }
+
+    /// What a public release must not hold ([`release::leak`]): the private
+    /// repository's name, GitHub's runner's paths and this machine's checkouts.
+    fn needles(&self) -> Vec<(String, bool)> {
+        let s = &self.settings;
+        let mut needles = vec![
+            (s.repo.clone(), true),
+            ("/home/runner/work/".to_string(), false),
+            (self.src().to_string_lossy().into_owned(), false),
+        ];
+        if let Some(c) = &s.checkout {
+            needles.push((c.to_string_lossy().into_owned(), false));
+        }
+        needles
     }
 
     /// gh in src, its words in the release's log: its stdout, or its last
@@ -3379,14 +3576,23 @@ impl Shared {
             };
             id
         };
-        let docker = self
-            .output(&self.settings.docker, &["info"], &self.settings.dir, 30)
-            .await
-            .is_ok_and(|o| o.status.success());
-        self.lock().watcher.docker = docker;
-        if !docker {
-            self.hold(Some("waiting for Docker"));
-            return None;
+        // A build on split.repo's GitHub Actions needs neither Docker nor act
+        // here: it holds the build slot alone.
+        let remote = {
+            let inner = self.lock();
+            let r = &inner.records.get(&id)?.request;
+            self.settings.remote(r)
+        };
+        if !remote {
+            let docker = self
+                .output(&self.settings.docker, &["info"], &self.settings.dir, 30)
+                .await
+                .is_ok_and(|o| o.status.success());
+            self.lock().watcher.docker = docker;
+            if !docker {
+                self.hold(Some("waiting for Docker"));
+                return None;
+            }
         }
         let label = {
             let inner = self.lock();
@@ -3398,10 +3604,12 @@ impl Shared {
                 self.settings.prefix
             )
         };
-        if let Err(holder) = self.take_lock(&label).await {
-            self.lock().watcher.lock_holder = Some(holder);
-            self.hold(Some("waiting for your bana ci"));
-            return None;
+        if !remote {
+            if let Err(holder) = self.take_lock(&label).await {
+                self.lock().watcher.lock_holder = Some(holder);
+                self.hold(Some("waiting for your bana ci"));
+                return None;
+            }
         }
         let mut inner = self.lock();
         inner.watcher.lock_holder = None;
@@ -3650,7 +3858,11 @@ impl Shared {
                     .last()
                     .map(String::from)
             });
-        let (repo, machine, bana) = (s.repo.clone(), s.machine.clone(), s.bana_commit.clone());
+        let machine = match &rec.remote {
+            Some(r) => format!("{}'s GitHub Actions ({})", r.repo, r.label()),
+            None => s.machine.clone(),
+        };
+        let (repo, bana) = (s.repo.clone(), s.bana_commit.clone());
         let dir = self.build_dir(id);
         let made = tokio::task::spawn_blocking(move || {
             // What a builder's own results.jsonl says stays.
@@ -3705,7 +3917,7 @@ impl Shared {
     ) {
         let s = &self.settings;
         let dir = self.build_dir(id);
-        let (tier, fix_job) = {
+        let (tier, fix_job, split_env) = {
             let mut inner = self.lock();
             let inner = &mut *inner;
             let Some(rec) = inner.records.get_mut(&id) else {
@@ -3713,6 +3925,15 @@ impl Shared {
             };
             let old = rec.build.clone();
             rec.build = Build::new(&list, now());
+            let split_env = s.split_env(&rec.request);
+            rec.remote = s
+                .split_repo
+                .clone()
+                .filter(|_| !split_env.is_empty())
+                .map(|repo| actlog::Remote {
+                    repo,
+                    ..actlog::Remote::default()
+                });
             if let Ok(reason) = cancel.try_recv() {
                 if inner.stopping && reason == INTERRUPTED {
                     // The daemon stops before act ran: it is queued again as it was.
@@ -3734,8 +3955,9 @@ impl Shared {
             let tier = rec.request.tier.clone();
             let fix_job = rec.request.fix.as_ref().and(rec.request.job.clone());
             self.publish(inner);
-            (tier, fix_job)
+            (tier, fix_job, split_env)
         };
+        let remote = !split_env.is_empty();
         self.post.notify_one();
 
         let port = free_port().unwrap_or(34567);
@@ -3754,7 +3976,7 @@ impl Shared {
         if fix_job.is_some() && s.fix_token == JobToken::Empty {
             cmd.arg("--action-offline-mode");
         }
-        cmd.env_clear().envs(s.child_env(id));
+        cmd.env_clear().envs(s.child_env(id)).envs(split_env);
         if fix_job.is_some() {
             cmd.env("BANA_ROUND_CONF", dir.join("round.conf"));
         }
@@ -3796,8 +4018,10 @@ impl Shared {
         // `bana ci` execs act: from here the lock is act's, so it stays held
         // while act runs even if the daemon dies.
         let start = started(&s.path, pid).await;
-        let label = self.lock_label();
-        self.write_owner(pid, &start, &label);
+        if !remote {
+            let label = self.lock_label();
+            self.write_owner(pid, &start, &label);
+        }
         {
             let mut inner = self.lock();
             if let Some(rec) = inner.records.get_mut(&id) {
@@ -3893,6 +4117,9 @@ impl Shared {
         let _ = std::fs::remove_file(dir.join("secrets"));
         // Containers are left behind only when act did not end on its own.
         self.sweep(id, ladder.is_some() || code.is_none()).await;
+        if remote {
+            self.remote_run(id);
+        }
 
         let (pin, green) = {
             let mut inner = self.lock();
@@ -3941,6 +4168,9 @@ impl Shared {
             let _ = std::fs::remove_dir_all(dir.join("artifacts"));
         }
         self.write_report(id).await;
+        if remote {
+            self.comment(id).await;
+        }
         if let Some((git_ref, sha)) = pin {
             if let Err(e) = self
                 .git(&["update-ref", &watch::green_pin(&git_ref), &sha], 30)
@@ -4029,12 +4259,14 @@ impl Shared {
                 ["--label".to_string(), label]
             }
         };
+        // The release repo is the daemon's, never the built commit's bana.conf's.
         let run = Command::new(&s.bash)
             .arg(&s.script)
             .args(["installer", "dist"])
             .args(&how)
             .env_clear()
             .envs(s.child_env(id))
+            .env("BANA_RELEASE_REPO", &s.release_repo)
             .current_dir(self.build_dir(id))
             .stdin(Stdio::null())
             .kill_on_drop(true)
@@ -4046,6 +4278,61 @@ impl Shared {
             Ok(Err(e)) => Err(format!("{}: {e}", s.bash)),
             Ok(Ok(o)) if o.status.success() => Ok(()),
             Ok(Ok(o)) => Err(failure(&o)),
+        }
+    }
+
+    /// A remote build's run, from its builder's `remote.json` (lib/split.sh
+    /// split_remote): the page's chip, its statuses' link, the comment.
+    fn remote_run(&self, id: u64) {
+        let Ok(text) = std::fs::read_to_string(self.build_dir(id).join("remote.json")) else {
+            return;
+        };
+        let Ok(found) = serde_json::from_str::<actlog::Remote>(&text) else {
+            return;
+        };
+        let mut inner = self.lock();
+        let Some(rec) = inner.records.get_mut(&id) else {
+            return;
+        };
+        let Some(r) = rec.remote.as_mut() else { return };
+        if (r.run, &r.url) == (found.run, &found.url) {
+            return;
+        }
+        (r.run, r.url) = (found.run, found.url.filter(|u| u.starts_with("https://")));
+        self.save(rec);
+        self.publish(&inner);
+    }
+
+    /// A remote build's details, on the private repository: a commit comment
+    /// with its CI report, labelled with its public run. Comments make no
+    /// push, branch or workflow run there. A failure only says so.
+    async fn comment(&self, id: u64) {
+        let Some(rec) = self.lock().records.get(&id).cloned() else {
+            return;
+        };
+        let Some(remote) = &rec.remote else { return };
+        let s = &self.settings;
+        let dir = self.build_dir(id);
+        let report = std::fs::read_to_string(dir.join("report.md")).unwrap_or_default();
+        let body = remote_comment(remote, &rec, &report, &s.machine);
+        let file = dir.join("comment.md");
+        if let Err(e) = std::fs::write(&file, body) {
+            eprintln!("bana daemon: build {id}: comment.md: {e}");
+            return;
+        }
+        let api = format!("repos/{}/commits/{}/comments", s.repo, rec.request.sha);
+        let at = format!("body=@{}", file.display());
+        match self
+            .output(&s.gh, &["api", "-X", "POST", &api, "-F", &at], &dir, 60)
+            .await
+        {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => eprintln!(
+                "bana daemon: build {id}: the comment on {}: {}",
+                s.repo,
+                failure(&o)
+            ),
+            Err(e) => eprintln!("bana daemon: build {id}: the comment on {}: {e}", s.repo),
         }
     }
 
@@ -4125,6 +4412,10 @@ impl Shared {
         let line = actlog::log_line(raw);
         if let Some(f) = log {
             let _ = writeln!(f, "{line}");
+        }
+        // bana split's builder found its run: remote.json has it.
+        if line.starts_with(r#"{"bana":"remote""#) {
+            self.remote_run(id);
         }
         let ev = actlog::parse_line(&line);
         if ev == Event::Other {
@@ -4325,18 +4616,28 @@ impl Shared {
                 let inner = self.lock();
                 to_post(&inner).first().and_then(|(id, context)| {
                     let rec = inner.records.get(id)?;
-                    let p = rec.statuses.get(context)?.clone();
-                    let url = inner.state.target_url_ok.then(|| {
-                        let s = &self.settings;
-                        let mut u =
-                            format!("http://127.0.0.1:{}/#p={}&build={id}", s.port, s.prefix);
-                        if let Some(key) = context
-                            .strip_prefix(&rec.context_prefix)
-                            .and_then(|k| k.strip_prefix('/'))
-                        {
-                            u += &format!("&job={}", url_encode(key));
-                        }
-                        u
+                    let mut p = rec.statuses.get(context)?.clone();
+                    // A remote build's status says so, and links its public run.
+                    if let Some(r) = &rec.remote {
+                        p.description = actlog::cut(
+                            &format!("remote {}: {}", r.repo, p.description),
+                            actlog::DESCRIPTION_MAX,
+                        );
+                    }
+                    let remote_url = rec.remote.as_ref().and_then(|r| r.url.clone());
+                    let url = remote_url.or_else(|| {
+                        inner.state.target_url_ok.then(|| {
+                            let s = &self.settings;
+                            let mut u =
+                                format!("http://127.0.0.1:{}/#p={}&build={id}", s.port, s.prefix);
+                            if let Some(key) = context
+                                .strip_prefix(&rec.context_prefix)
+                                .and_then(|k| k.strip_prefix('/'))
+                            {
+                                u += &format!("&job={}", url_encode(key));
+                            }
+                            u
+                        })
                     });
                     Some((*id, context.clone(), rec.request.sha.clone(), p, url))
                 })
@@ -4820,6 +5121,47 @@ fn wanted(f: &fix::Fix, jobs: Option<Vec<String>>) -> Result<Vec<String>, RoundE
     Ok(want)
 }
 
+/// A commit comment's limit is 65,536 characters; bana's stays under this.
+const COMMENT_MAX: usize = 60_000;
+
+/// The commit comment of remote build `rec`: a header naming its public run,
+/// then its CI report (cut to [`COMMENT_MAX`]), then where the rest is.
+fn remote_comment(remote: &actlog::Remote, rec: &Record, report: &str, machine: &str) -> String {
+    let id = rec.request.id;
+    let result = match rec.build.state {
+        BuildState::Success => "passed",
+        BuildState::Failure => "failed",
+        _ => "did not finish",
+    };
+    let run = match (&remote.url, remote.run) {
+        (Some(u), Some(n)) => format!("[run {n}]({u})"),
+        (Some(u), None) => format!("[its run]({u})"),
+        _ => "its run".to_string(),
+    };
+    let head = format!(
+        "### bana: {}, {result}\n\nBuild #{id} of {} at `{}`, built on GitHub's machines from {} \
+         ({run}), dispatched by bana on {machine}.\n\n",
+        remote.label(),
+        watch::short_ref(&rec.request.git_ref),
+        rec.request.sha.get(..10).unwrap_or(&rec.request.sha),
+        remote.repo,
+    );
+    let foot = format!(
+        "\n\nAll of its output: bana's page on {machine} (build #{id}), or `bana report {id}` there.\n"
+    );
+    let room = COMMENT_MAX.saturating_sub(head.len() + foot.len() + 80);
+    let mut body = report.trim_end().to_string();
+    if body.len() > room {
+        let mut at = room;
+        while !body.is_char_boundary(at) {
+            at -= 1;
+        }
+        body.truncate(at);
+        body.push_str("\n\n… (cut here: the rest is on bana's page)");
+    }
+    format!("{head}{body}{foot}")
+}
+
 /// Posts one commit status to `repo`'s `sha` with the GitHub CLI (`gh api`),
 /// as the poster does. An error is what went wrong; it has `target_url` in it
 /// when GitHub's answer named the link. `bana-manager post-status` runs this
@@ -4997,6 +5339,7 @@ pub(crate) mod tests {
 if [[ $1 == installer ]]; then
   b=${BANA_BUILD##*-}
   printf '%s\n' "$@" "$BANA_PROJECT_ROOT" "$PWD" >"$ctl/installer.$b"
+  printf '%s\n' "${BANA_RELEASE_REPO-unset}" >"$ctl/installer-release.$b"
   [[ ! -e $ctl/installer-fails ]] || { echo "bana installer: install.name: not 'a b'" >&2; exit 1; }
   echo '#!/bin/sh' >"$2/install.sh"
   (cd "$2" && { sha256sum install.sh *.tar.gz 2>/dev/null || shasum -a 256 install.sh *.tar.gz; }) >"$2/SHA256SUMS"
@@ -5016,6 +5359,11 @@ env >"$ctl/env.$b"
 ls -l secrets | cut -c1-10 >"$ctl/secrets-mode.$b"
 cat secrets >"$ctl/secrets.$b"
 cp event.json "$ctl/event.$b"
+if [[ -n ${BANA_SPLIT_REPO:-} ]]; then
+  u=https://github.com/$BANA_SPLIT_REPO/actions/runs/4242
+  printf '{"repo": "%s", "run": 4242, "url": "%s", "logs": "%s"}\n' "$BANA_SPLIT_REPO" "$u" "$BANA_SPLIT_LOGS" >remote.json
+  echo "{\"bana\":\"remote\",\"msg\":\"remote run in public repo $BANA_SPLIT_REPO: $u (logs: $BANA_SPLIT_LOGS)\"}"
+fi
 mode=$(cat "$ctl/mode" 2>/dev/null)
 n=0
 case $mode in
@@ -5261,6 +5609,7 @@ exec git \"$@\"
         fn posts(&self) -> Vec<Post> {
             self.read("gh.log")
                 .lines()
+                .filter(|l| l.contains("/statuses/"))
                 .map(|l| {
                     let a: Vec<&str> = l.trim_end_matches('\t').split('\t').collect();
                     let f = |k: &str| a.iter().find_map(|x| x.strip_prefix(k)).map(String::from);
@@ -5494,10 +5843,68 @@ exec git \"$@\"
             ),
             ("repo = o/r\nprefix = w\nladder = 60\n", "ladder"),
             ("repo = o/r\nprefix = w\ngrace = 0\n", "grace"),
+            ("repo = o/r\nprefix = w\nrelease.repo = r\n", "release.repo"),
+            ("repo = o/r\nprefix = w\nsplit.repo = o/r b\n", "split.repo"),
+            ("repo = o/r\nprefix = w\nsplit.repo = O/R\n", "split.repo"),
+            ("repo = o/r\nprefix = w\nsplit.ci = github\n", "split.ci"),
+            (
+                "repo = o/r\nprefix = w\nsplit.repo = o/p\nsplit.ci = cloud\n",
+                "split.ci",
+            ),
+            ("repo = o/r\nprefix = w\nsplit.logs = all\n", "split.logs"),
+            (
+                "repo = o/r\nprefix = w\nsplit.workflow = ABC\n",
+                "split.workflow",
+            ),
+            ("repo = o/r\nprefix = w\nsplit.key = k1\n", "split.key"),
         ] {
             let e = Settings::parse(text, dir, env.clone()).unwrap_err();
             assert!(e.contains(why), "{text:?}: {e}");
         }
+    }
+
+    #[test]
+    fn bana_split_keys_and_the_release_repo() {
+        let env: BTreeMap<String, String> = [("HOME", "/home/me")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let dir = Path::new("/x/wid");
+        let s = Settings::parse("repo = o/r\nprefix = wid\n", dir, env.clone()).unwrap();
+        assert_eq!(
+            (
+                s.release_repo.as_str(),
+                s.public_release(),
+                s.split_repo.as_deref()
+            ),
+            ("o/r", None, None)
+        );
+        assert_eq!((s.split_github, s.split_logs.as_str()), (false, "private"));
+        let text =
+            "repo = o/r\nprefix = wid\nrelease.repo = o/r-releases\nsplit.repo = o/r-releases\n\
+                    split.ci = github\nsplit.logs = public\nsplit.key = 1234\n\
+                    split.workflow = 0123456789abcdef0123456789abcdef01234567\n";
+        let s = Settings::parse(text, dir, env.clone()).unwrap();
+        assert_eq!(s.public_release(), Some("o/r-releases"));
+        assert_eq!(
+            (
+                s.split_repo.as_deref(),
+                s.split_github,
+                s.split_logs.as_str()
+            ),
+            (Some("o/r-releases"), true, "public")
+        );
+        assert_eq!(
+            s.split_workflow.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        // Releases alone (split.ci = local): private code, public releases.
+        let text = "repo = o/r\nprefix = wid\nrelease.repo = o/r-releases\nsplit.repo = o/r-releases\nsplit.ci = local\n";
+        let s = Settings::parse(text, dir, env).unwrap();
+        assert_eq!(
+            (s.public_release(), s.split_github),
+            (Some("o/r-releases"), false)
+        );
     }
 
     #[test]
@@ -6174,6 +6581,169 @@ exec git \"$@\"
         assert!(!p.lock().exists());
         d.shutdown().await;
         p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_split_build_runs_on_the_public_repo_and_says_so() {
+        let p = Project::new("remote");
+        // Docker is down, and a live bana ci holds act's lock: neither holds a remote build.
+        p.set("docker-down", true);
+        std::fs::create_dir_all(p.lock()).unwrap();
+        let mut ci = Std::new("sleep").arg("60").spawn().unwrap();
+        let lstart = started(&std::env::var("PATH").unwrap(), ci.id()).await;
+        let owner = format!("{}\n{lstart}\nbana ci quick (p)\n", ci.id());
+        std::fs::write(p.lock().join("owner"), &owner).unwrap();
+        let d = start(
+            &p,
+            "split.repo = o/r-releases\nsplit.ci = github\nsplit.logs = private\nsplit.key = 77\n\
+             split.workflow = 0123456789abcdef0123456789abcdef01234567\nrelease.repo = o/r-releases\n",
+        )
+        .await;
+        let a = p.commit("fail", "on GitHub");
+        p.push("main");
+        poll(&d).await;
+        let rec = finished(&d, 1).await;
+        assert_eq!(rec.build.state, BuildState::Failure);
+        assert_eq!(
+            rec.remote,
+            Some(actlog::Remote {
+                repo: "o/r-releases".into(),
+                run: Some(4242),
+                url: Some("https://github.com/o/r-releases/actions/runs/4242".into()),
+            })
+        );
+        assert_eq!(
+            std::fs::read_to_string(p.lock().join("owner")).unwrap(),
+            owner,
+            "act's lock is not taken, nor written"
+        );
+        let env = p.read("env.1");
+        for want in [
+            "BANA_SPLIT_REPO=o/r-releases\n".to_string(),
+            "BANA_SPLIT_PRIVATE=o/r\n".into(),
+            "BANA_SPLIT_LOGS=private\n".into(),
+            "BANA_SPLIT_KEY=77\n".into(),
+            "BANA_SPLIT_WORKFLOW=0123456789abcdef0123456789abcdef01234567\n".into(),
+            format!("BANA_SPLIT_HOME={}\n", p.dir.join("split").display()),
+            format!("BANA_SPLIT_SHA={a}\n"),
+            "BANA_SPLIT_REF=refs/heads/main\n".into(),
+        ] {
+            assert!(env.contains(&want), "{want}: {env}");
+        }
+        // Its statuses, on the private repo alone, say where it ran and link the run.
+        posted(&d).await;
+        let posts = p.posts();
+        assert!(!posts.is_empty());
+        for post in &posts {
+            assert_eq!(post.sha, a);
+            assert!(
+                post.description.starts_with("remote o/r-releases: "),
+                "{post:?}"
+            );
+        }
+        assert_eq!(
+            posts[0].description,
+            "remote o/r-releases: running on GitHub (quick)"
+        );
+        // Once the run is found, they link it (the first, before, links the page).
+        assert_eq!(
+            posts.last().unwrap().url.as_deref(),
+            Some("https://github.com/o/r-releases/actions/runs/4242")
+        );
+        // The details, on the private repo: a commit comment, its CI report under the run's name.
+        let log = p.read("gh.log");
+        let comment = format!("api\t-X\tPOST\trepos/o/r/commits/{a}/comments\t-F\tbody=@");
+        assert!(log.contains(&comment), "{log}");
+        assert!(
+            !log.contains("repos/o/r-releases"),
+            "nothing written on the public repo: {log}"
+        );
+        let body = std::fs::read_to_string(p.dir.join("builds/1/comment.md")).unwrap();
+        assert!(
+            body.starts_with("### bana: remote run 4242 in public repo o/r-releases, failed\n\n"),
+            "{body}"
+        );
+        assert!(body.contains("([run 4242](https://github.com/o/r-releases/actions/runs/4242))"));
+        assert!(body.contains("\n# CI report: o/r"), "{body}");
+        assert!(body.ends_with("or `bana report 1` there.\n"), "{body}");
+        let report = std::fs::read_to_string(p.dir.join("builds/1/report.md")).unwrap();
+        assert!(
+            report.contains(
+                "on o/r-releases's GitHub Actions (remote run 4242 in public repo o/r-releases)"
+            ),
+            "{report}"
+        );
+        let last = d.summary().last.unwrap();
+        assert_eq!(
+            last.remote.as_ref().map(|r| r.repo.as_str()),
+            Some("o/r-releases")
+        );
+
+        // While one runs, the menu says where.
+        p.set("hold", true);
+        p.commit("pass", "again");
+        p.push("main");
+        poll(&d).await;
+        until("build 2 runs", || {
+            d.summary()
+                .running
+                .as_ref()
+                .is_some_and(|b| b.remote.as_ref().and_then(|r| r.run) == Some(4242))
+        })
+        .await;
+        let line = &actlog::tray_view(&[d.summary()], &[]).projects[0].status_line;
+        assert!(line.ends_with(" remotely on o/r-releases"), "{line}");
+        p.set("hold", false);
+        finished(&d, 2).await;
+        d.shutdown().await;
+        let _ = ci.kill();
+        let _ = ci.wait();
+        p.remove();
+    }
+
+    #[test]
+    fn fix_rounds_and_builds_here_are_never_remote() {
+        let env: BTreeMap<String, String> = [("HOME", "/home/me")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let text = "repo = o/r\nprefix = wid\nsplit.repo = o/p\nsplit.ci = github\n";
+        let s = Settings::parse(text, Path::new("/x/wid"), env.clone()).unwrap();
+        let push = Request {
+            sha: "a".repeat(40),
+            git_ref: "refs/heads/main".into(),
+            ..Request::default()
+        };
+        assert!(s.remote(&push));
+        assert_eq!(s.split_env(&push).len(), 8);
+        let round = Request {
+            fix: Some("abc1234".into()),
+            job: Some("rust".into()),
+            ..push.clone()
+        };
+        assert!(
+            round.is_fix() && !s.remote(&round),
+            "Claude's snapshots build here"
+        );
+        assert!(s.split_env(&round).is_empty());
+        let text = "repo = o/r\nprefix = wid\nsplit.repo = o/p\nsplit.ci = local\n";
+        let s = Settings::parse(text, Path::new("/x/wid"), env).unwrap();
+        assert!(!s.remote(&push) && s.split_env(&push).is_empty());
+        // build.json keeps where it ran.
+        let rec = Record {
+            remote: Some(actlog::Remote {
+                repo: "o/p".into(),
+                run: Some(9),
+                url: Some("https://github.com/o/p/actions/runs/9".into()),
+            }),
+            ..Record::default()
+        };
+        let back: Record = serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+        assert_eq!(back.remote, rec.remote);
+        assert_eq!(
+            rec.remote.unwrap().label(),
+            "remote run 9 in public repo o/p"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -7761,6 +8331,183 @@ exec git \"$@\"
             (r.state, r.build),
             (State::Published, id),
             "a re-run leaves it"
+        );
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_split_projects_release_goes_to_its_public_repo() {
+        use release::State;
+        let p = Project::new("public");
+        let d = start(
+            &p,
+            "daemon.tags = v*\nrelease.repo = o/r-releases\nsplit.repo = o/r-releases\n",
+        )
+        .await;
+        let first = git(&p.work, &["rev-parse", "HEAD"]);
+        let a = p.commit("files", "Packages for all (#7)");
+        p.push("main");
+        p.tag("v0.1.0");
+        poll(&d).await;
+        let id = tag_build(&d, "v0.1.0").unwrap();
+        assert_eq!(finished(&d, id).await.build.state, BuildState::Success);
+        let r = rel_in(&d, "v0.1.0", State::Asking).await;
+        assert_eq!(r.public_repo.as_deref(), Some("o/r-releases"));
+        // Notes for the public: no #7, no commit, no link to the private repo.
+        let n = r.notes.clone().unwrap();
+        assert_eq!(
+            n.text,
+            "## Pull requests\n\n- Packages for all\n\n## Other changes\n\n- the start\n"
+        );
+        assert!(!n.text.contains(&a[..7]) && !n.text.contains(&first[..7]));
+        let v = d.release("v0.1.0").unwrap();
+        assert_eq!(
+            (&v["public_repo"], &v["check"]["missing_prs"]),
+            (&json!("o/r-releases"), &json!([]))
+        );
+        // The installer downloads from the public repo: the daemon says so, not bana.conf.
+        assert_eq!(p.read(&format!("installer-release.{id}")), "o/r-releases\n");
+        // A file that names the private repo (or a build's path) stops the publish.
+        let dist = p.dir.join(format!("builds/{id}/dist"));
+        let sums = std::fs::read_to_string(dist.join("SHA256SUMS")).unwrap();
+        std::fs::write(
+            dist.join("NOTICE.txt"),
+            "built from https://github.com/o/r\n",
+        )
+        .unwrap();
+        let h = crate::artifacts::sha256(&dist.join("NOTICE.txt")).unwrap();
+        std::fs::write(dist.join("SHA256SUMS"), format!("{sums}{h}  NOTICE.txt\n")).unwrap();
+        let r = publish_now(&d, "v0.1.0", n.rev).await;
+        assert_eq!(r.state, State::Failed);
+        assert_eq!(
+            r.reason.as_deref(),
+            Some("NOTICE.txt holds o/r, and o/r-releases is public: nothing was published (docs/SPLIT.md: Releases)")
+        );
+        assert_eq!(
+            p.read("gh-release.log").matches("release create").count(),
+            0
+        );
+        std::fs::remove_file(dist.join("NOTICE.txt")).unwrap();
+        std::fs::write(dist.join("SHA256SUMS"), sums).unwrap();
+        // The notes, and the title, are read too (a merge's subject names the private repo).
+        let merge = "- Merge branch 'main' of github.com:o/r\n";
+        let v = d.save_notes("v0.1.0", merge, None, n.rev, "you").unwrap();
+        let r = publish_now(&d, "v0.1.0", v["rev"].as_u64().unwrap()).await;
+        assert_eq!(
+            r.reason.as_deref(),
+            Some("the release's notes hold o/r, and o/r-releases is public: nothing was published (edit them on bana's page)")
+        );
+        let v = d
+            .save_notes("v0.1.0", &n.text, Some("o/r v0.1.0"), r.rev(), "you")
+            .unwrap();
+        let r = publish_now(&d, "v0.1.0", v["rev"].as_u64().unwrap()).await;
+        assert_eq!(
+            r.reason.as_deref(),
+            Some("the release's title holds o/r, and o/r-releases is public: nothing was published (edit them on bana's page)")
+        );
+        assert_eq!(
+            p.read("gh-release.log").matches("release create").count(),
+            0
+        );
+        let v = d
+            .save_notes("v0.1.0", &n.text, None, r.rev(), "you")
+            .unwrap();
+        let r = publish_now(&d, "v0.1.0", v["rev"].as_u64().unwrap()).await;
+        assert_eq!(
+            (r.state, r.url.as_deref()),
+            (
+                State::Published,
+                Some("https://github.com/o/r-releases/releases/tag/v0.1.0")
+            )
+        );
+        let log = p.read("gh-release.log");
+        assert!(
+            log.lines().count() >= 3 && log.lines().all(|l| l.contains(" -R o/r-releases ")),
+            "{log}"
+        );
+        // gh makes the tag on the public repo, which has none of the private commits.
+        let argv = std::fs::read_to_string(p.flag("releases/v0.1.0").join("argv")).unwrap();
+        assert!(
+            argv.starts_with("release\ncreate\nv0.1.0\n-R\no/r-releases\n--title\n"),
+            "{argv}"
+        );
+        assert!(!argv.contains("--verify-tag"), "{argv}");
+        let body = std::fs::read_to_string(p.flag("releases/v0.1.0").join("notes")).unwrap();
+        assert!(
+            body.contains("curl -fsSL https://github.com/o/r-releases/releases/download/v0.1.0/install.sh | sh"),
+            "{body}"
+        );
+        // `## Tested` names no machine of the owner's: the table alone.
+        assert!(body.contains("## Tested\n\n| Standard |"), "{body}");
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_release_made_before_split_on_is_written_again_for_the_public_repo() {
+        use release::State;
+        let p = Project::new("moved");
+        let d = start(&p, "daemon.tags = v*\n").await;
+        let a = p.commit("files", "Packages for all (#7)");
+        p.push("main");
+        p.tag("v0.1.0");
+        poll(&d).await;
+        let id = tag_build(&d, "v0.1.0").unwrap();
+        assert_eq!(finished(&d, id).await.build.state, BuildState::Success);
+        let r = rel_in(&d, "v0.1.0", State::Asking).await;
+        assert_eq!(r.public_repo, None);
+        let private = r.notes.clone().unwrap();
+        assert!(private.text.contains("(#7)"), "{}", private.text);
+        d.shutdown().await;
+        // bana split on: the releases go to the public repo from here on.
+        let s = p
+            .settings("daemon.tags = v*\nrelease.repo = o/r-releases\nsplit.repo = o/r-releases\n");
+        let d = start_with(s).await;
+        let r = rel(&d, "v0.1.0").unwrap();
+        assert_eq!(
+            r.public_repo.as_deref(),
+            Some("o/r-releases"),
+            "as it loads"
+        );
+        let n = r.notes.clone().unwrap();
+        assert_eq!(n.rev, private.rev + 1);
+        assert!(
+            !n.text.contains("#7") && !n.text.contains(&a[..7]),
+            "{}",
+            n.text
+        );
+        // Publish with the rev the owner saw before: refused, as for any other rev.
+        assert!(d.publish_release("v0.1.0", private.rev).is_err());
+        d.shutdown().await;
+        // The owner's own notes, written before: Publish stops once, to have them read again.
+        let mut r = release::load(&p.dir).remove("v0.1.0").unwrap();
+        r.public_repo = None;
+        r.notes = Some(release::Notes {
+            text: "Fixes #7 in o/r.\n".into(),
+            source: "you".into(),
+            rev: n.rev + 1,
+            ..release::Notes::default()
+        });
+        release::save(&p.dir, &r);
+        let s = p
+            .settings("daemon.tags = v*\nrelease.repo = o/r-releases\nsplit.repo = o/r-releases\n");
+        let d = start_with(s).await;
+        assert_eq!(
+            rel(&d, "v0.1.0").unwrap().public_repo,
+            None,
+            "the owner's notes wait"
+        );
+        let r = publish_now(&d, "v0.1.0", n.rev + 1).await;
+        assert_eq!(
+            r.reason.as_deref(),
+            Some("the releases go to o/r-releases now, not where they went when its notes were written: read them (a public repository's must name nothing private), then Publish again; nothing was published")
+        );
+        assert_eq!(r.public_repo.as_deref(), Some("o/r-releases"));
+        let r = publish_now(&d, "v0.1.0", n.rev + 1).await;
+        assert_eq!(
+            r.reason.as_deref(),
+            Some("the release's notes hold o/r, and o/r-releases is public: nothing was published (edit them on bana's page)")
         );
         d.shutdown().await;
         p.remove();

@@ -9,7 +9,8 @@
 #     The archives are DIST's release files named NAME-...-(linux|macos)-(x64|arm64).tar.gz
 #     and NAME-...-windows-(x64|arm64).zip, one per platform, each holding one directory;
 #     their sha256 is baked into the installers, which refuse anything else.
-#     --tag TAG        a GitHub release: the installers download from it (gh, else curl)
+#     --tag TAG        a GitHub release: the installers download from it (gh, else curl), in
+#                      the release repo (bana split's public one, bana.conf's release.repo, else repo)
 #     --label LABEL    a build of bana's daemon (nightly-<sha>, say): its installer needs --from
 #   bana install [BUILD | --from FILE|DIR] [INSTALLER OPTIONS]
 #     a daemon build's files on this machine: sh DIST/install.sh --from DIST, in your terminal
@@ -93,7 +94,7 @@ installer_archive() { # FILE: holds one directory, and nothing outside it
 
 installer_main() {
   local dist='' tag='' local_=0 name bins hook hook_ps1 iprefix ibin iconfig k v envs='' envps=''
-  local globs=() g f b p plat unix='' win='' files=() sums sh ps
+  local globs=() g f b p plat unix='' win='' files=() sums sh ps rrepo
   while (($#)); do
     case $1 in
     --tag | --label)
@@ -111,6 +112,8 @@ installer_main() {
   [[ -d $dist ]] || die "bana installer: no directory $dist"
   ((local_)) || need_repo
   [[ -z $repo || $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "repo: owner/name, not '$repo'"
+  rrepo=$(release_repo)
+  [[ -z $rrepo || $rrepo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "release.repo: owner/name, not '$rrepo'"
   installer_check "the tag" "$tag" '^[A-Za-z0-9][A-Za-z0-9._+-]{0,99}$'
   [[ $tag != current && $tag != receipt ]] || die "bana installer: '$tag' is the installer's own name, not a tag"
 
@@ -194,11 +197,11 @@ installer_main() {
       if ((local_)); then
         echo "#   sh install.sh --from DIR (DIR: this build's files; bana install on the daemon's machine)"
       else
-        echo "#   curl -fsSL https://github.com/$repo/releases/download/$tag/install.sh | sh"
-        echo "#   gh release download $tag -R $repo -p install.sh -O - | sh   (a private repository)"
+        echo "#   curl -fsSL https://github.com/$rrepo/releases/download/$tag/install.sh | sh"
+        echo "#   gh release download $tag -R $rrepo -p install.sh -O - | sh   (a private repository)"
       fi
       installer_let NAME "$name"
-      installer_let REPO "$repo"
+      installer_let REPO "$rrepo"
       installer_let TAG "$tag"
       echo "LOCAL=$local_"
       installer_let BINS "$bins"
@@ -218,7 +221,7 @@ installer_main() {
       echo "# $name $tag's installer, made by bana from bana.conf (install.*)."
       sed '/^#@BUILD@$/,$d' "$bana_root/lib/install.ps1.in"
       echo "\$Name = $(installer_qps "$name")"
-      echo "\$Repo = $(installer_qps "$repo")"
+      echo "\$Repo = $(installer_qps "$rrepo")"
       echo "\$Tag = $(installer_qps "$tag")"
       echo "\$Local = \$$( ((local_)) && echo true || echo false)"
       echo "\$HookPs1 = $(installer_qps "$hook_ps1")"

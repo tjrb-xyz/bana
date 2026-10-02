@@ -31,7 +31,10 @@ fresh() {
   export HOME=$T/w/home FAKE_STATE=$T/w/state FAKE_LOG=$T/w/log
   unset FAKE_OS FAKE_ARCH FAKE_UID FAKE_IOREG BANA_SYS_ROOT BANA_TOKEN FAKE_GH FAKE_POOL FAKE_SVC_FAIL GITHUB_TOKEN \
     FAKE_HEALTH FAKE_LINGER FAKE_GH_SCOPES BANA_DAEMON_BIN BANA_DAEMON_STEP CARGO_TARGET_DIR \
-    FAKE_CARGO_FAIL FAKE_VERSION FAKE_LATEST FAKE_SEEN BANA_UPGRADE_NOW FAKE_RELEASES BANA_RELEASES BANA_RELEASE_REPO
+    FAKE_CARGO_FAIL FAKE_VERSION FAKE_LATEST FAKE_SEEN BANA_UPGRADE_NOW FAKE_RELEASES BANA_RELEASES BANA_RELEASE_REPO \
+    FAKE_GH_STORE FAKE_GH_DENY FAKE_GH_FAIL_AT FAKE_GH_MISSING FAKE_RUN_CONCLUSION FAKE_RUN_BUNDLE FAKE_RUN_NOBUNDLE \
+    FAKE_RUN_VIEWS FAKE_RUN_SEAL FAKE_RUN_SEAL_PUB FAKE_RUN_SHOWS FAKE_RUN_BRANCH \
+    BANA_SPLIT_CONSENT
   # What the host (GitHub's runners, act, a daemon's build) may have set, which bana reads.
   unset XDG_CONFIG_HOME BANA_HOME BANA_CONFIG BANA_PROJECT_ROOT BANA_ACT_LOCKED BANA_DAEMON ACT \
     RUNNER_ENVIRONMENT GITHUB_WORKSPACE DOCKER_HOST DISPLAY WAYLAND_DISPLAY
@@ -1367,6 +1370,31 @@ bash "$bana" add --no-hook --no-claude </dev/null >"$T/out" 2>&1 || { cat "$T/ou
 check "add --no-hook: no hook" test ! -e "$hook"
 check "add --no-claude: leaves Claude Code alone" lacks "$T/out" "Claude Code"
 bash "$bana" add </dev/null >/dev/null 2>&1
+# bana split's keys: bana add keeps them; bana settings and the installer read them.
+printf '%s\n' "release.repo = acme/widget-releases" "split.repo = acme/widget-releases" "split.ci = github" \
+  "split.logs = private" "split.workflow = 0123456789abcdef0123456789abcdef01234567" "split.key = 42" >>"$d/daemon/settings"
+echo "release.repo = acme/from-a-commit" >>.github/bana.conf
+bash "$bana" add </dev/null >/dev/null 2>&1
+check "add again: keeps bana split's keys" same "$(grep '^split\.\|^release\.' "$d/daemon/settings" | tr '\n' ' ')" \
+  "release.repo = acme/widget-releases split.repo = acme/widget-releases split.ci = github split.logs = private split.workflow = 0123456789abcdef0123456789abcdef01234567 split.key = 42 "
+check "add again: and only the project's keys" only_keys "$project_keys" "$d/daemon/settings"
+bash "$bana" settings >"$T/out"
+check "settings: the release repo, bana split's over bana.conf's" has "$T/out" "release.repo = acme/widget-releases"
+check "settings: split's keys" has "$T/out" "split.ci = github"
+mkdir -p "$T/w/rr"
+printf 'x\n' >"$T/w/rr/x.txt" && mkdir -p "$T/w/rr/wid-1" && tar czf "$T/w/rr/wid-1-linux-x64.tar.gz" -C "$T/w/rr" wid-1
+rm "$T/w/rr/x.txt"
+bash "$bana" installer "$T/w/rr" --tag v1 >/dev/null 2>&1 || true
+check "installer --tag: downloads from the release repo" has "$T/w/rr/install.sh" "REPO='acme/widget-releases'"
+BANA_RELEASE_REPO=acme/the-daemons bash "$bana" installer "$T/w/rr" --tag v1 >/dev/null 2>&1 || true
+check "installer --tag: the daemon's BANA_RELEASE_REPO first" has "$T/w/rr/install.sh" "REPO='acme/the-daemons'"
+check "installer --tag: its one-liner too" has "$T/w/rr/install.sh" "https://github.com/acme/the-daemons/releases/download/v1/install.sh"
+sed -i.bak '/^release\.repo = acme\/from-a-commit$/d' .github/bana.conf && rm -f .github/bana.conf.bak
+grep -v '^split\.\|^release\.' "$d/daemon/settings" >"$T/s" && cp "$T/s" "$d/daemon/settings"
+bash "$bana" installer "$T/w/rr" --tag v1 >/dev/null 2>&1 || true
+check "installer --tag: no split: the repo" has "$T/w/rr/install.sh" "REPO='acme/widget'"
+rm -rf "$T/w/rr"
+bash "$bana" add </dev/null >/dev/null 2>&1
 
 # A second project: its own settings, hook and tools.
 two_world
@@ -1991,7 +2019,7 @@ check "package: the four archives, install.sh, SHA256SUMS and notes.md" same "$(
 check "package: SHA256SUMS passes sha256sum -c" bash -c "cd '$T/dist' && sha256sum -c --quiet SHA256SUMS"
 check "package: SHA256SUMS has the archives and install.sh" same "$(awk '{ print $2 }' "$T/dist/SHA256SUMS" | tr '\n' ' ')" \
   "bana-v$V-linux-arm64.tar.gz bana-v$V-linux-x64.tar.gz bana-v$V-macos-arm64.tar.gz bana-v$V-macos-x64.tar.gz install.sh "
-want=$( (cd "$here/.." && { printf '%s\n' bin/bana bin/bana-manager LICENSE README.md lib/install.sh.in lib/install.ps1.in; ls lib/*.sh; }) |
+want=$( (cd "$here/.." && { printf '%s\n' bin/bana bin/bana-manager LICENSE README.md lib/install.sh.in lib/install.ps1.in lib/split.yml.in; ls lib/*.sh; }) |
   sed "s|^|bana-v$V/|" | LC_ALL=C sort)
 for p in linux-x64 linux-arm64 macos-x64 macos-arm64; do
   check "package: $p holds bana-v$V/, with bana's files and nothing else" same "$(tar -tzf "$T/dist/bana-v$V-$p.tar.gz" | LC_ALL=C sort)" "$want"
@@ -2042,7 +2070,9 @@ check "workflows: and neither self-test" same "$(grep -c '^    if: .*&& !inputs.
 # bana is public: 'private' in its README, install.sh and workflows is about a project's repository.
 grep -n -i private "$here/../README.md" "$here/../install.sh" "$gh_dir"/*.yml |
   grep -v -e 'Use the daemon only on a private repository' -e 'Use bana with private' \
-    -e '# a private repository' -e '# Windows, a private repository' -e 'for private images' >"$T/out" || true
+    -e '# a private repository' -e '# Windows, a private repository' -e 'for private images' \
+    -e 'Private code, public CI and releases: bana split' -e 'keeps its code in its private repository' \
+    -e 'logs private|public' >"$T/out" || true
 check "workflows: no 'private' about bana itself" same "$(cat "$T/out")" ""
 
 # ---- hook: bana's install.sh; the daemon moves to the new bana first, or nothing changes ---------
@@ -2418,6 +2448,7 @@ else
   check "add: which workflow, and why" has "$T/out" "The workflow: bana's default."
   check "add: next, commit and push what it proposes" has "$T/out" \
     "git commit, git push    bana.conf and the workflow changes: the daemon builds pushed commits, with theirs"
+  check "add: next, or builds on a public repository's GitHub Actions" has "$T/out" "bana split plan"
   check "add: no terminal, nothing written (no bana.conf made)" test ! -e .github/bana.conf -a ! -e bana.conf
   check "add: the workflow as it was" same "$(git status --porcelain)" ""
   FAKE_OS=Darwin FAKE_ARCH=arm64 bash "$bana" add >"$T/out" 2>&1 || true
@@ -2611,6 +2642,9 @@ fi
 check "doctor: adds anyway" test -e "$HOME/.bana/wid/daemon/settings"
 bash "$bana" remove --purge >/dev/null 2>&1 || true
 unset BANA_DAEMON_BIN BANA_DAEMON_STEP
+
+# shellcheck source=tests/split.sh
+source "$here/split.sh"
 
 echo "$((n - fails)) of $n passed"
 ((fails == 0))

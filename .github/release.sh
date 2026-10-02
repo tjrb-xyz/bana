@@ -7,7 +7,8 @@
 #   .github/release.sh pack MANAGER X.Y.Z PLAT OUT
 #                                      OUT/bana-vX.Y.Z-PLAT.tar.gz: bana-vX.Y.Z/ with bin/bana (the
 #                                      commit stamped: GITHUB_SHA, else HEAD), bin/bana-manager
-#                                      (MANAGER, built for PLAT), lib/, LICENSE and README.md.
+#                                      (MANAGER, built for PLAT), lib/ (its .sh files, install.sh.in,
+#                                      install.ps1.in and split.yml.in), LICENSE and README.md.
 #                                      PLAT: linux-x64, linux-arm64, macos-x64 or macos-arm64
 #   .github/release.sh dist DIR X.Y.Z  DIR's archives as release vX.Y.Z: install.sh (bana installer's,
 #                                      with lib/install-hook.sh) and SHA256SUMS, then notes.md (the
@@ -88,7 +89,7 @@ pack() { # MANAGER VERSION PLAT OUT
   sed "s/^BANA_COMMIT=/BANA_COMMIT=$sha/" "$root/bin/bana" >"$d/bin/bana"
   grep -q "^BANA_COMMIT=$sha" "$d/bin/bana" || die "pack: bin/bana has no BANA_COMMIT= line to stamp"
   cp "$mgr" "$d/bin/bana-manager"
-  cp "$root"/lib/*.sh "$root"/lib/install.sh.in "$root"/lib/install.ps1.in "$d/lib/"
+  cp "$root"/lib/*.sh "$root"/lib/install.sh.in "$root"/lib/install.ps1.in "$root"/lib/split.yml.in "$d/lib/"
   cp "$root/LICENSE" "$root/README.md" "$d/"
   chmod 755 "$d/bin/bana" "$d/bin/bana-manager"
   chmod 644 "$d"/lib/* "$d/LICENSE" "$d/README.md"

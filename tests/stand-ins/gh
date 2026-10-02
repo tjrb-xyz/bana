@@ -11,6 +11,8 @@
 # api graphql answers each nN:issueOrPullRequest(number:N) alias from FAKE_PRS/N.json (the
 # node), and like GitHub gives null and an error, and exits 1, for a number it lacks;
 # api -X POST repos/O/R/releases/generate-notes gives notes naming the tags it was given.
+# With FAKE_GH_STORE (a directory), GitHub's repositories as bana split uses them
+# (gh_store, below, has the layout and the calls it answers).
 echo "gh $*" >>"$FAKE_LOG"
 [ "${FAKE_GH:-1}" = 1 ] || exit 1
 store=${FAKE_RELEASE_STORE:-}
@@ -42,6 +44,356 @@ fail_at() { # WHAT
   echo "gh auth refresh -h github.com -s workflow" >&2
   exit 1
 }
+
+# bana split's GitHub, in FAKE_GH_STORE: repos/OWNER/NAME/ has visibility (PUBLIC, PRIVATE),
+# permission (ADMIN), default_branch (main), files/PATH (contents; commits, a fake sha a write),
+# keys/ID/{title,key,read_only} (deploy keys), secrets/NAME and envs/ENV/secrets/NAME (the value's length
+# only: a secret is never stored), envs/ENV/branches, vars/NAME, settings/* (Actions
+# permissions, retention, fork approval, disabled.WORKFLOW), rulesets/N.json, collaborators
+# (default: octo), comments/SHA/N (commit comments), runs/ID/{title,inputs,status,conclusion,
+# views,event,branch,head,created,artifact/} (a dispatch makes one, at its --ref's (the default
+# branch's) last commit: FAKE_RUN_CONCLUSION, default success; FAKE_RUN_SEAL, a directory of out/
+# and art/, sealed as the run's runner.sh would (to BANA_SEAL_PUB, or the public key in
+# FAKE_RUN_SEAL_PUB), or FAKE_RUN_BUNDLE, a sealed bundle's directory, is its artifact
+# bana-sealed, none with FAKE_RUN_NOBUNDLE; FAKE_RUN_VIEWS run views before it completes,
+# default 1; FAKE_RUN_SHOWS run lists before it is listed, default 0; FAKE_RUN_BRANCH, the branch
+# it says it ran on, as a dispatch of another branch's workflow would). --jq takes the expressions bana
+# sends (lib/split.sh's split_jq_*), each its own way. FAKE_GH_DENY=deploy-key refuses a deploy
+# key as an organization's policy does; FAKE_GH_FAIL_AT=repo-create|contents|secret|variable|
+# environment|ruleset|dispatch fails that call; FAKE_GH_MISSING=retention|fork-approval answers 404.
+gh_store() {
+  S=$FAKE_GH_STORE
+  R='' ENV='' JQ='' X='' FIELDS='' NAME='' DIR='' HDR='' POS='' INPUT='' REF=''
+  if [ "$1" = api ]; then cmd=api; shift; else cmd="$1 $2"; shift 2; fi
+  while [ $# -gt 0 ]; do
+    case $1 in
+    -R) R=$2; shift ;;
+    --env) ENV=$2; shift ;;
+    --jq) JQ=$2; shift ;;
+    -X) X=$2; shift ;;
+    -f | -F) FIELDS="$FIELDS$2
+"; shift ;;
+    -H) HDR=$2; shift ;;
+    -n) NAME=$2; shift ;;
+    -D) DIR=$2; shift ;;
+    --input) INPUT=$2; shift ;;
+    --ref) REF=$2; shift ;;
+    --json | -L | --workflow | --event | --description | --body) shift ;;
+    -*) ;;
+    *) POS="$POS$1
+" ;;
+    esac
+    shift
+  done
+  pos() { printf '%s' "$POS" | sed -n "$1p"; }
+  field() { printf '%s' "$FIELDS" | sed -n "s/^$1=//p" | head -1; }
+  nf() { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
+  failing() { [ "${FAKE_GH_FAIL_AT:-}" != "$1" ] || { echo "gh: Server Error (HTTP 500): $1" >&2; exit 1; }; }
+  next_id() { n=$(cat "$S/next_id" 2>/dev/null || echo 100); echo $((n + 1)) >"$S/next_id"; echo "$n"; }
+  repo_dir() {
+    d=$S/repos/$1
+    [ -d "$d" ] || { echo "GraphQL: Could not resolve to a Repository with the name '$1'. (repository) (HTTP 404)" >&2; exit 1; }
+  }
+  blob() { git hash-object "$1"; }
+  commit() { printf '%s\n' "$(printf '%s %s' "$1" "$(date +%s%N)" | git hash-object --stdin)" >>"$2/commits"; }
+  case $cmd in
+  "repo create")
+    failing repo-create
+    R=$(pos 1)
+    [ ! -d "$S/repos/$R" ] || { echo "GraphQL: Name already exists on this account (createRepository)" >&2; exit 1; }
+    mkdir -p "$S/repos/$R/files"
+    case " $* " in *" --private "*) echo PRIVATE ;; *) echo PUBLIC ;; esac >"$S/repos/$R/visibility"
+    echo ADMIN >"$S/repos/$R/permission"
+    echo "https://github.com/$R"
+    exit 0 ;;
+  "repo view")
+    repo_dir "$(pos 1)"
+    [ "$JQ" = '"\(.visibility) \(.viewerPermission) \(.isEmpty)"' ] || { echo "gh-store: repo view --jq $JQ" >&2; exit 2; }
+    e=true
+    [ -z "$(ls -A "$d/files" 2>/dev/null)" ] || e=false
+    echo "$(cat "$d/visibility") $(cat "$d/permission" 2>/dev/null || echo ADMIN) $e"
+    exit 0 ;;
+  "secret set" | "secret list" | "secret delete")
+    repo_dir "$R"
+    failing secret
+    sd=$d/secrets
+    [ -z "$ENV" ] || { [ -d "$d/envs/$ENV" ] || nf; sd=$d/envs/$ENV/secrets; }
+    case $cmd in
+    "secret set") mkdir -p "$sd"; wc -c | tr -d ' ' >"$sd/$(pos 1)" ;;
+    "secret list")
+      [ "$JQ" = '.[].name' ] || { echo "gh-store: secret list --jq $JQ" >&2; exit 2; }
+      ls "$sd" 2>/dev/null || true ;;
+    "secret delete") [ -f "$sd/$(pos 1)" ] || nf; rm -f "$sd/$(pos 1)" ;;
+    esac
+    exit 0 ;;
+  "variable set" | "variable get" | "variable list" | "variable delete")
+    repo_dir "$R"
+    failing variable
+    case $cmd in
+    "variable set") mkdir -p "$d/vars"; cat >"$d/vars/$(pos 1)" ;;
+    "variable get") [ -f "$d/vars/$(pos 1)" ] || nf; cat "$d/vars/$(pos 1)" ;;
+    "variable list")
+      [ "$JQ" = '.[].name' ] || { echo "gh-store: variable list --jq $JQ" >&2; exit 2; }
+      ls "$d/vars" 2>/dev/null || true ;;
+    "variable delete") [ -f "$d/vars/$(pos 1)" ] || nf; rm -f "$d/vars/$(pos 1)" ;;
+    esac
+    exit 0 ;;
+  "workflow disable" | "workflow enable")
+    repo_dir "$R"
+    [ -f "$d/files/.github/workflows/$(pos 1)" ] || nf
+    mkdir -p "$d/settings"
+    if [ "$cmd" = "workflow disable" ]; then : >"$d/settings/disabled.$(pos 1)"; else rm -f "$d/settings/disabled.$(pos 1)"; fi
+    exit 0 ;;
+  "workflow run")
+    repo_dir "$R"
+    failing dispatch
+    [ -f "$d/files/.github/workflows/$(pos 1)" ] || nf
+    [ ! -e "$d/settings/disabled.$(pos 1)" ] || { echo "could not create workflow dispatch event: HTTP 422: Workflow is disabled" >&2; exit 1; }
+    id=$(next_id)
+    mkdir -p "$d/runs/$id"
+    printf '%s' "$FIELDS" >"$d/runs/$id/inputs"
+    echo "bana $(field id) $(field nonce)" >"$d/runs/$id/title"
+    echo queued >"$d/runs/$id/status"
+    echo "${FAKE_RUN_CONCLUSION:-success}" >"$d/runs/$id/conclusion"
+    echo "${FAKE_RUN_VIEWS:-1}" >"$d/runs/$id/views"
+    echo "${FAKE_RUN_SHOWS:-0}" >"$d/runs/$id/shows"
+    echo workflow_dispatch >"$d/runs/$id/event"
+    b=${FAKE_RUN_BRANCH:-${REF:-$(cat "$d/default_branch" 2>/dev/null || echo main)}}
+    echo "$b" >"$d/runs/$id/branch"
+    tail -1 "$d/commits" 2>/dev/null >"$d/runs/$id/head" || true
+    date -u +%Y-%m-%dT%H:%M:%SZ >"$d/runs/$id/created"
+    a=$d/runs/$id/artifact/bana-sealed
+    if [ -n "${FAKE_RUN_NOBUNDLE:-}" ]; then :
+    elif [ -n "${FAKE_RUN_SEAL:-}" ]; then
+      # As runner.sh's seal step: the run's id, inputs and BANA_SEAL_PUB.
+      w=$d/runs/$id/work
+      mkdir -p "$w" "$a" && cp -R "$FAKE_RUN_SEAL"/. "$w/"
+      key=$(cat "${FAKE_RUN_SEAL_PUB:-$d/vars/BANA_SEAL_PUB}")
+      GITHUB_RUN_ID=$id BANA_ID=$(field id) BANA_SHA=$(field sha) BANA_NONCE=$(field nonce) BANA_SEAL_PUB=$key \
+        bash -c '. "$1"; split_runner_seal "$2" "$3"' _ "$(dirname "$0")/../../lib/split.sh" "$w" "$a" >/dev/null
+      rm -rf "$w"
+      next_id >"$d/runs/$id/artifact/id"
+    elif [ -n "${FAKE_RUN_BUNDLE:-}" ]; then
+      mkdir -p "$a"
+      cp "$FAKE_RUN_BUNDLE"/* "$a/"
+      next_id >"$d/runs/$id/artifact/id"
+    fi
+    echo "✓ Created workflow_dispatch event for $(pos 1) at main"
+    exit 0 ;;
+  "run list")
+    repo_dir "$R"
+    case $JQ in
+    '.[] | "\(.databaseId) \(.url) \(.displayTitle)"') full='' ;;
+    '.[] | "\(.databaseId) \(.event) \(.headBranch) \(.headSha) \(.createdAt) \(.url) \(.displayTitle)"') full=1 ;;
+    *) echo "gh-store: run list --jq $JQ" >&2; exit 2 ;;
+    esac
+    for r in "$d"/runs/*/; do
+      [ -d "$r" ] || continue
+      # Not listed yet (shows: the lists before it is).
+      v=$(cat "$r/shows" 2>/dev/null || echo 0)
+      if [ "$v" -gt 0 ]; then echo $((v - 1)) >"$r/shows"; continue; fi
+      t=$(cat "$r/title")
+      r=$(basename "$r")
+      u=https://github.com/$R/actions/runs/$r
+      if [ -z "$full" ]; then echo "$r $u $t"; continue; fi
+      f=$d/runs/$r
+      echo "$r $(cat "$f/event" 2>/dev/null || echo workflow_dispatch) $(cat "$f/branch" 2>/dev/null || echo main)" \
+        "$(cat "$f/head" 2>/dev/null || echo none) $(cat "$f/created" 2>/dev/null || echo 2000-01-01T00:00:00Z) $u $t"
+    done | sort -rn
+    exit 0 ;;
+  "run view")
+    repo_dir "$R"
+    r=$d/runs/$(pos 1)
+    [ -d "$r" ] || nf
+    [ "$JQ" = '"\(.status) \(.conclusion)", (.jobs[0].steps[]? | "\(.conclusion) \(.name)")' ] || { echo "gh-store: run view --jq $JQ" >&2; exit 2; }
+    v=$(cat "$r/views")
+    st=$(cat "$r/status")
+    if [ "$st" != completed ] && [ "$st" != cancelled ]; then
+      if [ "$v" -le 0 ]; then st=completed; else st=in_progress; echo $((v - 1)) >"$r/views"; fi
+      echo "$st" >"$r/status"
+    fi
+    case $st in
+    completed) c=$(cat "$r/conclusion") ;;
+    cancelled) st=completed c=cancelled ;;
+    *) c='' ;;
+    esac
+    echo "$st $c"
+    if [ "$st" = completed ]; then
+      if [ "$c" = success ]; then f=success b=success; elif [ -n "${FAKE_RUN_NOBUNDLE:-}" ]; then f=failure b=skipped; else f=success b=failure; fi
+      printf '%s\n' "success Set up job" "success check" "$f fetch" "$b build" "success summary" "success seal" "success upload"
+    fi
+    exit 0 ;;
+  "run download")
+    repo_dir "$R"
+    a=$d/runs/$(pos 1)/artifact/$NAME
+    [ -d "$a" ] || { echo "no valid artifacts found to download" >&2; exit 1; }
+    mkdir -p "$DIR"
+    cp "$a"/* "$DIR/"
+    exit 0 ;;
+  "run cancel")
+    repo_dir "$R"
+    [ -d "$d/runs/$(pos 1)" ] || nf
+    echo cancelled >"$d/runs/$(pos 1)/status"
+    exit 0 ;;
+  "run delete")
+    repo_dir "$R"
+    [ -d "$d/runs/$(pos 1)" ] || nf
+    rm -rf "${d:?}/runs/$(pos 1)"
+    exit 0 ;;
+  api)
+    path=$(pos 1)
+    [ -z "$(pos 2)" ] || { echo "gh-store: api, more than a path: $POS" >&2; exit 2; }
+    case $path in repos/*/*) ;; *) return 0 ;; esac
+    p=${path#repos/}
+    o=${p%%/*} p=${p#*/}
+    n=${p%%/*} p=${p#"$n"}
+    p=${p#/}
+    p=${p%%\?*}
+    [ -d "$S/repos/$o/$n" ] || nf
+    repo_dir "$o/$n"
+    X=${X:-GET}
+    case "$X $p" in
+    "GET ")
+      [ "$JQ" = .default_branch ] || return 0
+      cat "$d/default_branch" 2>/dev/null || echo main ;;
+    "POST keys")
+      [ "${FAKE_GH_DENY:-}" != deploy-key ] || {
+        echo "gh: Deploy keys are disabled for this repository. (HTTP 422)" >&2; exit 1; }
+      id=$(next_id)
+      mkdir -p "$d/keys/$id"
+      field key | cut -d' ' -f1-2 >"$d/keys/$id/key"
+      field title >"$d/keys/$id/title"
+      field read_only >"$d/keys/$id/read_only"
+      echo '{}' ;;
+    "GET keys")
+      [ "$JQ" = '.[] | "\(.id) \(.read_only) \(.key) \(.title)"' ] || { echo "gh-store: --jq $JQ" >&2; exit 2; }
+      for k in "$d"/keys/*/; do
+        [ -d "$k" ] || continue
+        echo "$(basename "$k") $(cat "$k/read_only") $(cat "$k/key") $(cat "$k/title")"
+      done ;;
+    "DELETE keys/"*)
+      [ -d "$d/keys/${p#keys/}" ] || nf
+      rm -rf "${d:?}/keys/${p#keys/}" ;;
+    "GET contents/.github/workflows")
+      [ "$JQ" = '.[] | .name + " " + .sha' ] || { echo "gh-store: --jq $JQ" >&2; exit 2; }
+      [ -d "$d/files/.github/workflows" ] || nf
+      for f in "$d"/files/.github/workflows/*; do [ -f "$f" ] && echo "$(basename "$f") $(blob "$f")"; done ;;
+    "GET contents")
+      [ "$JQ" = '.[].path' ] || { echo "gh-store: --jq $JQ" >&2; exit 2; }
+      ls -A "$d/files" ;;
+    "GET contents/"*)
+      f=$d/files/${p#contents/}
+      [ -f "$f" ] || nf
+      case $JQ in
+      .sha) blob "$f" ;;
+      '') [ "$HDR" = "Accept: application/vnd.github.raw" ] || { echo "gh-store: contents: raw only" >&2; exit 2; }; cat "$f" ;;
+      *) echo "gh-store: --jq $JQ" >&2; exit 2 ;;
+      esac ;;
+    "PUT contents/"*)
+      failing contents
+      f=$d/files/${p#contents/}
+      if [ -f "$f" ]; then
+        [ "$(field sha)" = "$(blob "$f")" ] || { echo "gh: $p does not match $(field sha) (HTTP 409)" >&2; exit 1; }
+      elif [ -n "$(field sha)" ]; then nf; fi
+      mkdir -p "$(dirname "$f")"
+      field content | openssl base64 -d -A >"$f"
+      commit "$p" "$d"
+      echo '{}' ;;
+    "GET commits")
+      [ "$JQ" = '.[].sha' ] || { echo "gh-store: --jq $JQ" >&2; exit 2; }
+      [ ! -f "$d/commits" ] || sed '1!G;h;$!d' "$d/commits" ;;
+    "GET commits/"*)
+      [ "$JQ" = .sha ] || { echo "gh-store: --jq $JQ" >&2; exit 2; }
+      if [ "${p#commits/}" != "$(cat "$d/default_branch" 2>/dev/null || echo main)" ] || [ ! -s "$d/commits" ]; then nf; fi
+      tail -1 "$d/commits" ;;
+    "GET actions/workflows/"*)
+      [ "$JQ" = .state ] || { echo "gh-store: --jq $JQ" >&2; exit 2; }
+      w=${p#actions/workflows/}
+      [ -f "$d/files/.github/workflows/$w" ] || nf
+      if [ -e "$d/settings/disabled.$w" ]; then echo disabled_manually; else echo active; fi ;;
+    "GET environments")
+      [ "$JQ" = '.environments[].name' ] || { echo "gh-store: --jq $JQ" >&2; exit 2; }
+      ls "$d/envs" 2>/dev/null || true ;;
+    "GET rulesets")
+      [ "$JQ" = '.[] | select(.name == "bana split") | .id' ] || { echo "gh-store: --jq $JQ" >&2; exit 2; }
+      for f in "$d"/rulesets/*.json; do
+        [ -f "$f" ] && grep -q '"name": "bana split"' "$f" && basename "$f" .json
+      done
+      true ;;
+    "PUT rulesets/"*)
+      failing ruleset
+      [ -f "$d/rulesets/${p#rulesets/}.json" ] || nf
+      cat "$INPUT" >"$d/rulesets/${p#rulesets/}.json"
+      echo '{}' ;;
+    "PUT actions/permissions/workflow" | "PUT actions/permissions" | "PUT actions/permissions/selected-actions")
+      mkdir -p "$d/settings"
+      printf '%s' "$FIELDS" >"$d/settings/$(echo "$p" | tr / .)"
+      echo '{}' ;;
+    "PUT actions/permissions/fork-pr-contributor-approval" | "PUT actions/permissions/artifact-and-log-retention")
+      case $p in *retention) m=retention ;; *) m=fork-approval ;; esac
+      [ "${FAKE_GH_MISSING:-}" != "$m" ] || nf
+      mkdir -p "$d/settings"
+      printf '%s' "$FIELDS" >"$d/settings/$m"
+      echo '{}' ;;
+    "GET actions/permissions")
+      [ "$JQ" = .allowed_actions ] || { echo "gh-store: --jq $JQ" >&2; exit 2; }
+      sed -n 's/^allowed_actions=//p' "$d/settings/actions.permissions" 2>/dev/null || echo all ;;
+    "GET actions/permissions/workflow")
+      [ "$JQ" = .default_workflow_permissions ] || { echo "gh-store: --jq $JQ" >&2; exit 2; }
+      sed -n 's/^default_workflow_permissions=//p' "$d/settings/actions.permissions.workflow" 2>/dev/null || echo write ;;
+    "PUT environments/"*)
+      failing environment
+      e=${p#environments/}
+      mkdir -p "$d/envs/$e"
+      printf '%s' "$FIELDS" >"$d/envs/$e/settings"
+      echo '{}' ;;
+    "DELETE environments/"*)
+      [ -d "$d/envs/${p#environments/}" ] || nf
+      rm -rf "${d:?}/envs/${p#environments/}" ;;
+    "POST environments/"*/deployment-branch-policies)
+      e=${p#environments/} e=${e%/deployment-branch-policies}
+      [ -d "$d/envs/$e" ] || nf
+      field name >>"$d/envs/$e/branches"
+      echo '{}' ;;
+    "GET environments/"*/deployment-branch-policies)
+      e=${p#environments/} e=${e%/deployment-branch-policies}
+      [ -d "$d/envs/$e" ] || nf
+      [ "$JQ" = '.branch_policies[].name' ] || { echo "gh-store: --jq $JQ" >&2; exit 2; }
+      cat "$d/envs/$e/branches" 2>/dev/null || true ;;
+    "POST rulesets")
+      failing ruleset
+      mkdir -p "$d/rulesets"
+      cat "$INPUT" >"$d/rulesets/$(next_id).json"
+      echo '{}' ;;
+    "GET collaborators")
+      [ "$JQ" = '.[].login' ] || { echo "gh-store: --jq $JQ" >&2; exit 2; }
+      cat "$d/collaborators" 2>/dev/null || echo octo ;;
+    "POST commits/"*/comments)
+      c=${p#commits/} c=${c%/comments}
+      mkdir -p "$d/comments/$c"
+      b=$(field body)
+      case $b in @*) cat "${b#@}" ;; *) printf '%s' "$b" ;; esac >"$d/comments/$c/$(next_id)"
+      echo '{}' ;;
+    "GET actions/runs/"*/artifacts)
+      r=${p#actions/runs/} r=${r%/artifacts}
+      [ -d "$d/runs/$r" ] || nf
+      [ "$JQ" = '.artifacts[] | select(.name == "bana-sealed") | .id' ] || { echo "gh-store: --jq $JQ" >&2; exit 2; }
+      [ ! -f "$d/runs/$r/artifact/id" ] || cat "$d/runs/$r/artifact/id" ;;
+    "DELETE actions/artifacts/"*)
+      a=${p#actions/artifacts/} found=''
+      for r in "$d"/runs/*/; do
+        [ "$(cat "$r/artifact/id" 2>/dev/null)" = "$a" ] || continue
+        rm -rf "$r/artifact"
+        found=1
+      done
+      [ -n "$found" ] || nf ;;
+    *) return 0 ;;
+    esac
+    exit 0 ;;
+  esac
+  return 0
+}
+[ -z "${FAKE_GH_STORE:-}" ] || gh_store "$@"
 
 case "$*" in
 "auth status") echo "  - Token scopes: ${FAKE_GH_SCOPES-'gist', 'repo', 'workflow'}" ;;

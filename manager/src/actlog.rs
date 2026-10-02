@@ -140,7 +140,14 @@ pub struct Job {
     pub steps: Vec<Step>,
     /// The step that failed it.
     pub failed_step: Option<String>,
+    /// Why it did not run here, when act's skip says ([`ELSEWHERE_SYSTEMD`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elsewhere: Option<String>,
 }
+
+/// A `<prefix>-systemd` job that a remote build (`bana split`) left out: no
+/// job runs on GitHub's runner's own machine, which holds the deploy key.
+pub const ELSEWHERE_SYSTEMD: &str = "runs locally, needs systemd";
 
 impl Job {
     /// The step it runs now.
@@ -437,6 +444,10 @@ impl Build {
             if job.state == JobState::Waiting {
                 job.state = JobState::Unsupported;
             }
+            // act names each of the job's labels: `-P wid-systemd=...`.
+            if l.msg.contains("-systemd=...`") {
+                job.elsewhere = Some(ELSEWHERE_SYSTEMD.into());
+            }
             return;
         }
         if job.state == JobState::Waiting {
@@ -668,11 +679,14 @@ impl Report {
                 if skipped > 0 {
                     d += &format!(", {skipped} skipped");
                 }
-                let away: Vec<&str> = b
+                let away: Vec<String> = b
                     .jobs
                     .iter()
                     .filter(|j| j.state == JobState::Unsupported)
-                    .map(|j| j.key.as_str())
+                    .map(|j| match &j.elsewhere {
+                        Some(why) => format!("{} ({why})", j.key),
+                        None => j.key.clone(),
+                    })
                     .collect();
                 if !away.is_empty() {
                     d += &format!("; not run here: {}", away.join(", "));
@@ -927,6 +941,31 @@ pub struct BuildView {
     /// Its files were refused, or have no installer.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub files_problem: bool,
+    /// It runs, or ran, on a public repository's GitHub Actions (`bana split`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote: Option<Remote>,
+}
+
+/// A build `bana split` runs on a public repository's GitHub Actions: the
+/// repository, and its run once the builder found it (`remote.json`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Remote {
+    pub repo: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+impl Remote {
+    /// How descriptions and comments say where it ran.
+    pub fn label(&self) -> String {
+        match self.run {
+            Some(n) => format!("remote run {n} in public repo {}", self.repo),
+            None => format!("remote run in public repo {}", self.repo),
+        }
+    }
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -1163,14 +1202,21 @@ pub fn project_view(s: &Summary) -> ProjectView {
                 .map(|j| j.key.as_str())
                 .collect();
             let jobs = (!jobs.is_empty()).then(|| jobs.join(", "));
-            tip.push(format!("bana: building {} {at} ({})", s.prefix, b.tier));
+            let remotely = b
+                .remote
+                .as_ref()
+                .map_or(String::new(), |r| format!(" remotely on {}", r.repo));
+            tip.push(format!(
+                "bana: building {} {at} ({}){remotely}",
+                s.prefix, b.tier
+            ));
             tip.extend(jobs.clone());
             tip.push(minutes(b.elapsed));
             tip.extend(queued);
             if w.paused {
                 tip.push("automatic builds paused".into());
             }
-            let mut line = format!("{}: building {at}", s.prefix);
+            let mut line = format!("{}: building {at}{remotely}", s.prefix);
             if let Some(j) = jobs {
                 line += &format!(" · {j}");
             }
@@ -1674,6 +1720,31 @@ mod tests {
             again.finish(c.exit, c.reason, b.ended_at.unwrap());
             assert_eq!(again, b, "{}: act.jsonl read again after a restart", c.name);
         }
+    }
+
+    #[test]
+    fn a_systemd_job_a_remote_build_left_out_says_where_it_runs() {
+        let list = [(0, "host".to_string()), (0, "linux".to_string())];
+        let mut b = Build::new(&list, 1);
+        let log = r#"{"jobID":"host","matrix":{},"msg":"🚧  Skipping unsupported platform -- Try running with `-P self-hosted=...`"}
+{"jobID":"host","matrix":{},"msg":"🚧  Skipping unsupported platform -- Try running with `-P wid-systemd=...`"}
+{"jobID":"linux","matrix":{},"step":"t","stepID":["0"],"stage":"Main","msg":"ok","stepResult":"success"}
+{"jobID":"linux","matrix":{},"msg":"done","jobResult":"success"}
+"#;
+        b.fold_lines(log, 1);
+        b.finish(Some(0), None, 2);
+        let r = Report::new("quick", "quick", "mbp");
+        assert_eq!(
+            r.describe(&b).map(|d| d.1).as_deref(),
+            Some("passed on mbp in 1s · 1 job; not run here: host (runs locally, needs systemd)")
+        );
+        let res = crate::results::fold_json_listed(log, &list);
+        let back = crate::results::Results::from_jsonl(&res.to_jsonl());
+        assert_eq!(back.jobs[0].elsewhere.as_deref(), Some(ELSEWHERE_SYSTEMD));
+        // A macOS job says nothing of where it runs.
+        let mut m = Build::new(&[(0, "mac".to_string())], 1);
+        m.fold_lines(r#"{"jobID":"mac","matrix":{},"msg":"🚧  Skipping unsupported platform -- Try running with `-P wid-macos=...`"}"#, 1);
+        assert_eq!(m.jobs[0].elsewhere, None);
     }
 
     #[test]
