@@ -130,7 +130,8 @@ split_runner_build() { # DIR
     "${BANA_REF:-}" "$BANA_SHA" "$tier" >"$d/event.json"
   args=(workflow_dispatch --json --rm --container-daemon-socket - -C "$d/src"
     -W "$d/src/.github/workflows/$split_workflow" -e "$d/event.json" --artifact-server-path "$d/art"
-    --container-architecture linux/amd64 "${split_platforms[@]}")
+    --container-architecture linux/amd64 --env "GITHUB_RUN_ID=${BANA_ID##*-}" --env "GITHUB_RUN_NUMBER=${BANA_ID##*-}"
+    "${split_platforms[@]}")
   [[ -z ${BANA_JOB:-} ]] || args+=(-j "$BANA_JOB")
   echo "build: act $split_act_version, the workflow $split_workflow${BANA_TIER:+ at $BANA_TIER}${BANA_JOB:+, job $BANA_JOB}"
   envs=(PATH="$PATH" HOME="$HOME" RUNNER_TEMP="$RUNNER_TEMP")
@@ -349,6 +350,8 @@ split_jq_view='"\(.visibility) \(.viewerPermission) \(.isEmpty)"'
 split_jq_keys='.[] | "\(.id) \(.read_only) \(.key) \(.title)"'
 split_jq_files='.[] | .name + " " + .sha'
 split_jq_runs='.[] | "\(.databaseId) \(.url) \(.displayTitle)"'
+split_jq_run='"\(.status) \(.conclusion)", (.jobs[0].steps[]? | "\(.conclusion) \(.name)")'
+split_jq_artifact='.artifacts[] | select(.name == "bana-sealed") | .id'
 
 # The project's files for bana split: ~/.bana/<prefix>/split (0700): seal.pem (the seal key,
 # 0600, never leaves this machine) and seal.pub.pem, deploy.pub (the deploy key's public
@@ -843,25 +846,32 @@ split_ok() { printf '  ok    %s\n' "$*"; }
 split_warn() { printf '  WARN  %s\n' "$*"; s_warns=$((s_warns + 1)); }
 split_fail() { printf '  FAIL  %s\n' "$*"; s_fails=$((s_fails + 1)); }
 
-# The public side as bana left it. --quick: its one workflow as bana pushed it, and the deploy
-# key read-only (before every remote build). Read-only; exit 1 on a FAIL.
+# The two things every remote build needs as bana left them: PUB's one workflow, bana.yml at
+# blob WORKFLOW, and PRIV's deploy key KEY, read-only and the one in DIR/deploy.pub.
+split_quick() { # PUB PRIV WORKFLOW KEY DIR
+  local v line found=''
+  v=$(gh api "repos/$1/contents/.github/workflows" --jq "$split_jq_files" 2>/dev/null) || v='(none)'
+  if [[ -n $3 && $v == "bana.yml $3" ]]; then split_ok "$1's one workflow is bana.yml, as bana pushed it"
+  else split_fail "$1's workflows are not bana's (changed outside bana: bana split sync puts bana's back): $(tr '\n' ' ' <<<"$v")"; fi
+  while read -r line; do
+    [[ ${line%% *} == "$4" ]] && found=$line
+  done < <(gh api "repos/$2/keys" --jq "$split_jq_keys" 2>/dev/null || true)
+  if [[ -z $4 || -z $found ]]; then split_fail "$2 has no deploy key ${4:-(none set)}: bana split rekey"
+  elif [[ $(cut -d' ' -f2 <<<"$found") != true ]]; then split_fail "$2's deploy key $4 can write: bana split rekey"
+  elif [[ -f $5/deploy.pub && $(cut -d' ' -f3-4 <<<"$found") != "$(cut -d' ' -f1-2 "$5/deploy.pub")" ]]; then
+    split_fail "$2's deploy key $4 is not the one bana made: bana split rekey"
+  else split_ok "$2's deploy key $4 is read-only"; fi
+}
+
+# The public side as bana left it. --quick: split_quick alone (bana add's doctor). Read-only;
+# exit 1 on a FAIL.
 split_check() { # [--quick]
-  local pub key wf v line found='' root b
+  local pub key wf v line root b
   s_fails=0 s_warns=0
   pub=$(split_get split.repo) || { echo "bana split is off for $prefix (bana split on)"; return 1; }
   wf=$(split_get split.workflow) || wf=''
   key=$(split_get split.key) || key=''
-  v=$(gh api "repos/$pub/contents/.github/workflows" --jq "$split_jq_files" 2>/dev/null) || v='(none)'
-  if [[ $v == "bana.yml $wf" ]]; then split_ok "$pub's one workflow is bana.yml, as bana pushed it"
-  else split_fail "$pub's workflows are not bana's (changed outside bana: bana split sync puts bana's back): $(tr '\n' ' ' <<<"$v")"; fi
-  while read -r line; do
-    [[ ${line%% *} == "$key" ]] && found=$line
-  done < <(gh api "repos/$repo/keys" --jq "$split_jq_keys" 2>/dev/null || true)
-  if [[ -z $found ]]; then split_fail "$repo has no deploy key $key: bana split rekey"
-  elif [[ $(cut -d' ' -f2 <<<"$found") != true ]]; then split_fail "$repo's deploy key $key can write: bana split rekey"
-  elif [[ -f $s_dir/deploy.pub && $(cut -d' ' -f3-4 <<<"$found") != "$(cut -d' ' -f1-2 "$s_dir/deploy.pub")" ]]; then
-    split_fail "$repo's deploy key $key is not the one bana made: bana split rekey"
-  else split_ok "$repo's deploy key $key is read-only"; fi
+  split_quick "$pub" "$repo" "$wf" "$key" "$s_dir"
   if [[ ${1:-} != --quick ]]; then
     v=$(split_view "$pub") || v=''
     case $v in PUBLIC\ *) split_ok "$pub is public" ;; *) split_fail "$pub is not public, or gh cannot see it (${v:-gh repo view $pub})" ;; esac
@@ -1087,6 +1097,123 @@ split_off() { # [--yes] [--purge-runs]
   say "bana split is off for $prefix: its builds run here$([[ -n $keep ]] && v=$(split_get release.repo) && echo "; releases still publish on $v")."
   echo "  $pub stays. To archive it: gh repo archive $pub"
   echo "  To delete it (and its releases): gh auth refresh -s delete_repo && gh repo delete $pub"
+}
+
+# ---- the remote build: bana ci, for the daemon, when split.ci = github --------------------------
+
+# A build of BANA_SPLIT_SHA on BANA_SPLIT_REPO's GitHub Actions, printed as act prints it: the
+# daemon's statuses, page, report and bana fix take it as a build here. The guard first
+# (split_quick: nothing is dispatched unless PUB is as bana left it); then the dispatch, the
+# run found by its name (bana BANA_BUILD), remote.json and a line naming it; its progress
+# while it runs (a SIGINT cancels it there too); then its sealed output, opened with this
+# machine's seal key: act's lines on stdout, its stderr on stderr, the jobs' uploads in
+# ARTIFACTS, and the bundle deleted from GitHub. The daemon writes the details to the private
+# repository (a commit comment). Exits as act did. BANA_SPLIT_POLL: seconds between asks (10).
+split_remote() { # TIER JOB ARTIFACTS
+  local tier=$1 job=$2 art=$3 pub=${BANA_SPLIT_REPO:-} priv=${BANA_SPLIT_PRIVATE:-} id=${BANA_BUILD:-}
+  local logs=${BANA_SPLIT_LOGS:-private} dir=${BANA_SPLIT_HOME:-} sha=${BANA_SPLIT_SHA:-} ref=${BANA_SPLIT_REF:-}
+  local poll=${BANA_SPLIT_POLL:-10} out line run='' url='' st='' last='' k tmp rc=1 failed pem
+  if [[ -z $pub || -z $priv || ! $id =~ ^[a-z0-9-]+$ || ! $sha =~ ^[0-9a-f]{40}$ || ! -d $dir ]]; then
+    echo "Error: bana split: the daemon gave no repository, build, commit or $dir" >&2
+    return 1
+  fi
+  if ! out=$(
+    s_fails=0 s_warns=0
+    split_quick "$pub" "$priv" "${BANA_SPLIT_WORKFLOW:-}" "${BANA_SPLIT_KEY:-}" "$dir"
+    ((s_fails == 0))
+  ); then
+    echo "Error: $pub is not as bana left it, so nothing was dispatched: $(grep FAIL <<<"$out" | head -1 | sed 's/^ *FAIL *//') (bana split check)" >&2
+    return 1
+  fi
+  if ! out=$(gh workflow run bana.yml -R "$pub" -f "id=$id" -f "sha=$sha" -f "ref=$ref" -f "tier=$tier" -f "job=$job" -f "logs=$logs" 2>&1); then
+    echo "Error: gh workflow run bana.yml -R $pub: $(tail -1 <<<"$out")" >&2
+    return 1
+  fi
+  echo "{\"bana\":\"remote\",\"msg\":\"dispatched to $pub: waiting for its run\"}"
+  for ((k = 0; k < 24; k++)); do
+    line=$(gh run list -R "$pub" --workflow bana.yml --event workflow_dispatch -L 20 --json databaseId,url,displayTitle \
+      --jq "$split_jq_runs" 2>/dev/null | awk -v t="bana $id" '{ n = $1; u = $2; $1 = ""; $2 = ""; sub(/^ +/, "") } $0 == t { print n " " u; exit }') || line=''
+    [[ -z $line ]] || break
+    sleep "$poll"
+  done
+  if [[ -z $line ]]; then
+    echo "Error: the run on $pub did not show up (gh run list -R $pub --workflow bana.yml)" >&2
+    return 1
+  fi
+  run=${line%% *} url=${line#* }
+  [[ $run =~ ^[0-9]+$ && $url == https://* ]] || { echo "Error: gh run list said: $line" >&2; return 1; }
+  trap 'gh run cancel "$run" -R "$pub" >/dev/null 2>&1; echo "Error: cancelled, and its run on $pub too" >&2; exit 130' INT TERM
+  printf '{"repo": "%s", "run": %s, "url": "%s", "logs": "%s"}\n' "$pub" "$run" "$url" "$logs" >remote.json
+  echo "{\"bana\":\"remote\",\"msg\":\"remote run in public repo $pub: $url (logs: $logs)\"}"
+  while :; do
+    out=$(gh run view "$run" -R "$pub" --json status,conclusion,jobs --jq "$split_jq_run" 2>/dev/null) || out=''
+    st=$(head -1 <<<"$out")
+    if [[ -n $st && $st != "$last" ]]; then
+      echo "{\"bana\":\"remote\",\"msg\":\"$pub run $run: ${st% }\"}"
+      last=$st
+    fi
+    case $st in completed\ *) break ;; esac
+    sleep "$poll"
+  done
+  trap - INT TERM
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/bana-remote.XXXXXX")
+  if gh run download "$run" -R "$pub" -n bana-sealed -D "$tmp/sealed" >/dev/null 2>&1; then
+    for pem in "$dir/seal.pem" "$dir/seal.old.pem"; do
+      [[ -f $pem ]] || continue
+      split_unseal "$tmp/sealed" "$tmp/open" "$pem" 2>"$tmp/why" && break
+      rm -rf "$tmp/open"
+    done
+  fi
+  if [[ -f $tmp/open/out/act.jsonl ]]; then
+    cat "$tmp/open/out/act.jsonl"
+    cat "$tmp/open/out/act.err" >&2 2>/dev/null || true
+    rc=$(cat "$tmp/open/out/rc" 2>/dev/null) || rc=1
+    [[ $rc =~ ^[0-9]+$ ]] || rc=1
+    if [[ -n $(ls -A "$tmp/open/art" 2>/dev/null) ]]; then
+      mkdir -p "$art" && cp -R "$tmp/open/art/." "$art/"
+    fi
+    k=$(gh api "repos/$pub/actions/runs/$run/artifacts" --jq "$split_jq_artifact" 2>/dev/null) || k=''
+    [[ ! $k =~ ^[0-9]+$ ]] || gh api -X DELETE "repos/$pub/actions/artifacts/$k" >/dev/null 2>&1 || true
+  else
+    # Nothing sealed: it failed before act ran (the fetch, the runner), or the bundle does not open.
+    failed=$(sed 1d <<<"$out" | awk '$1 == "failure" { $1 = ""; sub(/^ /, ""); print; exit }')
+    if [[ -s $tmp/why ]]; then
+      echo "Error: the run on $pub ($url) left a bundle this machine cannot open: $(tail -1 "$tmp/why") (bana split check)" >&2
+    else
+      echo "Error: the run on $pub ${st#completed }${failed:+ at its $failed step}, with no output sealed: $url" >&2
+    fi
+    rc=1
+  fi
+  rm -rf "$tmp"
+  return "$rc"
+}
+
+# bana ci --remote: this checkout's HEAD (pushed: the public run fetches it from GitHub) built on
+# the public repository, as the daemon builds it, by hand: its steps on the terminal, act's
+# lines in ~/.bana/<prefix>/ci/remote.jsonl, the uploads in ci/remote/artifacts. No comment.
+split_ci_remote() { # ROOT TIER JOB
+  local pub b rc
+  s_settings=$(d_project "$prefix")
+  [[ -f $s_settings ]] || die "$prefix is not added here (bana add): bana ci --remote builds on its bana split repository"
+  pub=$(d_setting split.repo "$s_settings") || pub=''
+  [[ -n $pub ]] || die "bana split is off for $prefix: bana split on first"
+  b=$(git -C "$1" rev-parse HEAD) || die "No commit in $1"
+  git -C "$1" branch -r --contains "$b" 2>/dev/null | grep -q . ||
+    warn "$(git -C "$1" rev-parse --short HEAD) may not be on GitHub yet: the run on $pub fetches it from $repo"
+  mkdir -p "$home/ci/remote"
+  say "bana ci --remote: $(git -C "$1" rev-parse --short HEAD)${2:+ at $2}${3:+, job $3}, on $pub's GitHub Actions"
+  (
+    cd "$home/ci/remote" || exit 1
+    BANA_SPLIT_REPO=$pub BANA_SPLIT_PRIVATE=$repo BANA_BUILD=$prefix-ci-$(date +%s) \
+      BANA_SPLIT_LOGS=$(d_setting split.logs "$s_settings" || echo private) BANA_SPLIT_HOME=$home/split \
+      BANA_SPLIT_WORKFLOW=$(d_setting split.workflow "$s_settings" || true) BANA_SPLIT_KEY=$(d_setting split.key "$s_settings" || true) \
+      BANA_SPLIT_SHA=$b BANA_SPLIT_REF=$(git -C "$1" symbolic-ref -q HEAD || true) \
+      split_remote "$2" "$3" "$home/ci/remote/artifacts"
+  ) >"$home/ci/remote.jsonl" && rc=0 || rc=$?
+  if command -v jq >/dev/null; then BANA_LOGS=private split_runner_steps <"$home/ci/remote.jsonl"; fi
+  sed -n 's/^{"bana":"remote","msg":"\(remote run in [^"]*\)"}$/\1/p' "$home/ci/remote.jsonl"
+  echo "act's lines: $home/ci/remote.jsonl"
+  return "$rc"
 }
 
 split_main() {

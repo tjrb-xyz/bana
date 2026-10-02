@@ -927,6 +927,31 @@ pub struct BuildView {
     /// Its files were refused, or have no installer.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub files_problem: bool,
+    /// It runs, or ran, on a public repository's GitHub Actions (`bana split`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote: Option<Remote>,
+}
+
+/// A build `bana split` runs on a public repository's GitHub Actions: the
+/// repository, and its run once the builder found it (`remote.json`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Remote {
+    pub repo: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+impl Remote {
+    /// How descriptions and comments say where it ran.
+    pub fn label(&self) -> String {
+        match self.run {
+            Some(n) => format!("remote run {n} in public repo {}", self.repo),
+            None => format!("remote run in public repo {}", self.repo),
+        }
+    }
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -1163,14 +1188,21 @@ pub fn project_view(s: &Summary) -> ProjectView {
                 .map(|j| j.key.as_str())
                 .collect();
             let jobs = (!jobs.is_empty()).then(|| jobs.join(", "));
-            tip.push(format!("bana: building {} {at} ({})", s.prefix, b.tier));
+            let remotely = b
+                .remote
+                .as_ref()
+                .map_or(String::new(), |r| format!(" remotely on {}", r.repo));
+            tip.push(format!(
+                "bana: building {} {at} ({}){remotely}",
+                s.prefix, b.tier
+            ));
             tip.extend(jobs.clone());
             tip.push(minutes(b.elapsed));
             tip.extend(queued);
             if w.paused {
                 tip.push("automatic builds paused".into());
             }
-            let mut line = format!("{}: building {at}", s.prefix);
+            let mut line = format!("{}: building {at}{remotely}", s.prefix);
             if let Some(j) = jobs {
                 line += &format!(" · {j}");
             }

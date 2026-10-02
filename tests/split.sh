@@ -532,3 +532,93 @@ check "add again: keeps bana split's settings" has "$sset" "split.repo = acme/wi
 check "split: the risks in docs/SPLIT.md are the wizard's" same \
   "$(awk '/^```text$/ { n++; if (n == 2) { on = 1; next } } on && /^```$/ { exit } on' "$bana_root/docs/SPLIT.md")" "$(sp split_risk)"
 check "split help: every command" same "$(bash "$bana" split help 2>&1 | grep -c '^  bana split')" 12
+
+# ---- split: the remote build, as the daemon runs it (bana ci, with BANA_SPLIT_*) ----------------
+fresh
+split_world
+BANA_SPLIT_CONSENT=$yes_phrase bash "$bana" split on --repo acme/widget-releases </dev/null >"$T/out" 2>&1 || cat "$T/out"
+# What the public run seals: act's lines (the fixture), its exit, an upload; sealed by the runner.
+rb=$T/w/runner && mkdir -p "$rb/out" "$rb/art/7/package"
+cp "$fx/act.jsonl" "$rb/out/act.jsonl" && echo 1 >"$rb/out/rc" && echo "Error: Job 'rust' failed" >"$rb/out/act.err"
+echo tarball >"$rb/art/7/package/pkg.tar.gz.zip"
+BANA_SEAL_PUB=$(cat "$s/seal.pub.pem") sp split_runner_seal "$rb" "$T/w/bundle" >/dev/null
+b7=$T/w/builds/7 && mkdir -p "$b7"
+sha=$(git rev-parse HEAD)
+remote_ci() { # [ENV...]: bana ci as the daemon runs a remote build (Settings::split_env)
+  (cd "$b7" && env BANA_PROJECT_ROOT="$T/w/project" BANA_ACT_LOCKED=1 BANA_BUILD=wid-7 BANA_SPLIT_POLL=0 \
+    BANA_SPLIT_REPO=acme/widget-releases BANA_SPLIT_PRIVATE=acme/widget BANA_SPLIT_LOGS=private \
+    BANA_SPLIT_WORKFLOW="$(sed -n 's/^split.workflow = //p' "$sset")" BANA_SPLIT_KEY="$(sed -n 's/^split.key = //p' "$sset")" \
+    BANA_SPLIT_HOME="$s" BANA_SPLIT_SHA="$sha" BANA_SPLIT_REF=refs/heads/main FAKE_RUN_BUNDLE="$T/w/bundle" FAKE_RUN_CONCLUSION=failure "$@" \
+    bash "$bana" ci quick --event event.json -- --json --artifact-server-path artifacts)
+}
+echo '{}' >"$b7/event.json"
+: >"$FAKE_LOG"
+remote_ci >"$T/out" 2>"$T/err" && st=0 || st=$?
+run=$(sed -n 's/.*"run": \([0-9]*\),.*/\1/p' "$b7/remote.json")
+check "remote build: exits as act did" same "$st" 1
+check "remote build: act's lines, as act printed them" same "$(grep -v '^{"bana":' "$T/out")" "$(cat "$fx/act.jsonl")"
+check "remote build: a line names its run, first" same "$(grep '^{"bana":"remote"' "$T/out" | sed -n 2p)" \
+  '{"bana":"remote","msg":"remote run in public repo acme/widget-releases: https://github.com/acme/widget-releases/actions/runs/'"$run"' (logs: private)"}'
+check "remote build: and its progress" has "$T/out" '{"bana":"remote","msg":"acme/widget-releases run '"$run"': completed failure"}'
+check "remote build: act's stderr" has "$T/err" "Error: Job 'rust' failed"
+check "remote build: remote.json" same "$(cat "$b7/remote.json")" \
+  "{\"repo\": \"acme/widget-releases\", \"run\": $run, \"url\": \"https://github.com/acme/widget-releases/actions/runs/$run\", \"logs\": \"private\"}"
+check "remote build: the uploads where the daemon collects them" same "$(cat "$b7/artifacts/7/package/pkg.tar.gz.zip")" tarball
+check "remote build: the sealed bundle deleted from GitHub" test ! -e "$pub/runs/$run/artifact"
+check "remote build: dispatched with the build's inputs" same "$(tr '\n' ' ' <"$pub/runs/$run/inputs")" \
+  "id=wid-7 sha=$sha ref=refs/heads/main tier=quick job= logs=private "
+check "remote build: on the public repo, the dispatch and the bundle's delete alone" same \
+  "$(writes | sed 's/artifacts\/[0-9]*/artifacts\/N/' | tr '\n' '|')" \
+  "gh workflow run bana.yml -R acme/widget-releases -f id=wid-7 -f sha=$sha -f ref=refs/heads/main -f tier=quick -f job= -f logs=private|gh api -X DELETE repos/acme/widget-releases/actions/artifacts/N|"
+check "remote build: no act, no Docker here" bash -c "! grep -qE '^act |^docker ' '$FAKE_LOG'"
+check "remote build: nothing decrypted left behind" bash -c "! ls '${TMPDIR:-/tmp}' | grep -q bana-remote"
+# The guard: a public side not as bana left it dispatches nothing.
+: >"$FAKE_LOG"
+echo 'on: push' >"$pub/files/.github/workflows/evil.yml"
+remote_ci >"$T/out" 2>"$T/err" && st=0 || st=$?
+check "remote build, the guard: fails" same "$st" 1
+check "remote build, the guard: says why" has "$T/err" "Error: acme/widget-releases is not as bana left it, so nothing was dispatched: acme/widget-releases's workflows are not bana's"
+check "remote build, the guard: no dispatch" bash -c "! grep -q 'workflow run' '$FAKE_LOG'"
+rm "$pub/files/.github/workflows/evil.yml"
+remote_ci BANA_SPLIT_KEY=999 >"$T/out" 2>"$T/err" || true
+check "remote build, the guard: another deploy key" has "$T/err" "acme/widget has no deploy key 999"
+# Nothing sealed: the run failed before act (the fetch), or a bundle this machine cannot open.
+remote_ci FAKE_RUN_NOBUNDLE=1 FAKE_RUN_CONCLUSION=failure >"$T/out" 2>"$T/err" && st=0 || st=$?
+check "remote build, no bundle: one failure, where" same "$st:$(sed 's/runs\/[0-9]*/runs\/N/' "$T/err")" \
+  "1:Error: the run on acme/widget-releases failure at its fetch step, with no output sealed: https://github.com/acme/widget-releases/actions/runs/N"
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$T/w/other.pem" 2>/dev/null
+openssl pkey -in "$T/w/other.pem" -pubout -out "$T/w/other.pub" 2>/dev/null
+BANA_SEAL_PUB=$(cat "$T/w/other.pub") sp split_runner_seal "$rb" "$T/w/bundle2" >/dev/null
+remote_ci FAKE_RUN_BUNDLE="$T/w/bundle2" >"$T/out" 2>"$T/err" && st=0 || st=$?
+check "remote build, another seal key: refused" same "$st" 1
+check "remote build, another seal key: says so" has "$T/err" "left a bundle this machine cannot open: the bundle's key does not open with $s/seal.pem"
+# A cancel (the daemon's SIGINT, to the process group) cancels the run there too.
+: >"$FAKE_LOG"
+# As the daemon starts it: a process group of its own, SIGINT as the default.
+: >"$T/out" && rm -f "$b7/remote.json"
+(cd "$b7" && exec env BANA_PROJECT_ROOT="$T/w/project" BANA_ACT_LOCKED=1 BANA_BUILD=wid-7 BANA_SPLIT_POLL=0.2 \
+  BANA_SPLIT_REPO=acme/widget-releases BANA_SPLIT_PRIVATE=acme/widget BANA_SPLIT_HOME="$s" BANA_SPLIT_SHA="$sha" \
+  BANA_SPLIT_WORKFLOW="$(sed -n 's/^split.workflow = //p' "$sset")" BANA_SPLIT_KEY="$(sed -n 's/^split.key = //p' "$sset")" \
+  FAKE_RUN_VIEWS=300 python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setpgrp(); os.execvp(sys.argv[1], sys.argv[1:])' \
+  bash "$bana" ci quick --event event.json >"$T/out" 2>"$T/err") &
+cpid=$!
+for _ in $(seq 100); do grep -q 'remote run in public repo' "$T/out" 2>/dev/null && break; sleep 0.1; done
+run=$(sed -n 's/.*"run": \([0-9]*\),.*/\1/p' "$b7/remote.json")
+kill -INT -- "-$cpid" 2>/dev/null || true
+wait "$cpid" && st=0 || st=$?
+check "remote build, cancelled: exit 130" same "$st" 130
+check "remote build, cancelled: the run there too" has "$FAKE_LOG" "gh run cancel $run -R acme/widget-releases"
+check "remote build, cancelled: says so" has "$T/err" "Error: cancelled, and its run on acme/widget-releases too"
+# bana ci --list stays act -l, here; a fix round (no BANA_SPLIT_*) runs act here.
+: >"$FAKE_LOG"
+(cd "$b7" && env BANA_PROJECT_ROOT="$T/w/project" BANA_SPLIT_REPO=acme/widget-releases bash "$bana" ci --list) >/dev/null 2>&1 || true
+check "remote build: --list is act's, here" has "$FAKE_LOG" "act -l -C"
+check "remote build: --list dispatches nothing" bash -c "! grep -q 'workflow run' '$FAKE_LOG'"
+# bana ci --remote, by hand: the checkout's HEAD there, its steps here.
+: >"$FAKE_LOG"
+FAKE_RUN_BUNDLE=$T/w/bundle BANA_SPLIT_POLL=0 bash "$bana" ci quick --remote >"$T/out" 2>&1 && st=0 || st=$?
+check "ci --remote: exits as act did" same "$st" 1
+check "ci --remote: the steps" has "$T/out" "rust / cargo test: failed (12s)"
+check "ci --remote: where it ran" has "$T/out" "remote run in public repo acme/widget-releases: https://github.com/acme/widget-releases/actions/runs/"
+check "ci --remote: act's lines kept" same "$(grep -v '^{"bana":' "$HOME/.bana/wid/ci/remote.jsonl")" "$(cat "$fx/act.jsonl")"
+check "ci --remote: its build name" has "$FAKE_LOG" "-f id=wid-ci-"
