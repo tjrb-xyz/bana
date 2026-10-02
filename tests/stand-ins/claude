@@ -1,9 +1,12 @@
 #!/bin/sh
 # Stand-in Claude Code: it never runs a prompt. It logs its arguments and where it ran, and
 # keeps them for the tests in $FAKE_STATE: claude.cwd, and claude.args (each argument ends
-# with a NUL). --version answers as Claude Code does. `mcp add|remove|get NAME` keep the
-# names registered in claude.mcp, one a line (get fails for one that is not there, and
-# with FAKE_CLAUDE_MCP_DOWN set says it failed to connect, exiting 0 as Claude Code does).
+# with a NUL). --version answers as Claude Code does. --help lists its options: -n, --name
+# unless FAKE_CLAUDE_NO_NAME (an older Claude Code), then FAKE_CLAUDE_HELP_LINES more, all
+# from one process, which a closed pipe ends (as it does Claude Code), failing the exit.
+# `mcp add|remove|get NAME` keep the names registered in claude.mcp, one a line (get fails
+# for one that is not there, and with FAKE_CLAUDE_MCP_DOWN set says it failed to connect,
+# exiting 0 as Claude Code does).
 # -p (headless) prints stream-json as Claude Code does, ending in a result line, its keys
 # in Claude Code's order (type near the end)
 # (FAKE_CLAUDE_SUBTYPE: its subtype, success by default; any other exits 1). With
@@ -13,6 +16,14 @@
 # hook's exit goes on a line of claude.stops, and what it said on stderr into the stream.
 printf 'claude %s (in %s)\n' "$*" "$(pwd -P)" >>"$FAKE_LOG"
 [ "${1:-}" != --version ] || { echo "2.1.284 (Claude Code)"; exit 0; }
+if [ "${1:-}" = --help ]; then
+  exec awk -v name="${FAKE_CLAUDE_NO_NAME:-}" -v n="${FAKE_CLAUDE_HELP_LINES:-0}" 'BEGIN {
+    print "Usage: claude [options] [command] [prompt]"
+    if (name == "") print "  -n, --name <name>                     Set a display name for this session"
+    for (i = 1; i <= n; i++) printf "  --option-%-28d One more option\n", i
+    print "  -p, --print                           Print response and exit"
+  }'
+fi
 if [ "${1:-}" = mcp ]; then
   reg=$FAKE_STATE/claude.mcp
   case ${2:-} in

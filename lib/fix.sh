@@ -203,7 +203,9 @@ fix_headless() { # BANA-MANAGER FIX WT DIR
   extra=$(conf fix.allow) turns=$(conf fix.turns 60) budget=$(conf fix.budget_usd 5)
   [[ -z $extra ]] || allow+=" $extra"
   say "Claude Code works on fix $fix unattended (at most $turns turns and \$$budget): tail -f $log"
-  (cd "$wt" && exec claude -p "$(cat "$dir/prompt.txt")" -n "bana fix $fix" --permission-mode dontAsk \
+  local named=()
+  ! fix_claude_names || named=(-n "bana fix $fix")
+  (cd "$wt" && exec claude -p "$(cat "$dir/prompt.txt")" ${named[@]+"${named[@]}"} --permission-mode dontAsk \
     --allowedTools "$allow" --disallowedTools "$deny" --max-turns "$turns" --max-budget-usd "$budget" \
     --strict-mcp-config --mcp-config "$mc" --output-format stream-json --verbose) </dev/null >"$log" || rc=$?
   # The last line whose type is result, whatever the order of its keys.
@@ -280,8 +282,24 @@ fix_start() {
   # A log pasted on stdin used it up: Claude Code gets the terminal back.
   if [[ ! -t 0 ]] && (: </dev/tty) 2>/dev/null; then exec </dev/tty; fi
   cd "$wt" || die "No worktree $wt"
-  # --mcp-config takes several values: -n ends them, before the prompt.
-  exec claude ${mcp[@]+"${mcp[@]}"} -n "bana fix $fix" "$(cat "$dir/prompt.txt")"
+  # --mcp-config takes several values: -n ends them, before the prompt (or --, for a Claude
+  # Code without session names).
+  if fix_claude_names; then
+    exec claude ${mcp[@]+"${mcp[@]}"} -n "bana fix $fix" "$(cat "$dir/prompt.txt")"
+  fi
+  exec claude ${mcp[@]+"${mcp[@]}"} -- "$(cat "$dir/prompt.txt")"
+}
+
+# Whether this Claude Code names its sessions (-n, --name); an older one says "unknown
+# option '-n'", so bana says once that its session goes unnamed. The help is read whole
+# first: `claude --help | grep -q` stops reading at the match, and claude, its pipe closed,
+# fails the pipeline under pipefail, as if it had no --name.
+fix_claude_names() {
+  local h
+  h=$(claude --help 2>/dev/null) || true
+  [[ $h != *--name* ]] || return 0
+  echo "  this Claude Code predates session names (-n, --name): the session goes unnamed"
+  return 1
 }
 
 # ---- the fixes ---------------------------------------------------------------------------

@@ -898,6 +898,13 @@ print(list(s), s["bana"]["args"])' "$(claude_arg 17)")" "['bana'] ['mcp', '--dir
   check "fix --headless: the gate blocked once for the red round" same "$(tr '\n' ' ' <"$FAKE_STATE/claude.stops")" "2 0 "
   check "fix --headless: with what failed" has "$d/fix/$x5.d/claude.jsonl" "Round 0 failed: rust (build 9). You have 5 rounds left"
   check "fix --headless: says how Claude Code stopped" has "$T/out" "Claude Code stopped: error_max_turns"
+  # An older Claude Code, without -n (--name): unattended too, its session goes unnamed.
+  rc=0
+  FAKE_CLAUDE_NO_NAME=1 bash "$bana" fix --log "$paste" --headless >"$T/out" 2>&1 || rc=$?
+  check "fix (headless): an older Claude Code gets no -n, still -p and stream-json" \
+    same "$rc $(claude_arg 1) $(claude_arg 3) $(claude_arg 4) $(claude_arg 16) $(claude_arg 17) $(claude_arg 18) $(claude_argc)" \
+    "0 -p --permission-mode dontAsk --output-format stream-json --verbose 18"
+  check "fix (headless): and bana says its session goes unnamed, once" same "$(grep -c 'predates session names' "$T/out")" 1
 
   # With the daemon, a fix in a terminal is registered too (round 0), and bana fix list
   # says where each stands; bana fix drop tells the daemon, which drops its round builds.
@@ -906,6 +913,17 @@ print(list(s), s["bana"]["args"])' "$(claude_arg 17)")" "['bana'] ['mcp', '--dir
   check "fix: in a terminal too, the fix is registered with the daemon" has "$FAKE_LOG" \
     "-X POST -H Content-Type: application/json --data {\"fix\":\"$x5\"} http://127.0.0.1:8470/ci/v1/p/wid/fixes"
   check "fix: and Claude Code starts, interactive" same "$(claude_arg 1)" "-n"
+  check "fix: a Claude Code with session names is not told it lacks them" lacks "$T/out" "predates session names"
+  # An older Claude Code, without -n (--name): -- ends the options before the prompt.
+  FAKE_CLAUDE_NO_NAME=1 bash "$bana" fix --log "$paste" >"$T/out" 2>&1 || true
+  check "fix: a Claude Code without session names gets no -n" lacks "$T/out" "unknown option"
+  check "fix: -- before the prompt instead" same "$(claude_arg 1) $(claude_argc)" "-- 2"
+  check "fix: and the prompt" same "$(claude_arg 2)" "$(cat "$d/fix/$x5.d/prompt.txt")"
+  check "fix: and bana says its session goes unnamed, once" same "$(grep -c 'predates session names' "$T/out")" 1
+  # Its help read whole: grep -q would stop at -n, and claude, its pipe closed, fail pipefail.
+  FAKE_CLAUDE_HELP_LINES=20000 bash "$bana" fix --log "$paste" >"$T/out" 2>&1 || true
+  check "fix: --name found after 20000 lines of help under pipefail" \
+    same "$(claude_arg 1) $(claude_arg 2) $(claude_argc)" "-n bana fix $x5 3"
   bash "$bana" fix list >"$T/out" 2>&1 || true
   check "fix list: where it stands, its rounds and round 0" has "$T/out" "$x5  open, 0 of 5 rounds, round 0 failed; bana/fix-$x5"
   : >"$FAKE_LOG"
