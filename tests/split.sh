@@ -16,7 +16,7 @@ mkdir -p .github/workflows
 printf 'on: workflow_dispatch\njobs:\n  rust:\n    runs-on: wid-linux\n    steps:\n      - run: cargo test\n' >.github/workflows/ci.yml
 bash "$bana" split render >"$T/w/bana.yml" 2>"$T/out" || cat "$T/out"
 check "split render: lints as bana runs it" same "$(bash "$bana" split lint "$T/w/bana.yml" 2>&1)" "$T/w/bana.yml: as bana runs it"
-check "split render: dispatch only, and run-name bana <id>" has "$T/w/bana.yml" "run-name: bana \${{ inputs.id }}"
+check "split render: dispatch only, and run-name bana <id> <nonce>" has "$T/w/bana.yml" "run-name: bana \${{ inputs.id }} \${{ inputs.nonce }}"
 check "split render: the token gets nothing" has "$T/w/bana.yml" "permissions: {}"
 check "split render: upload-artifact, pinned" has "$T/w/bana.yml" "uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1"
 check "split render: the deploy key in the fetch step alone" same "$(grep -c 'secrets\.' "$T/w/bana.yml")" 2
@@ -27,8 +27,10 @@ check "split render: the runner is lib/split.sh's own" same \
   "$(awk '/^# ---- the runner: /, /^# ---- end of the runner/' "$bana_root/lib/split.sh")"
 check "split render: act, pinned" has "$T/w/runner.sh" "split_act_sha256='0191d6f1f3b716b5c55820032605d05fc3c1cdbf581ebeff655019e5dd1524c0'"
 check "split render: GitHub's host key, pinned" has "$T/w/runner.sh" "split_host_key='github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5"
-check "split render: Linux jobs in act.image" has "$T/w/runner.sh" "'-P' 'wid-linux=catthehacker/ubuntu:act-24.04'"
-check "split render: <prefix>-systemd's on the runner's machine (it has systemd)" has "$T/w/runner.sh" "'-P' 'wid-systemd=-self-hosted'"
+check "split render: Linux jobs in act.image, pinned by digest" has "$T/w/runner.sh" "'-P' 'wid-linux=catthehacker/ubuntu:act-24.04@sha256:c58e2b364da03b0c804c7d660f2ecbedf2f221a382b9baa0b344b0144780ff43'"
+check "split render: <prefix>-systemd's not run (not on the runner's machine, which holds the key)" has "$T/w/runner.sh" "'-P' 'wid-systemd=' "
+check "split render: no job on the runner's machine" lacks "$T/w/runner.sh" "=-self-hosted"
+check "split render: an image of its own, unless pinned, not run" has "$T/w/runner.sh" "'-P' 'ubuntu-20.04=' "
 check "split render: macOS jobs not run" has "$T/w/runner.sh" "'-P' 'wid-macos='"
 check "split render: no \${{ }} in the runner" lacks "$T/w/runner.sh" '${{'
 yq=${YQ:-$(command -v yq || true)}
@@ -55,6 +57,16 @@ mutant "actions/cache" '{ sub(/actions\/upload-artifact@/, "actions/cache@"); pr
 mutant "a cache input" '{ print } /^          retention-days: 1$/ { print "          cache: true" }' "a cache"
 mutant "no permissions" '!/^permissions:/' "no permissions: {}"
 mutant "a week of retention" '{ sub(/retention-days: 1$/, "retention-days: 7"); print }' "retention-days: 1, not more"
+mutant "an image by tag" '{ sub(/act-24.04@sha256:[0-9a-f]+/, "act-24.04"); print }' "wid-linux=catthehacker/ubuntu:act-24.04: an image pinned by digest only"
+mutant "a job on the runner's machine" '{ sub(/wid-systemd=/, "wid-systemd=-self-hosted"); print }' "wid-systemd runs on the machine of the runner"
+# act.image by tag: the digest Docker has here (the stand-in docker: none, so render refuses).
+printf 'act.image = example/img:1\n' >>.github/bana.conf
+bash "$bana" split render >"$T/out" 2>&1 && st=0 || st=$?
+check "split render: an image by tag with no digest here: refused" same "$st" 1
+check "split render: says how to pin it" has "$T/out" "bana split runs images pinned by digest: example/img:1 has none here"
+printf 'act.image = example/img:1@sha256:%s\n' "$(printf '0%.0s' {1..64})" >>.github/bana.conf
+bash "$bana" split render >"$T/w/pinned.yml" 2>"$T/out" || cat "$T/out"
+check "split render: an image pinned by digest, as it is" has "$T/w/pinned.yml" "'-P' 'wid-linux=example/img:1@sha256:0000"
 
 # ---- split: the runner's steps, on GitHub's side (here: a bare repository, a stand-in act) ----------
 fresh
@@ -71,14 +83,14 @@ run_step() { # STEP [ENV...]: the step as bana.yml runs it, with its inputs
   local s=$1
   shift
   env RUNNER_TEMP="$rt" BANA_ID=wid-7 BANA_SHA="$sha" BANA_REF=refs/heads/main BANA_TIER=quick BANA_JOB='' \
-    BANA_LOGS=private GITHUB_TOKEN=ghp_leak "$@" bash "$T/w/runner.sh" "$s"
+    BANA_LOGS=private BANA_NONCE=0123456789abcdef0123456789abcdef GITHUB_RUN_ID=4242 GITHUB_TOKEN=ghp_leak "$@" bash "$T/w/runner.sh" "$s"
 }
 run_step check >"$T/out" 2>&1
 check "runner check: the inputs bana sends" same "$(cat "$T/out")" "check: ok"
 run_step check BANA_SHA="$sha; curl evil" >"$T/out" 2>&1 && st=0 || st=$?
 check "runner check: refuses a sha that is no commit" same "$st:$(cat "$T/out")" "1:check: failed (not as bana sends them: sha)"
-run_step check BANA_TIER='$(id)' BANA_LOGS=all BANA_REF='refs/heads/a b' >"$T/out" 2>&1 || true
-check "runner check: and a ref, tier or logs bana would not send" has "$T/out" "not as bana sends them: ref tier logs"
+run_step check BANA_TIER='$(id)' BANA_LOGS=all BANA_REF='refs/heads/a b' BANA_NONCE=x >"$T/out" 2>&1 || true
+check "runner check: and a nonce, ref, tier or logs bana would not send" has "$T/out" "not as bana sends them: nonce ref tier logs"
 run_step fetch >"$T/out" 2>&1 && st=0 || st=$?
 check "runner fetch: no deploy key, no fetch" same "$st:$(cat "$T/out")" "1:fetch: failed (no deploy key here: bana split check)"
 key='-----BEGIN OPENSSH PRIVATE KEY-----
@@ -105,9 +117,10 @@ EOF
 chmod +x "$T/w/act"
 run_step build BANA_TEST_ACT="$T/w/act" BANA_SOURCE_KEY=leaked BANA_SOURCE=acme/widget >"$T/out" 2>&1 && st=0 || st=$?
 check "runner build: act's exit" same "$st:$(cat "$rt/bana/out/rc")" "1:1"
-check "runner build: each step, ok or failed, and its time" has "$T/out" "rust / cargo test: failed (12s)"
+check "runner build: each step, by its id, ok or failed, and its time" has "$T/out" "rust / step 0: failed (12s)"
 check "runner build: and each job" has "$T/out" "package: ok"
-check "runner build: a matrix value in a step's name is hidden" has "$T/out" "package / build *: ok (61s)"
+check "runner build: no step's name (a script, an expression's value, a matrix value)" lacks "$T/out" "cargo test"
+check "runner build: an id bana would not print, as ?" has "$T/out" "rust / step ?: ok (0s)"
 check "runner build: no output of the build" lacks "$T/out" "PRIVATE"
 check "runner build: no matrix value" lacks "$T/out" "MATRIXVALUE"
 check "runner build: no path" lacks "$T/out" "/home/runner"
@@ -128,8 +141,9 @@ check "runner build, logs public: the build's output too" has "$T/out" "PRIVATE-
 check "runner build, logs public: commands still off" has "$T/out" "::stop-commands::bana-"
 : >"$T/w/summary"
 run_step summary GITHUB_STEP_SUMMARY="$T/w/summary" >/dev/null 2>&1
-check "runner summary: a table of the steps" has "$T/w/summary" "| rust / cargo test | failed | 12s |"
-check "runner summary: the totals" has "$T/w/summary" "4 steps: 3 ok, 1 failed. The output is with the owner."
+check "runner summary: a table of the steps" has "$T/w/summary" "| rust / step 0 | failed | 12s |"
+check "runner summary: the totals" has "$T/w/summary" "6 steps: 5 ok, 1 failed. The output is with the owner."
+check "runner summary: no step's name" lacks "$T/w/summary" "cargo test"
 check "runner summary: nothing of the output" lacks "$T/w/summary" "PRIVATE"
 # The seal, to a key made here (bana split on makes it, in ~/.bana/<prefix>/split).
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$T/w/seal.pem" 2>/dev/null
@@ -137,6 +151,8 @@ openssl pkey -in "$T/w/seal.pem" -pubout -out "$T/w/seal.pub.pem" 2>/dev/null
 mkdir -p "$rt/bana/art/1/package" && echo tarball >"$rt/bana/art/1/package/pkg.tar.gz.zip"
 run_step seal >"$T/out" 2>&1 && st=0 || st=$?
 check "runner seal: no public key, no seal" same "$st:$(cat "$T/out")" "1:seal: failed (no BANA_SEAL_PUB here: bana split check)"
+run_step seal BANA_SEAL_PUB="$(cat "$T/w/seal.pub.pem")" GITHUB_RUN_ID= >"$T/out" 2>&1 && st=0 || st=$?
+check "runner seal: no run id, no seal" same "$st:$(cat "$T/out")" "1:seal: failed (no run id)"
 run_step seal BANA_SEAL_PUB="$(cat "$T/w/seal.pub.pem")" >"$T/out" 2>&1 && st=0 || st=$?
 check "runner seal: ok, and its size" same "$st:$(sed 's/([0-9]* bytes)/(N bytes)/' "$T/out")" "0:seal: ok (N bytes)"
 check "runner seal: what upload-artifact takes, alone" same "$(cd "$rt/bana/sealed" && echo *)" "bundle.enc key.enc"
@@ -148,6 +164,9 @@ check "unseal: act's output, as act wrote it" same "$(cat "$o/out/act.jsonl")" "
 check "unseal: act's exit" same "$(cat "$o/out/rc")" 1
 check "unseal: the jobs' uploads" same "$(cat "$o/art/1/package/pkg.tar.gz.zip")" tarball
 check "unseal: no archive left" test ! -e "$o/bundle.tgz"
+rm -rf "$o"
+sp split_unseal "$s" "$o" "$T/w/seal.pem" 4242 wid-7 "$sha" 0123456789abcdef0123456789abcdef 2>"$T/out" || cat "$T/out"
+check "unseal: sealed by the run asked for" same "$(cat "$o/out/rc" 2>/dev/null)" 1
 unsealed() { # NAME SEALED WHY [PEM]
   rm -rf "$T/w/o2"
   sp split_unseal "$2" "$T/w/o2" "${4:-$T/w/seal.pem}" >"$T/out" 2>&1 && st=0 || st=$?
@@ -163,17 +182,46 @@ openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$T/w/other.pe
 unsealed "another key's" "$s" "the bundle's key does not open with" "$T/w/other.pem"
 cp -R "$s" "$T/w/s3" && printf 'pass x\n' | openssl pkeyutl -encrypt -pubin -inkey "$T/w/seal.pub.pem" -pkeyopt rsa_padding_mode:oaep -out "$T/w/s3/key.enc"
 unsealed "a key file not bana's" "$T/w/s3" "the bundle's key is not bana's"
-# One sealed like bana's, holding more than out/ and art/.
-mkdir -p "$T/w/s4" "$T/w/evil/out" "$T/w/evil/etc" && echo x >"$T/w/evil/etc/x" && echo y >"$T/w/evil/out/y"
-tar -czf "$T/w/evil.tgz" -C "$T/w/evil" out etc
-pass=$(openssl rand -hex 32)
-printf '%s\n' "$pass" | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -salt -pass stdin -in "$T/w/evil.tgz" -out "$T/w/s4/bundle.enc"
-printf 'bana-seal 1\npass %s\nsha256 %s\n' "$pass" "$(sp split_sha256 "$T/w/s4/bundle.enc")" |
-  openssl pkeyutl -encrypt -pubin -inkey "$T/w/seal.pub.pem" -pkeyopt rsa_padding_mode:oaep -out "$T/w/s4/key.enc"
-unsealed "an archive with more" "$T/w/s4" "the bundle holds more than out/ and art/"
+unsealed2() { # NAME SEALED WHY RUN ID SHA NONCE: refused for another run
+  rm -rf "$T/w/o2"
+  sp split_unseal "$2" "$T/w/o2" "$T/w/seal.pem" "$4" "$5" "$6" "$7" >"$T/out" 2>&1 && st=0 || st=$?
+  check "unseal: refuses $1" same "$st" 1
+  check "unseal: $1: says why" has "$T/out" "$3"
+  check "unseal: $1: opens nothing" test ! -e "$T/w/o2/out" -a ! -e "$T/w/o2/bundle.tgz"
+}
+unsealed2 "another run's" "$s" "the bundle was sealed for another run (its run is not 4243)" 4243 wid-7 "$sha" 0123456789abcdef0123456789abcdef
+unsealed2 "another build's" "$s" "its id is not wid-8" 4242 wid-8 "$sha" 0123456789abcdef0123456789abcdef
+unsealed2 "another dispatch's" "$s" "its nonce is not ffff" 4242 wid-7 "$sha" ffff
+# Sealed like bana's, from DIR (its out/ and the rest), in sealed/N. VERSION: bana-seal's.
+seal_like() { # N DIR [VERSION]
+  local pass
+  mkdir -p "$T/w/sealed/$1"
+  (cd "$2" && tar -czf "$T/w/evil.tgz" -- *)
+  pass=$(openssl rand -hex 32)
+  printf '%s\n' "$pass" | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -salt -pass stdin -in "$T/w/evil.tgz" -out "$T/w/sealed/$1/bundle.enc"
+  printf 'bana-seal %s\npass %s\nsha256 %s\nrun 1\nid x\nsha y\nnonce z\n' "${3:-2}" "$pass" "$(sp split_sha256 "$T/w/sealed/$1/bundle.enc")" |
+    openssl pkeyutl -encrypt -pubin -inkey "$T/w/seal.pub.pem" -pkeyopt rsa_padding_mode:oaep -out "$T/w/sealed/$1/key.enc"
+}
+mkdir -p "$T/w/evil1/out" "$T/w/evil1/etc" && echo x >"$T/w/evil1/etc/x" && echo y >"$T/w/evil1/out/y"
+seal_like 4 "$T/w/evil1"
+unsealed "an archive with more" "$T/w/sealed/4" "the bundle holds more than out/ and art/"
+rm -rf "$T/w/evil1/etc" && seal_like 5 "$T/w/evil1" 1
+unsealed "an older bana.yml's seal" "$T/w/sealed/5" "the bundle's key is not bana's (an older bana.yml's: bana split sync)"
+mkdir -p "$T/w/evil1/art" && ln -s /etc/passwd "$T/w/evil1/art/x" && seal_like 6 "$T/w/evil1"
+unsealed "a symbolic link" "$T/w/sealed/6" "the bundle holds a link or a special file"
+rm "$T/w/evil1/art/x" && ln "$T/w/evil1/out/y" "$T/w/evil1/art/x" && seal_like 7 "$T/w/evil1"
+unsealed "a hard link" "$T/w/sealed/7" "the bundle holds a link or a special file"
+rm "$T/w/evil1/art/x" && head -c 4096 /dev/zero >"$T/w/evil1/art/z" && seal_like 8 "$T/w/evil1"
+rm -rf "$T/w/o2"
+BANA_SPLIT_MAX=1000 sp split_unseal "$T/w/sealed/8" "$T/w/o2" "$T/w/seal.pem" >"$T/out" 2>&1 && st=0 || st=$?
+check "unseal: refuses more than BANA_SPLIT_MAX" same "$st:$(cat "$T/out")" "1:the bundle holds more than 1000 bytes"
+sp split_unseal "$T/w/sealed/8" "$T/w/o2" "$T/w/seal.pem" >"$T/out" 2>&1 && st=0 || st=$?
+check "unseal: plain files and directories alone: opened" same "$st:$(wc -c <"$T/w/o2/art/z" | tr -d ' ')" "0:4096"
 # The step lines, from act's output alone.
-check "steps: only the step lines" same "$(sp split_runner_steps <"$fx/act.jsonl" | tr '\n' '|')" \
-  "rust / Set up job: ok (2s)|rust / cargo test: failed (12s)|rust: failed|package / build *: ok (61s)|package / Post upload: ok (1s)|package: ok|"
+check "steps: only the step lines, by act's ids" same "$(sp split_runner_steps <"$fx/act.jsonl" | tr '\n' '|')" \
+  "rust / setup job: ok (2s)|rust / step 0: failed (12s)|rust / step 1: ok (1s)|rust / step ?: ok (0s)|rust: failed|package / step 0: ok (61s)|package / Post step 1: ok (1s)|package: ok|"
+check "steps, here (bana's machine): with their names" same "$(BANA_LOGS=here sp split_runner_steps <"$fx/act.jsonl" | sed -n 2p)" \
+  "rust / cargo test: failed (12s)"
 check "steps, logs public: and the output" same "$(BANA_LOGS=public sp split_runner_steps <"$fx/act.jsonl" | grep -c PRIVATE)" 2
 
 # ---- split: bana split on, the wizard (GitHub: the gh stand-in's store) --------------------------
@@ -275,6 +323,11 @@ check "split on: titled for the public repository" same "$(cat "$FAKE_GH_STORE"/
 check "split on: the public repository, public" same "$(cat "$pub/visibility")" PUBLIC
 check "split on: its README, with the marker" has "$pub/files/README.md" "<!-- bana split: "
 check "split on: its marker names no repository" lacks "$pub/files/README.md" "acme/widget "
+check "split on: its marker, a random id kept here" has "$pub/files/README.md" "<!-- bana split: $(cat "$HOME/.bana/wid/split.mark") -->"
+check "split on: says the names that tell the private one" has "$T/out" "acme/widget-releases names acme/widget's name in public"
+check "split on: and the prefix" has "$T/out" "The prefix wid, in every run's name and labels on acme/widget-releases, is public"
+check "split on: one ruleset" same "$(find "$pub/rulesets" -name '*.json' | wc -l | tr -d ' ')" 1
+check "split on: bana.yml enabled" test ! -e "$pub/settings/disabled.bana.yml"
 check "split on: its one workflow, bana's render" same "$(cat "$pub/files/.github/workflows/bana.yml")" "$(bash "$bana" split render)"
 check "split on: and nothing else" same "$(cd "$pub/files" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" "./.github/workflows/bana.yml ./README.md "
 check "split on: bana-source's secrets" same "$(cd "$pub/envs/bana-source/secrets" && echo *)" "BANA_SOURCE BANA_SOURCE_KEY"
@@ -303,7 +356,7 @@ check "settings: split's" has "$T/out" "split.repo = acme/widget-releases"
 check "settings: the release repo" has "$T/out" "release.repo = acme/widget-releases"
 : >"$FAKE_LOG"
 bash "$bana" split check >"$T/out" 2>&1 && st=0 || st=$?
-check "split check: all ok" same "$st:$(grep -c '^  ok ' "$T/out")" "0:14"
+check "split check: all ok" same "$st:$(grep -c '^  ok ' "$T/out")" "0:15"
 check "split check: writes nothing" same "$(writes)" ""
 bash "$bana" split status >"$T/out" 2>&1 || true
 check "split status: on, where" has "$T/out" "public repository: https://github.com/acme/widget-releases"
@@ -321,7 +374,7 @@ wfs=$pub/files/.github/workflows
 echo 'on: push' >"$wfs/other.yml"
 failed_check "another workflow" "FAIL  acme/widget-releases's workflows are not bana's"
 bash "$bana" split check --quick >"$T/out" 2>&1 && st=0 || st=$?
-check "split check --quick: catches it too" same "$st:$(grep -c '^  ok \|^  FAIL ' "$T/out")" "1:2"
+check "split check --quick: catches it too" same "$st:$(grep -c '^  ok \|^  FAIL ' "$T/out")" "1:3"
 rm "$wfs/other.yml"
 cp "$wfs/bana.yml" "$T/w/kept.yml" && echo '# changed' >>"$wfs/bana.yml"
 failed_check "an edited bana.yml" "FAIL  acme/widget-releases's workflows are not bana's"
@@ -428,6 +481,69 @@ check "split status: off" has "$T/out" "bana split is off for wid (acme/widget):
 bash "$bana" remove </dev/null >/dev/null 2>&1 && st=0 || st=$?
 check "remove: once off, as before" same "$st" 0
 
+# off when gh fails: nothing is said to be gone that may not be, and nothing here goes.
+fresh
+split_world
+BANA_SPLIT_CONSENT=$yes_phrase bash "$bana" split on --repo acme/widget-releases </dev/null >"$T/out" 2>&1 || cat "$T/out"
+k=$(basename "$(echo "$FAKE_GH_STORE"/repos/acme/widget/keys/*)")
+FAKE_GH=0 bash "$bana" split off --yes </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "split off, gh failing: stops" same "$st" 1
+check "split off, gh failing: at the key" has "$T/out" "the deploy key on acme/widget ... failed"
+check "split off, gh failing: says nothing is gone" lacks "$T/out" "gone"
+check "split off, gh failing: the key is still there" test -d "$FAKE_GH_STORE/repos/acme/widget/keys/$k"
+check "split off, gh failing: the settings stay" has "$sset" "split.key = $k"
+check "split off, gh failing: and the files here" test -f "$s/seal.pem"
+FAKE_GH_FAIL_AT=variable bash "$bana" split off --yes </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "split off, the variable failing: stops" same "$st" 1
+check "split off, the variable failing: the key went" test ! -e "$FAKE_GH_STORE/repos/acme/widget/keys/$k"
+check "split off, the variable failing: says what is left" has "$T/out" "still on acme/widget-releases: the variable BANA_SEAL_PUB;"
+check "split off, the variable failing: not gone" has "$T/out" "acme/widget-releases's secrets, environment and variable ... failed"
+check "split off, the variable failing: the settings stay" has "$sset" "split.repo = acme/widget-releases"
+check "split off, the variable failing: and the files here" test -f "$s/seal.pem"
+bash "$bana" split off --yes </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "split off again: done" same "$st" 0
+check "split off again: the key, gone already, is gone" has "$T/out" "the deploy key on acme/widget ... gone"
+check "split off again: the rest" test ! -e "$pub/envs/bana-source" -a ! -e "$pub/vars/BANA_SEAL_PUB"
+check "split off again: the settings go" same "$(grep -c '^split\.' "$sset")" 0
+check "split off: the README's marker stays here" test -s "$HOME/.bana/wid/split.mark"
+# On again with the same public repository: taken as bana's, bana.yml enabled again, one ruleset.
+BANA_SPLIT_CONSENT=$yes_phrase bash "$bana" split on --repo acme/widget-releases </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "split on after off: done" same "$st" 0
+[[ $st == 0 ]] || sed 's/^/  | /' "$T/out"
+check "split on after off: bana.yml enabled again" test ! -e "$pub/settings/disabled.bana.yml"
+check "split on after off: still one ruleset" same "$(find "$pub/rulesets" -name '*.json' | wc -l | tr -d ' ')" 1
+check "split on after off: check passes" lacks "$T/out" "FAIL"
+gh workflow disable bana.yml -R acme/widget-releases
+bash "$bana" split check --quick >"$T/out" 2>&1 && st=0 || st=$?
+check "split check: a disabled bana.yml fails" same "$st" 1
+check "split check: says how to enable it" has "$T/out" "FAIL  bana.yml is disabled on acme/widget-releases: bana split sync enables it"
+bash "$bana" split sync --yes >"$T/out" 2>&1 || cat "$T/out"
+check "split sync: enables it" test ! -e "$pub/settings/disabled.bana.yml"
+
+# rekey failing half way: split.key is the key in use, whatever failed.
+old=$(sed -n 's/^split.key = //p' "$sset")
+FAKE_GH_FAIL_AT=variable bash "$bana" split rekey --yes </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+new=$(sed -n 's/^split.key = //p' "$sset")
+check "split rekey, the seal failing: stops" same "$st" 1
+check "split rekey, the seal failing: the new deploy key is in split.key" bash -c "[[ '$new' != '$old' && -d '$FAKE_GH_STORE/repos/acme/widget/keys/$new' ]]"
+bash "$bana" split check --quick >"$T/out" 2>&1 && st=0 || st=$?
+check "split rekey, the seal failing: the deploy key checks" same "$st" 0
+old=$new
+FAKE_GH_FAIL_AT=secret bash "$bana" split rekey --yes </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "split rekey, the secret failing: stops" same "$st:$(sed -n 's/^split.key = //p' "$sset")" "1:$old"
+check "split rekey, the secret failing: says the old key stays" has "$T/out" "failed: the old key ($old) stays"
+check "split rekey, the secret failing: the new key deleted" same "$(ls "$FAKE_GH_STORE/repos/acme/widget/keys")" "$old"
+bash "$bana" split check --quick >"$T/out" 2>&1 && st=0 || st=$?
+check "split rekey, the secret failing: the old key checks (its public half here)" same "$st" 0
+bash "$bana" split rekey --yes </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "split rekey, again: done" same "$st" 0
+
+# The ruleset failing: that step fails (and a run again updates the one there).
+fresh
+split_world
+FAKE_GH_FAIL_AT=ruleset BANA_SPLIT_CONSENT=$yes_phrase bash "$bana" split on --repo acme/widget-releases </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "split on, the ruleset failing: stops there" same "$st:$(grep -c '\[5/9\] .* failed$' "$T/out")" "1:1"
+
 # A stop half way, then on again: it goes on, and does nothing twice.
 fresh
 split_world
@@ -479,24 +595,29 @@ printf '%s\n' "expect The public repository [acme/widget-releases]:" "send " "ex
 on_tty "$T/w/tty" bash "$bana" split on >"$T/out" 2>&1 && st=0 || st=$?
 check "split on, a terminal: done" same "$st" 0
 check "split on, a terminal: offers both ways" has "$T/out" "2. on GitHub's new-repository page, filled in for you; then press Enter here"
-check "split on, a terminal: 1 makes it with gh" has "$FAKE_LOG" "gh repo create acme/widget-releases --public --disable-wiki --disable-issues --description CI runs and releases of widget, built by bana. The source is private."
+check "split on, a terminal: 1 makes it with gh" has "$FAKE_LOG" "gh repo create acme/widget-releases --public --disable-wiki --disable-issues --description CI runs and releases, built by bana. The source is private."
 check "split on, a terminal: logs private, the default" has "$sset" "split.logs = private"
 
-# GitHub's page: bana opens it filled in, waits, and takes the repository once it is there.
+# GitHub's page: after the typed yes and the deploy key, bana opens it filled in, waits, and takes
+# the repository once it is there.
 fresh
 split_world
 printf '%s\n' "expect The public repository [acme/widget-releases]:" "send acme/widget-ci" "expect Which? [1]" "send 2" \
+  "expect Which? [1]" "send 2" "expect Type \"yes, logs are public\"" \
+  "send yes, logs are public" "expect Type \"$yes_phrase\"" "send $yes_phrase" \
   "expect Press Enter once it is made" "send " "expect is not there yet" \
   "run mkdir -p '$FAKE_GH_STORE/repos/acme/widget-ci/files' && echo PRIVATE >'$FAKE_GH_STORE/repos/acme/widget-ci/visibility'" \
   "expect Press Enter once it is made" "send " "expect is not public" \
   "run echo PUBLIC >'$FAKE_GH_STORE/repos/acme/widget-ci/visibility'" \
-  "expect Press Enter once it is made" "send " "expect Which? [1]" "send 2" "expect Type \"yes, logs are public\"" \
-  "send yes, logs are public" "expect Type \"$yes_phrase\"" "send $yes_phrase" >"$T/w/tty"
+  "expect Press Enter once it is made" "send " >"$T/w/tty"
 FAKE_OS=Darwin on_tty "$T/w/tty" bash "$bana" split on >"$T/out" 2>&1 && st=0 || st=$?
 check "split on, GitHub's page: done" same "$st" 0
 [[ $st == 0 ]] || tail -20 "$T/out"
+check "split on, GitHub's page: after the typed yes and the deploy key" same \
+  "$(grep -oE "Type \"$yes_phrase\"|\[2/9\] a read-only deploy key on acme/widget ... ok|Press Enter once it is made" "$T/out" | uniq | tr '\n' '|')" \
+  "Type \"$yes_phrase\"|[2/9] a read-only deploy key on acme/widget ... ok|Press Enter once it is made|"
 check "split on, GitHub's page: opened, filled in" has "$FAKE_LOG" \
-  "open https://github.com/new?owner=acme&name=widget-ci&visibility=public&description=CI%20runs%20and%20releases%20of%20widget%2C%20built%20by%20bana.%20The%20source%20is%20private."
+  "open https://github.com/new?owner=acme&name=widget-ci&visibility=public&description=CI%20runs%20and%20releases%2C%20built%20by%20bana.%20The%20source%20is%20private."
 check "split on, GitHub's page: the URL shown too" has "$T/out" "  https://github.com/new?owner=acme&name=widget-ci&visibility=public"
 check "split on, GitHub's page: waits until it is there" has "$T/out" "acme/widget-ci is not there yet"
 check "split on, GitHub's page: and public" has "$T/out" "acme/widget-ci is not public (PRIVATE)"
@@ -505,11 +626,16 @@ check "split on, GitHub's page: the rest as with gh" has "$sset" "split.repo = a
 check "split on: logs public, with its own phrase" has "$sset" "split.logs = public"
 fresh
 split_world
-printf '%s\n' "expect Press Enter once it is made" "send q" >"$T/w/tty"
+printf '%s\n' "expect Which? [1]" "send 1" "expect Type \"$yes_phrase\"" "send $yes_phrase" \
+  "expect Press Enter once it is made" "send q" >"$T/w/tty"
 FAKE_OS=Linux on_tty "$T/w/tty" bash "$bana" split on --repo acme/widget-ci --web >"$T/out" 2>&1 && st=0 || st=$?
 check "split on --web, q: stops" same "$st" 1
-check "split on --web, q: nothing changed" same "$(grep -c 'Stopped: nothing changed' "$T/out"):$(writes)" "1:"
+check "split on --web, q: says it goes on from there" has "$T/out" "Stopped: bana split on goes on from here; bana split off undoes it"
+check "split on --web, q: nothing public made, the deploy key alone" same "$(writes | sed 's/ -f key=.*//')" \
+  "gh api -X POST repos/acme/widget/keys -f title=bana split: acme/widget-ci"
 check "split on --web, Linux without a display: the URL to open" has "$T/out" "https://github.com/new?owner=acme&name=widget-ci"
+bash "$bana" split on </dev/null >"$T/out" 2>&1 && st=0 || st=$?
+check "split on --web, again off a terminal: needs one" same "$st:$(grep -c 'needs a terminal' "$T/out")" "1:1"
 
 # bana add --split: the wizard after adding the project.
 fresh
@@ -541,14 +667,16 @@ BANA_SPLIT_CONSENT=$yes_phrase bash "$bana" split on --repo acme/widget-releases
 rb=$T/w/runner && mkdir -p "$rb/out" "$rb/art/7/package"
 cp "$fx/act.jsonl" "$rb/out/act.jsonl" && echo 1 >"$rb/out/rc" && echo "Error: Job 'rust' failed" >"$rb/out/act.err"
 echo tarball >"$rb/art/7/package/pkg.tar.gz.zip"
-BANA_SEAL_PUB=$(cat "$s/seal.pub.pem") sp split_runner_seal "$rb" "$T/w/bundle" >/dev/null
+# A bundle sealed by another run (run 1), to this machine's key.
+cp -R "$rb" "$T/w/rb2" && GITHUB_RUN_ID=1 BANA_ID=wid-7 BANA_SHA=$(git rev-parse HEAD) BANA_NONCE=0123456789abcdef0123456789abcdef \
+  BANA_SEAL_PUB=$(cat "$s/seal.pub.pem") sp split_runner_seal "$T/w/rb2" "$T/w/bundle" >/dev/null
 b7=$T/w/builds/7 && mkdir -p "$b7"
 sha=$(git rev-parse HEAD)
 remote_ci() { # [ENV...]: bana ci as the daemon runs a remote build (Settings::split_env)
   (cd "$b7" && env BANA_PROJECT_ROOT="$T/w/project" BANA_ACT_LOCKED=1 BANA_BUILD=wid-7 BANA_SPLIT_POLL=0 \
     BANA_SPLIT_REPO=acme/widget-releases BANA_SPLIT_PRIVATE=acme/widget BANA_SPLIT_LOGS=private \
     BANA_SPLIT_WORKFLOW="$(sed -n 's/^split.workflow = //p' "$sset")" BANA_SPLIT_KEY="$(sed -n 's/^split.key = //p' "$sset")" \
-    BANA_SPLIT_HOME="$s" BANA_SPLIT_SHA="$sha" BANA_SPLIT_REF=refs/heads/main FAKE_RUN_BUNDLE="$T/w/bundle" FAKE_RUN_CONCLUSION=failure "$@" \
+    BANA_SPLIT_HOME="$s" BANA_SPLIT_SHA="$sha" BANA_SPLIT_REF=refs/heads/main FAKE_RUN_SEAL="$rb" FAKE_RUN_CONCLUSION=failure "$@" \
     bash "$bana" ci quick --event event.json -- --json --artifact-server-path artifacts)
 }
 echo '{}' >"$b7/event.json"
@@ -565,11 +693,13 @@ check "remote build: remote.json" same "$(cat "$b7/remote.json")" \
   "{\"repo\": \"acme/widget-releases\", \"run\": $run, \"url\": \"https://github.com/acme/widget-releases/actions/runs/$run\", \"logs\": \"private\"}"
 check "remote build: the uploads where the daemon collects them" same "$(cat "$b7/artifacts/7/package/pkg.tar.gz.zip")" tarball
 check "remote build: the sealed bundle deleted from GitHub" test ! -e "$pub/runs/$run/artifact"
-check "remote build: dispatched with the build's inputs" same "$(tr '\n' ' ' <"$pub/runs/$run/inputs")" \
-  "id=wid-7 sha=$sha ref=refs/heads/main tier=quick job= logs=private "
-check "remote build: on the public repo, the dispatch and the bundle's delete alone" same \
-  "$(writes | sed 's/artifacts\/[0-9]*/artifacts\/N/' | tr '\n' '|')" \
-  "gh workflow run bana.yml -R acme/widget-releases -f id=wid-7 -f sha=$sha -f ref=refs/heads/main -f tier=quick -f job= -f logs=private|gh api -X DELETE repos/acme/widget-releases/actions/artifacts/N|"
+check "remote build: dispatched with the build's inputs, and a nonce" bash -c "tr '\n' ' ' <'$pub/runs/$run/inputs' |
+  grep -qE '^id=wid-7 sha=$sha ref=refs/heads/main tier=quick job= logs=private nonce=[0-9a-f]{32} \$'"
+check "remote build: on the public repo, the dispatch on its default branch and the bundle's delete alone" same \
+  "$(writes | sed 's/artifacts\/[0-9]*/artifacts\/N/; s/nonce=[0-9a-f]*/nonce=N/' | tr '\n' '|')" \
+  "gh workflow run bana.yml -R acme/widget-releases --ref main -f id=wid-7 -f sha=$sha -f ref=refs/heads/main -f tier=quick -f job= -f logs=private -f nonce=N|gh api -X DELETE repos/acme/widget-releases/actions/artifacts/N|"
+check "remote build: its workflow checked at the commit the run runs" has "$FAKE_LOG" \
+  "gh api repos/acme/widget-releases/contents/.github/workflows?ref=$(tail -1 "$pub/commits")"
 check "remote build: no act, no Docker here" bash -c "! grep -qE '^act |^docker ' '$FAKE_LOG'"
 check "remote build: nothing decrypted left behind" bash -c "! ls '${TMPDIR:-/tmp}' | grep -q bana-remote"
 # The guard: a public side not as bana left it dispatches nothing.
@@ -588,10 +718,17 @@ check "remote build, no bundle: one failure, where" same "$st:$(sed 's/runs\/[0-
   "1:Error: the run on acme/widget-releases failure at its fetch step, with no output sealed: https://github.com/acme/widget-releases/actions/runs/N"
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$T/w/other.pem" 2>/dev/null
 openssl pkey -in "$T/w/other.pem" -pubout -out "$T/w/other.pub" 2>/dev/null
-BANA_SEAL_PUB=$(cat "$T/w/other.pub") sp split_runner_seal "$rb" "$T/w/bundle2" >/dev/null
-remote_ci FAKE_RUN_BUNDLE="$T/w/bundle2" >"$T/out" 2>"$T/err" && st=0 || st=$?
+remote_ci FAKE_RUN_SEAL_PUB="$T/w/other.pub" >"$T/out" 2>"$T/err" && st=0 || st=$?
 check "remote build, another seal key: refused" same "$st" 1
 check "remote build, another seal key: says so" has "$T/err" "left a bundle this machine cannot open: the bundle's key does not open with $s/seal.pem"
+# A bundle another run sealed (a writer of the public repository can upload one): refused.
+remote_ci FAKE_RUN_SEAL= FAKE_RUN_BUNDLE="$T/w/bundle" >"$T/out" 2>"$T/err" && st=0 || st=$?
+check "remote build, another run's bundle: refused" same "$st:$(grep -c '^{"jobID\|"stepResult"' "$T/out")" "1:0"
+check "remote build, another run's bundle: says so" has "$T/err" "the bundle was sealed for another run (its run is not"
+# A run of another branch's workflow, named as bana's: never taken.
+remote_ci FAKE_RUN_BRANCH=evil BANA_SPLIT_POLL=0 >"$T/out" 2>"$T/err" && st=0 || st=$?
+check "remote build, a run on another branch: not taken" same "$st:$(cat "$T/err")" \
+  "1:Error: the run on acme/widget-releases did not show up (gh run list -R acme/widget-releases --workflow bana.yml)"
 # A cancel (the daemon's SIGINT, to the process group) cancels the run there too.
 : >"$FAKE_LOG"
 # As the daemon starts it: a process group of its own, SIGINT as the default.
@@ -609,6 +746,24 @@ wait "$cpid" && st=0 || st=$?
 check "remote build, cancelled: exit 130" same "$st" 130
 check "remote build, cancelled: the run there too" has "$FAKE_LOG" "gh run cancel $run -R acme/widget-releases"
 check "remote build, cancelled: says so" has "$T/err" "Error: cancelled, and its run on acme/widget-releases too"
+# A cancel while bana waits for its run to show up (10s between asks): at once, and the run,
+# looked up then, cancelled there too.
+: >"$FAKE_LOG" && : >"$T/out"
+(cd "$b7" && exec env BANA_PROJECT_ROOT="$T/w/project" BANA_ACT_LOCKED=1 BANA_BUILD=wid-8 BANA_SPLIT_POLL=10 \
+  BANA_SPLIT_REPO=acme/widget-releases BANA_SPLIT_PRIVATE=acme/widget BANA_SPLIT_HOME="$s" BANA_SPLIT_SHA="$sha" \
+  BANA_SPLIT_WORKFLOW="$(sed -n 's/^split.workflow = //p' "$sset")" BANA_SPLIT_KEY="$(sed -n 's/^split.key = //p' "$sset")" \
+  FAKE_RUN_SHOWS=1 python3 -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setpgrp(); os.execvp(sys.argv[1], sys.argv[1:])' \
+  bash "$bana" ci quick --event event.json >"$T/out" 2>"$T/err") &
+cpid=$!
+for _ in $(seq 100); do grep -q 'gh run list' "$FAKE_LOG" 2>/dev/null && break; sleep 0.1; done
+sleep 0.5
+t0=$(date +%s)
+kill -INT -- "-$cpid" 2>/dev/null || true
+wait "$cpid" && st=0 || st=$?
+run=$(grep -l 'bana wid-8 ' "$pub"/runs/*/title | sed 's|.*/runs/\([0-9]*\)/title|\1|')
+check "remote build, cancelled before its run showed: exit 130" same "$st" 130
+check "remote build, cancelled before its run showed: at once" test $(($(date +%s) - t0)) -lt 5
+check "remote build, cancelled before its run showed: the run there too" has "$FAKE_LOG" "gh run cancel $run -R acme/widget-releases"
 # bana ci --list stays act -l, here; a fix round (no BANA_SPLIT_*) runs act here.
 : >"$FAKE_LOG"
 (cd "$b7" && env BANA_PROJECT_ROOT="$T/w/project" BANA_SPLIT_REPO=acme/widget-releases bash "$bana" ci --list) >/dev/null 2>&1 || true
@@ -616,7 +771,7 @@ check "remote build: --list is act's, here" has "$FAKE_LOG" "act -l -C"
 check "remote build: --list dispatches nothing" bash -c "! grep -q 'workflow run' '$FAKE_LOG'"
 # bana ci --remote, by hand: the checkout's HEAD there, its steps here.
 : >"$FAKE_LOG"
-FAKE_RUN_BUNDLE=$T/w/bundle BANA_SPLIT_POLL=0 bash "$bana" ci quick --remote >"$T/out" 2>&1 && st=0 || st=$?
+FAKE_RUN_SEAL=$rb BANA_SPLIT_POLL=0 bash "$bana" ci quick --remote >"$T/out" 2>&1 && st=0 || st=$?
 check "ci --remote: exits as act did" same "$st" 1
 check "ci --remote: the steps" has "$T/out" "rust / cargo test: failed (12s)"
 check "ci --remote: where it ran" has "$T/out" "remote run in public repo acme/widget-releases: https://github.com/acme/widget-releases/actions/runs/"

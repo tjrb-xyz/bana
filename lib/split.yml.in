@@ -3,10 +3,11 @@
 # lib/split.yml.in and checks it before every run: with any other workflow here, bana
 # builds nothing. A run fetches the private commit with a read-only deploy key (deleted
 # before any of the project's code runs), builds it with act, and encrypts act's output
-# to a key only bana's machine has. This log shows the steps, ok or failed, and their
-# times: no output, unless the owner made the logs public (bana split logs public).
+# to a key only bana's machine has. This log shows the jobs and steps by their ids, ok or
+# failed, and their times: no names or output, unless the owner made the logs public
+# (bana split logs public).
 name: bana
-run-name: bana ${{ inputs.id }}
+run-name: bana ${{ inputs.id }} ${{ inputs.nonce }}
 on:
   workflow_dispatch:
     inputs:
@@ -16,6 +17,7 @@ on:
       tier: {description: "the workflow's tier", type: string, required: false}
       job: {description: "only this job", type: string, required: false}
       logs: {description: "private or public", type: string, required: false, default: private}
+      nonce: {description: "this dispatch's own", type: string, required: true}
 permissions: {}
 concurrency:
   group: bana-${{ inputs.id }}
@@ -34,6 +36,7 @@ jobs:
       BANA_TIER: ${{ inputs.tier }}
       BANA_JOB: ${{ inputs.job }}
       BANA_LOGS: ${{ inputs.logs }}
+      BANA_NONCE: ${{ inputs.nonce }}
     steps:
       - name: check
         run: |

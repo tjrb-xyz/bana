@@ -1132,6 +1132,11 @@ jobs:
     steps:
       - name: compile ${{ matrix.target }}
         run: echo "PRIVATE-OUTPUT src/secret.rs:42"; mkdir -p out; echo binary >out/demo.txt
+      - id: v
+        run: echo "ver=PRIVATE-STEP-OUTPUT" >>"$GITHUB_OUTPUT"
+      - name: version ${{ steps.v.outputs.ver }} ${{ github.workspace }}
+        run: "true"
+      - run: echo "PRIVATE-SCRIPT" >/dev/null
       - uses: actions/upload-artifact@v4
         with: {name: demo, path: out/demo.txt}
   test:
@@ -1155,7 +1160,7 @@ YML
   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$sp/seal.pem" 2>/dev/null
   openssl pkey -in "$sp/seal.pem" -pubout -out "$sp/seal.pub.pem" 2>/dev/null
   git -C "$sp/pub" init -q -b main . && git -C "$sp/pub" add -A && git -C "$sp/pub" -c user.name=t -c user.email=t@t commit -q -m public
-  printf '{"inputs":{"id":"sec-7","sha":"%s","ref":"refs/heads/main","tier":"quick","job":"","logs":"private"}}\n' "$ssha" >"$sp/event.json"
+  printf '{"inputs":{"id":"sec-7","sha":"%s","ref":"refs/heads/main","tier":"quick","job":"","logs":"private","nonce":"0123456789abcdef0123456789abcdef"}}\n' "$ssha" >"$sp/event.json"
   : >"$sp/started"
   # Without the stand-in gh ($T/bin), whose token GitHub would refuse for the action's clone.
   PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vx -e "$T/bin" -e "$here/stand-ins" | paste -sd: -) env -u GITHUB_TOKEN \
@@ -1163,11 +1168,13 @@ YML
     --artifact-server-path "$sp/art" --secret BANA_SOURCE=acme/secret --secret "BANA_SOURCE_KEY=unused over file://" \
     --var "BANA_SEAL_PUB=$(cat "$sp/seal.pub.pem")" --env "BANA_TEST_SOURCE=file://$sp/private.git" \
     --env "BANA_TEST_ACT=$act" >"$sp/console.txt" 2>&1 || true
-  check "split: the public console has each step" has "$sp/console.txt" "test / cargo test: failed"
-  check "split: a matrix value in a step's name hidden" has "$sp/console.txt" "build / compile *: ok"
-  check "split: <prefix>-systemd's job, on the runner's machine" has "$sp/console.txt" "host / on the runner's machine: ok"
+  check "split: the public console has each step, by its id" has "$sp/console.txt" "test / step 0: failed"
+  check "split: and the matrix job's" has "$sp/console.txt" "build / step v: ok"
+  check "split: no step's name (a script, an output, a matrix value)" not grep -qE 'compile|cargo test|version' "$sp/console.txt"
+  check "split: <prefix>-systemd's job, not on the runner's machine" not grep -qE 'host / |host: ' "$sp/console.txt"
   check "split: the job summary" has "$sp/console.txt" "steps: "
   check "split: no output, path or matrix value in public" not grep -qE 'PRIVATE|MATRIXVALUE|secret\.rs' "$sp/console.txt"
+  check "split: act.image pinned by digest" grep -q "sec-linux=[^']*@sha256:[0-9a-f]\{64\}'" "$sp/pub/.github/workflows/bana.yml"
   sealed=$(find "$HOME/.cache/act" -path '*/tmp/bana/sealed' -newer "$sp/started" -type d 2>/dev/null | head -1)
   check "split: sealed" test -s "$sealed/bundle.enc" -a -s "$sealed/key.enc"
   check "split: nothing in clear in the bundle" not grep -aq PRIVATE "$sealed/bundle.enc"
@@ -1175,6 +1182,8 @@ YML
   check "split: it opens here, act's whole output" has "$sp/open/out/act.jsonl" "PRIVATE-FAILURE assert_eq!(secret, 42)"
   check "split: and act's exit" same "$(cat "$sp/open/out/rc" 2>/dev/null)" 1
   check "split: and the upload, where the daemon collects it" test -n "$(find "$sp/open/art/7" -name '*.zip' 2>/dev/null)"
+  check "split: the systemd job skipped, its label named for the daemon" has "$sp/open/out/act.jsonl" '-P sec-systemd=...'
+  check "split: and never run" not grep -q 'PRIVATE-HOST' "$sp/open/out/act.jsonl"
 else
   echo "e2e-daemon: bana split's public workflow skipped (BANA_E2E_SPLIT=1 runs it)"
 fi

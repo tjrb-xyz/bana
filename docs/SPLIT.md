@@ -5,7 +5,7 @@ repository's GitHub Actions, where standard GitHub-hosted runners are free, and 
 there. The public repository holds a README and one workflow, `bana.yml`, which bana renders and checks.
 The daemon on your machine still watches the private repository; for each push it dispatches a run on
 the public one, which fetches the commit with a read-only deploy key, builds it with act (the same
-workflow `bana ci` runs), and prints only its steps. The full output is encrypted to a key on your
+workflow `bana ci` runs), and prints only its jobs and steps, by their ids. The full output is encrypted to a key on your
 machine: the daemon decrypts it, and writes it to the private repository (a commit comment) and to its
 page, labelled as a remote run with a link to the public one. Statuses, the CI report, the log viewer
 and `bana fix` work as for a build here.
@@ -13,7 +13,7 @@ and `bana fix` work as for a build here.
 ```text
 push to PRIVATE ─▶ bana daemon (your machine) ─▶ gh workflow run bana.yml -R PUBLIC
                                                      │  fetch (deploy key, then deleted) · act · seal
-PUBLIC's run log: "rust / cargo test: ok (12s)"  ◀───┘  artifact bana-sealed (1 day, encrypted)
+PUBLIC's run log: "rust / step 0: ok (12s)"     ◀───┘  artifact bana-sealed (1 day, encrypted)
 bana daemon ◀─ gh run download · decrypt ─▶ statuses, page, report, bana fix · commit comment on PRIVATE
 ```
 
@@ -33,18 +33,21 @@ bana split on --releases-only           # releases public, builds still here (sp
 bana add --split[=OWNER/NAME]           # add the project, then bana split on
 ```
 
-The public repository's default name is `OWNER/<name>-releases`. When it does not exist yet, the wizard
-asks how to make it:
+The public repository's default name is `OWNER/<name>-releases`, which says the private repository's name:
+the wizard warns of that, and of a prefix (bana.conf's `prefix`, in each run's name and labels) that says it,
+since both are public. Pick a neutral name with `--repo`, and a neutral prefix, if that matters. When the
+repository does not exist yet, the wizard asks how to make it:
 
-1. **here, with gh**: `gh repo create OWNER/NAME --public --disable-wiki --disable-issues`, after your yes;
-2. **on GitHub's new-repository page**: bana opens it filled in (`open` on a Mac, `xdg-open` on Linux with a
-   display, else it prints the link), you make the repository there, public and with nothing in it, and
-   press Enter. bana checks it is there, public and empty (a README alone is taken: GitHub's page may add
-   one, and bana's replaces it), and asks again until it is; `q` stops with nothing changed. `--web` picks
-   this way, and needs a terminal.
+1. **here, with gh**: `gh repo create OWNER/NAME --public --disable-wiki --disable-issues`, at its step;
+2. **on GitHub's new-repository page**: at its step, after your typed yes and the deploy key, bana opens it
+   filled in (`open` on a Mac, `xdg-open` on Linux with a display, else it prints the link), you make the
+   repository there, public and with nothing in it, and press Enter. bana checks it is there, public and
+   empty (a README alone is taken: GitHub's page may add one, and bana's replaces it), and asks again until
+   it is; `q` stops, and `bana split on` goes on from there (on a terminal). `--web` picks this way, and needs
+   a terminal.
 
 A public repository there already is taken only when it is empty, holds a README alone, or is bana's own
-(its README's marker). Off a terminal, `--repo` names it, gh makes it, and `BANA_SPLIT_CONSENT` must hold
+(its README's marker, a random id kept in `~/.bana/<prefix>/split.mark`, which `bana split off` keeps). Off a terminal, `--repo` names it, gh makes it, and `BANA_SPLIT_CONSENT` must hold
 the phrase the wizard would ask for (`yes, build OWNER/PRIVATE in public`).
 
 Before anything changes, `on` checks all of this and lists every problem at once: gh signed in with the
@@ -59,15 +62,16 @@ second typed phrase), then for the typed yes. Then, each step `[n/9] … ok`:
 2. a fresh ed25519 deploy key on the private repository, read-only (checked; a writable one is deleted).
    It comes first, so an organization whose policy forbids deploy keys stops the wizard before anything
    public exists. bana has no token fallback;
-3. the public repository (unless you made it on GitHub's page);
-4. its README, with a marker: a hash of the private repository's name;
+3. the public repository (with gh, or on GitHub's page, which bana waits for here);
+4. its README, with bana's marker: a random id, which names nothing;
 5. its Actions: a read-only default token, `actions/upload-artifact@*` as the only allowed action, the
-   environment `bana-source` limited to the default branch, and a ruleset that keeps that branch from
-   deletion and force pushes;
+   environment `bana-source` limited to the default branch, and a ruleset "bana split" that keeps that
+   branch from deletion and force pushes (made once; a run again updates it);
 6. `bana-source`'s two secrets, on gh's stdin: `BANA_SOURCE_KEY` (the deploy key's private half, then
    deleted here) and `BANA_SOURCE` (the private repository's name, so the logs mask it);
 7. the variable `BANA_SEAL_PUB`: the seal key's public half;
-8. `.github/workflows/bana.yml`, `bana split render`'s, checked by `bana split lint`;
+8. `.github/workflows/bana.yml`, `bana split render`'s, checked by `bana split lint`, and enabled (`bana split
+   off` disables it);
 9. the project's settings: `split.repo`, `split.ci`, `split.logs`, `split.workflow`, `split.key`, and
    `release.repo` (the public repository).
 
@@ -88,9 +92,11 @@ bana split ci github|local     # where pushes build; releases stay on the public
 bana split logs private|public # what a run prints publicly: its steps, or its whole output too
 ```
 
-`split.logs = private` (the default) prints a line a step and job, `rust / cargo test: failed (12s)`, and a
-job summary table of the same. Matrix values in a step's name become `*`. `public` prints each step's output
-too, and needs the typed phrase `yes, logs are public`; back to private needs a yes. Runs already on the
+`split.logs = private` (the default) prints a line a step and job, by act's ids alone: `rust / step 0: failed
+(12s)` (the step's `id:`, or its place in the job), `rust: failed`, and a job summary table of the same. A
+step's name never shows there: act names a step without one after its script, and expands `${{ }}` in a name
+(a step's output, a path, a matrix value). `bana ci --remote` prints the names here, from the sealed output.
+`public` prints each step's output too, and needs the typed phrase `yes, logs are public`; back to private needs a yes. Runs already on the
 public repository keep what they printed: `bana split purge-runs` deletes them.
 
 Fix rounds always build here, with act: Claude's snapshots never leave your machine. `bana ci` by hand
@@ -107,15 +113,29 @@ The public workflow takes `workflow_dispatch` alone, with the inputs id, sha, re
 - **build**: act, pinned by its tarball's sha256, runs the private workflow under `env -i` (PATH, HOME and
   RUNNER_TEMP), with no secrets, no GITHUB_TOKEN and no Docker socket in the job containers. Its output goes
   to a file; workflow commands are off while it runs, so nothing in it makes an annotation. Linux jobs run in
-  bana.conf's `act.image`; `<prefix>-systemd` jobs run on the runner's own machine (act's host mode), which
-  boots systemd; macOS jobs do not run;
+  bana.conf's `act.image`, pinned by digest: the default's digest is in lib/split.sh, an image by tag gets
+  the digest Docker has for it here (`docker pull` it first, or write `NAME@sha256:…`), and an
+  `act.platform.*` image runs only when pinned. No job runs on the runner's own machine (act's host mode):
+  GitHub's runner holds the deploy key in its memory and has passwordless sudo. So `<prefix>-systemd` jobs
+  are not run there, nor are macOS jobs: a remote build reports them as not run here (a systemd job as
+  "runs locally, needs systemd"). A split project's systemd jobs run on your machine;
 - **summary**: the table of steps;
 - **seal**: act's output and the jobs' uploads, as a tar, encrypted with AES-256-CBC (pbkdf2) under a fresh
-  key; that key and the ciphertext's sha256 are encrypted with RSA-OAEP to `BANA_SEAL_PUB`;
+  key; that key, the ciphertext's sha256, the run's id and bana's build, commit and nonce are encrypted with
+  RSA-OAEP to `BANA_SEAL_PUB`;
 - **upload**: the artifact `bana-sealed`, kept a day.
 
+The daemon dispatches the run on the public repository's default branch, after checking `bana.yml` at that
+branch's head, with a fresh nonce, and takes only the run named `bana <build> <nonce>`, made since, by that
+dispatch, on that branch at that commit. Its bundle opens only if it was sealed by that run (its id, build,
+commit and nonce), and its archive holds plain files and directories in `out/` and `art/` alone (no link),
+at most 8 GiB unpacked. A writer of the public repository who dispatches another branch's workflow, or
+uploads a bundle of their own, feeds nothing to bana. A cancel (the daemon's, or Ctrl-C) cancels the run
+there too, looking it up first if it has not shown yet.
+
 `bana split lint` refuses any other trigger, a token with scopes, `${{ }}` in a `run:` script, any action
-but upload-artifact pinned to a commit, a cache, and retention over a day.
+but upload-artifact pinned to a commit, a cache, retention over a day, an image not pinned by digest, and a
+job on the runner's own machine.
 
 ## Releases
 
@@ -127,11 +147,23 @@ default branch (no `--verify-tag`), and GitHub's automatic *Source code* archive
 or changelog links. The release's page says the notes and files become public. Release files are built by the
 release tier (on the public repository inside the sealed bundle, or here), and uploaded from your machine.
 
-Before Publish uploads anything to the public repository, it reads every file (inside each `.tar.gz` and
-`.zip`) for the private repository's name, `/home/runner/work/` and the build's checkout paths. One found stops
-the publish, naming the file and what it holds. A Rust binary carries its source paths in panic messages and
-debug info: build release files with `RUSTFLAGS="--remap-path-prefix=$PWD=."` and stripped
-(`[profile.release] strip = true`), or the files of a remote build are refused.
+Before Publish uploads anything to the public repository, it reads every file for the private repository's
+name (in ASCII and UTF-16LE), `/home/runner/work/` and the build's checkout paths. A file is read by what its
+bytes say it is, not its name: gzip, bzip2, xz and zstd streams through their tools; tar and zip (jar, whl,
+apk…) archives unpacked, with their members' names and link targets, and archives inside them in turn; with
+bsdtar (macOS's tar, or Linux's libarchive-tools), deb, rpm, cpio, 7z, xar, rar, cab and ISO images too. A
+format bana cannot read (a dmg, squashfs or AppImage, lz4, lzip, an MSI, or one whose tool is not here),
+archives nested more than 6 deep, or more than 16 GiB unpacked count as holding something. Then the release's
+title and its notes as they would be sent, `## Tested` and `## Install` included (`## Tested` is the CI
+report's table alone: its line names your machine). One found stops the publish, naming the file (and the
+member) and what it holds. A Rust binary carries its source paths in panic messages and debug info: build
+release files with `RUSTFLAGS="--remap-path-prefix=$PWD=."` and stripped (`[profile.release] strip = true`),
+or the files of a remote build are refused. A commit subject such as "Merge branch 'main' of
+github.com:OWNER/PRIVATE" in bana's notes is refused too: edit the notes on bana's page.
+
+A release made before `bana split on` (or after `off`) had its notes written for the other repository: when
+its notes are bana's, they are written again for the new one as the daemon starts (a new rev, so a Publish
+of the old ones is refused); when they are yours, Publish stops once, saying so, for you to read them again.
 
 `bana split ci local` with `release.repo` set is "private code, public releases" with no public CI.
 
@@ -145,19 +177,27 @@ bana split purge-runs [--yes]
 bana split off [--yes] [--purge-runs]
 ```
 
-`check` fails when the public repository has another workflow, or `bana.yml` is not the one bana pushed, or
-the deploy key can write or is gone, or the environment, its secrets, the variables, the allowed actions or
-the token's default are not as bana set them, or a debug variable is there, or a remote of your checkout
-points at the public repository, or it shares a commit with the private one. It warns of other collaborators
-(each can read your code through the deploy key) and of an older render. Before every remote build, the
-daemon runs `check --quick` (the workflow and the deploy key): on a FAIL it dispatches nothing, and the
-build fails saying why.
+`check` fails when the public repository has another workflow, or `bana.yml` is not the one bana pushed or
+is disabled, or the deploy key can write or is gone, or the environment, its secrets, `BANA_SEAL_PUB`, the
+allowed actions or the token's default are not as bana set them, or a debug variable is there, or a remote of
+your checkout points at the public repository, or it shares a commit with the private one. It warns of other
+variables, of other collaborators (each can read your code through the deploy key) and of an older render.
+Before every remote build, the daemon runs `check --quick` (the workflow, enabled, and the deploy key): on a
+FAIL it dispatches nothing, and the build fails saying why.
 
 `off` deletes the deploy key first, which cuts the public side's access at once, then the secrets, the
-environment and the variable, disables `bana.yml`, and with `--purge-runs` deletes the runs. It keeps
-`release.repo` (your installers point there) unless you say otherwise on a terminal, and removes
-`~/.bana/<prefix>/split`. It never archives or deletes the repository: `gh repo archive OWNER/NAME`, or
-`gh auth refresh -s delete_repo && gh repo delete OWNER/NAME`. `bana remove` refuses while bana split is on.
+environment and the variable, disables `bana.yml`, and with `--purge-runs` deletes the runs. A thing is
+"gone" only when GitHub deleted it, or lists the rest without it: when gh fails, `off` says what may be left
+and stops, keeping bana split's settings and `~/.bana/<prefix>/split` until `bana split off` again finishes.
+Then it keeps `release.repo` (your installers point there) unless you say otherwise on a terminal, and
+removes `~/.bana/<prefix>/split`. What stays on the public repository: its README, `bana.yml` (disabled),
+its Actions settings (upload-artifact alone, a read-only token) and the ruleset; `bana split on` with it
+again takes it as bana's and enables `bana.yml`. It never archives or deletes the repository: `gh repo
+archive OWNER/NAME`, or `gh auth refresh -s delete_repo && gh repo delete OWNER/NAME`. `bana remove`
+refuses while bana split is on.
+
+`rekey` makes the new deploy key, sets it on the public repository, and records it (`split.key`) before it
+deletes the old one; when that fails, the new key is deleted and the old one stays in use.
 
 The settings are the daemon's (`~/.bana/<prefix>/daemon/settings`), written by bana split alone and kept by
 `bana add`; a commit's bana.conf cannot move CI, logs or releases.
@@ -168,20 +208,26 @@ The wizard shows this before your yes, with your repositories' names:
 
 ```text
 bana will build <private> on GitHub's machines from the PUBLIC repository <public>. The
-workflow there is bana's own. With logs set to private it prints only job and step names,
-ok or failed, and durations. Your full output is encrypted to a key on this machine, then
-written to <private> (as a commit comment) and to bana's page. Even so:
+workflow there is bana's own. With logs set to private it prints only job ids, step
+numbers, ok or failed, and durations: no step's name, which may hold its script. Your
+full output is encrypted to a key on this machine, then written to <private> (as a
+commit comment) and to bana's page. Even so:
 - Anyone can see that <public> exists, its workflow file, each run's inputs (commit sha,
-  branch or tag name, tier), job and step names, timings, results and the encrypted
-  bundle's size.
+  branch or tag name, tier, job), job ids, step numbers, timings, results and the
+  encrypted bundle's size.
+- Names are public: <public>'s, which you choose, and the prefix <prefix>, in each run's
+  name and labels (unless bana.conf sets a neutral one). Neither need say <private>.
 - Anything printed before bana's redirect (a runner, Docker or download failure), or
   written to the runner's log some other way, is public, and copies cannot be taken back.
 - The deploy key in <public> reads ALL of <private>: every branch and its history. Anyone
   with write access to <public>, or anyone who takes over your GitHub account or gh token,
   can use it to copy your code. Deleting the key stops future reads, not past copies.
-- Your build's own code and dependencies run on GitHub's machines with network access.
-  They cannot reach the key, but a malicious dependency could send your code anywhere.
-- Jobs that need secrets get none. macOS and Windows jobs do not run there.
+- Your build's own code and dependencies run on GitHub's machines with network access,
+  in act's containers. The key is off disk by then, but GitHub's runner keeps it in its
+  memory: code that escapes its container could read it, and a malicious dependency
+  could send your code anywhere.
+- Jobs that need secrets get none. macOS, Windows and <prefix>-systemd jobs do not run
+  there: systemd jobs are for this machine.
 - Release notes, release files and the installer are public on purpose. Binaries can be
   reverse-engineered.
 - If you turn logs to public, compiler errors, test output, paths and source lines become
@@ -196,7 +242,7 @@ If any of this is unacceptable, answer no and keep CI on this machine.
 
 ## What a remote build looks like
 
-On the public repository, a run's log is its steps (`fetch: ok`, `rust / cargo test: failed (12s)`) and a job
+On the public repository, a run's log is its steps (`fetch: ok`, `rust / step 0: failed (12s)`) and a job
 summary of them; in the private repository, a comment on the commit:
 
 ```text
@@ -238,11 +284,17 @@ scratch pair of repositories (a private one with a small workflow, and `bana spl
    curl and no sign-in, and the notes link nothing private.
 8. The billing and terms wording in the risks: [About billing for GitHub Actions](https://docs.github.com/en/billing/managing-billing-for-your-products/managing-billing-for-github-actions/about-billing-for-github-actions)
    and GitHub's terms for Actions.
-9. A `<prefix>-systemd` job: act's host mode on the runner's machine, which boots systemd.
+9. act.image's default digest (`split_image_digest` in lib/split.sh) is Docker Hub's for
+   `catthehacker/ubuntu:act-24.04` (`docker buildx imagetools inspect`), and act on the runner pulls an image
+   by `NAME:TAG@sha256:…`.
+10. gh's run list fields bana matches a run by (`event`, `headBranch`, `headSha`, `createdAt`, and the
+   run-name with the nonce), `gh workflow run --ref`, `repos/O/R/commits/BRANCH`, `contents?ref=SHA`,
+   `actions/workflows/bana.yml`'s `state` and `gh workflow enable`, and the rulesets list and its PUT.
 
 ## Limits
 
-Linux jobs only (act inside `ubuntu-latest`); jobs that need secrets, private submodules or private git
+Linux jobs only, in containers (act inside `ubuntu-latest`): `<prefix>-systemd` and macOS jobs run on your
+machine; jobs that need secrets, private submodules or private git
 dependencies stay with `bana split ci local`. act on a hosted runner pulls its images each run, so it is
 slower than act here, and behaves as act does, not as GitHub's own runner. A remote build holds bana's one
 build slot while it waits on GitHub, so other projects' builds here wait too. With your machine off, nothing
