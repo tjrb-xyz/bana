@@ -127,6 +127,12 @@ default branch (no `--verify-tag`), and GitHub's automatic *Source code* archive
 or changelog links. The release's page says the notes and files become public. Release files are built by the
 release tier (on the public repository inside the sealed bundle, or here), and uploaded from your machine.
 
+Before Publish uploads anything to the public repository, it reads every file (inside each `.tar.gz` and
+`.zip`) for the private repository's name, `/home/runner/work/` and the build's checkout paths. One found stops
+the publish, naming the file and what it holds. A Rust binary carries its source paths in panic messages and
+debug info: build release files with `RUSTFLAGS="--remap-path-prefix=$PWD=."` and stripped
+(`[profile.release] strip = true`), or the files of a remote build are refused.
+
 `bana split ci local` with `release.repo` set is "private code, public releases" with no public CI.
 
 ## Undo, and the rest
@@ -187,6 +193,52 @@ written to <private> (as a commit comment) and to bana's page. Even so:
   docs.github.com, About billing for GitHub Actions).
 If any of this is unacceptable, answer no and keep CI on this machine.
 ```
+
+## What a remote build looks like
+
+On the public repository, a run's log is its steps (`fetch: ok`, `rust / cargo test: failed (12s)`) and a job
+summary of them; in the private repository, a comment on the commit:
+
+```text
+### bana: remote run 9182736 in public repo acme/widget-ci, failed
+
+Build #57 of main at `1a2b3c4d5e`, built on GitHub's machines from acme/widget-ci ([run 9182736](…)),
+dispatched by bana on mbp.
+
+# CI report: acme/widget · main 1a2b3c4 · quick · failed
+…
+All of its output: bana's page on mbp (build #57), or `bana report 57` there.
+```
+
+and on bana's page, the build's *remote: acme/widget-ci #9182736* chip and link; its statuses say
+`remote acme/widget-ci: failed at "cargo test"` and link the run.
+
+## Check on GitHub before relying on it (LIVE-CHECK)
+
+bana's tests run on stand-ins for GitHub and gh; these can only be checked against GitHub itself, once, with a
+scratch pair of repositories (a private one with a small workflow, and `bana split on` for it):
+
+1. The public log of a passing and a failing run holds only the step lines and the summary: no output,
+   annotation or path (and with `bana split logs public`, the output too). Download the log archive as well.
+2. The fetch: GitHub serves a commit by sha to a read-only deploy key (`git fetch --depth 1 … SHA`), and the
+   pinned host key (`split_host_key` in lib/split.sh) is GitHub's ed25519 key in
+   [GitHub's SSH key fingerprints](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints).
+3. The pins in lib/split.sh: act's version and its `act_Linux_x86_64.tar.gz` sha256 (the release's
+   `checksums.txt`), and actions/upload-artifact's commit for its tag.
+4. The seal: macOS's LibreSSL and the runner's OpenSSL 3 agree on `openssl enc -aes-256-cbc -pbkdf2 -iter
+   100000` and `openssl pkeyutl -pkeyopt rsa_padding_mode:oaep` (a run sealed there opens here).
+5. The REST endpoints the wizard uses and `bana split check` reads: deploy keys (`repos/O/R/keys`),
+   environments and their deployment branch policies, `actions/permissions` and `selected-actions`, the
+   workflow permissions, rulesets, and the two it tries: `actions/permissions/fork-pr-contributor-approval` and
+   `actions/permissions/artifact-and-log-retention` (where missing, the wizard says what to set by hand). And
+   gh's flags: `gh secret set --env` on stdin, `gh variable get`, `gh workflow run -f`, `gh run list
+   --json databaseId,url,displayTitle`, `gh run download -n`.
+6. An organization's policy that forbids deploy keys: the wizard stops at step 2, with nothing public made.
+7. A release on the public repository: gh makes the tag on its default branch, the installer downloads with
+   curl and no sign-in, and the notes link nothing private.
+8. The billing and terms wording in the risks: [About billing for GitHub Actions](https://docs.github.com/en/billing/managing-billing-for-your-products/managing-billing-for-github-actions/about-billing-for-github-actions)
+   and GitHub's terms for Actions.
+9. A `<prefix>-systemd` job: act's host mode on the runner's machine, which boots systemd.
 
 ## Limits
 

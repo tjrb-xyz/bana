@@ -586,6 +586,32 @@ pub fn same_files(assets: &[Asset], want: &[(String, String)]) -> bool {
         })
 }
 
+/// What in a release file's bytes would tell a public release repository's
+/// readers about the private code (`bana split`): the first of `needles` it
+/// holds, ASCII case aside. A needle `(text, true)` is a repository name,
+/// matched as a whole name (`o/r` is not in `o/r-releases`, is in
+/// `github.com/o/r.git`); `(text, false)` a path, matched anywhere.
+pub fn leak<'a>(bytes: &[u8], needles: &'a [(String, bool)]) -> Option<&'a str> {
+    let hay = bytes.to_ascii_lowercase();
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+    for (text, name) in needles {
+        let n = text.to_ascii_lowercase().into_bytes();
+        if n.is_empty() || n.len() > hay.len() {
+            continue;
+        }
+        let found = (0..=hay.len() - n.len()).any(|i| {
+            hay[i..i + n.len()] == n[..]
+                && (!name
+                    || ((i == 0 || !(word(hay[i - 1]) || hay[i - 1] == b'.'))
+                        && hay.get(i + n.len()).is_none_or(|&b| !word(b))))
+        });
+        if found {
+            return Some(text);
+        }
+    }
+    None
+}
+
 /// gh release view's output, or its error: `release not found` is none.
 pub fn existing(view: Result<&str, &str>) -> Result<Existing, String> {
     let text = match view {
@@ -1257,6 +1283,25 @@ mod tests {
             finals_args("o/r").join(" "),
             "release list -R o/r --exclude-drafts --exclude-pre-releases -L 100 --json tagName"
         );
+    }
+
+    #[test]
+    fn what_a_public_release_file_must_not_hold() {
+        let needles = vec![
+            ("Acme/Widget".to_string(), true),
+            ("/home/runner/work/".to_string(), false),
+        ];
+        let leak = |text: &str| leak(text.as_bytes(), &needles);
+        assert_eq!(leak("REPO='acme/widget-releases'"), None, "the public one");
+        assert_eq!(leak("see bigacme/widget, acme/widgets"), None);
+        assert_eq!(leak("git@github.com:acme/widget.git"), Some("Acme/Widget"));
+        assert_eq!(leak("ACME/WIDGET"), Some("Acme/Widget"), "case aside");
+        assert_eq!(leak("acme/widget"), Some("Acme/Widget"));
+        assert_eq!(
+            leak("panicked at /home/runner/work/_temp/bana/src/src/main.rs:3"),
+            Some("/home/runner/work/")
+        );
+        assert_eq!(leak(""), None);
     }
 
     #[test]

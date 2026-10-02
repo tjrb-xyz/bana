@@ -2745,6 +2745,33 @@ impl Shared {
         let upload: Vec<String> = manifest.iter().map(|(_, n)| n.clone()).collect();
         let files = &upload[..upload.len() - 1];
 
+        if let Some(public) = s.public_release() {
+            // bana split: the private repo's name, or a build's paths, in a file
+            // stop a publish to the public repo.
+            self.progress(
+                tag,
+                "looking in the files for the private repo's name and paths",
+            );
+            let mut needles = vec![
+                (s.repo.clone(), true),
+                ("/home/runner/work/".to_string(), false),
+                (self.src().to_string_lossy().into_owned(), false),
+            ];
+            if let Some(c) = &s.checkout {
+                needles.push((c.to_string_lossy().into_owned(), false));
+            }
+            let (at, names, path) = (dist.clone(), upload.clone(), s.path.clone());
+            let found =
+                tokio::task::spawn_blocking(move || scan_files(&at, &names, &needles, &path))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            if let Some((name, what)) = found {
+                return Err(format!(
+                    "{name} holds {what}, and {public} is public: nothing was published (docs/SPLIT.md: Releases)"
+                ));
+            }
+        }
+
         self.progress(tag, "checking the tag on origin");
         let cred = self.credentials();
         let (plain, deref) = (format!("refs/tags/{tag}"), format!("refs/tags/{tag}^{{}}"));
@@ -5053,6 +5080,47 @@ fn wanted(f: &fix::Fix, jobs: Option<Vec<String>>) -> Result<Vec<String>, RoundE
         ));
     }
     Ok(want)
+}
+
+/// The first of `names` (in `dir`) that holds one of `needles`
+/// ([`release::leak`]), and what: a `.tar.gz` and a `.zip` are read through
+/// `tar -xzO` and `unzip -p`, the rest as they are. A file none of those can
+/// read counts as holding it.
+fn scan_files(
+    dir: &Path,
+    names: &[String],
+    needles: &[(String, bool)],
+    path: &str,
+) -> Option<(String, String)> {
+    for name in names {
+        let file = dir.join(name);
+        let run = |program: &str, args: &[&str]| {
+            std::process::Command::new(program)
+                .args(args)
+                .arg(&file)
+                .env("PATH", path)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| o.stdout)
+        };
+        let bytes = if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+            run("tar", &["-xzOf"])
+        } else if name.ends_with(".zip") {
+            run("unzip", &["-p"])
+        } else {
+            std::fs::read(&file).ok()
+        };
+        let Some(bytes) = bytes else {
+            return Some((name.clone(), "what bana cannot read".into()));
+        };
+        if let Some(what) = release::leak(&bytes, needles) {
+            return Some((name.clone(), what.to_string()));
+        }
+    }
+    None
 }
 
 /// A commit comment's limit is 65,536 characters; bana's stays under this.
@@ -8302,6 +8370,28 @@ exec git \"$@\"
         );
         // The installer downloads from the public repo: the daemon says so, not bana.conf.
         assert_eq!(p.read(&format!("installer-release.{id}")), "o/r-releases\n");
+        // A file that names the private repo (or a build's path) stops the publish.
+        let dist = p.dir.join(format!("builds/{id}/dist"));
+        let sums = std::fs::read_to_string(dist.join("SHA256SUMS")).unwrap();
+        std::fs::write(
+            dist.join("NOTICE.txt"),
+            "built from https://github.com/o/r\n",
+        )
+        .unwrap();
+        let h = crate::artifacts::sha256(&dist.join("NOTICE.txt")).unwrap();
+        std::fs::write(dist.join("SHA256SUMS"), format!("{sums}{h}  NOTICE.txt\n")).unwrap();
+        let r = publish_now(&d, "v0.1.0", n.rev).await;
+        assert_eq!(r.state, State::Failed);
+        assert_eq!(
+            r.reason.as_deref(),
+            Some("NOTICE.txt holds o/r, and o/r-releases is public: nothing was published (docs/SPLIT.md: Releases)")
+        );
+        assert_eq!(
+            p.read("gh-release.log").matches("release create").count(),
+            0
+        );
+        std::fs::remove_file(dist.join("NOTICE.txt")).unwrap();
+        std::fs::write(dist.join("SHA256SUMS"), sums).unwrap();
         let r = publish_now(&d, "v0.1.0", n.rev).await;
         assert_eq!(
             (r.state, r.url.as_deref()),
@@ -8329,6 +8419,62 @@ exec git \"$@\"
         );
         d.shutdown().await;
         p.remove();
+    }
+
+    #[test]
+    fn a_public_releases_files_are_read_inside_their_archives() {
+        let dir = std::env::temp_dir().join(format!("bana-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("demo-1/bin")).unwrap();
+        std::fs::write(
+            dir.join("demo-1/bin/demo"),
+            "built from git@github.com:o/r.git\n",
+        )
+        .unwrap();
+        let tar = |name: &str| {
+            let ok = Std::new("tar")
+                .args(["-czf", name, "demo-1"])
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok);
+        };
+        tar("demo-1-linux-x64.tar.gz");
+        std::fs::write(dir.join("install.sh"), "REPO='o/r-releases'\n").unwrap();
+        std::fs::write(dir.join("SHA256SUMS"), "abc  demo-1-linux-x64.tar.gz\n").unwrap();
+        let needles = vec![
+            ("o/r".to_string(), true),
+            ("/home/runner/work/".to_string(), false),
+        ];
+        let path = std::env::var("PATH").unwrap();
+        let names = |n: &[&str]| n.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            scan_files(&dir, &names(&["install.sh", "SHA256SUMS"]), &needles, &path),
+            None
+        );
+        assert_eq!(
+            scan_files(
+                &dir,
+                &names(&["install.sh", "demo-1-linux-x64.tar.gz"]),
+                &needles,
+                &path
+            ),
+            Some(("demo-1-linux-x64.tar.gz".into(), "o/r".into())),
+            "inside the archive"
+        );
+        std::fs::write(dir.join("demo-1/bin/demo"), "clean\n").unwrap();
+        tar("demo-1-linux-x64.tar.gz");
+        std::fs::write(dir.join("broken.tar.gz"), "not gzip").unwrap();
+        assert_eq!(
+            scan_files(&dir, &names(&["demo-1-linux-x64.tar.gz"]), &needles, &path),
+            None
+        );
+        assert_eq!(
+            scan_files(&dir, &names(&["broken.tar.gz"]), &needles, &path),
+            Some(("broken.tar.gz".into(), "what bana cannot read".into()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "multi_thread")]

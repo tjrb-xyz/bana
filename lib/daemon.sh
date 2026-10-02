@@ -1068,6 +1068,8 @@ d_remove() { # PREFIX [PURGE]
   dir=$(project_home "$1")
   if [[ -f $(d_project "$1") ]]; then
     r=$(d_setting repo "$(d_project "$1")") || r=''
+    ! d_setting split.repo "$(d_project "$1")" | grep -q . ||
+      warn "$1's bana split stays on GitHub: its deploy key on $r and $(d_setting split.repo "$(d_project "$1")")'s secrets (delete them there, or add $1 again and bana split off)"
     checkout=$(d_setting checkout "$(d_project "$1")") || checkout=
     rm -rf "$dir/daemon"
     if d_up; then d_rescan >/dev/null || warn "The daemon did not answer: it drops $1 within a minute"; fi

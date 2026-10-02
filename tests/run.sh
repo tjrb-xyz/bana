@@ -2069,7 +2069,9 @@ check "workflows: and neither self-test" same "$(grep -c '^    if: .*&& !inputs.
 # bana is public: 'private' in its README, install.sh and workflows is about a project's repository.
 grep -n -i private "$here/../README.md" "$here/../install.sh" "$gh_dir"/*.yml |
   grep -v -e 'Use the daemon only on a private repository' -e 'Use bana with private' \
-    -e '# a private repository' -e '# Windows, a private repository' -e 'for private images' >"$T/out" || true
+    -e '# a private repository' -e '# Windows, a private repository' -e 'for private images' \
+    -e 'Private code, public CI and releases: bana split' -e 'keeps its code in its private repository' \
+    -e 'logs private|public' >"$T/out" || true
 check "workflows: no 'private' about bana itself" same "$(cat "$T/out")" ""
 
 # ---- hook: bana's install.sh; the daemon moves to the new bana first, or nothing changes ---------

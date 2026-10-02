@@ -105,9 +105,10 @@ split_runner_fetch() { # DIR
   echo "fetch: ok"
 }
 
-# act, pinned, on the commit: no secrets, no GITHUB_TOKEN, no Docker socket in the job
-# containers, an environment of four variables. Its output goes to out/act.jsonl, and
-# only its steps reach the log as they end. BANA_TEST_ACT: an act already here (tests).
+# act, pinned, on the commit (images pulled when missing): no secrets, no GITHUB_TOKEN, no
+# Docker socket in the job containers, an environment of three variables. Its output goes to
+# out/act.jsonl, and only its steps reach the log as they end. BANA_TEST_ACT: an act already
+# here (tests).
 split_runner_build() { # DIR
   local d=$1 act=${BANA_TEST_ACT:-} rc=0 pid args=() envs=() tier=''
   mkdir -p "$d/out" "$d/art" "$d/bin"
@@ -128,9 +129,10 @@ split_runner_build() { # DIR
   [[ -z ${BANA_TIER:-} ]] || tier=",\"inputs\":{\"$split_tier_input\":\"$BANA_TIER\"}"
   printf '{"repository":{"full_name":"private/source"},"ref":"%s","after":"%s"%s}\n' \
     "${BANA_REF:-}" "$BANA_SHA" "$tier" >"$d/event.json"
-  args=(workflow_dispatch --json --rm --container-daemon-socket - -C "$d/src"
+  args=(workflow_dispatch --json --rm --pull=false --container-daemon-socket - -C "$d/src"
     -W "$d/src/.github/workflows/$split_workflow" -e "$d/event.json" --artifact-server-path "$d/art"
-    --container-architecture linux/amd64 --env "GITHUB_RUN_ID=${BANA_ID##*-}" --env "GITHUB_RUN_NUMBER=${BANA_ID##*-}"
+    --artifact-server-port $((20000 + RANDOM % 20000)) --container-architecture linux/amd64
+    --env "GITHUB_RUN_ID=${BANA_ID##*-}" --env "GITHUB_RUN_NUMBER=${BANA_ID##*-}"
     "${split_platforms[@]}")
   [[ -z ${BANA_JOB:-} ]] || args+=(-j "$BANA_JOB")
   echo "build: act $split_act_version, the workflow $split_workflow${BANA_TIER:+ at $BANA_TIER}${BANA_JOB:+, job $BANA_JOB}"
@@ -341,7 +343,6 @@ split_lint() { # FILE
       exit n > 0
     }' "$1"
 }
-
 
 # ---- the wizard and its toggles --------------------------------------------------------
 
@@ -637,7 +638,6 @@ split_on() { # [--repo R] [--web] [--releases-only]
   if v=$(split_state pub); then
     [[ -z $pub || $pub == "$v" ]] || die "bana split on was started with $v: bana split on goes on with it (bana split off undoes it)"
     s_pub=$v s_how=exists
-    [[ -n $(split_state how) && $(split_state how) != exists ]] && ! split_did repo && s_how=$(split_state how)
     logs=$(split_state logs || echo private)
     rel=$(split_state releases || true)
     say "Going on with bana split on for $s_pub (done: $(awk '$1 == "done" { printf "%s%s", s, $2; s = ", " }' "$s_state"))"
