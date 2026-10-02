@@ -148,17 +148,29 @@ that project:
 - the release bana asks about, or `#p=<prefix>&release=<tag>` ([Releases](#releases));
 - *Pause automatic builds* ([Projects](#projects)), *Check now* (fetch at once) and *Clear queue* (drops a
   backlog after a long time away);
-- *Run now*: a branch or tag at a tier, at the front of the queue. That is how a nightly runs;
-- the queue, each build with *Remove*;
-- the build: its jobs, the live log of the one you pick (a failed step opens by itself), *Cancel* and *Re-run*
-  (the same commit and tier again, even if it was built), and on a failed build *Fix with Claude*
-  ([FIX.md](FIX.md)), then the fix's card: its rounds, *Keep*, *Push*, *Compare on GitHub*, *More rounds* and
-  *Discard*;
+- *Run now…*: a branch or tag's head at a tier, all jobs or one (one job: below), at the front of the
+  queue, once you say yes. That is how a nightly runs;
+- the queue, each build with *Remove* (a one-job build says `· job JOB`);
+- the build: its jobs, the live log of the one you pick (a failed step opens by itself), *Run JOB…* for the job
+  picked (at its ref's current head), *Cancel* and *Re-run…* (the same commit, tier and job again, even if it was
+  built), and on a failed build *Fix with Claude* ([FIX.md](FIX.md)), then the fix's card: its rounds, *Keep*,
+  *Push*, *Compare on GitHub*, *More rounds* and *Discard*;
 - the build's *Report* (once it ended): the CI report's table, the rest as text, with *Copy* and *Download*;
 - the build's *Files* ([below](#a-builds-files)): each with its size, platform and *Download*, and the command
   that installs them here;
 - the history (the last 100 builds, each with its tests' share, `tests 95%`, and its files, `4 files`), and the
   pushes not built.
+
+*Run now…*, *Run JOB…* and *Re-run…* ask first, and the question says what will run: all jobs or one, the ref
+and its commit, the tier, and for a split project that it runs on the public repo's GitHub Actions, its log public
+by ids (or whole, with `split.logs = public`).
+
+**One job** is that job and the jobs it needs (`bana ci -j JOB`). It posts their statuses
+(`bana/JOB`…) but not the build's own `bana`, which speaks for the whole workflow; it moves no green, does not
+count as built (the commit's push build still runs), is never a release's build, and keeps none of its uploads.
+It never becomes the menu bar's last build or its *Fix #N with Claude…*, so a passing one cannot hide a full
+build's failure. Its build shows only the jobs it ran, and its description says `job JOB only`, as does a split
+project's commit comment. `bana daemon status` shows `· job JOB` on its running and queued lines.
 
 The runner pool's sections follow, under *Runner pool (optional)*, for the project shown. `bana manager` opens
 this page too while the daemon runs. With no project yet the page says to run `bana add`; a project the daemon
@@ -179,7 +191,7 @@ A push runs when:
    `[skip actions]`, `[actions skip]`;
 3. the workflow is in that commit;
 4. that commit has not been built at that tier already, so the same commit on a new branch, or pushed again, does
-   not run twice (*Re-run* does). A tag always runs, even on a commit built already: its build is the release.
+   not run twice (*Re-run* does, and a one-job build leaves it to come). A tag always runs, even on a commit built already: its build is the release.
 
 The rules come from `bana add`, never from the pushed commit, so a branch cannot widen them. Pull requests from
 forks never reach the daemon: it fetches only branches and tags.
@@ -574,6 +586,7 @@ On loopback, behind the token in `~/.bana/manager-token` but for the health:
 | `GET /ci/v1/projects` | a line a project: `{prefix, repo, checkout, paused, error, queue, running, last}` |
 | `POST /ci/v1/projects` | read the projects' settings again (`bana add`, `remove`, `pause` and `resume` send it): start the new ones, start the changed ones again, drop the removed ones; the same answer |
 | `/ci/v1/p/<prefix>/…` | the project's routes: `local`, `builds…`, `fixes…`, `releases…`, `daemon` (`{paused}`), `daemon/poll`, `queue/clear`, and the runner pool's. 404 for a project not added, 503 for one the daemon cannot start |
+| `POST /ci/v1/p/<prefix>/builds` | *Run now*: `{ref, tier, job}`, `job` optional (a workflow job id: that job and the jobs it needs); `{build}`, or 400 |
 
 The push hook posts `/ci/v1/p/<prefix>/daemon/poll`, with the port from `~/.bana/daemon.d/settings`.
 

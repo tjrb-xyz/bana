@@ -91,6 +91,8 @@ run_step check BANA_SHA="$sha; curl evil" >"$T/out" 2>&1 && st=0 || st=$?
 check "runner check: refuses a sha that is no commit" same "$st:$(cat "$T/out")" "1:check: failed (not as bana sends them: sha)"
 run_step check BANA_TIER='$(id)' BANA_LOGS=all BANA_REF='refs/heads/a b' BANA_NONCE=x >"$T/out" 2>&1 || true
 check "runner check: and a nonce, ref, tier or logs bana would not send" has "$T/out" "not as bana sends them: nonce ref tier logs"
+run_step check BANA_JOB='rust -P x' >"$T/out" 2>&1 && st=0 || st=$?
+check "runner check: and a job that is no job id" same "$st:$(cat "$T/out")" "1:check: failed (not as bana sends them: job)"
 run_step fetch >"$T/out" 2>&1 && st=0 || st=$?
 check "runner fetch: no deploy key, no fetch" same "$st:$(cat "$T/out")" "1:fetch: failed (no deploy key here: bana split check)"
 key='-----BEGIN OPENSSH PRIVATE KEY-----
@@ -134,11 +136,16 @@ check "runner build: only PATH, HOME and RUNNER_TEMP" same "$(cut -d= -f1 "$T/w/
 check "runner build: no Docker socket in the job containers" has <(tr '\n' ' ' <"$T/w/act.argv") "--container-daemon-socket - "
 check "runner build: no secret file, no secret" bash -c "! grep -Eqx -- '-s|--secret|--secret-file' '$T/w/act.argv'"
 check "runner build: the private workflow, in the fetched commit" has <(tr '\n' ' ' <"$T/w/act.argv") "-W $rt/bana/src/.github/workflows/ci.yml "
+check "runner build: a whole build, no -j" bash -c "! grep -qx -- -j '$T/w/act.argv'"
 check "runner build: the event names no repository" same "$(cat "$rt/bana/event.json")" \
   "{\"repository\":{\"full_name\":\"private/source\"},\"ref\":\"refs/heads/main\",\"after\":\"$sha\",\"inputs\":{\"tier\":\"quick\"}}"
 run_step build BANA_TEST_ACT="$T/w/act" BANA_LOGS=public >"$T/out" 2>&1 || true
 check "runner build, logs public: the build's output too" has "$T/out" "PRIVATE-OUTPUT /home/runner/work/private-src/src/main.rs:3"
 check "runner build, logs public: commands still off" has "$T/out" "::stop-commands::bana-"
+# A one-job build (Run JOB… on the page): its job, from the dispatch's input.
+run_step build BANA_TEST_ACT="$T/w/act" BANA_JOB=rust >"$T/out" 2>&1 || true
+check "split runner: BANA_JOB reaches act as -j" has <(tr '\n' ' ' <"$T/w/act.argv") " -j rust "
+check "split runner: and its first line names the job" has "$T/out" "the workflow ci.yml at quick, job rust"
 : >"$T/w/summary"
 run_step summary GITHUB_STEP_SUMMARY="$T/w/summary" >/dev/null 2>&1
 check "runner summary: a table of the steps" has "$T/w/summary" "| rust / step 0 | failed | 12s |"
@@ -672,12 +679,12 @@ cp -R "$rb" "$T/w/rb2" && GITHUB_RUN_ID=1 BANA_ID=wid-7 BANA_SHA=$(git rev-parse
   BANA_SEAL_PUB=$(cat "$s/seal.pub.pem") sp split_runner_seal "$T/w/rb2" "$T/w/bundle" >/dev/null
 b7=$T/w/builds/7 && mkdir -p "$b7"
 sha=$(git rev-parse HEAD)
-remote_ci() { # [ENV...]: bana ci as the daemon runs a remote build (Settings::split_env)
+remote_ci() { # [ENV...]: bana ci as the daemon runs a remote build (Settings::split_env); rjob: a one-job build's
   (cd "$b7" && env BANA_PROJECT_ROOT="$T/w/project" BANA_ACT_LOCKED=1 BANA_BUILD=wid-7 BANA_SPLIT_POLL=0 \
     BANA_SPLIT_REPO=acme/widget-releases BANA_SPLIT_PRIVATE=acme/widget BANA_SPLIT_LOGS=private \
     BANA_SPLIT_WORKFLOW="$(sed -n 's/^split.workflow = //p' "$sset")" BANA_SPLIT_KEY="$(sed -n 's/^split.key = //p' "$sset")" \
     BANA_SPLIT_HOME="$s" BANA_SPLIT_SHA="$sha" BANA_SPLIT_REF=refs/heads/main FAKE_RUN_SEAL="$rb" FAKE_RUN_CONCLUSION=failure "$@" \
-    bash "$bana" ci quick --event event.json -- --json --artifact-server-path artifacts)
+    bash "$bana" ci quick ${rjob:+-j "$rjob"} --event event.json -- --json --artifact-server-path artifacts)
 }
 echo '{}' >"$b7/event.json"
 : >"$FAKE_LOG"
@@ -702,6 +709,12 @@ check "remote build: its workflow checked at the commit the run runs" has "$FAKE
   "gh api repos/acme/widget-releases/contents/.github/workflows?ref=$(tail -1 "$pub/commits")"
 check "remote build: no act, no Docker here" bash -c "! grep -qE '^act |^docker ' '$FAKE_LOG'"
 check "remote build: nothing decrypted left behind" bash -c "! ls '${TMPDIR:-/tmp}' | grep -q bana-remote"
+# A one-job build (the daemon's bana ci -j rust): the run's job input is rust.
+: >"$FAKE_LOG"
+rjob=rust remote_ci >"$T/out" 2>"$T/err" || true
+run=$(sed -n 's/.*"run": \([0-9]*\),.*/\1/p' "$b7/remote.json")
+check "split: a one-job build dispatches -f job=rust" has "$FAKE_LOG" " -f tier=quick -f job=rust -f logs=private "
+check "split: and its run has that input" bash -c "tr '\n' ' ' <'$pub/runs/$run/inputs' | grep -q ' job=rust '"
 # The guard: a public side not as bana left it dispatches nothing.
 : >"$FAKE_LOG"
 echo 'on: push' >"$pub/files/.github/workflows/evil.yml"

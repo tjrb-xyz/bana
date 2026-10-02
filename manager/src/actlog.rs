@@ -639,6 +639,9 @@ pub struct Report {
     /// This machine, as the descriptions name it (`mbp`).
     pub machine: String,
     pub tier: String,
+    /// A one-job build's job (`bana ci -j`): the description says "job X
+    /// only", and does not count the jobs -j never ran as skipped.
+    pub job: Option<String>,
 }
 
 impl Report {
@@ -653,30 +656,39 @@ impl Report {
             },
             machine: machine.to_string(),
             tier: tier.to_string(),
+            job: None,
         }
     }
 
-    /// What the build's own status says: `passed on mbp in 12m · 5 jobs`.
+    /// What the build's own status says: `passed on mbp in 12m · 5 jobs`; a
+    /// one-job build's, `passed on mbp in 2m · job rust only (2 jobs)`.
     pub fn describe(&self, b: &Build) -> Option<(StatusState, String)> {
         let took = duration(span(b.started_at, b.ended_at));
         let count = |s: JobState| b.jobs.iter().filter(|j| j.state == s).count();
+        let only = self
+            .job
+            .as_ref()
+            .map(|j| format!(" · job {j} only"))
+            .unwrap_or_default();
         let (state, d) = match b.state {
             BuildState::Queued => return None,
-            BuildState::Running if self.tier.is_empty() => {
-                (StatusState::Pending, format!("running on {}", self.machine))
-            }
+            BuildState::Running if self.tier.is_empty() => (
+                StatusState::Pending,
+                format!("running on {}{only}", self.machine),
+            ),
             BuildState::Running => (
                 StatusState::Pending,
-                format!("running on {} ({})", self.machine, self.tier),
+                format!("running on {} ({}){only}", self.machine, self.tier),
             ),
             BuildState::Success => {
                 let (ran, skipped) = (count(JobState::Success), count(JobState::Skipped));
-                let mut d = format!(
-                    "passed on {} in {took} · {ran} job{}",
-                    self.machine,
-                    if ran == 1 { "" } else { "s" }
-                );
-                if skipped > 0 {
+                let jobs = format!("{ran} job{}", if ran == 1 { "" } else { "s" });
+                let mut d = match &self.job {
+                    // The jobs -j left out end as skipped: they are not this build's.
+                    Some(_) => format!("passed on {} in {took}{only} ({jobs})", self.machine),
+                    None => format!("passed on {} in {took} · {jobs}", self.machine),
+                };
+                if skipped > 0 && self.job.is_none() {
                     d += &format!(", {skipped} skipped");
                 }
                 let away: Vec<String> = b
@@ -714,7 +726,7 @@ impl Report {
                 if failed.len() > 1 {
                     d += &format!(", +{} more", failed.len() - 1);
                 }
-                d += &format!(" · {took} on {}", self.machine);
+                d += &format!(" · {took} on {}{only}", self.machine);
                 (StatusState::Failure, d)
             }
             BuildState::Error => (StatusState::Error, b.stop_reason().to_string()),
@@ -922,6 +934,9 @@ pub struct BuildView {
     pub tier: String,
     /// `push`, `manual`, `rerun` or `retry`.
     pub trigger: String,
+    /// A manual build of one job (and the jobs it needs): that job's id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
     pub attempt: u32,
     pub state: BuildState,
     pub reason: Option<String>,
@@ -988,6 +1003,9 @@ pub struct QueuedView {
     pub sha: String,
     pub tier: String,
     pub trigger: String,
+    /// A one-job build's job (a round's is on its fix).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
     pub queued_at: i64,
     /// Why it waits, when not just for the running build: `paused`,
     /// `waiting for Docker`, `waiting for your bana ci`.
@@ -2161,6 +2179,58 @@ mod tests {
     }
 
     #[test]
+    fn a_one_job_builds_description_says_job_only() {
+        let one = Report {
+            job: Some("rust".into()),
+            ..Report::new("quick", "quick", "mbp")
+        };
+        let running = Build::new(&[(0, "plan".into()), (1, "rust".into())], 0);
+        assert_eq!(
+            one.describe(&running).unwrap().1,
+            "running on mbp (quick) · job rust only"
+        );
+        // -j ran plan and rust: web, which it never ran, is not called skipped.
+        let mut b = Build::new(
+            &[(0, "plan".into()), (1, "rust".into()), (1, "web".into())],
+            0,
+        );
+        for job in ["plan", "rust"] {
+            let line = format!(
+                r#"{{"jobID":"{job}","matrix":{{}},"msg":"x","time":"2026-09-28T13:00:05Z","jobResult":"success"}}"#
+            );
+            b.fold(&parse_line(&line), 0);
+        }
+        b.started_at = parse_time("2026-09-28T13:00:00Z");
+        b.finish(Some(0), None, parse_time("2026-09-28T13:00:10Z").unwrap());
+        assert_eq!(b.jobs[2].state, JobState::Skipped);
+        assert_eq!(
+            one.describe(&b).unwrap().1,
+            "passed on mbp in 10s · job rust only (2 jobs)"
+        );
+        let whole = Report::new("quick", "quick", "mbp");
+        assert_eq!(
+            whole.describe(&b).unwrap().1,
+            "passed on mbp in 10s · 2 jobs, 1 skipped"
+        );
+        let mut b = Build::new(&[(0, "plan".into()), (1, "rust".into())], 0);
+        for extra in [
+            r#""step":"test","stepID":["1"],"stepResult":"failure""#,
+            r#""jobResult":"failure""#,
+        ] {
+            let line = format!(
+                r#"{{"jobID":"rust","matrix":{{}},"msg":"x","time":"2026-09-28T13:00:05Z",{extra}}}"#
+            );
+            b.fold(&parse_line(&line), 0);
+        }
+        b.started_at = parse_time("2026-09-28T13:00:00Z");
+        b.finish(Some(1), None, parse_time("2026-09-28T13:00:10Z").unwrap());
+        assert_eq!(
+            one.describe(&b).unwrap().1,
+            "rust failed at \"test\" · 10s on mbp · job rust only"
+        );
+    }
+
+    #[test]
     fn a_cancel_keeps_its_first_reason() {
         let mut b = Build::new(&[(0, "a".into())], 0);
         b.cancel("cancelled from the menu bar");
@@ -2236,6 +2306,7 @@ mod tests {
             git_ref: "main".into(),
             sha: "1a2b3c4d5e6f".into(),
             tier: "quick".into(),
+            job: None,
             trigger: "push".into(),
             attempt: 1,
             state,

@@ -1347,8 +1347,9 @@ impl Daemon {
     }
 
     /// Run now: `git_ref` (a head last fetched: `refs/heads/main`, or `main`)
-    /// at `tier`, at the front of the queue.
-    pub fn run_now(&self, git_ref: &str, tier: &str) -> Result<u64, String> {
+    /// at `tier`, at the front of the queue; with `job`, only that job and the
+    /// jobs it needs (`bana ci -j`).
+    pub fn run_now(&self, git_ref: &str, tier: &str, job: Option<&str>) -> Result<u64, String> {
         let s = &self.0.settings;
         if !(s.tiers.iter().any(|t| t == tier) || s.tiers.is_empty() && tier.is_empty()) {
             return Err(format!("tier: one of {}", s.tiers.join(", ")));
@@ -1369,6 +1370,7 @@ impl Daemon {
                 git_ref,
                 sha,
                 tier: tier.to_string(),
+                job: job.map(str::to_string),
                 ..Request::default()
             },
             true,
@@ -1378,8 +1380,8 @@ impl Daemon {
         Ok(id)
     }
 
-    /// A new build of a build's commit, tier and before, at the front of the
-    /// queue; it runs even if that commit was built.
+    /// A new build of a build's commit, tier, before and job (a one-job build's),
+    /// at the front of the queue; it runs even if that commit was built.
     pub fn rerun(&self, id: u64) -> Result<u64, String> {
         let mut inner = self.0.lock();
         let r = inner
@@ -1400,6 +1402,7 @@ impl Daemon {
             sha: r.request.sha.clone(),
             tier: r.request.tier.clone(),
             before: r.request.before.clone(),
+            job: r.request.job.clone(),
             ..Request::default()
         };
         let new = self.0.enqueue(&mut inner, req, true);
@@ -2203,6 +2206,7 @@ impl Shared {
                 None => self.settings.machine.clone(),
             },
             tier: rec.request.tier.clone(),
+            job: rec.request.job.clone().filter(|_| rec.request.is_partial()),
         }
     }
 
@@ -2221,6 +2225,7 @@ impl Shared {
             sha: r.request.sha.clone(),
             tier: r.request.tier.clone(),
             trigger: r.request.trigger.as_str().to_string(),
+            job: r.request.job.clone().filter(|_| r.request.is_partial()),
             attempt: r.request.attempt,
             state: b.state,
             reason: b.reason.clone(),
@@ -2269,12 +2274,15 @@ impl Shared {
                 .filter_map(|id| inner.records.get(id))
                 .map(|r| r.request.view(waiting.clone()))
                 .collect(),
-            // A fix's rounds show on its card, not as the project's last build.
+            // A fix's rounds show on its card, not as the project's last build;
+            // a one-job build says nothing of the whole workflow.
             last: inner
                 .records
                 .values()
                 .rev()
-                .find(|r| r.build.state.finished() && !r.request.is_fix())
+                .find(|r| {
+                    r.build.state.finished() && !r.request.is_fix() && !r.request.is_partial()
+                })
                 .map(|r| self.view(inner, r)),
             failed: newest_failed(&inner.records),
             release: release::shown(&inner.releases, now()).map(|r| actlog::ReleaseAsk {
@@ -2503,7 +2511,8 @@ impl Shared {
         let Some(q) = inner.records.get(&id).map(|r| &r.request) else {
             return;
         };
-        if q.is_fix() || q.tier != self.settings.rules.tag_tier {
+        // A one-job build (from the page) ran part of the workflow: it is no release's.
+        if q.is_fix() || q.is_partial() || q.tier != self.settings.rules.tag_tier {
             return;
         }
         let Some(tag) = q
@@ -3917,7 +3926,7 @@ impl Shared {
     ) {
         let s = &self.settings;
         let dir = self.build_dir(id);
-        let (tier, fix_job, split_env) = {
+        let (tier, job, is_round, split_env) = {
             let mut inner = self.lock();
             let inner = &mut *inner;
             let Some(rec) = inner.records.get_mut(&id) else {
@@ -3953,9 +3962,10 @@ impl Shared {
             want(rec, updates, &mut inner.seq);
             self.save(rec);
             let tier = rec.request.tier.clone();
-            let fix_job = rec.request.fix.as_ref().and(rec.request.job.clone());
+            let job = rec.request.job.clone();
+            let is_round = rec.request.is_fix();
             self.publish(inner);
-            (tier, fix_job, split_env)
+            (tier, job, is_round, split_env)
         };
         let remote = !split_env.is_empty();
         self.post.notify_one();
@@ -3966,18 +3976,18 @@ impl Shared {
         if !tier.is_empty() {
             cmd.arg(&tier);
         }
-        if let Some(job) = &fix_job {
+        if let Some(job) = &job {
             cmd.args(["-j", job]);
         }
         cmd.args(["--event", "event.json", "--"])
             .args(s.act_flags(id, port));
         // A round runs Claude's code: without a token, act does not fetch
         // actions either, and uses those the daemon's builds cached.
-        if fix_job.is_some() && s.fix_token == JobToken::Empty {
+        if is_round && s.fix_token == JobToken::Empty {
             cmd.arg("--action-offline-mode");
         }
         cmd.env_clear().envs(s.child_env(id)).envs(split_env);
-        if fix_job.is_some() {
+        if is_round {
             cmd.env("BANA_ROUND_CONF", dir.join("round.conf"));
         }
         cmd.current_dir(&dir)
@@ -4146,7 +4156,9 @@ impl Shared {
             } else {
                 &rules.tier
             };
-            let green = state == BuildState::Success && !rec.request.is_fix();
+            // A one-job build ran part of the workflow: it says nothing of the rest.
+            let green =
+                state == BuildState::Success && !rec.request.is_fix() && !rec.request.is_partial();
             let pin = (green && rec.request.tier == *push_tier).then(|| {
                 inner.state.green.insert(git_ref.clone(), sha.clone());
                 self.save_state(&inner.state);
@@ -4162,9 +4174,10 @@ impl Shared {
             .lock()
             .records
             .get(&id)
-            .is_some_and(|r| r.request.is_fix())
+            .is_some_and(|r| r.request.is_fix() || r.request.is_partial())
         {
-            // A fix's round keeps nothing it uploaded.
+            // A fix's round keeps nothing it uploaded, nor does a one-job build:
+            // neither is ever collected.
             let _ = std::fs::remove_dir_all(dir.join("artifacts"));
         }
         self.write_report(id).await;
@@ -4865,6 +4878,10 @@ fn want(rec: &mut Record, updates: Vec<Status>, seq: &mut u64) {
         return;
     }
     for s in updates {
+        // A one-job build: its jobs' statuses, not the build's (the whole workflow's).
+        if rec.request.is_partial() && s.context == rec.context_prefix {
+            continue;
+        }
         *seq += 1;
         rec.statuses.insert(
             s.context,
@@ -4914,12 +4931,13 @@ fn to_post(inner: &Inner) -> Vec<(u64, String)> {
 
 /// The newest build that failed, unless one since passed: what the menu bar
 /// offers to fix. A build that ended in error (cancelled, timed out) says
-/// nothing either way.
+/// nothing either way, nor does a one-job build (a passing one never hides a
+/// full build's failure).
 fn newest_failed(records: &BTreeMap<u64, Record>) -> Option<u64> {
     records
         .values()
         .rev()
-        .filter(|r| !r.request.is_fix())
+        .filter(|r| !r.request.is_fix() && !r.request.is_partial())
         .find(|r| matches!(r.build.state, BuildState::Success | BuildState::Failure))
         .filter(|r| r.build.state == BuildState::Failure)
         .map(|r| r.request.id)
@@ -4983,7 +5001,11 @@ fn append(path: &Path, text: &str) {
 
 fn built(records: &BTreeMap<u64, Record>) -> Built {
     let mut b = Built::default();
-    for r in records.values().filter(|r| !r.request.is_fix()) {
+    // A one-job build leaves the commit's own build to come.
+    for r in records
+        .values()
+        .filter(|r| !r.request.is_fix() && !r.request.is_partial())
+    {
         b.add(&r.request.sha, &r.request.tier, r.build.state);
     }
     b
@@ -5138,9 +5160,14 @@ fn remote_comment(remote: &actlog::Remote, rec: &Record, report: &str, machine: 
         (Some(u), None) => format!("[its run]({u})"),
         _ => "its run".to_string(),
     };
+    // A one-job build ran that job and the jobs it needs, not the workflow.
+    let only = match &rec.request.job {
+        Some(j) if rec.request.is_partial() => format!(", job {j} only"),
+        _ => String::new(),
+    };
     let head = format!(
-        "### bana: {}, {result}\n\nBuild #{id} of {} at `{}`, built on GitHub's machines from {} \
-         ({run}), dispatched by bana on {machine}.\n\n",
+        "### bana: {}, {result}\n\nBuild #{id} of {} at `{}`{only}, built on GitHub's machines \
+         from {} ({run}), dispatched by bana on {machine}.\n\n",
         remote.label(),
         watch::short_ref(&rec.request.git_ref),
         rec.request.sha.get(..10).unwrap_or(&rec.request.sha),
@@ -6768,7 +6795,7 @@ exec git \"$@\"
         assert_eq!(pushes.len(), 2, "{:?}", d.summary().queue);
         until("paused", || waiting(&d).as_deref() == Some(PAUSED)).await;
         // Run now and a rerun pass them.
-        let manual = d.run_now("side", "nightly").unwrap();
+        let manual = d.run_now("side", "nightly", None).unwrap();
         assert_eq!(finished(&d, manual).await.build.state, BuildState::Success);
         let rerun = d.rerun(1).unwrap();
         assert_eq!(finished(&d, rerun).await.build.state, BuildState::Success);
@@ -6834,8 +6861,10 @@ exec git \"$@\"
         until("build 1 to start", || !p.read("pid.1").is_empty()).await;
 
         // Run now goes to the front of the queue; a queued build is just removed.
-        assert!(d.run_now("main", "weekly").is_err() && d.run_now("nope", "quick").is_err());
-        let m = d.run_now("main", "nightly").unwrap();
+        assert!(
+            d.run_now("main", "weekly", None).is_err() && d.run_now("nope", "quick", None).is_err()
+        );
+        let m = d.run_now("main", "nightly", None).unwrap();
         assert_eq!(
             d.summary()
                 .queue
@@ -6892,7 +6921,7 @@ exec git \"$@\"
         assert_eq!(r.request.before, Some(watch::zeros(&a)));
 
         // Run now at another tier posts under its own contexts.
-        let m = d.run_now("refs/heads/main", "nightly").unwrap();
+        let m = d.run_now("refs/heads/main", "nightly", None).unwrap();
         let r = finished(&d, m).await;
         assert_eq!(
             (r.build.state, r.request.trigger),
@@ -7275,13 +7304,296 @@ exec git \"$@\"
         p.push("main");
         poll(&d).await;
         assert_eq!(d.clear_queue(), 1);
-        let id = d.run_now("main", "nightly").unwrap();
+        let id = d.run_now("main", "nightly", None).unwrap();
         d.set_paused(false);
         assert_eq!(finished(&d, id).await.build.state, BuildState::Success);
         // It says nothing of b's quick jobs: the next push still diffs from a.
         assert_eq!(d.0.lock().state.green.get("refs/heads/main"), Some(&a));
         d.shutdown().await;
         p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_one_job_build_of_a_tag_takes_over_no_release() {
+        let p = Project::new("one-job-tag");
+        let d = start(&p, "daemon.tags = v*\n").await;
+        p.set("hold", true);
+        p.commit("pass", "a");
+        p.push("main");
+        p.tag("v0.1.0");
+        poll(&d).await;
+        let id = tag_build(&d, "v0.1.0").expect("the tag is queued");
+        assert_eq!(rel(&d, "v0.1.0").expect("its release").build, id);
+        let tier = d.0.settings.rules.tag_tier.clone();
+        let one = d.run_now("v0.1.0", &tier, Some("plan")).unwrap();
+        assert_ne!(one, id);
+        assert_eq!(
+            rel(&d, "v0.1.0").unwrap().build,
+            id,
+            "still the tag's own build"
+        );
+        p.set("hold", false);
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_one_job_build_posts_its_jobs_but_moves_no_green_nor_counts_as_built() {
+        let p = Project::new("one-job");
+        let d = start(&p, "").await;
+        let a = p.commit("pass", "a");
+        p.push("main");
+        poll(&d).await;
+        assert_eq!(finished(&d, 1).await.build.state, BuildState::Success);
+        posted(&d).await;
+        // b's push build waits; one job of b, asked for by hand, passes.
+        d.set_paused(true);
+        let b = p.commit("pass", "b");
+        p.push("main");
+        poll(&d).await;
+        assert_eq!(d.clear_queue(), 1);
+        assert!(d.run_now("main", "quick", Some("plan")).is_ok());
+        let id = d.summary().queue[0].id;
+        d.set_paused(false);
+        let r = finished(&d, id).await;
+        assert_eq!(r.build.state, BuildState::Success);
+        assert_eq!(r.request.job.as_deref(), Some("plan"));
+        let argv: Vec<String> = p
+            .read(&format!("argv.{id}"))
+            .lines()
+            .map(String::from)
+            .collect();
+        assert_eq!(argv[..3], ["quick", "-j", "plan"], "{argv:?}");
+        assert!(
+            !argv.iter().any(|a| a == "--action-offline-mode"),
+            "{argv:?}"
+        );
+        // Green stays at a, and b is not built at quick: its push build is still to come.
+        assert_eq!(d.0.lock().state.green.get("refs/heads/main"), Some(&a));
+        assert!(!built(&d.0.lock().records).contains(&b, "quick"));
+        // It posts its job's status, not the build's.
+        posted(&d).await;
+        let of_b: Vec<String> = p
+            .posts()
+            .into_iter()
+            .filter(|x| x.sha == b)
+            .map(|x| x.context)
+            .collect();
+        assert!(of_b.iter().any(|c| c == "bana/plan"), "{of_b:?}");
+        assert!(!of_b.iter().any(|c| c == "bana"), "{of_b:?}");
+        let view = d.builds(None, 10).into_iter().find(|v| v.id == id).unwrap();
+        assert_eq!(view.job.as_deref(), Some("plan"));
+        assert!(
+            view.description.contains(" · job plan only ("),
+            "{}",
+            view.description
+        );
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rerun_keeps_its_job() {
+        let p = Project::new("one-job-rerun");
+        let d = start(&p, "").await;
+        let one = d.run_now("main", "quick", Some("plan")).unwrap();
+        assert_eq!(finished(&d, one).await.build.state, BuildState::Success);
+        p.set("hold", true);
+        let n = d.rerun(one).unwrap();
+        // Queued, and running, it says its job.
+        let q = d.summary().queue.into_iter().find(|q| q.id == n);
+        assert!(
+            q.is_none_or(|q| q.job.as_deref() == Some("plan")),
+            "queued: its job"
+        );
+        until("the re-run to start", || {
+            !p.read(&format!("pid.{n}")).is_empty()
+        })
+        .await;
+        let running = d.summary().running.expect("the re-run runs");
+        assert_eq!((running.id, running.job.as_deref()), (n, Some("plan")));
+        p.set("hold", false);
+        let r = finished(&d, n).await;
+        assert_eq!(
+            (r.request.trigger, r.request.job.as_deref(), r.build.state),
+            (Trigger::Rerun, Some("plan"), BuildState::Success)
+        );
+        let argv = p.read(&format!("argv.{n}"));
+        assert!(argv.starts_with("quick\n-j\nplan\n"), "{argv}");
+        // A whole build's re-run stays whole.
+        let whole = d.run_now("main", "quick", None).unwrap();
+        finished(&d, whole).await;
+        let again = d.rerun(whole).unwrap();
+        let r = finished(&d, again).await;
+        assert_eq!(r.request.job, None);
+        assert!(!p.read(&format!("argv.{again}")).contains("\n-j\n"));
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_passing_one_job_build_keeps_the_full_failures_fix_offer() {
+        let p = Project::new("one-job-fix");
+        let d = start(&p, "").await;
+        p.commit("fail", "a");
+        p.push("main");
+        poll(&d).await;
+        assert_eq!(finished(&d, 1).await.build.state, BuildState::Failure);
+        assert_eq!(d.summary().failed, Some(1));
+        // b's push build waits; one job of b passes.
+        d.set_paused(true);
+        p.commit("pass", "b");
+        p.push("main");
+        poll(&d).await;
+        assert_eq!(d.clear_queue(), 1);
+        let one = d.run_now("main", "quick", Some("plan")).unwrap();
+        assert_eq!(finished(&d, one).await.build.state, BuildState::Success);
+        let s = d.summary();
+        assert_eq!(s.failed, Some(1), "still offered to fix");
+        assert_eq!(s.last.map(|l| l.id), Some(1), "the last whole build");
+        // A one-job build that fails is not offered either: it says nothing of the rest.
+        p.commit("fail", "c");
+        p.push("main");
+        poll(&d).await;
+        assert_eq!(d.clear_queue(), 1);
+        let bad = d.run_now("main", "quick", Some("lint")).unwrap();
+        assert_eq!(finished(&d, bad).await.build.state, BuildState::Failure);
+        assert_eq!(d.summary().failed, Some(1));
+        // A whole build that passes still clears it.
+        p.commit("pass", "d");
+        p.push("main");
+        d.set_paused(false);
+        let whole = d.0.lock().state.next_id;
+        poll(&d).await;
+        let r = finished(&d, whole).await;
+        assert_eq!(
+            (r.request.trigger, r.build.state),
+            (Trigger::Push, BuildState::Success)
+        );
+        assert_eq!(d.summary().failed, None);
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_one_job_builds_artifacts_are_removed() {
+        let p = Project::new("one-job-files");
+        let d = start(&p, "").await;
+        // A commit whose jobs upload files; its push build waits.
+        d.set_paused(true);
+        p.commit("files", "packages");
+        p.push("main");
+        poll(&d).await;
+        assert_eq!(d.clear_queue(), 1);
+        let one = d.run_now("main", "quick", Some("package")).unwrap();
+        let rec = finished(&d, one).await;
+        assert_eq!((rec.build.state, rec.dist), (BuildState::Success, None));
+        let dir = p.dir.join(format!("builds/{one}"));
+        assert!(!dir.join("artifacts").exists(), "never collected: removed");
+        assert!(!dir.join("dist").exists());
+        assert!(!p.flag(&format!("installer.{one}")).exists());
+        // The same commit's whole build collects them into dist/.
+        let whole = d.run_now("main", "quick", None).unwrap();
+        let rec = finished(&d, whole).await;
+        assert_eq!(rec.build.state, BuildState::Success);
+        let dist = rec.dist.expect("collected");
+        assert!(dist.problem.is_none() && !dist.files.is_empty(), "{dist:?}");
+        assert!(p.flag(&format!("installer.{whole}")).exists());
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_one_job_build_of_a_split_project_passes_its_job() {
+        let p = Project::new("one-job-split");
+        let d = start(
+            &p,
+            "split.repo = o/r-releases\nsplit.ci = github\nsplit.logs = private\nsplit.key = 77\n\
+             split.workflow = 0123456789abcdef0123456789abcdef01234567\nrelease.repo = o/r-releases\n",
+        )
+        .await;
+        let a = p.commit("pass", "on GitHub");
+        p.push("main");
+        poll(&d).await;
+        assert_eq!(finished(&d, 1).await.build.state, BuildState::Success);
+        posted(&d).await;
+        let before = p.posts().len();
+        let one = d.run_now("main", "quick", Some("rust")).unwrap();
+        let rec = finished(&d, one).await;
+        assert_eq!(rec.build.state, BuildState::Success);
+        assert_eq!(
+            rec.remote.as_ref().map(|r| r.repo.as_str()),
+            Some("o/r-releases")
+        );
+        // bana ci gets -j, and the split's environment: lib/split.sh dispatches it as job=rust.
+        let argv = p.read(&format!("argv.{one}"));
+        assert!(argv.starts_with("quick\n-j\nrust\n"), "{argv}");
+        let env = p.read(&format!("env.{one}"));
+        for want in [
+            "BANA_SPLIT_REPO=o/r-releases\n".to_string(),
+            "BANA_SPLIT_PRIVATE=o/r\n".into(),
+            format!("BANA_SPLIT_SHA={a}\n"),
+            "BANA_SPLIT_REF=refs/heads/main\n".into(),
+        ] {
+            assert!(env.contains(&want), "{want}: {env}");
+        }
+        // Its comment says so; its statuses are its jobs', not the build's.
+        let body = std::fs::read_to_string(p.dir.join(format!("builds/{one}/comment.md"))).unwrap();
+        assert!(
+            body.contains(&format!(
+                "Build #{one} of main at `{}`, job rust only, built on",
+                &a[..10]
+            )),
+            "{body}"
+        );
+        posted(&d).await;
+        let mine: Vec<(String, String)> = p.posts()[before..]
+            .iter()
+            .map(|x| (x.context.clone(), x.state.clone()))
+            .collect();
+        assert!(
+            mine.contains(&("bana/rust".into(), "success".into())),
+            "{mine:?}"
+        );
+        assert!(!mine.iter().any(|(c, _)| c == "bana"), "{mine:?}");
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[test]
+    fn the_remote_comment_names_the_job() {
+        let remote = actlog::Remote {
+            repo: "o/p".into(),
+            run: Some(9),
+            url: Some("https://github.com/o/p/actions/runs/9".into()),
+        };
+        let mut rec = Record {
+            request: Request {
+                id: 4,
+                git_ref: "refs/heads/main".into(),
+                sha: "0123456789abcdef0123456789abcdef01234567".into(),
+                job: Some("rust".into()),
+                ..Request::default()
+            },
+            ..Record::default()
+        };
+        rec.build.state = BuildState::Success;
+        let body = remote_comment(&remote, &rec, "# CI report: o/r\n", "mbp");
+        assert!(
+            body.starts_with(
+                "### bana: remote run 9 in public repo o/p, passed\n\nBuild #4 of main at `0123456789`, \
+                 job rust only, built on GitHub's machines from o/p ([run 9](https://github.com/o/p/actions/runs/9)), \
+                 dispatched by bana on mbp.\n\n"
+            ),
+            "{body}"
+        );
+        // A whole build's names none; a round's job is no one-job build.
+        rec.request.job = None;
+        let whole = remote_comment(&remote, &rec, "", "mbp");
+        assert!(whole.contains("at `0123456789`, built on"), "{whole}");
+        rec.request.job = Some("rust".into());
+        rec.request.fix = Some("abc1234".into());
+        assert!(!remote_comment(&remote, &rec, "", "mbp").contains("job rust"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

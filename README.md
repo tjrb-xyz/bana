@@ -71,9 +71,12 @@ click has a submenu for each project (*Cancel #N*, *Fix #N with Claude…*, *Pub
 builds*) and *Quit bana*, which stops local CI until the next login.
 
 **The page**, *Local CI*, has a project picker (with two or more projects), the queue, the running build with
-its jobs and live log, and the history. *Run now* builds a branch at any tier, which is how a nightly runs.
-*Pause automatic builds* holds the pushes (the running build finishes, and Run now still builds); *Cancel* stops
-one; *Re-run* builds the same commit again.
+its jobs and live log, and the history. *Run now…* builds a branch at any tier, which is how a nightly runs, all
+of its jobs or one. *Pause automatic builds* holds the pushes (the running build finishes, and Run now still
+builds); *Cancel* stops one; *Re-run…* builds the same commit again; *Run JOB…* runs one job, at its ref's
+current head. Each asks first, saying what will run (and, for a split project, that it runs on the public repo's
+GitHub Actions). One job means that job and the jobs it needs (`bana ci -j`): it posts their statuses but not
+`bana`, moves no green, and leaves the commit's own build to come.
 
 **Which pushes run:** branches matching `daemon.branches` (all but `dependabot/*` and `renovate/*`), tags
 matching `daemon.tags` (none by default), and not a head commit with `[skip ci]` or another of GitHub's skip

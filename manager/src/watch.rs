@@ -348,7 +348,8 @@ pub struct Request {
     /// when a re-run or a retry is queued (the build it runs again had it).
     pub before: Option<String>,
     /// A fix's build (its sha7), and a retry of one: the job it runs
-    /// (`bana ci -j`) and its round.
+    /// (`bana ci -j`) and its round. A manual build of one job (from the page)
+    /// has `job` alone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -372,6 +373,14 @@ impl Request {
         self.fix.is_some()
     }
 
+    /// A manual build of one job (and the jobs it needs), not the whole
+    /// workflow: it posts its jobs' statuses but not the build's, moves no
+    /// green, counts as built nowhere and is no release's. A round, which runs
+    /// one job too, is [`Self::is_fix`] instead.
+    pub fn is_partial(&self) -> bool {
+        self.job.is_some() && !self.is_fix()
+    }
+
     /// How the page and the menu bar show it while it waits.
     pub fn view(&self, waiting: Option<String>) -> QueuedView {
         QueuedView {
@@ -380,6 +389,7 @@ impl Request {
             sha: self.sha.clone(),
             tier: self.tier.clone(),
             trigger: self.trigger.as_str().to_string(),
+            job: self.job.clone().filter(|_| self.is_partial()),
             queued_at: self.queued_at,
             waiting,
         }

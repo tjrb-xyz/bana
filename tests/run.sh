@@ -1524,7 +1524,14 @@ check "daemon status: the running build" has "$T/out" "running: #12 main (quick,
 check "daemon status: the queue" has "$T/out" "queued: 2 (next: #13 feat/x)"
 check "daemon status: the last build" has "$T/out" "last: #11 main failure: failed on mbp: mac (test)"
 check "daemon status: no release line without one" lacks "$T/out" "release "
+check "daemon status: no job for a whole build" lacks "$T/out" "· job"
 cp "$FAKE_STATE/local.json" "$T/local.json"
+sed 's/"trigger":"push","attempt":1,/"trigger":"manual","job":"linux","attempt":1,/; s/"queued_at":990,/"queued_at":990,"job":"mac",/' \
+  "$T/local.json" >"$FAKE_STATE/local.json"
+bash "$bana" daemon status >"$T/out" 2>&1 || { cat "$T/out"; false; }
+check "daemon status: a one-job build running says its job" has "$T/out" \
+  "running: #12 main · job linux (quick, 3 min): running on mbp: linux"
+check "daemon status: and a queued one" has "$T/out" "queued: 2 (next: #13 feat/x · job mac)"
 sed 's/"port":8471}/"port":8471,"release":{"tag":"v0.1.0","state":"asking","build":12}}/' "$T/local.json" >"$FAKE_STATE/local.json"
 bash "$bana" daemon status >"$T/out" 2>&1 || { cat "$T/out"; false; }
 check "daemon status: the release bana asks about" has "$T/out" "  release v0.1.0: waiting for your answer (bana daemon open wid)"

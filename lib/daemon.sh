@@ -950,14 +950,17 @@ d_status_project() { # PORT PROJECT
   [[ -z $v || $v == null ]] || echo "  act is busy with $v"
   v=$(d_val "$flat" watcher.post_error)
   [[ -z $v || $v == null ]] || echo "  statuses: $v ($(d_val "$flat" watcher.unposted) not posted)"
+  # A one-job build (Run JOB… on the page) says its job: " · job JOB".
   v=$(d_val "$flat" running.id)
   if [[ -n $v ]]; then
-    echo "  running: #$v $(d_val "$flat" running.ref) ($(d_val "$flat" running.tier), $(d_ago "$(d_val "$flat" running.elapsed)")): $(d_text "$flat" running.description)"
+    h=$(d_val "$flat" running.job)
+    echo "  running: #$v $(d_val "$flat" running.ref)${h:+ · job $h} ($(d_val "$flat" running.tier), $(d_ago "$(d_val "$flat" running.elapsed)")): $(d_text "$flat" running.description)"
   else
     echo "  running: nothing"
   fi
   v=$(d_val "$flat" 'queue.#')
-  [[ ${v:-0} == 0 ]] || echo "  queued: $v (next: #$(d_val "$flat" queue.0.id) $(d_val "$flat" queue.0.ref))"
+  h=$(d_val "$flat" queue.0.job)
+  [[ ${v:-0} == 0 ]] || echo "  queued: $v (next: #$(d_val "$flat" queue.0.id) $(d_val "$flat" queue.0.ref)${h:+ · job $h})"
   v=$(d_val "$flat" last.id)
   [[ -z $v ]] || echo "  last: #$v $(d_val "$flat" last.ref) $(d_val "$flat" last.state): $(d_text "$flat" last.description)"
   # The release bana asks about (Linux has no menu bar: this line is the ask there).

@@ -759,17 +759,27 @@ async fn project_health(State(d): D) -> Json<Value> {
     )
 }
 
-/// The summary, and what Run now may offer: the refs fetched and the tiers.
+/// The summary, and what Run now may offer: the refs fetched (and their
+/// heads), the tiers, and where a split project's builds run.
 async fn local(State(d): D) -> Json<Value> {
     Json(local_view(&d))
 }
 
 fn local_view(d: &Daemon) -> Value {
+    let s = d.settings();
+    let heads = d.heads();
     let mut v = json!(d.summary());
-    v["refs"] = json!(d.heads().keys().collect::<Vec<_>>());
-    v["tiers"] = json!(d.settings().tiers);
+    v["refs"] = json!(heads.keys().collect::<Vec<_>>());
+    // What Run now… and Run JOB… name before they run: the ref's head.
+    v["heads"] = json!(heads);
+    v["tiers"] = json!(s.tiers);
+    // A split project's builds run on its public repo's GitHub Actions.
+    v["split"] = match s.split_repo.as_ref().filter(|_| s.split_github) {
+        Some(repo) => json!({"repo": repo, "logs": s.split_logs}),
+        None => Value::Null,
+    };
     v["skipped"] = json!(d.skipped().iter().rev().take(20).collect::<Vec<_>>());
-    v["port"] = json!(d.settings().port);
+    v["port"] = json!(s.port);
     v
 }
 
@@ -877,6 +887,9 @@ struct RunNow {
     git_ref: String,
     #[serde(default)]
     tier: String,
+    /// Only this job (a workflow job id) and the jobs it needs.
+    #[serde(default)]
+    job: Option<String>,
 }
 
 async fn run_now(State(d): D, Json(b): Json<RunNow>) -> Response {
@@ -886,8 +899,14 @@ async fn run_now(State(d): D, Json(b): Json<RunNow>) -> Response {
     if !b.tier.is_empty() && !valid_tier(&b.tier) {
         return err(StatusCode::BAD_REQUEST, "tier: a word from the settings");
     }
+    if b.job
+        .as_deref()
+        .is_some_and(|j| !crate::rounds::valid_job(j))
+    {
+        return err(StatusCode::BAD_REQUEST, "job: a workflow job's id");
+    }
     // Refused unless the ref is a head fetched and the tier a settings' tier.
-    match d.run_now(&b.git_ref, &b.tier) {
+    match d.run_now(&b.git_ref, &b.tier, b.job.as_deref()) {
         Ok(id) => Json(json!({ "build": id })).into_response(),
         Err(e) => err(StatusCode::BAD_REQUEST, e),
     }
@@ -1277,6 +1296,38 @@ mod tests {
         assert!(page.contains("Pause automatic builds") && !page.contains("Pause new builds"));
         assert!(page.contains("No projects yet: run bana add in a project's checkout."));
         assert!(page.contains("Run bana add in its checkout, or bana remove"));
+    }
+
+    /// Run now…, Run JOB… and Re-run… ask before they post, and say what runs:
+    /// one job or all, the commit, the tier, and a split project's public repo.
+    #[test]
+    fn the_page_asks_before_it_runs_a_build() {
+        let page = include_str!("page.html");
+        let script = &page[page.find("<script>").unwrap()..];
+        for (handler, post) in [
+            (r#"$("build-rerun").addEventListener"#, "/rerun`)"),
+            (
+                r#"$("build-runjob").addEventListener"#,
+                r#""/builds", body)"#,
+            ),
+            (r#"$("run-now").addEventListener"#, r#""/builds", body)"#),
+        ] {
+            let at = script.find(handler).expect(handler);
+            let body = &script[at..at + script[at..].find(post).expect(post)];
+            assert!(body.contains("if (!askRun("), "{handler} asks first");
+        }
+        let ask = &script[script.find("function askRun(").unwrap()..];
+        let ask = &ask[..ask.find("\n}\n").unwrap()];
+        for says in [
+            "(and the jobs it needs)",
+            "all jobs",
+            "at tier",
+            "GitHub Actions, its log public",
+            "return confirm(q)",
+        ] {
+            assert!(ask.contains(says), "{says}: {ask}");
+        }
+        assert!(page.contains(">Run now…</button>") && page.contains(">Re-run…</button>"));
     }
 
     /// A manager over stand-in programs: a `bana` that reports one busy runner
@@ -1840,6 +1891,25 @@ esac"#,
     }
 
     #[tokio::test]
+    async fn a_split_projects_local_says_where_its_builds_run() {
+        let p = Project::new("srv-split");
+        let d = start_daemon(
+            &p,
+            "split.repo = o/r-releases\nsplit.ci = github\nsplit.logs = public\nsplit.key = 77\n\
+             split.workflow = 0123456789abcdef0123456789abcdef01234567\nrelease.repo = o/r-releases\n",
+        )
+        .await;
+        let l = local_view(&d);
+        assert_eq!(
+            l["split"],
+            json!({"repo": "o/r-releases", "logs": "public"}),
+            "{l}"
+        );
+        d.shutdown().await;
+        p.remove();
+    }
+
+    #[tokio::test]
     async fn health_has_latest_when_set() {
         let p = Project::new("srv-latest");
         let d = start_daemon(&p, "").await;
@@ -1966,6 +2036,8 @@ esac"#,
             (json!({"ref": "main"}), "tier"),
             (json!({"ref": "--help", "tier": "quick"}), "ref"),
             (json!({"ref": "main", "tier": "a b"}), "tier"),
+            (json!({"ref": "main", "tier": "quick", "job": "-x"}), "job"),
+            (json!({"ref": "main", "tier": "quick", "job": "a b"}), "job"),
         ] {
             let (code, v) = post("/ci/v1/p/p/builds", Some(body.clone())).await;
             assert_eq!(code, 400, "{body}: {v}");
@@ -1978,10 +2050,40 @@ esac"#,
         .await;
         assert_eq!(code, 200, "{v}");
         let queued = v["build"].as_u64().unwrap();
+        // Anything else is refused (axum's JSON rejection), a job given as a list too.
+        for body in [
+            json!({"ref": "main", "tier": "quick", "jobs": "plan"}),
+            json!({"ref": "main", "tier": "quick", "job": ["plan"]}),
+        ] {
+            let (code, v) = post("/ci/v1/p/p/builds", Some(body.clone())).await;
+            assert_eq!(code, 422, "{body}: {v}");
+        }
         let (_, l) = call(&app, "GET", "/ci/v1/p/p/local", None, true).await;
         assert_eq!(l["watcher"]["paused"], true);
+        // Each ref's head, which Run now… names; not a split project.
+        let main = l["heads"]["refs/heads/main"].as_str().unwrap_or_default();
+        assert!(
+            main.len() == 40 && main.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{l}"
+        );
+        assert!(l["split"].is_null(), "{l}");
         assert_eq!(l["queue"][0]["id"], queued, "{l}");
         assert_eq!(l["queue"][0]["trigger"], "manual");
+        // One job of it, asked for by id.
+        let (code, v) = post(
+            "/ci/v1/p/p/builds",
+            Some(json!({"ref": "main", "tier": "quick", "job": "plan"})),
+        )
+        .await;
+        assert_eq!(code, 200, "{v}");
+        let one = v["build"].as_u64().unwrap();
+        let (_, l) = call(&app, "GET", "/ci/v1/p/p/local", None, true).await;
+        assert_eq!(
+            l["queue"][1]["id"], one,
+            "after the other hand-asked build: {l}"
+        );
+        assert_eq!(l["queue"][1]["job"], "plan", "{l}");
+        assert_eq!(d.cancel(one, "not this one"), Ok(()));
         until("the queue to wait for Docker", || {
             d.summary().queue.first().and_then(|q| q.waiting.clone())
                 == Some("waiting for Docker".into())
