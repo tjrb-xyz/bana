@@ -1,0 +1,24 @@
+[ci/plan] ⭐ Run Set up job
+[ci/plan]   ✅  Success - Set up job
+[ci/plan] ⭐ Run Main echo go=true >>"$GITHUB_OUTPUT"
+[ci/plan]   ✅  Success - Main echo go=true >>"$GITHUB_OUTPUT" [4.892181ms]
+[ci/plan]   ⚙  ::set-output:: go=true
+[ci/plan] ⭐ Run Complete job
+[ci/plan] Cleaning up container for job plan
+[ci/plan]   ✅  Success - Complete job
+[ci/plan] 🏁  Job succeeded
+[ci/sd  ] ⭐ Run Set up job
+[ci/sd  ]   ✅  Success - Set up job
+[ci/sd  ] ⭐ Run Main sudo loginctl enable-linger "$USER"
+systemctl --user is-system-running
+id -un
+[ci/sd  ]   | running
+[ci/sd  ]   | runner
+[ci/sd  ]   ✅  Success - Main sudo loginctl enable-linger "$USER"
+systemctl --user is-system-running
+id -un
+ [27.737372ms]
+[ci/sd  ] ⭐ Run Complete job
+[ci/sd  ] Cleaning up container for job sd
+[ci/sd  ]   ✅  Success - Complete job
+[ci/sd  ] 🏁  Job succeeded

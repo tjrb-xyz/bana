@@ -5,6 +5,7 @@
 # AWK=original-awk with its BSD awk.
 #
 #   tests/run.sh            all of them (as root, it also tests a Proxmox container's root path)
+# shellcheck disable=SC2016 # scripts for the bash under test (sdx), expanded there
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -588,6 +589,371 @@ check "view: and its errors" has "$T/view" "bana fails"
 check "view: act's errors" has "$T/view" "Error: workflow is not valid"
 check "view: not other lines" lacks "$T/view" "apt-get"
 check "view: no job ran" same "$(tail -1 "$T/view")" "no job ran · act's output: "
+
+# ---- jobs that need systemd: lib/systemd.sh, on stand-ins (tests/systemd.sh: on real Docker) ----
+# act's answers, recorded from act 0.2.89 (tests/fixtures/systemd): plan runs on wid-linux; sd
+# on wid-systemd needs plan; sd2, a matrix on wid-systemd, needs sd; gated, on wid-systemd, needs
+# plan and runs if plan's output says so (a dry run has no outputs); after, on wid-linux, needs sd;
+# never's if: is false. first.*: act's run with wid-systemd on no place; inner-sd.*: act's run of
+# sd in its container (plan again, then sd).
+sdfx=$here/fixtures/systemd
+# SCRIPT, in the bash under test with lib/systemd.sh (after lib/split.sh, for its pins) and set
+# -euo pipefail, as bin/bana has them, with the settings of a run in this checkout.
+sdx() { # SCRIPT
+  SDX=$1 SDLIB=$here/../lib FAKE_ACT_LIST=$(cat "$FAKE_STATE/fx/list.txt") FAKE_ACT_PROBE=$(cat "$FAKE_STATE/fx/probe.jsonl") \
+    bash -c 'set -euo pipefail
+    base_home=$HOME/.bana
+    source "$SDLIB/split.sh"
+    source "$SDLIB/systemd.sh"
+    sysd_docker=(docker) sysd_act=(act)
+    sd_root=$PWD sd_wf=$PWD/.github/workflows/ci.yml
+    sd_args=(workflow_dispatch -C "$sd_root" -W "$sd_wf" --artifact-server-path "$FAKE_STATE/art" -P wid-linux=img -P wid-systemd= --json)
+    sd_labels=" wid-systemd " sd_image=img sd_arch=linux/arm64 sd_net=bridge sd_label="" sd_bin=$FAKE_STATE/act-linux
+    sd_cache=$FAKE_STATE/cache sd_probe_file=$FAKE_STATE/probe sd_log=$FAKE_STATE/systemd.log sd_art=$FAKE_STATE/art
+    sd_name=bana-systemd-wid sd_life=""
+    eval "$SDX"'
+}
+sd_world() {
+  fresh
+  mkdir -p .github/workflows "$FAKE_STATE/fx" "$FAKE_STATE/list" "$FAKE_STATE/cache/actions-checkout@v4" "$FAKE_STATE/art/1/plan-up"
+  cp "$sdfx/ci.yml" .github/workflows/ci.yml
+  cp "$sdfx"/* "$FAKE_STATE/fx/"
+  for j in sd sd2 after gated; do cp "$sdfx/list-$j.txt" "$FAKE_STATE/list/$j"; done
+  printf '#!/bin/sh\n' >"$FAKE_STATE/act-linux"
+  chmod +x "$FAKE_STATE/act-linux"
+  echo old >"$FAKE_STATE/art/1/plan-up/f"
+  git add -A && git -c user.name=t -c user.email=t@t commit -q -m one
+}
+sd_up_here='sd_up "$sd_name" img linux/arm64 bridge "" "$sd_bin" "$sd_cache" "$PWD"'
+# docker run's arguments, a line each: no privilege, socket, device, host namespace or writable mount
+# (docker.socket is a unit the container masks, not Docker's socket).
+sd_nothing_more() { # FILE
+  ! grep -qE -- '--privileged|--cap-add|docker\.sock([^e]|$)|--pid|--ipc|--uts|--userns|--device|--volumes-from|/sys/fs/cgroup|unconfined|--cgroupns=host|^host$|=host$|--mount|--volume' "$1" &&
+    awk 'p == "-v" && $0 !~ /:ro$/ { bad = 1 } { p = $0 } END { exit bad }' "$1"
+}
+
+sd_world
+sdx "$sd_up_here" >"$T/out" 2>&1 && st=0 || st=$?
+check "systemd: a container comes up" same "$st $(cat "$T/out")" "0 "
+printf '%s\n' run -d --rm --name bana-systemd-wid --network bridge --platform linux/arm64 --cgroupns=private \
+  --security-opt writable-cgroups=true --tmpfs /run --tmpfs /run/lock --stop-signal SIGRTMIN+3 -e container=docker \
+  --entrypoint /sbin/init -v "$FAKE_STATE/act-linux:/bana/bin/act:ro" -v "$FAKE_STATE/cache:/bana/in/cache:ro" \
+  -v "$PWD:$PWD:ro" img systemd.mask=docker.service systemd.mask=docker.socket systemd.mask=containerd.service \
+  systemd.mask=ssh.socket systemd.mask=ssh.service systemd.mask=apt-daily.timer systemd.mask=apt-daily-upgrade.timer \
+  systemd.mask=motd-news.timer systemd.mask=dpkg-db-backup.timer systemd.mask=e2scrub_all.timer \
+  systemd.mask=fstrim.timer ---- >"$T/sd-want"
+check "systemd: docker run is exactly the recipe" same "$(cat "$FAKE_STATE/docker.run")" "$(cat "$T/sd-want")"
+check "systemd: the recipe, on one line of lib/systemd.sh" same "$(grep '^sd_run_flags=(' "$here/../lib/systemd.sh")" \
+  "sd_run_flags=(--cgroupns=private --security-opt writable-cgroups=true --tmpfs /run --tmpfs /run/lock --stop-signal SIGRTMIN+3 -e container=docker --entrypoint /sbin/init)"
+check "systemd: nothing more (no privilege, socket, device, host namespace or writable mount)" sd_nothing_more "$FAKE_STATE/docker.run"
+# What bana split's lint will hold its part of lib/systemd.sh to (bana.yml carries it).
+awk '/^# ---- systemd: /, /^# ---- end of systemd/' "$here/../lib/systemd.sh" >"$T/sd-part"
+check "systemd: its part says none of those (the recipe's line aside), nor \${{, uses: or a cache key" same \
+  "$(grep -v '^sd_run_flags=(' "$T/sd-part" | grep -E -- '--privileged|--cap-add|docker\.sock([^e]|$)|--pid|--ipc|--uts|--userns|--device|--volumes-from|--network[ =]host|--net=host|--cgroupns|--security-opt|unconfined|\$\{\{|^ *(- )?uses: |^ *(- )?[a-z-]*cache[a-z-]*:' || true)" ""
+check "systemd: a mount is read-only, and sd_ro the one same-path mount" same \
+  "$(grep -o -- '-v "[^"]*"' "$T/sd-part" | grep -cv ':ro"$') $(grep -c 'sd_mounts+=(' "$T/sd-part") $(grep -c '^  sd_mounts+=(-v "$1:$1:ro")$' "$T/sd-part")" "0 1 1"
+check "systemd: a leftover removed by name first" awk '/^docker rm -f bana-systemd-wid$/ && !r { rm = NR } /^docker run / && !r { r = NR } END { exit !(rm && rm < r) }' "$FAKE_LOG"
+check "systemd: no label by hand" lacks "$FAKE_STATE/docker.run" "--label"
+check "systemd: runner is the user's uid (1000 here)" same "$(head -1 "$FAKE_STATE/ctr/bana-systemd-wid/setup")" 1000
+rm -f "$FAKE_STATE/docker.run"
+sdx 'sd_up "$sd_name" img linux/amd64 host wid "$sd_bin" "$FAKE_STATE/no-cache" "$PWD"'
+tr '\n' ' ' <"$FAKE_STATE/docker.run" >"$T/out"
+check "systemd: a label only when given (the daemon's)" has "$T/out" "--label xyz.tjrb.bana=wid --platform linux/amd64 "
+check "systemd: act.network host is not the container's: Docker's bridge" lacks "$T/out" "--network"
+check "systemd: no cache, no mount for it" lacks "$T/out" "/bana/in/cache"
+FAKE_UID=0 sdx "$sd_up_here"' && echo "$sd_uid"' >"$T/out"
+check "systemd: as root here, runner is 1001 (as on GitHub's runners)" same "$(cat "$T/out") $(head -1 "$FAKE_STATE/ctr/bana-systemd-wid/setup")" "1001 1001"
+check "systemd: the checkout, for runner to read" same "$(sed -n 2p "$FAKE_STATE/ctr/bana-systemd-wid/setup")" "$PWD"
+
+# A file (the daemon's secrets, mode 600) goes in as a copy runner owns, not as a mount; one in
+# the checkout, a directory, /dev/null and a relative path are not copied.
+printf 'GITHUB_TOKEN=x\n' >"$FAKE_STATE/secrets"
+chmod 600 "$FAKE_STATE/secrets"
+rm -f "$FAKE_STATE/docker.run"
+sdx 'sd_up "$sd_name" img linux/arm64 "" "" "$sd_bin" "" "$PWD" "$FAKE_STATE/secrets" "$PWD/.github/bana.conf" /dev/null rel'
+check "systemd: a file goes in as a copy" same "$(cat "$FAKE_STATE/ctr/bana-systemd-wid/files$FAKE_STATE/secrets")" "GITHUB_TOKEN=x"
+check "systemd: at its own path" has "$FAKE_LOG" "docker cp -L $FAKE_STATE/secrets bana-systemd-wid:$FAKE_STATE/secrets"
+check "systemd: not a mount" lacks "$FAKE_STATE/docker.run" "secrets"
+check "systemd: runner gets it, and nothing else" same "$(sed -n '3,$p' "$FAKE_STATE/ctr/bana-systemd-wid/setup")" "$FAKE_STATE/secrets"
+check "systemd: one mount for the checkout" same "$(grep -c ":ro$" "$FAKE_STATE/docker.run")" 2
+
+# Why not here.
+check "systemd: Docker 28 and later can" same "$(sdx sd_why)" ""
+check "systemd: API 1.47 says Docker 28" same "$(FAKE_DOCKER_API=1.47 sdx sd_why)" "needs Docker 28 or later (writable cgroups)"
+check "systemd: API 1.100 is later than 1.48" same "$(FAKE_DOCKER_API=1.100 sdx sd_why)" ""
+check "systemd: rootless says so" same "$(FAKE_DOCKER_ROOTLESS=1 sdx sd_why)" "rootless Docker refuses writable cgroups"
+check "systemd: no Docker says so" same "$(FAKE_DOCKER=0 sdx sd_why)" "Docker is not running"
+check "systemd: no act for the container says so" same "$(sdx 'sd_bin=$FAKE_STATE/none; sd_why')" "no act for its container"
+
+# Not up: the container goes, and why.
+FAKE_SYSD_STATE=starting BANA_SYSTEMD_WAIT=1 sdx "$sd_up_here"' || echo "st=$? $sd_err"' >"$T/out"
+check "systemd: not ready in time: status 1, and why" same "$(cat "$T/out")" "st=1 systemd was not up in 1s (starting)"
+check "systemd: not ready in time: removed" test ! -e "$FAKE_STATE/ctr/bana-systemd-wid"
+FAKE_UID=501 FAKE_SYSD_UNREADABLE=1 sdx "$sd_up_here"' || echo "st=$? $sd_err"' >"$T/out"
+check "systemd: an unreadable checkout fails with uid U" same "$(cat "$T/out")" "st=1 the systemd container cannot read the checkout as uid 501"
+check "systemd: and the container goes" test ! -e "$FAKE_STATE/ctr/bana-systemd-wid"
+FAKE_DOCKER_RUN_FAIL='exec: "/sbin/init": stat /sbin/init: no such file or directory' sdx "$sd_up_here"' || echo "st=$? $sd_err"' >"$T/out"
+check "systemd: an image without systemd says so" same "$(cat "$T/out")" "st=1 act.image img cannot run systemd jobs (no /sbin/init or setpriv)"
+FAKE_DOCKER_RUN_FAIL='no space left on device' sdx "$sd_up_here"' || echo "st=$? $sd_err"' >"$T/out"
+check "systemd: docker run failing says why" same "$(cat "$T/out")" "st=1 docker run: docker: Error response from daemon: no space left on device"
+mkdir -p "$T/w/a:b"
+sdx 'sd_up "$sd_name" img linux/arm64 "" "" "$sd_bin" "" "$PWD" "$PWD/../a:b" || echo "st=$? $sd_err"' >"$T/out" 2>&1
+check "systemd: a path with ':' is not mounted" same "$(cat "$T/out")" "st=1 a path Docker cannot mount: $PWD/../a:b"
+
+# act in the container: runner's, GITHUB_TOKEN by its name.
+rm -f "$FAKE_STATE/act.inner"
+GITHUB_TOKEN=tok-sekrit-1 sdx "$sd_up_here"'; (sd_act "$sd_name" "$sd_uid" workflow_dispatch -j sd)'
+check "systemd: GITHUB_TOKEN by name only" lacks "$FAKE_LOG" "tok-sekrit-1"
+check "systemd: GITHUB_TOKEN reaches act" has "$FAKE_STATE/act.inner.env" "GITHUB_TOKEN=tok-sekrit-1"
+check "systemd: act as runner, its environment its own" same "$(grep -E '^(HOME|USER|LOGNAME|RUNNER_USER|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS)=' "$FAKE_STATE/act.inner.env" | sort | tr '\n' ' ')" \
+  "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus HOME=/home/runner LOGNAME=runner RUNNER_USER=runner USER=runner XDG_RUNTIME_DIR=/run/user/1000 "
+check "systemd: none of this bash's" lacks "$FAKE_STATE/act.inner.env" "SDLIB="
+check "systemd: act with its arguments" same "$(cat "$FAKE_STATE/act.inner")" "workflow_dispatch -j sd"
+check "systemd: through setpriv, as uid 1000, in the checkout" has "$FAKE_LOG" "docker exec -u root -w $PWD -e USER=runner"
+check "systemd: and its pid where root keeps it" has "$FAKE_STATE/ctr/bana-systemd-wid/exec" 'exec setpriv --reuid="$u" --regid="$u" --init-groups /bana/bin/act "$@"'
+# sd_int: Ctrl-C for act in its container, through the pid file; asked before act started, act
+# does not start. (Here act is this bash's: started as sd_one starts it, in its own process
+# group, as without job control a background command ignores SIGINT.)
+FAKE_ACT_INT=1 FAKE_ACT_SLEEP_SYSD=30 sdx "$sd_up_here"'
+  set -m
+  (sd_act "$sd_name" "$sd_uid" workflow_dispatch -j sd) &
+  p=$!
+  set +m
+  for i in $(seq 100); do [[ ! -e $FAKE_STATE/act.inner.env ]] || break; sleep 0.05; done
+  sleep 0.3
+  sd_live=$sd_name
+  sd_int
+  st=0; wait "$p" || st=$?; echo "st=$st"' >"$T/out" 2>&1
+check "sd_int reaches the inner act through the root pid file" has "$FAKE_STATE/act.inner.int" int
+check "sd_int: act ends as Ctrl-C ends it" has "$T/out" "st=1"
+rm -f "$FAKE_STATE/act.inner"
+sdx "$sd_up_here"'; sd_live=$sd_name; sd_int; st=0; (sd_act "$sd_name" "$sd_uid" -j sd) || st=$?; echo "st=$st"' >"$T/out"
+check "sd_int: before act starts, act does not" same "$(cat "$T/out") $(cat "$FAKE_STATE/act.inner" 2>/dev/null)" "st=130 "
+# The lifeline: bash killed (-9), the container powers off.
+sdx "$sd_up_here"'; sd_lifeline "$sd_name"; kill -KILL $$' 2>/dev/null || true
+for i in $(seq 60); do [[ -e $FAKE_STATE/ctr/bana-systemd-wid ]] || break; sleep 0.05; done
+check "sd_lifeline: bash killed, the container powers off" same "$(grep -c 'bana-systemd-wid powered off' "$FAKE_LOG") $([[ -e $FAKE_STATE/ctr/bana-systemd-wid ]] && echo there)" "1 "
+sdx "$sd_up_here"'; sd_lifeline "$sd_name"; sd_down "$sd_name"; sleep 0.3; echo "${sd_life_pid:-none}"' >"$T/out"
+check "sd_down: the lifeline closed, the container gone" same "$(cat "$T/out") $([[ -e $FAKE_STATE/ctr/bana-systemd-wid ]] && echo there)" "none "
+
+# act_linux: act, pinned, for the container's CPU.
+sd_world
+mkdir -p "$T/w/tgz"
+printf '#!/bin/sh\necho act-linux\n' >"$T/w/tgz/act"
+chmod 755 "$T/w/tgz/act"
+tar -czf "$T/w/act.tgz" -C "$T/w/tgz" act
+sum=$(sdx "split_sha256 $T/w/act.tgz")
+FAKE_TARBALL=$T/w/act.tgz sdx "split_act_sha256_arm64=$sum"'; act_linux linux/arm64; echo "$sd_bin"; act_linux arm64; echo "$sd_bin"' >"$T/out"
+a=$HOME/.bana/act-linux/0.2.89-arm64
+check "act_linux: downloaded, checked, in place" same "$(sort -u "$T/out")" "$a/act"
+check "act_linux: the one downloaded" same "$("$a/act")" "act-linux"
+check "act_linux: downloaded once" same "$(grep -c '^curl .*releases/download/v0.2.89/act_Linux_arm64.tar.gz$' "$FAKE_LOG")" 1
+check "act_linux: nothing else left there" same "$(ls -A "$a")" act
+FAKE_TARBALL=$T/w/act.tgz sdx 'act_linux x86_64 || echo "st=$? $sd_err"' >"$T/out"
+check "act_linux: wrong sha256 refused" same "$(cat "$T/out")" "st=1 act 0.2.89 for Linux (x86_64) did not download, or is not the one pinned"
+check "act_linux: and nothing kept" same "$(ls -A "$HOME/.bana/act-linux/0.2.89-x86_64")" ""
+check "act_linux: the pins, as act's release has them" same "$(sdx 'echo "$split_act_sha256_arm64"')" daa8679ba9615a74d2d0cec321dc593f21948a2a11bb65862b063d8b930f4bcb
+BANA_SYSTEMD_ACT=$FAKE_STATE/act-linux sdx 'act_linux x86_64; echo "$sd_bin"' >"$T/out"
+check "act_linux: override honoured" same "$(cat "$T/out") $(grep -c x86_64.tar.gz "$FAKE_LOG")" "$FAKE_STATE/act-linux 1"
+
+# sd_probe: one dry run, every label on the image, the systemd ones on an image no one has.
+sd_world
+sdx 'sd_probe "$sd_probe_file" "${sd_args[@]}"'
+printf '%s\t%s\t%s\t%s\n' plan 'ci/plan ' '{}' 0 sd 'ci/sd   ' '{}' 1 sd2 ci/sd2-1 '{"n":1}' 1 sd2 ci/sd2-2 '{"n":2}' 1 \
+  after ci/after '{}' 0 >"$T/sd-want"
+check "sd_probe: ids, names, matrices and systemd entries, including a systemd job that needs one" \
+  same "$(cat "$FAKE_STATE/probe")" "$(cat "$T/sd-want")"
+check "sd_probe: a dry run, every label on the image, wid-systemd on bana-systemd-probe" has "$FAKE_STATE/act.probe" \
+  "--json -P wid-linux=img -P wid-systemd=bana-systemd-probe -n --json --concurrent-jobs 1"
+check "sd_probe: no file of its own left" same "$(cd "$FAKE_STATE" && echo probe*)" probe
+sdx 'sd_labels=" wid-systemd other "; sd_args+=(-P Old-Ubuntu=x -Pself=y --platform=z=); sd_probe "$sd_probe_file" "${sd_args[@]}"'
+check "sd_probe: each label once, lowercase, from each form of -P, and a systemd label the run has not" has \
+  <(tail -1 "$FAKE_STATE/act.probe") \
+  "--platform=z= -P wid-linux=img -P wid-systemd=bana-systemd-probe -P old-ubuntu=img -P self=img -P z=img -P other=bana-systemd-probe -n --json --concurrent-jobs 1"
+printf '%s\n' '{"job":"ci/x","jobID":"a b","level":"info","matrix":{},"msg":"🚀  Start image=img"}' >>"$FAKE_STATE/fx/probe.jsonl"
+sdx 'sd_probe "$sd_probe_file" "${sd_args[@]}"' 2>"$T/err"
+check "sd_probe: an id bana cannot use, left out" same "$(cut -f1 "$FAKE_STATE/probe" | tr '\n' ' ')" "plan sd sd2 sd2 after "
+check "sd_probe: and said" has "$T/err" "bana: left out, an id bana cannot use: a b"
+cp "$sdfx/probe.jsonl" "$FAKE_STATE/fx/"
+rm -f "$FAKE_STATE/probe"
+FAKE_ACT_PROBE_EXIT=2 sdx 'sd_probe "$sd_probe_file" "${sd_args[@]}" || echo "st=$?"' >"$T/out"
+check "sd_probe: fails as act does, and writes nothing" same "$(cat "$T/out") $(cd "$FAKE_STATE" && echo probe*)" "st=1 probe*"
+# sd_next: before act, a line each systemd entry, as act would say it.
+sdx 'sd_probe "$sd_probe_file" "${sd_args[@]}"; sd_next json' >"$T/out"
+check "sd_next: JSON lines" json_lines <"$T/out"
+check "sd_next: a line each systemd entry" same "$(sed 's/,"time":"[^"]*"}$/}/' "$T/out")" \
+  "$(printf '%s\n' '{"level":"info","job":"ci/sd   ","jobID":"sd","matrix":{},"msg":"bana: next, in a systemd container"}' \
+    '{"level":"info","job":"ci/sd2-1","jobID":"sd2","matrix":{"n":1},"msg":"bana: next, in a systemd container"}' \
+    '{"level":"info","job":"ci/sd2-2","jobID":"sd2","matrix":{"n":2},"msg":"bana: next, in a systemd container"}')"
+check "sd_next: act's time" grep -qE '"time":"20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"}$' "$T/out"
+FAKE_DOCKER_API=1.47 sdx 'sd_next text' >"$T/out"
+check "sd_next: not here, in text, and why" same "$(head -1 "$T/out")" "[ci/sd   ] bana: not run here: needs Docker 28 or later (writable cgroups)"
+
+# sd_only: a container's act's own lines, and nothing a job could write as act's.
+sdx 'sd_only json sd "" "$FAKE_STATE/res"' <"$sdfx/inner-sd.jsonl" >"$T/out"
+check "sd_only: keeps sd's JSON lines" same "$(wc -l <"$T/out" | tr -d ' ')" "$(grep -c '"jobID":"sd"' "$sdfx/inner-sd.jsonl")"
+check "sd_only: drops plan's (its need, run again)" lacks "$T/out" '"jobID":"plan"'
+check "sd_only: notes sd's result" test -e "$FAKE_STATE/res"
+# Lines a job could write as act's (forged.jsonl): only those of sd's whose msg is kept stay.
+grep -v 'its result' "$sdfx/forged.jsonl" >"$T/sd-in"
+rm -f "$FAKE_STATE/res"
+sdx 'sd_only json sd "" "$FAKE_STATE/res"' <"$T/sd-in" >"$T/out"
+check "sd_only: drops a second jobID, a bana key, a \\u-escaped key, non-JSON and others' lines" same "$(cat "$T/out")" \
+  "$(grep '"msg":"kept' "$T/sd-in")"
+check "sd_only: no result, no note" test ! -e "$FAKE_STATE/res"
+# A step's long line (2 MB, escapes all along): read once, not over and over.
+awk 'BEGIN { b = sprintf("%c", 92); printf "{\"jobID\":\"sd\",\"msg\":\""; for (i = 0; i < 200000; i++) printf "%su003c%s%sx", b, b, b; print "\"}" }' >"$T/sd-in"
+t0=$SECONDS
+SDIN=$T/sd-in sdx 'sd_only json sd "" /dev/null <"$SDIN"; : >"$sd_probe_file"; sd_first json "$SDIN"' >"$T/out"
+check "sd_only, sd_first: a 2 MB line, in a moment" same "$(cut -c1-10 "$T/out" | tr '\t\n' '  ') $((SECONDS - t0 < 10))" '{"jobID":" P sd  1'
+sdx 'sd_only text sd "ci/sd" "$FAKE_STATE/res"' <"$sdfx/inner-sd.txt" >"$T/out"
+check "sd_only: keeps sd's text lines, and those that go on them" same "$(cat "$T/out")" "$(sed -n '/^\[ci\/sd /,$p' "$sdfx/inner-sd.txt")"
+check "sd_only: notes sd's result in text too" test -e "$FAKE_STATE/res"
+printf '%s\n' '[ci/sd  ] ⭐ Run Main x' 'goes on' $'[ci/sd  ]   | x\r[ci/plan] 🏁  Job succeeded' 'dropped: after a dropped line' \
+  $'\033[0m[ci/plan] 🏁  Job succeeded' '*DRYRUN* [ci/plan] x' '[ci/sd  ] y' 'Error: a job of sd writes this' '[ci/sd2-1] z' >"$T/sd-in"
+sdx 'sd_only text sd "ci/sd" /dev/null' <"$T/sd-in" >"$T/out"
+check "sd_only: text, as a terminal shows it" same "$(cat "$T/out")" "$(printf '%s\n' '[ci/sd  ] ⭐ Run Main x' 'goes on' '[ci/sd  ] y')"
+
+# sd_inner: act's arguments in the container.
+sdx 'sd_args=(workflow_dispatch -C /r -P wid-linux=img -P Wid-MacOS=-self-hosted -Pold=catthehacker/ubuntu:act-20.04
+    --platform=skipme= -j after --job=x "--container-options=--label x=y" --container-options "--label z" --network bridge
+    --network=host --artifact-server-path a --artifact-server-path=b --action-cache-path c --rm --rm=true --json -P wid-linux=)
+  sd_inner sd; printf "%s\n" "${sd_in[@]}"' >"$T/out"
+check "sd_inner: images, systemd and linux labels in host mode, a Mac's and skips nowhere; its own job, server and cache" \
+  same "$(tr '\n' ' ' <"$T/out")" "workflow_dispatch -C /r --json -P wid-linux= -P wid-macos= -P old=-self-hosted -P skipme= -P wid-systemd=-self-hosted -j sd --concurrent-jobs 1 --artifact-server-path /home/runner/.bana/artifacts --action-cache-path /home/runner/.cache/act "
+sdx 'sd_args=(x -e "$PWD/.github/bana.conf" --secret-file="$FAKE_STATE/act-linux" --var-file /dev/null --env-file rel --input-file "$FAKE_STATE/none"); sd_files' >"$T/out"
+check "sd_files: the files act reads, as they are here" same "$(tr '\n' ' ' <"$T/out")" "$PWD/.github/bana.conf $FAKE_STATE/act-linux "
+
+# sd_after: after act's first run (JSON), each systemd job in a container of its own.
+sd_run() { # MODE FIRST: the probe, bana's next lines, and sd_after on FIRST as act's output
+  local m=$1 f=$2
+  cp "$f" "$FAKE_STATE/t.1"
+  : >"$FAKE_STATE/t.2"
+  sdx "$([[ $m == text ]] && echo 'sd_args=("${sd_args[@]:0:11}");')"'
+    sd_probe "$sd_probe_file" "${sd_args[@]}"; sd_next '"$m"'; sd_after '"$m"' "$FAKE_STATE/t.1" "$FAKE_STATE/t.2"' >"$T/out" 2>"$T/err"
+}
+sd_world
+FAKE_ACT_OUT_SYSD=$(cat "$sdfx/inner-sd.jsonl") sd_run json "$sdfx/first.jsonl" && st=0 || st=$?
+check "sd_after: passes" same "$st $(cat "$T/err")" "0 "
+check "sd_after: JSON lines" json_lines <"$T/out"
+check "sd_after: a dependent says it needs sd" has "$T/out" '"job":"ci/after","jobID":"after","matrix":{},"msg":"bana: not run here: needs sd, a systemd job"'
+check "sd_after: a systemd job the probe missed (an if: on a need's output) runs too, from act's skip" has "$T/out" \
+  '"job":"ci/gated","jobID":"gated","matrix":{},"msg":"bana: next, in a systemd container"'
+check "sd_after: one container a systemd job, in turn: sd, sd2 (it needs sd), gated" same \
+  "$(awk '{ for (i = 1; i < NF; i++) if ($i == "-j") printf "%s ", $(i + 1) }' "$FAKE_STATE/act.inner")" "sd sd2 gated "
+check "sd_after: three containers, each fresh" same "$(grep -c '^docker rm -f bana-systemd-wid$' "$FAKE_LOG") $(grep -c '^----$' "$FAKE_STATE/docker.run")" "6 3"
+check "sd_after: none left" same "$(docker ps)" ""
+check "sd_after: sd's act: the run's arguments, its labels in host mode, its job, server and cache" same "$(head -1 "$FAKE_STATE/act.inner")" \
+  "workflow_dispatch -C $PWD -W $PWD/.github/workflows/ci.yml --json -P wid-linux=-self-hosted -P wid-systemd=-self-hosted -j sd --concurrent-jobs 1 --artifact-server-path /home/runner/.bana/artifacts --action-cache-path /home/runner/.cache/act"
+check "sd_after: sd's own lines, once each" same "$(grep -c '"jobID":"sd",' "$T/out")" "$(($(grep -c '"jobID":"sd"' "$sdfx/inner-sd.jsonl") + 1))"
+check "sd_after: plan's, run again inside, not" lacks "$T/out" '"jobID":"plan"'
+check "sd_after: all of it in sd_log" same "$(grep -c '"jobID":"plan"' "$FAKE_STATE/systemd.log")" "$((3 * $(grep -c '"jobID":"plan"' "$sdfx/inner-sd.jsonl")))"
+check "sd_after: the probe's entries, and gated's" same "$(cut -f1,4 "$FAKE_STATE/probe" | tr '\t\n' ': ')" "plan:0 sd:1 sd2:1 sd2:1 after:0 gated:1 "
+# In text: names, as act's text has them, through act -l.
+sd_world
+FAKE_ACT_OUT_SYSD=$(cat "$sdfx/inner-sd.txt") sd_run text "$sdfx/first.txt" && st=0 || st=$?
+check "sd_after (text): passes" same "$st $(cat "$T/err")" "0 "
+check "sd_after (text): bana's next lines" same "$(grep -c '^\[ci/sd.*\] bana: next, in a systemd container$' "$T/out")" 3
+check "sd_after (text): a dependent says it needs sd" has "$T/out" "[ci/after] bana: not run here: needs sd, a systemd job"
+check "sd_after (text): gated, found by its name" has "$T/out" "[ci/gated] bana: next, in a systemd container"
+check "sd_after (text): sd's lines" same "$(grep -c '^\[ci/sd  \]' "$T/out")" "$(grep -c '^\[ci/sd  \]' "$sdfx/inner-sd.txt")"
+check "sd_after (text): not plan's" lacks "$T/out" "[ci/plan]"
+check "sd_after (text): one container each" same "$(grep -c '^----$' "$FAKE_STATE/docker.run")" 3
+# A need failed in act's run: act skipped sd and said nothing of it; no container starts.
+sd_world
+grep -v 'Skipping' "$sdfx/first.jsonl" | sed 's/"jobResult":"success"/"jobResult":"failure"/' >"$T/sd-first"
+sd_run json "$T/sd-first" && st=0 || st=$?
+check "sd_after: a need that failed in the first act starts no container" same "$st $(cat "$FAKE_STATE/docker.run" 2>/dev/null)" "0 "
+check "sd_after: and says so" has "$T/out" '"jobID":"sd","matrix":{},"msg":"bana: not run here: needs plan, which failed"'
+check "sd_after: for each entry of sd2 too" same "$(grep -c '"jobID":"sd2".*"msg":"bana: not run here: needs plan, which failed"' "$T/out")" 2
+check "sd_after: after still needs sd" has "$T/out" '"jobID":"after","matrix":{},"msg":"bana: not run here: needs sd, a systemd job"'
+# A need not run here (a Mac's job on Linux): no container.
+sd_world
+# shellcheck disable=SC2016 # act's backquotes
+printf '%s\n' '{"dryrun":false,"job":"ci/plan ","jobID":"plan","level":"info","matrix":{},"msg":"🚧  Skipping unsupported platform -- Try running with `-P wid-macos=...`","time":"2026-10-02T17:19:05Z"}' >"$T/sd-first"
+sd_run json "$T/sd-first" || true
+check "sd_after: a need not run here starts no container" same "$(cat "$FAKE_STATE/docker.run" 2>/dev/null)" ""
+check "sd_after: and says so" has "$T/out" '"jobID":"sd","matrix":{},"msg":"bana: not run here: needs plan, which is not run here"'
+# act said nothing of sd (its if:, unless a need runs in a container): no container.
+sd_world
+grep -v 'Skipping' "$sdfx/first.jsonl" >"$T/sd-first"
+sd_run json "$T/sd-first" || true
+check "sd_after: a systemd job act would not run (its if:) starts no container" same "$(cat "$FAKE_STATE/docker.run" 2>/dev/null)" ""
+check "sd_after: and no line for it" lacks "$T/out" '"jobID":"sd","matrix":{},"msg":"bana: not'
+# The inner act failing before sd's result: a need failed in its container.
+sd_world
+FAKE_ACT_OUT_SYSD=$(grep '"jobID":"plan"' "$sdfx/inner-sd.jsonl" | sed 's/"jobResult":"success"/"jobResult":"failure"/') \
+  FAKE_ACT_ERR_SYSD=$'\033[31mError: Job \'plan\' failed\033[0m' FAKE_ACT_EXIT_SYSD=3 sd_run json "$sdfx/first.jsonl" && st=0 || st=$?
+check "sd_after: the inner act failing without sd's result fails the run, with act's status" same "$st" 3
+check "sd_after: gives the not-run line" has "$T/out" \
+  "\"jobID\":\"sd\",\"matrix\":{},\"msg\":\"bana: not run here: a job it needs failed in its systemd container (its output: $FAKE_STATE/systemd.log)\""
+check "sd_after: and a red Error" has "$T/err" $'\033[31mError: systemd job sd did not run: Job \'plan\' failed\033[0m'
+check "sd_after: sd2 then needs sd, which failed" has "$T/out" '"jobID":"sd2","matrix":{"n":1},"msg":"bana: not run here: needs sd, which failed"'
+check "sd_after: gated still runs (its own container)" same "$(grep -c '^----$' "$FAKE_STATE/docker.run")" 2
+# A container that does not start: the same pair, and why.
+sd_world
+FAKE_DOCKER_RUN_FAIL='no space left on device' sd_run json "$sdfx/first.jsonl" && st=0 || st=$?
+check "sd_after: a container that does not start fails the run" same "$st" 1
+check "sd_after: says so" has "$T/out" '"jobID":"sd","matrix":{},"msg":"bana: not run here: its systemd container did not start"'
+check "sd_after: and why, in red" has "$T/err" $'\033[31mError: systemd job sd did not run: docker run: docker: Error response from daemon: no space left on device\033[0m'
+# Docker too old: not run here, the run passes, no container.
+sd_world
+FAKE_DOCKER_API=1.47 sd_run json "$sdfx/first.jsonl" && st=0 || st=$?
+check "sd_after: Docker 1.47: not run here, the run passes" same "$st $(cat "$FAKE_STATE/docker.run" 2>/dev/null)" "0 "
+check "sd_after: Docker 1.47: why, for each systemd job" same "$(grep -c 'bana: not run here: needs Docker 28 or later (writable cgroups)' "$T/out")" 4
+# A stop starts no container.
+sd_world
+cp "$sdfx/first.jsonl" "$FAKE_STATE/t.1"
+sdx 'sd_probe "$sd_probe_file" "${sd_args[@]}"; sd_next json; sd_stop=1; sd_after json "$FAKE_STATE/t.1"' >"$T/out"
+check "sd_after: a stop starts no container" same "$(cat "$FAKE_STATE/docker.run" 2>/dev/null)" ""
+
+# sd_copy_out: a container's uploads come back as plain files, new names only.
+sd_tar() { # NAME ENTRY...: an archive of artifacts/, ENTRY: PATH (a file), PATH/ (a directory), PATH@MODE, PATH->LINK, PATH|fifo
+  python3 - "$@" <<'PY'
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], "w") as t:
+    for e in sys.argv[2:]:
+        i = tarfile.TarInfo(e.split("->")[0].split("@")[0].split("|")[0].rstrip("/"))
+        if e.endswith("/"): i.type, i.mode = tarfile.DIRTYPE, 0o755; t.addfile(i)
+        elif "->" in e: i.type, i.linkname = tarfile.SYMTYPE, e.split("->")[1]; t.addfile(i)
+        elif e.endswith("|fifo"): i.type = tarfile.FIFOTYPE; t.addfile(i)
+        else:
+            d = b"new\n"; i.size, i.mode = len(d), int(e.split("@")[1], 8) if "@" in e else 0o644
+            t.addfile(i, io.BytesIO(d))
+PY
+}
+sd_world
+sd_tar "$T/sd-good.tar" artifacts/ artifacts/1/ artifacts/1/plan-up/ artifacts/1/plan-up/f artifacts/1/sd-up/ artifacts/1/sd-up/f@4755 \
+  "artifacts/2/x y/" "artifacts/2/x y/g"
+FAKE_SYSD_TAR=$T/sd-good.tar sdx "$sd_up_here"'; sd_copy_out "$sd_name" "$sd_art"'
+check "sd_copy_out: moves only new names" same "$(cat "$FAKE_STATE/art/1/plan-up/f") $(cat "$FAKE_STATE/art/1/sd-up/f")" "old new"
+check "sd_copy_out: a name with a space" test -f "$FAKE_STATE/art/2/x y/g"
+check "sd_copy_out: strips setuid" same "$(find "$FAKE_STATE/art/1/sd-up/f" -perm -4000 | wc -l | tr -d ' ')" 0
+check "sd_copy_out: this user's" test -O "$FAKE_STATE/art/1/sd-up/f"
+for c in "a link:artifacts/ artifacts/1/ artifacts/1/sd-up/ artifacts/1/sd-up/l->/etc/passwd:a link or a special file" \
+  "a fifo:artifacts/ artifacts/1/ artifacts/1/sd-up/ artifacts/1/sd-up/p|fifo:a link or a special file" \
+  "..:artifacts/ artifacts/1/ artifacts/1/sd-up/../../../../evil:a path out of its uploads" \
+  "an absolute path:/abs/evil:a path out of its uploads" \
+  "a path outside artifacts:other/f:a path out of its uploads"; do
+  sd_world
+  # shellcheck disable=SC2046 # the entries, a word each
+  sd_tar "$T/sd-bad.tar" $(cut -d: -f2 <<<"$c")
+  FAKE_SYSD_TAR=$T/sd-bad.tar sdx "$sd_up_here"'; sd_copy_out "$sd_name" "$sd_art" || echo "st=$? $sd_err"' >"$T/out"
+  check "sd_copy_out: refuses ${c%%:*}" same "$(cat "$T/out")" "st=1 ${c##*:}"
+  check "sd_copy_out: ${c%%:*}: nothing moved" same "$(cd "$FAKE_STATE/art" && find . | sort | tr '\n' ' ')" ". ./1 ./1/plan-up ./1/plan-up/f "
+done
+check "sd_copy_out: nothing reached outside" test ! -e "$T/evil" -a ! -e /abs/evil
+sd_world
+FAKE_SYSD_TAR=$T/sd-good.tar BANA_SYSTEMD_MAX=1000 sdx "$sd_up_here"'; sd_copy_out "$sd_name" "$sd_art" || echo "st=$? $sd_err"' >"$T/out"
+check "sd_copy_out: more than BANA_SYSTEMD_MAX refused" same "$(cat "$T/out")" "st=1 more than 1000 bytes"
+FAKE_SYSD_ART=$T/w/none/artifacts sdx "$sd_up_here"'; sd_copy_out "$sd_name" "$sd_art" && echo ok' >"$T/out" 2>&1
+check "sd_copy_out: no uploads, nothing to do" same "$(cat "$T/out")" ok
+# sd_after: a refused upload fails the run, in red.
+sd_world
+FAKE_SYSD_TAR=$T/sd-bad.tar FAKE_ACT_OUT_SYSD=$(cat "$sdfx/inner-sd.jsonl") sd_run json "$sdfx/first.jsonl" && st=0 || st=$?
+check "sd_after: refused uploads fail the run, and say why" same "$st $(grep -c 'its uploads were refused: a path out of its uploads' "$T/err")" "1 2"
+check "sd_after: sd's act passed: not called a need's failure" lacks "$T/out" '"jobID":"sd","matrix":{},"msg":"bana: not run here: a job it needs'
+check "sd_after: sd2 then needs sd, which failed" has "$T/out" '"jobID":"sd2","matrix":{"n":2},"msg":"bana: not run here: needs sd, which failed"'
 
 # ---- bana fix: a failure handed to Claude Code, on a branch of its own -----------------------------
 # bana fix runs bana-manager (fix prepare makes the worktree, the brief and the prompt): the one

@@ -1,9 +1,109 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Stand-in docker: running unless FAKE_DOCKER=0; with FAKE_DOCKER_NOIMAGE=1 it has no image.
+# version says API FAKE_DOCKER_API (1.48); info's security options say rootless with
+# FAKE_DOCKER_ROOTLESS=1.
+# A systemd container (lib/systemd.sh) is the directory $FAKE_STATE/ctr/NAME. run appends its
+# arguments to $FAKE_STATE/docker.run (a line each, then ----), or fails with
+# FAKE_DOCKER_RUN_FAIL as docker's error. In it, exec answers:
+#   systemctl is-system-running   FAKE_SYSD_STATE (running)
+#   the root's setup (useradd)    its arguments in NAME/setup; FAKE_SYSD_UNREADABLE=1: the
+#                                 checkout cannot be read (5)
+#   the lifeline (cat)            reads until its input closes, then powers off: NAME goes
+#   act (bana-act.pid)            tests/stand-ins/act, with FAKE_IN_CONTAINER=1, the -e's and
+#                                 the FAKE_* here, and no other environment; its pid in
+#                                 NAME/act.pid, its exec arguments in NAME/exec (a line each)
+#   kill -INT (sd_int)            NAME/stop, and SIGINT to that pid
+#   mkdir -p DIR                  NAME/files/DIR
+# cp -L FILE NAME:FILE copies to NAME/files/FILE; cp NAME:PATH - is a tar of NAME/artifacts,
+# of FAKE_SYSD_ART (a directory named artifacts), or FAKE_SYSD_TAR (an archive) as it is.
+# rm -f NAME: its act is killed, NAME goes. ps lists the containers.
 echo "docker $*" >>"$FAKE_LOG"
+c=$FAKE_STATE/ctr
+gone() { # NAME
+  local p
+  : "${FAKE_STATE:?}"
+  p=$(cat "$c/$1/act.pid" 2>/dev/null) || p=''
+  [[ -z $p ]] || kill -KILL "$p" 2>/dev/null || true
+  rm -rf "${c:?}/$1"
+}
 case $1 in
-info) [ "${FAKE_DOCKER:-1}" = 1 ] ;;
+info)
+  [ "${FAKE_DOCKER:-1}" = 1 ] || exit 1
+  case $* in
+  *SecurityOptions*)
+    if [ -n "${FAKE_DOCKER_ROOTLESS:-}" ]; then echo '["name=seccomp,profile=builtin","name=rootless","name=cgroupns"]'
+    else echo '["name=seccomp,profile=builtin","name=cgroupns"]'; fi ;;
+  esac ;;
+version)
+  [ "${FAKE_DOCKER:-1}" = 1 ] || { echo "Cannot connect to the Docker daemon at unix:///var/run/docker.sock." >&2; exit 1; }
+  echo "${FAKE_DOCKER_API:-1.48}" ;;
 context) echo "unix://$FAKE_STATE/orbstack.sock" ;;
 image) [ "${FAKE_DOCKER_NOIMAGE:-0}" != 1 ] ;;
 pull) echo "$2: Pulling from the registry" ;;
+run)
+  printf '%s\n' "$@" ---- >>"$FAKE_STATE/docker.run"
+  [ -z "${FAKE_DOCKER_RUN_FAIL:-}" ] || { echo "docker: Error response from daemon: $FAKE_DOCKER_RUN_FAIL" >&2; exit 125; }
+  name=''
+  while (($#)); do [[ $1 != --name ]] || name=$2; shift; done
+  mkdir -p "$c/$name/files"
+  echo "0123456789ab$name" ;;
+rm)
+  shift
+  for a in "$@"; do [[ $a == -f ]] || gone "$a"; done ;;
+ps)
+  for a in "$c"/*; do
+    [[ -d $a ]] || continue
+    case $* in *.ID*) echo "0123456789ab${a##*/} ${a##*/}" ;; *) echo "${a##*/}" ;; esac
+  done ;;
+cp)
+  if [[ $2 == -L ]]; then
+    n=${4%%:*} f=${4#*:}
+    [[ -d $c/$n ]] || { echo "Error response from daemon: No such container: $n" >&2; exit 1; }
+    cp "$3" "$c/$n/files$f"
+  else
+    n=${2%%:*}
+    [[ -d $c/$n ]] || { echo "Error response from daemon: No such container: $n" >&2; exit 1; }
+    if [[ -n ${FAKE_SYSD_TAR:-} ]]; then cat "$FAKE_SYSD_TAR"
+    elif [[ -n ${FAKE_SYSD_ART:-} ]]; then tar -cf - -C "${FAKE_SYSD_ART%/*}" artifacts
+    else mkdir -p "$c/$n/artifacts" && tar -cf - -C "$c/$n" artifacts; fi
+  fi ;;
+exec)
+  shift
+  envs=()
+  while [[ $1 == -* ]]; do
+    case $1 in -u | -w) shift ;; -e) envs+=("$2"); shift ;; esac
+    shift
+  done
+  n=$1
+  shift
+  [[ -d $c/$n ]] || { echo "Error response from daemon: No such container: $n" >&2; exit 1; }
+  case $1 in
+  systemctl) s=${FAKE_SYSD_STATE:-running}; echo "$s"; [[ $s == running ]]; exit ;;
+  mkdir) shift 2; for d in "$@"; do mkdir -p "$c/$n/files$d"; done; exit 0 ;;
+  esac
+  case $3 in
+  *useradd*)
+    printf '%s\n' "${@:5}" >"$c/$n/setup"
+    [[ -z ${FAKE_SYSD_UNREADABLE:-} ]] || exit 5
+    echo "runner:x:$5:$5::/home/runner:/bin/bash" ;;
+  *"cat >/dev/null"*)
+    exec 3<&0
+    cat <&3 >/dev/null &
+    p=$!
+    while kill -0 "$p" 2>/dev/null && [[ -d $c/$n ]]; do sleep 0.05; done
+    if [[ -d $c/$n ]]; then echo "docker: $n powered off" >>"$FAKE_LOG"; gone "$n"; else kill "$p" 2>/dev/null; fi ;;
+  *"kill -INT"*)
+    : >"$c/$n/stop"
+    kill -INT "$(cat "$c/$n/act.pid")" 2>/dev/null ;;
+  *bana-act.pid*)
+    printf '%s\n' "$@" >"$c/$n/exec"
+    [[ ! -e $c/$n/stop ]] || exit 130
+    e=(PATH="$PATH" FAKE_IN_CONTAINER=1)
+    for v in $(compgen -e); do [[ $v != FAKE_* ]] || e+=("$v=${!v}"); done
+    for v in ${envs[@]+"${envs[@]}"}; do
+      if [[ $v == *=* ]]; then e+=("$v"); elif [[ -n ${!v+x} ]]; then e+=("$v=${!v}"); fi
+    done
+    # shellcheck disable=SC2016 # sh's own
+    sh -c 'echo $$ >"$0"; exec "$@"' "$c/$n/act.pid" env -i "${e[@]}" act "${@:6}" ;;
+  esac ;;
 esac

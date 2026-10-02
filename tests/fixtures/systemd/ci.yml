@@ -1,0 +1,42 @@
+name: ci
+on: workflow_dispatch
+jobs:
+  plan:
+    runs-on: wid-linux
+    outputs:
+      go: ${{ steps.p.outputs.go }}
+    steps:
+      - id: p
+        run: echo go=true >>"$GITHUB_OUTPUT"
+  sd:
+    needs: plan
+    runs-on: wid-systemd
+    steps:
+      - run: |
+          sudo loginctl enable-linger "$USER"
+          systemctl --user is-system-running
+          id -un
+  sd2:
+    needs: sd
+    strategy:
+      matrix:
+        n: [1, 2]
+    runs-on: wid-systemd
+    steps:
+      - run: echo sd2 ${{ matrix.n }} $(systemctl --user is-system-running)
+  gated:
+    needs: plan
+    if: needs.plan.outputs.go == 'true'
+    runs-on: wid-systemd
+    steps:
+      - run: echo gated ran
+  after:
+    needs: sd
+    runs-on: wid-linux
+    steps:
+      - run: echo after
+  never:
+    if: false
+    runs-on: wid-linux
+    steps:
+      - run: echo never

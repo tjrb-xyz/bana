@@ -10,8 +10,35 @@
 echo "act $*" >>"$FAKE_LOG"
 [ "$1" != --version ] || { echo "act version 0.2.89"; exit 0; }
 # act -l: FAKE_ACT_LIST as its table (none by default), and nothing else: bana ci's view lists
-# the jobs while act runs, and must not take its pid or environment here.
-[ "$1" != -l ] || { [ -z "${FAKE_ACT_LIST:-}" ] || printf '%s\n' "$FAKE_ACT_LIST"; exit 0; }
+# the jobs while act runs, and must not take its pid or environment here. act -l -j JOB:
+# $FAKE_STATE/list/JOB, when there is one.
+if [ "$1" = -l ]; then
+  j='' prev=''
+  for a in "$@"; do [ "$prev" != -j ] || j=$a; prev=$a; done
+  if [ -n "$j" ] && [ -f "$FAKE_STATE/list/$j" ]; then cat "$FAKE_STATE/list/$j"
+  elif [ -n "${FAKE_ACT_LIST:-}" ]; then printf '%s\n' "$FAKE_ACT_LIST"; fi
+  exit 0
+fi
+# lib/systemd.sh's probe (a label on bana-systemd-probe): FAKE_ACT_PROBE as its output, and
+# FAKE_ACT_PROBE_EXIT; its arguments in act.probe.
+case " $* " in
+*"=bana-systemd-probe "*)
+  echo "$*" >>"$FAKE_STATE/act.probe"
+  [ -z "${FAKE_ACT_PROBE:-}" ] || printf '%s\n' "$FAKE_ACT_PROBE"
+  exit "${FAKE_ACT_PROBE_EXIT:-0}" ;;
+esac
+# In a systemd container (tests/stand-ins/docker, FAKE_IN_CONTAINER): its arguments in act.inner,
+# its environment in act.inner.env; FAKE_ACT_OUT_SYSD on stdout, FAKE_ACT_ERR_SYSD on stderr,
+# then FAKE_ACT_SLEEP_SYSD seconds, and FAKE_ACT_EXIT_SYSD. FAKE_ACT_INT as below.
+if [ -n "${FAKE_IN_CONTAINER:-}" ]; then
+  echo "$*" >>"$FAKE_STATE/act.inner"
+  env >"$FAKE_STATE/act.inner.env"
+  [ -z "${FAKE_ACT_INT:-}" ] || trap 'sleep 0.2; echo "act: interrupted, in its container"; echo int >>"$FAKE_STATE/act.inner.int"; exit 1' INT
+  [ -z "${FAKE_ACT_OUT_SYSD:-}" ] || printf '%s\n' "$FAKE_ACT_OUT_SYSD"
+  [ -z "${FAKE_ACT_ERR_SYSD:-}" ] || printf '%s\n' "$FAKE_ACT_ERR_SYSD" >&2
+  if [ -n "${FAKE_ACT_SLEEP_SYSD:-}" ]; then sleep "$FAKE_ACT_SLEEP_SYSD" & wait $!; fi
+  exit "${FAKE_ACT_EXIT_SYSD:-0}"
+fi
 if [ -d "$FAKE_STATE/labels" ]; then
   job='' entry='' verbose='' dry='' prev=''
   for a in "$@"; do
@@ -46,6 +73,6 @@ if [ -n "${FAKE_ACT_LATE:-}" ]; then
   while [ ! -e "$FAKE_STATE/late" ]; do sleep 0.05; done
   echo '{"msg":"late"}'
   echo "late" >&2
-  echo ok >"$FAKE_STATE/act.survived"
+  echo ok >>"$FAKE_STATE/act.survived"
 fi
 [ "${FAKE_ACT_EXIT:-0}" = 0 ] || { echo "Error: Job 'rust' failed" >&2; exit "$FAKE_ACT_EXIT"; }

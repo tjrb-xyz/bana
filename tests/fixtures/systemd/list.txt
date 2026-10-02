@@ -1,0 +1,7 @@
+Stage  Job ID  Job name  Workflow name  Workflow file  Events           
+0      never   never     ci             ci.yml         workflow_dispatch
+0      plan    plan      ci             ci.yml         workflow_dispatch
+1      sd      sd        ci             ci.yml         workflow_dispatch
+1      gated   gated     ci             ci.yml         workflow_dispatch
+2      after   after     ci             ci.yml         workflow_dispatch
+2      sd2     sd2       ci             ci.yml         workflow_dispatch

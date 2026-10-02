@@ -79,6 +79,10 @@ jobs:
           echo "$ACT_SHA256_LINUX_X86_64  $RUNNER_TEMP/act.tar.gz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/act.tar.gz" -C "$RUNNER_TEMP/act" act
           "$RUNNER_TEMP/act/act" --version
+      # Jobs that need systemd: lib/systemd.sh's unprivileged container on Docker 28, cgroup v2
+      # and AppArmor, as GitHub's runners have them (a bana split runner is one of these).
+      - name: tests/systemd.sh
+        run: BANA_SYSTEMD=1 BANA_SYSTEMD_PULL=1 BANA_SYSTEMD_ACT="$RUNNER_TEMP/act/act" tests/systemd.sh
       - name: tests/e2e-daemon.sh
         run: BANA_E2E=1 BANA_E2E_ACT="$RUNNER_TEMP/act/act" tests/e2e-daemon.sh
 

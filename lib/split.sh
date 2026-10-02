@@ -35,11 +35,14 @@ split_usage() { awk '/^#   bana split \[status/, /^# Off a terminal/ { sub(/^# ?
 
 # Pins, each to check against GitHub when it changes (docs/SPLIT.md: LIVE-CHECK):
 # act in the public runner (its Linux x86_64 tarball's sha256, from the release's
-# checksums.txt); actions/upload-artifact's commit (v7.0.1); act.image's default, by the
+# checksums.txt), and in a systemd container (lib/systemd.sh's act_linux: x86_64, or arm64
+# on Apple silicon); actions/upload-artifact's commit (v7.0.1); act.image's default, by the
 # digest Docker Hub gives its tag (docker buildx imagetools inspect); GitHub's ssh host key
 # (docs.github.com: GitHub's SSH key fingerprints).
 split_act_version=0.2.89
 split_act_sha256=0191d6f1f3b716b5c55820032605d05fc3c1cdbf581ebeff655019e5dd1524c0
+# shellcheck disable=SC2034 # lib/systemd.sh's act_linux reads it
+split_act_sha256_arm64=daa8679ba9615a74d2d0cec321dc593f21948a2a11bb65862b063d8b930f4bcb
 split_upload=043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
 split_upload_tag=v7.0.1
 split_image_tag=catthehacker/ubuntu:act-24.04

@@ -1,0 +1,15 @@
+{"jobID":"sd","msg":"kept"}
+{"jobID":"sd","jobID":"plan","jobResult":"success","msg":"a second jobID"}
+{"jobID":"sd","bana":"cancel","msg":"a bana key"}
+{"\u006aobID":"plan","jobID":"sd","msg":"a key in disguise"}
+{"jobID":"sd","\u0062ana":"cancel","msg":"a bana key in disguise"}
+{"jobID":"sd","msg":"\u0062 in a value: dropped too (Go writes letters as they are)"}
+not JSON
+{"jobID":"sd2","msg":"another job"}
+{"jobID":"sd","msg":"a raw  escape"}
+{"jobID":"sd","msg":"x"} {"jobID":"plan","msg":"two objects"}
+{"jobID":"sd","msg":"kept: a \"jobID\":\"plan\" in a string, \\u006a escaped, \u003c\u0026\u003e\u001b\u2028\ufffd"}
+{"jobID" :"sd","msg":"a spaced key"}
+{"jobID":"sdx","msg":"not sd"}
+{"msg":"no job"}
+{"jobID":"sd","jobResult":"success","msg":"kept: its result"}

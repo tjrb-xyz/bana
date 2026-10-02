@@ -1,0 +1,17 @@
+[ci/plan ] ⭐ Run Set up job
+[ci/plan ] 🚀  Start image=catthehacker/ubuntu:act-24.04
+[ci/plan ]   🐳  docker pull image=catthehacker/ubuntu:act-24.04 platform=linux/amd64 username= forcePull=false
+[ci/plan ]   🐳  docker create image=catthehacker/ubuntu:act-24.04 platform=linux/amd64 entrypoint=["tail" "-f" "/dev/null"] cmd=[] network="host"
+[ci/plan ]   🐳  docker run image=catthehacker/ubuntu:act-24.04 platform=linux/amd64 entrypoint=["tail" "-f" "/dev/null"] cmd=[] network="host"
+[ci/plan ]   🐳  docker exec cmd=[node --no-warnings -e console.log(process.execPath)] user= workdir=
+[ci/plan ]   ✅  Success - Set up job
+[ci/plan ] ⭐ Run Main echo go=true >>"$GITHUB_OUTPUT"
+[ci/plan ]   🐳  docker exec cmd=[bash -e /var/run/act/workflow/p] user= workdir=
+[ci/plan ]   ✅  Success - Main echo go=true >>"$GITHUB_OUTPUT" [88.972642ms]
+[ci/plan ]   ⚙  ::set-output:: go=true
+[ci/plan ] ⭐ Run Complete job
+[ci/plan ] Cleaning up container for job plan
+[ci/plan ]   ✅  Success - Complete job
+[ci/plan ] 🏁  Job succeeded
+[ci/sd   ] 🚧  Skipping unsupported platform -- Try running with `-P wid-systemd=...`
+[ci/gated] 🚧  Skipping unsupported platform -- Try running with `-P wid-systemd=...`
