@@ -268,15 +268,22 @@ check "settings: with bana.conf's" has "$T/out" "act.platform.macos-14 = mac"
 check "settings: tart_name" has "$T/out" "tart_name = bana-tart"
 check "settings: release.platforms (none declared)" has "$T/out" "release.platforms = "
 # shellcheck disable=SC2016 # act's backquotes
-FAKE_ACT_OUT=$(printf '%s\n' '[ci/win   ] 🚧  Skipping unsupported platform -- Try running with `-P windows-11-arm=...`' \
+skips=$(printf '%s\n' '[ci/win   ] 🚧  Skipping unsupported platform -- Try running with `-P windows-11-arm=...`' \
   '[ci/mac] 🚧  Skipping unsupported platform -- Try running with `-P macos-14=...`' \
   '[ci/box] 🚧  Skipping unsupported platform -- Try running with `-P self-hosted=...`' \
-  '[ci/box] 🚧  Skipping unsupported platform -- Try running with `-P box-9=...`') \
-  FAKE_OS=Linux FAKE_ARCH=x86_64 bash "$bana" ci >/dev/null 2>"$T/err"
-check "platform: a job skipped for a label bana does not know is a warning" has "$T/err" \
+  '[ci/box] 🚧  Skipping unsupported platform -- Try running with `-P box-9=...`')
+FAKE_ACT_OUT=$skips FAKE_OS=Linux FAKE_ARCH=x86_64 bash "$bana" ci -v >/dev/null 2>"$T/err"
+check "platform: -v: a job skipped for a label bana does not know is a warning" has "$T/err" \
   "not run here: win (runs-on: windows-11-arm): see bana add"
-check "platform: once a job, with all its labels" has "$T/err" "not run here: box (runs-on: self-hosted box-9): see bana add"
-check "platform: not a job act.platform places (a Mac's, on Linux)" lacks "$T/err" "not run here: mac"
+check "platform: -v: once a job, with all its labels" has "$T/err" "not run here: box (runs-on: self-hosted box-9): see bana add"
+check "platform: -v: not a job act.platform places (a Mac's, on Linux)" lacks "$T/err" "not run here: mac"
+# Without -v, the view says it, as each job is skipped: once.
+FAKE_ACT_OUT=$skips FAKE_OS=Linux FAKE_ARCH=x86_64 bash "$bana" ci >"$T/out" 2>"$T/err"
+check "view: a job with no place is said once" same "$(cat "$T/out" "$T/err" | grep -c 'box.*not run here\|not run here.*box')" 1
+check "view: as the view says it" has "$T/out" "– box: not run here (no place here for box-9: see bana add)"
+check "view: and not again after the run" lacks "$T/err" "see bana add"
+check "view: a Mac's job, on Linux, by its label's place" has "$T/out" "– mac: not run here (macos-14: on a Mac only)"
+check "view: and the count" has "$T/out" "3 not run here · act's output: $HOME/.bana/wid/ci/last.log"
 
 # ---- bana ci for the daemon: its own checkout, an event, a secret file -----------------------
 fresh
@@ -331,6 +338,8 @@ check "daemon ci: a missing event file" has "$T/out" "--event: no file nothing.j
 : >"$FAKE_LOG"
 BANA_PROJECT_ROOT=$src bash "$bana" ci --list >/dev/null
 check "daemon ci: --list, of that checkout" has "$FAKE_LOG" "act -l -C $src -W $src/.github/workflows/ci.yml"
+FAKE_ACT_LIST='0  plan  plan  ci' BANA_PROJECT_ROOT=$src bash "$bana" ci --list >"$T/out"
+check "ci --list: still act -l's table, as it is (the stand-in's -l ends there)" same "$(cat "$T/out")" "0  plan  plan  ci"
 cd "$src"
 
 # ---- one act at a time on this machine ----------------------------------------------------
@@ -415,9 +424,18 @@ git add .github && git -c user.name=t -c user.email=t@t commit -q -m one
 echo 'on: push' >.github/workflows/ci.yml && echo new >new.txt && echo mine >'my notes.txt'
 ci=$HOME/.bana/wid/ci
 env_of() { sed -n "s/^$1=//p" "$ci/last.env"; }
+FAKE_ACT_OUT='[ci/rust] ⭐ Run Main cargo test' FAKE_ACT_EXIT=1 bash "$bana" ci -v -j rust >"$T/out" 2>"$T/err" && st=0 || st=$?
+check "log: -v: bana ci exits with act's status (1)" same "$st" 1
+check "log: -v: act's output on the terminal, as it comes" has "$T/out" "[ci/rust] ⭐ Run Main cargo test"
+check "log: -v: and act's stderr" has "$T/out" "Error: Job 'rust' failed"
+check "log: -v: no view of it" lacks "$T/out" "▶ rust"
+check "log: -v: where act's output is, once" same "$(grep -c "act's output: $ci/last.log" "$T/out")" 1
+check "log: -v: the job is still in last.env" same "$(env_of job)" "rust"
 FAKE_ACT_OUT='[ci/rust] ⭐ Run Main cargo test' FAKE_ACT_EXIT=1 bash "$bana" ci -j rust >"$T/out" 2>"$T/err" && st=0 || st=$?
 check "log: bana ci exits with act's status (1)" same "$st" 1
-check "log: act's output on the terminal" has "$T/out" "[ci/rust] ⭐ Run Main cargo test"
+check "log: the terminal shows the job starting, not act's line" has "$T/out" "▶ rust"
+check "log: and not act's line itself" lacks "$T/out" "[ci/rust] ⭐ Run Main cargo test"
+check "view: act's output path said once on failure" same "$(grep -c "act's output: $ci/last.log" "$T/out")" 1
 check "log: and in ci/last.log" has "$ci/last.log" "[ci/rust] ⭐ Run Main cargo test"
 check "log: with act's stderr" has "$ci/last.log" "Error: Job 'rust' failed"
 check "log: under their names once act ended" test ! -e "$ci/last.log.part" -a ! -e "$ci/last.env.part"
@@ -457,6 +475,10 @@ cp "$ci/last.env" "$T/last.env"
 bash "$bana" ci -n >/dev/null
 check "log: a dry run leaves the last run's log" same "$(cat "$ci/last.log")" "all green"
 check "log: and its last.env" same "$(cat "$ci/last.env")" "$(cat "$T/last.env")"
+FAKE_ACT_OUT='{"job":"ci/rust","msg":"x"}' bash "$bana" ci -- --json >"$T/out" 2>&1
+check "view: --json goes straight through" has "$T/out" '{"job":"ci/rust","msg":"x"}'
+check "view: --json: no view of it" lacks "$T/out" "no job ran"
+check "view: --json: and all of it in last.log" same "$(cat "$ci/last.log")" '{"job":"ci/rust","msg":"x"}'
 rm -rf "$ci"
 BANA_CI_LOG=no bash "$bana" ci >/dev/null &
 p=$!
@@ -486,11 +508,14 @@ interrupt() { # PID
   while ! grep -qs 'act: started' "$ci/last.log.part" && ((i++ < 100)); do sleep 0.1; done
   kill -INT -- "-$1"
 }
-FAKE_ACT_INT=1 FAKE_ACT_OUT='act: started' "${own_group[@]}" bash "$bana" ci >"$T/out" 2>&1 &
+mkdir -p "$T/w/tmp"
+TMPDIR=$T/w/tmp FAKE_ACT_INT=1 FAKE_ACT_OUT='act: started' "${own_group[@]}" bash "$bana" ci >"$T/out" 2>&1 &
 p=$!
 interrupt "$p"
 wait "$p" && st=0 || st=$?
 check "log: Ctrl-C: act's last words are in last.log (tee -i)" has "$ci/last.log" "act: interrupted, its containers removed"
+check "view: Ctrl-C: the view still ends, with its last line" same "$(tail -1 "$T/out")" "no job ran · act's output: $ci/last.log"
+check "view: Ctrl-C: no temp file left" same "$(ls -A "$T/w/tmp")" ""
 check "log: Ctrl-C: after the rest of act's output" has "$ci/last.log" "act: started"
 check "log: Ctrl-C: act's status" same "$st" 1
 check "log: Ctrl-C: last.env too" same "$(env_of exit)" "1"
@@ -505,6 +530,64 @@ interrupt "$p"
 wait "$p" && st=0 || st=$?
 check "log: Ctrl-C killing act: bana ci still ends the log" has "$ci/last.log" "act: started"
 check "log: Ctrl-C killing act: its status" same "$st $(env_of exit) $(env_of stopped)" "130 130 1"
+check "view: Ctrl-C killing act: the view still ends" same "$(tail -1 "$T/out")" "no job ran · act's output: $ci/last.log"
+# On a terminal (a pty), the view has colours; tee's file has none of them.
+FAKE_ACT_OUT=$'[ci/rust] ⭐ Run Main cargo test\n[ci/rust] 🏁  Job succeeded' \
+  python3 -c 'import pty, sys; pty.spawn(sys.argv[1:])' bash "$bana" ci -j rust </dev/null >"$T/out" 2>&1
+check "view: bana ci on a terminal colours it" has "$T/out" $'\033[32m✓\033[0m rust'
+check "view: and last.log has act's lines as they were" same "$(cat "$ci/last.log")" $'[ci/rust] ⭐ Run Main cargo test\n[ci/rust] 🏁  Job succeeded'
+
+# ---- bana ci's view: act's text, recorded (act 0.2.89, host mode), as bana ci shows it ----------
+view() { # FIXTURES [ONLY]: lib/view.awk over FIXTURES' act.txt, with its list.txt (act -l)
+  awk -v list="$1/list.txt" -v table="$T/view.table" -v only="${2:-}" -v logfile=/home/me/.bana/wid/ci/last.log \
+    -f "$here/../lib/view.awk" <"$1/act.txt"
+}
+printf 'wid-linux\tlinux\nwid-macos\tmac\nold-ubuntu\tskip no act image\nold-debian\tskip\n' >"$T/view.table"
+view "$here/fixtures/view" >"$T/view"
+check "view: a job's start" has "$T/view" "▶ rust"
+check "view: its end" has "$T/view" "✓ plan"
+check "view: a failure names its step" has "$T/view" "✗ rust: clippy"
+check "view: and shows its last 20 lines" same "$(grep -c '^    warning line' "$T/view") $(grep -c 'warning line 10$' "$T/view")" "20 0"
+check "view: the plan's choice" has "$T/view" "  plan (quick): runs rust · skips background"
+check "view: a job its if: skipped says so" has "$T/view" "– background-linux: skipped (its if: was false, or a job it needs did not pass)"
+check "view: a Mac's job on Linux" has "$T/view" "– macOS tests: not run here (wid-macos: on a Mac only)"
+check "view: a job whose label has no place here" has "$T/view" "– sd: not run here (no place here for wid-systemd: see bana add)"
+check "view: once, for all of its labels" same "$(grep -c -- '– sd:' "$T/view")" 1
+check "view: act's own lines stay in the log" lacks "$T/view" "Run Set up job"
+check "view: and the step's output lines" lacks "$T/view" "compiling"
+check "view: act's 'Error: Job failed' is not said twice" lacks "$T/view" "Error: Job 'rust' failed"
+check "view: the count, and where act's output is" same "$(tail -1 "$T/view")" \
+  "1 passed, 1 failed, 1 skipped, 2 not run here · act's output: /home/me/.bana/wid/ci/last.log"
+check "view: no colours off a terminal" lacks "$T/view" $'\033['
+view "$here/fixtures/view" rust >"$T/view"
+check "view: with -j, jobs not asked for are not called skipped" lacks "$T/view" "background-linux: skipped"
+# A matrix's entries (test-1, test-2) and a name with an expression (web (quick)): act -l lists
+# test and 'web (${{ inputs.tier }})'.
+view "$here/fixtures/view/matrix" >"$T/view"
+check "view: a matrix job and a \${{ }} name count as run" same "$(tail -1 "$T/view")" \
+  "5 passed, 1 skipped · act's output: /home/me/.bana/wid/ci/last.log"
+check "view: each entry of the matrix" same "$(grep -c '^✓ test-[12]$' "$T/view")" 2
+check "view: the name as act worked it out" has "$T/view" "✓ web (quick)"
+check "view: only the job its if: skipped is called skipped" same "$(grep -- ': skipped' "$T/view")" \
+  "– never: skipped (its if: was false, or a job it needs did not pass)"
+# shellcheck disable=SC2016 # act's backquotes
+printf '%s\n' '[ci/a] ⭐ Run Main x' '[ci/a] 🏁  Job succeeded' '[ci/a] 🏁  Job succeeded' '[ci/a] 🏁  Job failed' \
+  '[ci/old] 🚧  Skipping unsupported platform -- Try running with `-P old-ubuntu=...`' \
+  '[ci/older] 🚧  Skipping unsupported platform -- Try running with `-P old-debian=...`' |
+  awk -v list=/dev/null -v table="$T/view.table" -v logfile=L -v tty=1 -f "$here/../lib/view.awk" >"$T/view"
+check "view: a job ends once" same "$(grep -cE '✓|✗' "$T/view")" 1
+check "view: and is counted once" has "$T/view" "1 passed, 2 not run here · act's output: L"
+check "view: on a terminal, in colour" has "$T/view" $'\033[32m✓\033[0m a'
+check "view: a label skipped, with its reason" has "$T/view" "– old: not run here (old-ubuntu: no act image)"
+check "view: a label skipped, without one" has "$T/view" "– older: not run here (old-debian: act.platform.old-debian = skip)"
+printf '%s\n' $'\033[1mact: quick\033[0m' 'apt-get: 30 lines of noise' $'\033[33mbana warns\033[0m' \
+  $'\033[31mbana fails\033[0m' 'Error: workflow is not valid' | awk -v list=/dev/null -v table=/dev/null -f "$here/../lib/view.awk" >"$T/view"
+check "view: bana's own lines" has "$T/view" "act: quick"
+check "view: and its warnings" has "$T/view" "bana warns"
+check "view: and its errors" has "$T/view" "bana fails"
+check "view: act's errors" has "$T/view" "Error: workflow is not valid"
+check "view: not other lines" lacks "$T/view" "apt-get"
+check "view: no job ran" same "$(tail -1 "$T/view")" "no job ran · act's output: "
 
 # ---- bana fix: a failure handed to Claude Code, on a branch of its own -----------------------------
 # bana fix runs bana-manager (fix prepare makes the worktree, the brief and the prompt): the one
@@ -1286,6 +1369,7 @@ check "daemon: the snapshot's binary, in daemon.d" cmp -s "$T/w/bana-manager" "$
 check "daemon: the snapshot's bana" cmp -s "$bana" "$m/bin/bana"
 check "daemon: the snapshot's lib" cmp -s "$here/../lib/add.sh" "$m/lib/add.sh"
 check "daemon: the snapshot's installer templates" cmp -s "$here/../lib/install.sh.in" "$m/lib/install.sh.in"
+check "daemon snapshot: lib/view.awk (bana ci's view)" cmp -s "$here/../lib/view.awk" "$m/lib/view.awk"
 check "daemon: daemon.d/settings has only the machine's keys" only_keys "$machine_keys" "$m/settings"
 cat >"$T/want" <<EOF
 port = 8471
@@ -1795,7 +1879,7 @@ p=$T/w/p r=$T/w/p/v$V m=$HOME/.bana/daemon.d sha=0123456789abcdef0123456789abcde
 mkdir -p "$r/bin" "$r/lib" "$T/w/b"
 sed "s/^BANA_COMMIT=/BANA_COMMIT=$sha/" "$bana" >"$r/bin/bana"
 chmod 755 "$r/bin/bana"
-cp "$here"/../lib/*.sh "$here"/../lib/install.*.in "$r/lib/"
+cp "$here"/../lib/*.sh "$here"/../lib/*.awk "$here"/../lib/install.*.in "$r/lib/"
 fake_manager() { # VERSION
   cat >"$r/bin/bana-manager" <<EOF
 #!/bin/sh
@@ -1853,7 +1937,7 @@ health_pid() { curl -fsS http://127.0.0.1:8470/ci/v1/health | sed -n 's/.*"pid":
 # A copy of bana (T), with a lib file of its own.
 copy_bana() { # DIR
   rm -rf "$1" && mkdir -p "$1/bin" "$1/lib"
-  cp "$bana" "$1/bin/" && cp "$here"/../lib/*.sh "$here"/../lib/install.*.in "$1/lib/"
+  cp "$bana" "$1/bin/" && cp "$here"/../lib/*.sh "$here"/../lib/*.awk "$here"/../lib/install.*.in "$1/lib/"
 }
 (cd "$HOME" && bash "$bana" daemon install --no-open) >"$T/out" 2>&1 || { cat "$T/out"; false; }
 check "handover: a first install has no snapshot before" test ! -e "$m.prev" -a ! -e "$m.new"
@@ -2044,11 +2128,14 @@ check "package: the four archives, install.sh, SHA256SUMS and notes.md" same "$(
 check "package: SHA256SUMS passes sha256sum -c" bash -c "cd '$T/dist' && sha256sum -c --quiet SHA256SUMS"
 check "package: SHA256SUMS has the archives and install.sh" same "$(awk '{ print $2 }' "$T/dist/SHA256SUMS" | tr '\n' ' ')" \
   "bana-v$V-linux-arm64.tar.gz bana-v$V-linux-x64.tar.gz bana-v$V-macos-arm64.tar.gz bana-v$V-macos-x64.tar.gz install.sh "
-want=$( (cd "$here/.." && { printf '%s\n' bin/bana bin/bana-manager LICENSE README.md lib/install.sh.in lib/install.ps1.in lib/split.yml.in; ls lib/*.sh; }) |
+want=$( (cd "$here/.." && { printf '%s\n' bin/bana bin/bana-manager LICENSE README.md lib/install.sh.in lib/install.ps1.in lib/split.yml.in; ls lib/*.sh lib/*.awk; }) |
   sed "s|^|bana-v$V/|" | LC_ALL=C sort)
 for p in linux-x64 linux-arm64 macos-x64 macos-arm64; do
   check "package: $p holds bana-v$V/, with bana's files and nothing else" same "$(tar -tzf "$T/dist/bana-v$V-$p.tar.gz" | LC_ALL=C sort)" "$want"
 done
+check "package: lib/view.awk (bana ci's view) and lib/split.yml.in shipped, nothing else" same \
+  "$(tar -tzf "$T/dist/bana-v$V-linux-x64.tar.gz" | grep -v '\.sh$' | grep "^bana-v$V/lib/." | LC_ALL=C sort | tr '\n' ' ')" \
+  "bana-v$V/lib/install.ps1.in bana-v$V/lib/install.sh.in bana-v$V/lib/split.yml.in bana-v$V/lib/view.awk "
 check "package: its files are root's (0:0), not the build's user's" \
   same "$(tar --numeric-owner -tvzf "$T/dist/bana-v$V-linux-x64.tar.gz" |
     awk '{ print ($2 ~ /\//) ? $2 : $3 "/" $4 }' | sort -u)" "0/0" # GNU tar: 0/0; BSD tar: 0 0

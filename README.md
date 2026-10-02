@@ -142,6 +142,7 @@ brew install act                 # and OrbStack, for Docker
 bana ci                          # every job, with the first tier (quick)
 bana ci nightly                  # another tier
 bana ci -j rust                  # one job, and the jobs it needs
+bana ci -v                       # act's own output as it comes, not bana's view of it
 bana ci --x64                    # Linux containers as x86_64 (Rosetta, on Apple silicon)
 bana ci --list                   # the jobs
 bana ci -- --reuse               # anything after -- goes to act; --reuse keeps containers, and their builds
@@ -157,7 +158,9 @@ bana ci -- --reuse               # anything after -- goes to act; --reuse keeps 
 A job takes the first of its labels that has a place, as act does. `act.platform.<label>` (lowercase) in
 bana.conf is `linux` (a container from `act.image`), `mac` (the Mac itself; elsewhere not run), `skip [reason]`
 (not run) or an image of its own; `bana add` asks and writes these. `self-hosted` and a label with `=` cannot
-be keys. After a run, bana names the jobs that had no place: *not run here: JOB (runs-on: ...): see bana add*.
+be keys. The run's view names each job that had no place as act skips it: *– JOB: not run here (no place here
+for LABEL: see bana add)*; with `-v`, bana names them after the run: *not run here: JOB (runs-on: ...): see bana
+add*.
 
 The run uses your working tree, uncommitted changes included, and the workflow's tier input (`tiers`,
 `tier_input` in bana.conf). Artifacts land in `~/.bana/act/artifacts/1/<name>/<name>.zip` (upload-artifact@v4:
@@ -169,6 +172,17 @@ act's output also goes to `~/.bana/<prefix>/ci/last.log`, and what ran to `last.
 tier, job, network, versions, exit status, and whether Ctrl-C stopped it), for `bana fix`, which a failed run
 points to. `ci.log = no` skips it. The workflow's `vars.*` come from `~/.bana/<prefix>/vars` (`KEY=value`
 lines) if you write one, as under the daemon.
+
+The terminal shows bana's view of the run, not act's output: a line as each job starts (`▶ rust`) and ends
+(`✓ rust`, or `✗ rust: cargo test --workspace` and that step's last 20 lines), a plan step's choice when it
+prints a JSON line such as `{"tier":"quick","rust":true,"web":false}` (`plan (quick): runs rust · skips web`),
+and why a job did not run: *not run here*, with its label's place (on Linux, `– macos: not run here
+(example-macos: on a Mac only)`), or *skipped*, when its `if:` was false or a job it needs did not pass (act
+prints nothing for those). A matrix's entries show as act names them (`✓ package-1`). bana's own lines and
+act's errors come through. Then a count and the log's path (`4 passed, 1 skipped, 1 not run here · act's
+output: ~/.bana/example/ci/last.log`). `-v` shows act's output as it comes instead, as does act's `-- --json`;
+the log has all of it either way. A dry run (`-n`) and `ci.log = no` show act's output too, and `-v` does
+nothing with `--remote`, whose lines come from GitHub.
 
 Limits worth knowing:
 - act uses your working tree only for a checkout step without `ref:` (or with `ref:` equal to the current ref).
@@ -627,7 +641,7 @@ send the jobs elsewhere without a change to the workflow.
 ## Commands
 
 ```sh
-bana ci [TIER] [-j JOB] [--x64] [--list] [--event FILE] [-- ACT-OPTIONS]
+bana ci [TIER] [-j JOB] [-v] [--x64] [--list] [--event FILE] [-- ACT-OPTIONS]
 bana fix [BUILD | last | --log FILE|-] [--open | --headless]   # and brief, list, push, drop: docs/FIX.md
 bana report [BUILD | last | --log FILE|-] [--json]   # the CI report, per standard
 bana installer DIST (--tag T | --label L)   # the project's install.sh, install.ps1 and SHA256SUMS

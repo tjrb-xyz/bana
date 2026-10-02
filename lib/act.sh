@@ -10,6 +10,8 @@
 #     --x64            Linux containers as x86_64 (on Apple silicon, through OrbStack's Rosetta)
 #     --list           the jobs, without running them
 #     -n, --dry-run    what would run
+#     -v, --verbose    act's own output as it comes (by default: a line as each job starts and
+#                      ends, a failed step's last lines, and why a job did not run)
 #     --event FILE     run with this event (a push's payload), whose inputs carry the tier
 #     --remote         HEAD, pushed, on the project's bana split repository (docs/SPLIT.md)
 #   Linux jobs (<prefix>-linux, ubuntu-*) run in containers from bana.conf's act.image; on a
@@ -125,7 +127,7 @@ act_lock() { # LABEL
 }
 
 act_main() {
-  local tier='' x64='' list='' dry='' event='' secrets='' remote='' locked jobs=() pass=() args=() extra=()
+  local tier='' x64='' list='' dry='' event='' secrets='' remote='' verbose='' locked jobs=() pass=() args=() extra=()
   local wf root here tiers image arch net i o dc all=()
   while (($#)); do
     case $1 in
@@ -133,6 +135,7 @@ act_main() {
     --x64) x64=1 ;;
     --list | -l) list=1 ;;
     -n | --dry-run) dry=1 ;;
+    -v | --verbose) verbose=1 ;;
     --event) event=${2:?--event FILE}; shift ;;
     --remote) remote=1 ;;
     --) shift; pass=("$@"); break ;;
@@ -302,9 +305,12 @@ act_relay() {
 # and ended (Unix seconds), exit (act's), and stopped (1: Ctrl-C stopped it, so it did not
 # fail). Both take their names when act ends (.part until then). act's output goes through
 # tee, so bash stays, holding the lock, until act ends; its EXIT trap then frees the lock.
+# The terminal gets act_view's lines, or with -v (or act's --json) act's output itself.
 # Uses act_main's locals.
 act_logged() { # ACT-ARGUMENT...
-  local dir=$home/ci sha ref dirty v b='' started status stopped=''
+  local dir=$home/ci sha ref dirty v b='' started status stopped='' view=1 a
+  [[ -z $verbose ]] || view=
+  for a in "$@"; do case $a in --json | --json=[1tT]*) view= ;; esac; done
   mkdir -p "$dir"
   rm -f "$dir/last.report.md"
   sha=$(git -C "$root" rev-parse -q --verify HEAD 2>/dev/null) || true
@@ -315,23 +321,46 @@ act_logged() { # ACT-ARGUMENT...
   # bana's own commit (a checkout's or a release's; none for a copy).
   b=$(bana_commit)
   started=$(date +%s)
-  # Ctrl-C reaches act, which stops its jobs and ends; tee -i and bash (trapping it) wait
-  # for that, so the log ends as act's output does.
+  # Ctrl-C reaches act, which stops its jobs and ends; tee -i, the view and bash (trapping it)
+  # wait for that, so the log ends as act's output does.
   trap 'stopped=1' INT
-  if act "$@" 2>&1 | tee -i "$dir/last.log.part"; then status=0; else status=${PIPESTATUS[0]}; fi
+  if act "$@" 2>&1 | tee -i "$dir/last.log.part" | act_view "$view"; then status=0; else status=${PIPESTATUS[0]}; fi
   trap - INT
   printf '%s\n' "sha=$sha" "ref=$ref" "dirty=$dirty" "tier=$tier" "job=${jobs[1]:-}" "event=$event" \
     "network=$net" "act=$v" "bana=$b" "started=$started" "ended=$(date +%s)" "exit=$status" \
     "stopped=${stopped:-0}" >"$dir/last.env.part"
   mv -f "$dir/last.log.part" "$dir/last.log"
   mv -f "$dir/last.env.part" "$dir/last.env"
-  act_unmapped "$dir/last.log"
+  # The view said these already: each job without a place, and where act's output is.
+  [[ -n $view ]] || act_unmapped "$dir/last.log"
   act_report "$dir"
   if ((status)) && [[ -z $stopped ]]; then
-    echo "act's output: $dir/last.log"
+    [[ -n $view ]] || echo "act's output: $dir/last.log"
     say "bana fix: hand this failure to Claude Code on a fix branch"
   fi
   exit "$status"
+}
+
+# What bana ci shows by hand of act's text, all of which goes to last.log (lib/view.awk): a
+# line as each job starts and ends, a failed step's last 20 lines, the plan's choice, why a job
+# did not run (its label's place here, or its if:), bana's own lines and act's errors; then a
+# count and the log's path. VIEW empty (-v, or act's --json): act's output as it comes. It
+# ignores Ctrl-C, as tee -i does, so act's last lines still reach the terminal; and if the view
+# cannot run, act's output goes on as it is (tee and act must never lose their reader).
+# The last command of act_logged's pipeline, so a subshell of its own. Uses act_main's locals.
+act_view() { # VIEW(1|'')
+  local lf tf tty=''
+  trap '' INT
+  [[ -n $1 ]] || { cat; return; }
+  [[ ! -t 1 ]] || tty=1
+  lf=$(mktemp "${TMPDIR:-/tmp}/bana-view.XXXXXX") || { cat; return; }
+  tf=$(mktemp "${TMPDIR:-/tmp}/bana-view.XXXXXX") || { rm -f "$lf"; cat; return; }
+  # Neither may read the view's input, act's output.
+  act -l -C "$root" -W "$wf" </dev/null >"$lf" 2>/dev/null || true
+  act_platform_table </dev/null >"$tf" 2>/dev/null || true
+  awk -v list="$lf" -v table="$tf" -v only="${jobs[1]:-}" -v logfile="$dir/last.log" -v tty="$tty" \
+    -f "$bana_root/lib/view.awk" || cat || true
+  rm -f "$lf" "$tf"
 }
 
 # The CI report of the run (bana report last), when a bana-manager that makes one is here

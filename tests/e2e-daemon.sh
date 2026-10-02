@@ -766,6 +766,10 @@ s=$(date +%s)
 out=$(cd "$w" && bash "$bana" ci quick -j broken -- --pull=false 2>&1) && code=0 || code=$?
 echo "   bana ci: exit $code in $(($(date +%s) - s)) s"
 check "hand: bana ci failed" test "$code" -ne 0
+check "hand: the terminal has bana's view: broken failed at its step" has <(printf '%s\n' "$out") "✗ broken: test"
+check "hand: with the step's last lines" has <(printf '%s\n' "$out") "    test result: FAILED. 1 passed; 1 failed"
+check "hand: not act's own lines" test "$(printf '%s\n' "$out" | grep -c 'Run Main')" = 0
+check "hand: the count, and where act's output is" has <(printf '%s\n' "$out") "1 failed · act's output: $d/ci/last.log"
 check "hand: and points to bana fix" has <(printf '%s\n' "$out") "bana fix: hand this failure"
 check "hand: it kept its log" has "$d/ci/last.log" "tests::the_answer"
 check "hand: and what ran" has "$d/ci/last.env" "sha=$h"

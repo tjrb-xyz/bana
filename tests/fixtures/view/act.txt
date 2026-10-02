@@ -1,0 +1,62 @@
+[ci/plan       ] ⭐ Run Set up job
+[ci/sd         ] 🚧  Skipping unsupported platform -- Try running with `-P self-hosted=...`
+[ci/sd         ] 🚧  Skipping unsupported platform -- Try running with `-P wid-systemd=...`
+[ci/macOS tests] 🚧  Skipping unsupported platform -- Try running with `-P self-hosted=...`
+[ci/macOS tests] 🚧  Skipping unsupported platform -- Try running with `-P wid-macos=...`
+[ci/plan       ]   ✅  Success - Set up job
+[ci/plan       ] ⭐ Run Main json='{"tier":"quick","rust":true,"background":false}'
+echo "$json"
+echo "json=$json" >> "$GITHUB_OUTPUT"
+[ci/plan       ]   | {"tier":"quick","rust":true,"background":false}
+[ci/plan       ]   ✅  Success - Main json='{"tier":"quick","rust":true,"background":false}'
+echo "$json"
+echo "json=$json" >> "$GITHUB_OUTPUT"
+ [4.277785ms]
+[ci/plan       ]   ⚙  ::set-output:: json={"tier":"quick","rust":true,"background":false}
+[ci/plan       ] ⭐ Run Complete job
+[ci/plan       ] Cleaning up container for job plan
+[ci/plan       ]   ✅  Success - Complete job
+[ci/plan       ] 🏁  Job succeeded
+[ci/rust            ] ⭐ Run Set up job
+[ci/rust            ]   ✅  Success - Set up job
+[ci/rust            ] ⭐ Run Main build
+[ci/rust            ]   | compiling
+[ci/rust            ]   | done
+[ci/rust            ]   ✅  Success - Main build [1.00955411s]
+[ci/rust            ] ⭐ Run Main clippy
+[ci/rust            ]   | warning line 1
+[ci/rust            ]   | warning line 2
+[ci/rust            ]   | warning line 3
+[ci/rust            ]   | warning line 4
+[ci/rust            ]   | warning line 5
+[ci/rust            ]   | warning line 6
+[ci/rust            ]   | warning line 7
+[ci/rust            ]   | warning line 8
+[ci/rust            ]   | warning line 9
+[ci/rust            ]   | warning line 10
+[ci/rust            ]   | warning line 11
+[ci/rust            ]   | warning line 12
+[ci/rust            ]   | warning line 13
+[ci/rust            ]   | warning line 14
+[ci/rust            ]   | warning line 15
+[ci/rust            ]   | warning line 16
+[ci/rust            ]   | warning line 17
+[ci/rust            ]   | warning line 18
+[ci/rust            ]   | warning line 19
+[ci/rust            ]   | warning line 20
+[ci/rust            ]   | warning line 21
+[ci/rust            ]   | warning line 22
+[ci/rust            ]   | warning line 23
+[ci/rust            ]   | warning line 24
+[ci/rust            ]   | warning line 25
+[ci/rust            ]   | warning line 26
+[ci/rust            ]   | warning line 27
+[ci/rust            ]   | warning line 28
+[ci/rust            ]   | warning line 29
+[ci/rust            ]   | warning line 30
+[ci/rust            ]   ❌  Failure - Main clippy [7.00058ms]
+[ci/rust            ] exit status 1
+[ci/rust            ] ⭐ Run Complete job
+[ci/rust            ]   ✅  Success - Complete job
+[ci/rust            ] 🏁  Job failed
+Error: Job 'rust' failed

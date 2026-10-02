@@ -18,7 +18,7 @@
 #                            builds and releases on a public repository's GitHub Actions, its code
 #                            private (bana split help; docs/SPLIT.md)
 # On this machine, when you want it (act, in OrbStack's Docker; nothing stays running):
-#   bana ci [TIER] [-j JOB] [--x64] [--list] [--event FILE]   the workflow's jobs here (bana ci --help);
+#   bana ci [TIER] [-j JOB] [-v] [--x64] [--list] [--event FILE]   the workflow's jobs here (bana ci --help);
 #                            act's output stays in ~/.bana/<prefix>/ci/last.log, for bana fix
 #   bana fix [BUILD | last | --log FILE|-] [--open | --headless]   a failed run to Claude Code, on a branch
 #                            of its own in a worktree (bana fix help: brief, list, push, drop)

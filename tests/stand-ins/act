@@ -9,6 +9,9 @@
 # matrix line.
 echo "act $*" >>"$FAKE_LOG"
 [ "$1" != --version ] || { echo "act version 0.2.89"; exit 0; }
+# act -l: FAKE_ACT_LIST as its table (none by default), and nothing else: bana ci's view lists
+# the jobs while act runs, and must not take its pid or environment here.
+[ "$1" != -l ] || { [ -z "${FAKE_ACT_LIST:-}" ] || printf '%s\n' "$FAKE_ACT_LIST"; exit 0; }
 if [ -d "$FAKE_STATE/labels" ]; then
   job='' entry='' verbose='' dry='' prev=''
   for a in "$@"; do

@@ -1,0 +1,55 @@
+time="2026-10-02T16:17:44Z" level=info msg="Using docker host 'unix:///var/run/docker.sock', and daemon socket 'unix:///var/run/docker.sock'"
+time="2026-10-02T16:17:44Z" level=info msg="Start server on http://192.0.2.2:34567"
+[ci/plan] ⭐ Run Set up job
+[ci/plan]   ✅  Success - Set up job
+[ci/plan] ⭐ Run Main json='{"tier":"quick","rust":true,"test":true}'
+echo "$json"
+echo "json=$json" >> "$GITHUB_OUTPUT"
+[ci/plan]   | {"tier":"quick","rust":true,"test":true}
+[ci/plan]   ✅  Success - Main json='{"tier":"quick","rust":true,"test":true}'
+echo "$json"
+echo "json=$json" >> "$GITHUB_OUTPUT"
+ [4.249922ms]
+[ci/plan]   ⚙  ::set-output:: json={"tier":"quick","rust":true,"test":true}
+[ci/plan] ⭐ Run Complete job
+[ci/plan] Cleaning up container for job plan
+[ci/plan]   ✅  Success - Complete job
+[ci/plan] 🏁  Job succeeded
+[ci/rust       ] ⭐ Run Set up job
+[ci/web (quick)] ⭐ Run Set up job
+[ci/test-2     ] ⭐ Run Set up job
+[ci/test-1     ] ⭐ Run Set up job
+[ci/test-2     ]   ✅  Success - Set up job
+[ci/test-2     ] 🧪  Matrix: map[n:2]
+[ci/rust       ]   ✅  Success - Set up job
+[ci/test-2     ] ⭐ Run Main echo "entry 2"
+[ci/rust       ] ⭐ Run Main build
+[ci/test-1     ]   ✅  Success - Set up job
+[ci/test-1     ] 🧪  Matrix: map[n:1]
+[ci/test-2     ]   | entry 2
+[ci/test-2     ]   ✅  Success - Main echo "entry 2" [5.925782ms]
+[ci/test-2     ] ⭐ Run Complete job
+[ci/test-2     ] Cleaning up container for job test
+[ci/test-1     ] ⭐ Run Main echo "entry 1"
+[ci/rust       ]   | compiling
+[ci/rust       ]   ✅  Success - Main build [7.760631ms]
+[ci/rust       ] ⭐ Run Complete job
+[ci/rust       ] Cleaning up container for job rust
+[ci/rust       ]   ✅  Success - Complete job
+[ci/rust       ] 🏁  Job succeeded
+[ci/test-2     ]   ✅  Success - Complete job
+[ci/test-2     ] 🏁  Job succeeded
+[ci/test-1     ]   | entry 1
+[ci/test-1     ]   ✅  Success - Main echo "entry 1" [4.509768ms]
+[ci/test-1     ] ⭐ Run Complete job
+[ci/test-1     ] Cleaning up container for job test
+[ci/test-1     ]   ✅  Success - Complete job
+[ci/test-1     ] 🏁  Job succeeded
+[ci/web (quick)]   ✅  Success - Set up job
+[ci/web (quick)] ⭐ Run Main echo web
+[ci/web (quick)]   | web
+[ci/web (quick)]   ✅  Success - Main echo web [3.860502ms]
+[ci/web (quick)] ⭐ Run Complete job
+[ci/web (quick)] Cleaning up container for job web (quick)
+[ci/web (quick)]   ✅  Success - Complete job
+[ci/web (quick)] 🏁  Job succeeded

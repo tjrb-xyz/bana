@@ -1,0 +1,38 @@
+name: ci
+on: workflow_dispatch
+jobs:
+  plan:
+    runs-on: [self-hosted, wid-linux]
+    outputs:
+      background: ${{ fromJSON(steps.p.outputs.json).background }}
+    steps:
+      - id: p
+        run: |
+          json='{"tier":"quick","rust":true,"background":false}'
+          echo "$json"
+          echo "json=$json" >> "$GITHUB_OUTPUT"
+  rust:
+    needs: plan
+    runs-on: [self-hosted, wid-linux]
+    steps:
+      - name: build
+        run: echo compiling; sleep 1; echo done
+      - name: clippy
+        run: |
+          for i in $(seq 30); do echo "warning line $i"; done
+          exit 1
+  background-linux:
+    needs: plan
+    if: needs.plan.outputs.background == 'true'
+    runs-on: [self-hosted, wid-systemd]
+    steps:
+      - run: echo never
+  sd:
+    runs-on: [self-hosted, wid-systemd]
+    steps:
+      - run: echo never
+  macos:
+    name: macOS tests
+    runs-on: [self-hosted, wid-macos]
+    steps:
+      - run: echo never

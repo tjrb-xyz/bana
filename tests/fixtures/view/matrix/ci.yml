@@ -1,0 +1,44 @@
+name: ci
+on:
+  workflow_dispatch:
+    inputs:
+      tier:
+        type: string
+        default: quick
+jobs:
+  plan:
+    runs-on: [self-hosted, wid-linux]
+    outputs:
+      json: ${{ steps.p.outputs.json }}
+    steps:
+      - id: p
+        run: |
+          json='{"tier":"${{ inputs.tier }}","rust":true,"test":true}'
+          echo "$json"
+          echo "json=$json" >> "$GITHUB_OUTPUT"
+  rust:
+    needs: plan
+    runs-on: [self-hosted, wid-linux]
+    steps:
+      - name: build
+        run: echo compiling
+  test:
+    needs: plan
+    strategy:
+      matrix:
+        n: [1, 2]
+    runs-on: [self-hosted, wid-linux]
+    steps:
+      - run: echo "entry ${{ matrix.n }}"
+  web:
+    name: web (${{ inputs.tier }})
+    needs: plan
+    runs-on: [self-hosted, wid-linux]
+    steps:
+      - run: echo web
+  never:
+    needs: plan
+    if: ${{ false }}
+    runs-on: [self-hosted, wid-linux]
+    steps:
+      - run: echo never
