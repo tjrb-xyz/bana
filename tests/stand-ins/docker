@@ -46,6 +46,8 @@ run)
   name=''
   while (($#)); do [[ $1 != --name ]] || name=$2; shift; done
   mkdir -p "$c/$name/files"
+  # Which container this is: a lifeline started for it never touches a later one of its name.
+  echo "$$-$RANDOM" >"$c/$name/id"
   echo "0123456789ab$name" ;;
 rm)
   shift
@@ -89,11 +91,13 @@ exec)
     [[ -z ${FAKE_SYSD_UNREADABLE:-} ]] || exit 5
     echo "runner:x:$5:$5::/home/runner:/bin/bash" ;;
   *"cat >/dev/null"*)
+    # As docker exec is, bound to this container (its id), not to the name.
+    id=$(cat "$c/$n/id" 2>/dev/null) || id=''
     exec 3<&0
     cat <&3 >/dev/null &
     p=$!
-    while kill -0 "$p" 2>/dev/null && [[ -d $c/$n ]]; do sleep 0.05; done
-    if [[ -d $c/$n ]]; then echo "docker: $n powered off" >>"$FAKE_LOG"; gone "$n"; else kill "$p" 2>/dev/null; fi ;;
+    while kill -0 "$p" 2>/dev/null && [[ $(cat "$c/$n/id" 2>/dev/null) == "$id" ]]; do sleep 0.05; done
+    if [[ $(cat "$c/$n/id" 2>/dev/null) == "$id" ]]; then echo "docker: $n powered off" >>"$FAKE_LOG"; gone "$n"; else kill "$p" 2>/dev/null; fi ;;
   *"kill -INT"*)
     : >"$c/$n/stop"
     kill -INT "$(cat "$c/$n/act.pid")" 2>/dev/null ;;
