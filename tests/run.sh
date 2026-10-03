@@ -320,16 +320,19 @@ BANA_ROUND_CONF=$T/w/round.conf BANA_PROJECT_ROOT=$src BANA_ACT_LOCKED=1 bash "$
 check "daemon round: a failing commit without bana.conf: act's defaults" lacks "$FAKE_LOG" "--reuse"
 : >"$FAKE_LOG"
 BANA_ROUND_CONF=$T/w/round.conf BANA_PROJECT_ROOT=$src BANA_ACT_LOCKED=1 bash "$bana" ci quick --event event.json -- --json --action-offline-mode >/dev/null
-check "daemon round without a token (offline): no fetch of the actions first" lacks "$FAKE_LOG" "--concurrent-jobs"
+# Its one dry run is the systemd probe's (lib/systemd.sh), offline as the round is: it fetches nothing.
+check "daemon round without a token (offline): no fetch of the actions first" same "$(grep -c -- '--concurrent-jobs' "$FAKE_LOG")" 1
+check "daemon round without a token (offline): only the probe, offline" grep -q -- '--action-offline-mode .*=bana-systemd-probe -n --json --concurrent-jobs 1$' "$FAKE_LOG"
 mv "$T/w/bana.conf.was" "$src/.github/bana.conf"
 : >"$FAKE_LOG"
-rm -f "$FAKE_STATE/act.fetch"
+rm -f "$FAKE_STATE/act.fetch" "$FAKE_STATE/act.probe"
 BANA_PROJECT_ROOT=$src BANA_ACT_LOCKED=1 bash "$bana" ci quick --event event.json -- -P box=-self-hosted --secret-file secrets --json >/dev/null
-check "daemon ci: the actions first, one job at a time, a dry run" same "$(grep -c -- '-n --concurrent-jobs 1$' "$FAKE_LOG")" 1
+# The fetch is the systemd probe's dry run (wid-systemd is a systemd label): one dry run.
+check "daemon ci: the actions first, one job at a time, a dry run" same "$(grep -c -- '-n --json --concurrent-jobs 1$' "$FAKE_LOG")" 1
 check "daemon ci: then the run, which fetches none" grep -q -- '--json --action-offline-mode$' "$FAKE_LOG"
 # Each label's last -P (act takes the last) in the fetch's dry run: the image, never the host.
-last_maps() { tr ' ' '\n' <"$FAKE_STATE/act.fetch" | awk 'p { split($0, kv, "="); m[kv[1]] = kv[2] } { p = ($0 == "-P") } END { for (k in m) print m[k] }' | sort -u; }
-check "daemon ci: the fetch runs no host step: each label goes to the image" same "$(last_maps)" "catthehacker/ubuntu:act-24.04"
+last_maps() { tr ' ' '\n' <"$FAKE_STATE/act.probe" | awk 'p { split($0, kv, "="); m[kv[1]] = kv[2] } { p = ($0 == "-P") } END { for (k in m) print m[k] }' | sort -u; }
+check "daemon ci: the fetch runs no host step: each label goes to the image (systemd's to the probe's)" same "$(last_maps | tr '\n' ' ')" "bana-systemd-probe catthehacker/ubuntu:act-24.04 "
 check "daemon ci: BANA_PROJECT_ROOT does not reach act's jobs" lacks "$FAKE_STATE/act.env" "BANA_PROJECT_ROOT="
 check "daemon ci: nor BANA_ACT_LOCKED" lacks "$FAKE_STATE/act.env" "BANA_ACT_LOCKED="
 check "daemon ci: BANA_ACT_LOCKED=1 leaves the lock to the daemon" test ! -e "$HOME/.bana/act.lock"
@@ -805,7 +808,9 @@ check "sd_only: no result, no note" test ! -e "$FAKE_STATE/res"
 awk 'BEGIN { b = sprintf("%c", 92); printf "{\"jobID\":\"sd\",\"msg\":\""; for (i = 0; i < 200000; i++) printf "%su003c%s%sx", b, b, b; print "\"}" }' >"$T/sd-in"
 t0=$SECONDS
 SDIN=$T/sd-in sdx 'sd_only json sd "" /dev/null <"$SDIN"; : >"$sd_probe_file"; sd_first json "$SDIN"' >"$T/out"
-check "sd_only, sd_first: a 2 MB line, in a moment" same "$(cut -c1-10 "$T/out" | tr '\t\n' '  ') $((SECONDS - t0 < 10))" '{"jobID":" P sd  1'
+check "sd_only, sd_first: a 2 MB line, in a moment" same "$(grep -c '^P	sd$' "$T/out") $((SECONDS - t0 < 10))" "1 1"
+# sd_only passes it whole, or, with mawk (each line cut at 4000 bytes, so no object), drops it.
+check "sd_only: a 2 MB line whole, or (mawk) none of it" bash -c '[[ $(grep -c "^{" "$1") == 0 ]] || cmp -s <(grep "^{" "$1") "$2"' _ "$T/out" "$T/sd-in"
 sdx 'sd_only text sd "ci/sd" "$FAKE_STATE/res"' <"$sdfx/inner-sd.txt" >"$T/out"
 check "sd_only: keeps sd's text lines, and those that go on them" same "$(cat "$T/out")" "$(sed -n '/^\[ci\/sd /,$p' "$sdfx/inner-sd.txt")"
 check "sd_only: notes sd's result in text too" test -e "$FAKE_STATE/res"
@@ -814,6 +819,18 @@ printf '%s\n' '[ci/sd  ] ⭐ Run Main x' 'goes on' $'[ci/sd  ]   | x\r[ci/plan] 
 sdx 'sd_only text sd "ci/sd" /dev/null' <"$T/sd-in" >"$T/out"
 check "sd_only: text, as a terminal shows it" same "$(cat "$T/out")" "$(printf '%s\n' '[ci/sd  ] ⭐ Run Main x' 'goes on' '[ci/sd  ] y')"
 
+# A line passes as act says it, before the next one comes (mawk would wait for a full buffer).
+mkfifo "$T/sd-fifo"
+sdx 'sd_only json sd "" /dev/null' <"$T/sd-fifo" >"$T/out" &
+p=$!
+exec 7>"$T/sd-fifo"
+echo '{"jobID":"sd","msg":"now"}' >&7
+i=0
+while [[ ! -s $T/out ]] && ((i++ < 100)); do sleep 0.05; done
+check "sd_only: a line passes as it comes" same "$(cat "$T/out")" '{"jobID":"sd","msg":"now"}'
+exec 7>&-
+wait "$p" || true
+rm -f "$T/sd-fifo"
 # sd_inner: act's arguments in the container.
 sdx 'sd_args=(workflow_dispatch -C /r -P wid-linux=img -P Wid-MacOS=-self-hosted -Pold=catthehacker/ubuntu:act-20.04
     --platform=skipme= -j after --job=x "--container-options=--label x=y" --container-options "--label z" --network bridge
@@ -824,6 +841,8 @@ check "sd_inner: images, systemd and linux labels in host mode, a Mac's and skip
 sdx 'sd_args=(x -e "$PWD/.github/bana.conf" --secret-file="$FAKE_STATE/act-linux" --var-file /dev/null --env-file rel --input-file "$FAKE_STATE/none"); sd_files' >"$T/out"
 check "sd_files: the files act reads, as they are here" same "$(tr '\n' ' ' <"$T/out")" "$PWD/.github/bana.conf $FAKE_STATE/act-linux "
 
+# The jobs the containers' acts ran (their -j), in turn.
+inner_jobs() { awk '{ for (i = 1; i < NF; i++) if ($i == "-j") printf "%s ", $(i + 1) }' "$FAKE_STATE/act.inner" 2>/dev/null; }
 # sd_after: after act's first run (JSON), each systemd job in a container of its own.
 sd_run() { # MODE FIRST: the probe, bana's next lines, and sd_after on FIRST as act's output
   local m=$1 f=$2
@@ -859,6 +878,12 @@ check "sd_after (text): gated, found by its name" has "$T/out" "[ci/gated] bana:
 check "sd_after (text): sd's lines" same "$(grep -c '^\[ci/sd  \]' "$T/out")" "$(grep -c '^\[ci/sd  \]' "$sdfx/inner-sd.txt")"
 check "sd_after (text): not plan's" lacks "$T/out" "[ci/plan]"
 check "sd_after (text): one container each" same "$(grep -c '^----$' "$FAKE_STATE/docker.run")" 3
+# [self-hosted, wid-systemd]: act's skip names both labels; sd is still no need placed nowhere.
+sd_world
+awk '{ print } /"jobID":"sd".*-P wid-systemd=/ { sub(/-P wid-systemd=/, "-P self-hosted="); print }' "$sdfx/first.jsonl" >"$T/sd-first"
+FAKE_ACT_OUT_SYSD=$(cat "$sdfx/inner-sd.jsonl") sd_run json "$T/sd-first" && st=0 || st=$?
+check "sd_after: a systemd job's self-hosted label too: sd2, which needs it, still runs" same "$st $(inner_jobs)" "0 sd sd2 gated "
+check "sd_after: and is not called a need not run here" lacks "$T/out" "which is not run here"
 # A need failed in act's run: act skipped sd and said nothing of it; no container starts.
 sd_world
 grep -v 'Skipping' "$sdfx/first.jsonl" | sed 's/"jobResult":"success"/"jobResult":"failure"/' >"$T/sd-first"
@@ -954,6 +979,179 @@ FAKE_SYSD_TAR=$T/sd-bad.tar FAKE_ACT_OUT_SYSD=$(cat "$sdfx/inner-sd.jsonl") sd_r
 check "sd_after: refused uploads fail the run, and say why" same "$st $(grep -c 'its uploads were refused: a path out of its uploads' "$T/err")" "1 2"
 check "sd_after: sd's act passed: not called a need's failure" lacks "$T/out" '"jobID":"sd","matrix":{},"msg":"bana: not run here: a job it needs'
 check "sd_after: sd2 then needs sd, which failed" has "$T/out" '"jobID":"sd2","matrix":{"n":2},"msg":"bana: not run here: needs sd, which failed"'
+
+# ---- bana ci: jobs that need systemd, run after act, each in a systemd container (stand-ins) ----
+# The same recordings: act's first run (FAKE_ACT_OUT), the probe (FAKE_ACT_PROBE), act -l, and the
+# act in each container (FAKE_ACT_OUT_SYSD, sd's own run).
+sdci() { # [--bg] COMMAND...: with the recordings, and the Linux act for the containers. --bg: for
+  # `sdci --bg ... &`, exec'd, so that $! is COMMAND's pid.
+  local e=(FAKE_ACT_LIST="$(cat "$sdfx/list.txt")" FAKE_ACT_PROBE="$(cat "$sdfx/probe.jsonl")" BANA_SYSTEMD_ACT="$FAKE_STATE/act-linux")
+  if [[ $1 == --bg ]]; then shift; exec env "${e[@]}" "$@"; fi
+  env "${e[@]}" "$@"
+}
+until_there() { # FILE: up to 10 s
+  local i=0
+  while [[ ! -s $1 ]] && ((i++ < 200)); do sleep 0.05; done
+}
+sd_world
+export CARGO_TARGET_DIR=$T/w/none
+ci=$HOME/.bana/wid/ci
+mkdir -p "$HOME/.cache/act/actions-checkout@v4"
+printf 'act.platform.box = my/box\nact.platform.far = skip not here\n' >>.github/bana.conf
+mkdir -p "$T/w/tmp"
+TMPDIR=$T/w/tmp FAKE_LOCK_SEEN=$HOME/.bana/act.lock FAKE_ACT_OUT=$(cat "$sdfx/first.txt") FAKE_ACT_OUT_SYSD=$(cat "$sdfx/inner-sd.txt") \
+  sdci bash "$bana" ci >"$T/out" 2>&1 && st=0 || st=$?
+check "ci systemd: passes" same "$st" 0
+check "ci systemd: one dry run, the probe" same "$(wc -l <"$FAKE_STATE/act.probe" | tr -d ' ') $(grep -c -- '^act workflow_dispatch .* -n ' "$FAKE_LOG")" "1 1"
+check "ci systemd: act's first run skips them (no place for wid-systemd)" grep -q -- "-P wid-systemd= .*--action-offline-mode$" "$FAKE_LOG"
+check "ci systemd: bana's next lines, before act's first line" \
+  awk '/^\[ci\/sd *\] bana: next, in a systemd container$/ && !n { n = NR } /^\[ci\/plan *\]/ && !p { p = NR } END { exit !(n && p && n < p) }' "$ci/last.log"
+check "ci systemd: then a container act for each: sd, sd2 (it needs sd), gated" same "$(inner_jobs)" "sd sd2 gated "
+check "ci systemd: sd2 is no dependent" lacks "$ci/last.log" "[ci/sd2-1] bana: not run here"
+check "ci systemd: after, which needs sd, is" has "$ci/last.log" "[ci/after] bana: not run here: needs sd, a systemd job"
+check "ci systemd: plan's lines once" same "$(grep -c '^\[ci/plan \] 🏁  Job succeeded' "$ci/last.log")" 1
+check "ci systemd: sd's lines from its container" has "$ci/last.log" "$(grep '^\[ci/sd  \] 🏁' "$sdfx/inner-sd.txt")"
+check "ci systemd: all its act said in last.systemd.log" same "$(grep -c '^\[ci/plan *\] 🏁  Job succeeded' "$ci/last.systemd.log")" 3
+check "ci systemd: the view says sd is next" has "$T/out" "→ sd: next, in a systemd container"
+check "ci systemd: and its end, counted" bash -c "grep -qx '✓ sd' '$T/out' && grep -q '^2 passed, 1 skipped, 1 not run here · ' '$T/out'"
+check "ci systemd: and why after is not run here" has "$T/out" "– after: not run here (needs sd, a systemd job)"
+tr '\n' ' ' <"$FAKE_STATE/docker.run" >"$T/sd-run"
+check "ci systemd: by hand, no label" lacks "$T/sd-run" "--label"
+check "ci systemd: named for the project" has "$T/sd-run" "--name bana-systemd-wid "
+check "ci systemd: mounts: the Linux act, act's cache and the checkout, read-only, nothing else" same \
+  "$(awk 'p == "-v" { print } { p = $0 }' "$FAKE_STATE/docker.run" | sort -u | tr '\n' ' ')" \
+  "$(printf '%s\n' "$FAKE_STATE/act-linux:/bana/bin/act:ro" "$HOME/.cache/act:/bana/in/cache:ro" "$PWD:$PWD:ro" | sort | tr '\n' ' ')"
+check "ci systemd: nothing more in docker run" sd_nothing_more "$FAKE_STATE/docker.run"
+a=" $(head -1 "$FAKE_STATE/act.inner") "
+check "ci systemd: the inner -P: systemd, linux and image labels host mode; Mac's and skips none" bash -c \
+  "for w in ' -P wid-linux=-self-hosted ' ' -P wid-systemd=-self-hosted ' ' -P box=-self-hosted ' ' -P wid-macos= ' ' -P far= ' ' -P ubuntu-18.04= ' ' -j sd --concurrent-jobs 1 ' ' --action-offline-mode '; do [[ '$a' == *\"\$w\"* ]] || { echo \"lacks \$w\" >&2; exit 1; }; done"
+check "ci systemd: no container left" same "$(ls "$FAKE_STATE/ctr" 2>/dev/null)" ""
+check "ci systemd: each went while bana ci held the lock" same "$(sort -u "$FAKE_STATE/docker.rm")" "held"
+check "ci systemd: the lock is gone after" test ! -e "$HOME/.bana/act.lock"
+check "ci systemd: no temp file left" same "$(ls -A "$T/w/tmp")" ""
+# The first failure's status, either way round.
+rm -f "$FAKE_STATE/act.inner"
+FAKE_ACT_EXIT=2 FAKE_ACT_EXIT_SYSD=3 FAKE_ACT_OUT=$(cat "$sdfx/first.txt") FAKE_ACT_OUT_SYSD=$(cat "$sdfx/inner-sd.txt") \
+  sdci bash "$bana" ci >"$T/out" 2>&1 && st=0 || st=$?
+check "ci systemd: act failing first, then sd failing: act's status (sd2 then needs sd, which failed)" same "$st $(inner_jobs)" "2 sd gated "
+FAKE_ACT_EXIT_SYSD=3 FAKE_ACT_OUT=$(cat "$sdfx/first.txt") FAKE_ACT_OUT_SYSD=$(cat "$sdfx/inner-sd.txt") \
+  sdci bash "$bana" ci >"$T/out" 2>&1 && st=0 || st=$?
+check "ci systemd: act passing, sd failing: sd's status" same "$st $(sed -n 's/^exit=//p' "$ci/last.env")" "3 3"
+check "ci systemd: and bana fix offered" has "$T/out" "bana fix: hand this failure"
+# A dry run neither probes nor starts a container.
+rm -f "$FAKE_STATE/act.probe" "$FAKE_STATE/docker.run"
+sdci bash "$bana" ci -n >/dev/null 2>&1
+check "ci systemd: a dry run probes nothing, starts no container" test ! -e "$FAKE_STATE/act.probe" -a ! -e "$FAKE_STATE/docker.run"
+# Docker before 28: not run here, the run passes, no container.
+FAKE_DOCKER_API=1.47 FAKE_ACT_OUT=$(cat "$sdfx/first.txt") sdci bash "$bana" ci >"$T/out" 2>&1 && st=0 || st=$?
+check "ci systemd: Docker 1.47: the run passes, no docker run" same "$st $(cat "$FAKE_STATE/docker.run" 2>/dev/null)" "0 "
+check "ci systemd: Docker 1.47: why, for sd" has "$T/out" "– sd: not run here (needs Docker 28 or later (writable cgroups))"
+# A container that does not start: the run fails, and says why.
+FAKE_DOCKER_RUN_FAIL='no space left on device' FAKE_ACT_OUT=$(cat "$sdfx/first.txt") sdci bash "$bana" ci >"$T/out" 2>&1 && st=0 || st=$?
+check "ci systemd: a container that does not start fails the run" same "$st" 1
+check "ci systemd: and says why, in red" has "$T/out" "Error: systemd job sd did not run: docker run: docker: Error response from daemon: no space left on device"
+# The probe fails: act alone, as before; the view names the label the jobs it skipped have.
+rm -f "$FAKE_STATE/docker.run"
+FAKE_ACT_PROBE_EXIT=1 FAKE_ACT_OUT=$(cat "$sdfx/first.txt") sdci bash "$bana" ci >"$T/out" 2>&1 && st=0 || st=$?
+check "ci systemd: a failed probe: says so" has "$T/out" "act's dry run failed, so no job that needs systemd runs here"
+check "ci systemd: a failed probe: act alone, no container, the run passes" same "$st $(cat "$FAKE_STATE/docker.run" 2>/dev/null)" "0 "
+check "ci systemd: a failed probe: the view says why sd did not run" has "$T/out" "– sd: not run here (wid-systemd: a job that needs systemd)"
+sed 's/wid-systemd/wid-linux/' "$sdfx/ci.yml" >.github/workflows/ci.yml
+FAKE_ACT_PROBE_EXIT=1 sdci bash "$bana" ci >"$T/out" 2>&1 || true
+check "ci systemd: a failed probe of a workflow without a systemd label says nothing of it" lacks "$T/out" "act's dry run failed"
+git checkout -q .github/workflows/ci.yml
+# No job of the run needs systemd (the probe finds none): act is exec'd as before.
+for d in hand daemon; do
+  rm -f "$FAKE_STATE/act.probe" "$FAKE_STATE/act.pid" "$FAKE_STATE/docker.run"
+  if [[ $d == hand ]]; then
+    FAKE_ACT_PROBE=$(sed 's/bana-systemd-probe/x/' "$sdfx/probe.jsonl") BANA_CI_LOG=no BANA_SYSTEMD_ACT=$FAKE_STATE/act-linux bash "$bana" ci >/dev/null 2>&1 &
+  else
+    FAKE_ACT_PROBE=$(sed 's/bana-systemd-probe/x/' "$sdfx/probe.jsonl") BANA_ACT_LOCKED=1 BANA_SYSTEMD_ACT=$FAKE_STATE/act-linux bash "$bana" ci -- --json >/dev/null 2>&1 &
+  fi
+  p=$!
+  wait "$p" || true
+  check "ci systemd: none in the run ($d): act is exec'd as before" same "$(cat "$FAKE_STATE/act.pid")" "$p"
+  check "ci systemd: none in the run ($d): the probe ran once, no container" same "$(wc -l <"$FAKE_STATE/act.probe" | tr -d ' ') $(cat "$FAKE_STATE/docker.run" 2>/dev/null)" "1 "
+done
+
+# The daemon's: JSON, its own act options, an event, secrets and vars (copies in the container).
+sd_world
+src=$PWD
+mkdir -p "$T/w/build" "$T/w/cache/actions-checkout@v4" && cd "$T/w/build"
+echo '{"inputs":{"tier":"quick"}}' >event.json
+echo 'S=1' >secrets && echo 'V=1' >"$T/w/vars"
+daemon_flags=(--json --rm --pull=false --secret-file secrets --env-file /dev/null --var-file "$T/w/vars" --input-file /dev/null
+  --container-daemon-socket - "--container-options=--label xyz.tjrb.bana=other" --artifact-server-path artifacts
+  --artifact-server-port 34567 --action-cache-path "$T/w/cache" --env GITHUB_RUN_ID=7)
+FAKE_ACT_OUT=$(cat "$sdfx/first.jsonl") FAKE_ACT_OUT_SYSD=$(cat "$sdfx/inner-sd.jsonl") BANA_PROJECT_ROOT=$src BANA_ACT_LOCKED=1 \
+  sdci bash "$bana" ci quick --event event.json -- "${daemon_flags[@]}" >"$T/out" 2>"$T/err" && st=0 || st=$?
+check "daemon ci systemd: passes" same "$st" 0
+check "daemon ci systemd: JSON lines after bana's first" bash -c "sed 1d '$T/out' | python3 -c 'import json,sys; [json.loads(l) for l in sys.stdin if l.strip()]'"
+check "daemon ci systemd: sd's next line first" same "$(sed -n 2p "$T/out" | grep -o '"jobID":"sd","matrix":{},"msg":"bana: next, in a systemd container"')" \
+  '"jobID":"sd","matrix":{},"msg":"bana: next, in a systemd container"'
+check "daemon ci systemd: plan's lines once" same "$(grep -c '"jobID":"plan".*"jobResult"' "$T/out")" 1
+check "daemon ci systemd: sd's result" grep -q '"jobID":"sd".*"jobResult":"success"' "$T/out"
+check "daemon ci systemd: labelled with the daemon's prefix, not bana.conf's" has "$FAKE_STATE/docker.run" "xyz.tjrb.bana=other"
+check "daemon ci systemd: and named for it" has "$FAKE_STATE/docker.run" "bana-systemd-other"
+check "daemon ci systemd: mounts: the Linux act, the daemon's act cache and the checkout, nothing else" same \
+  "$(awk 'p == "-v" { print } { p = $0 }' "$FAKE_STATE/docker.run" | sort -u | tr '\n' ' ')" \
+  "$(printf '%s\n' "$FAKE_STATE/act-linux:/bana/bin/act:ro" "$T/w/cache:/bana/in/cache:ro" "$src:$src:ro" | sort | tr '\n' ' ')"
+check "daemon ci systemd: the event, secrets and vars go in as copies" same \
+  "$(grep -o 'docker cp -L [^ ]*' "$FAKE_LOG" | sort -u | sed 's/^docker cp -L //' | tr '\n' ' ')" "$T/w/build/event.json $T/w/build/secrets $T/w/vars "
+check "daemon ci systemd: the inner act: no label, network, server path or --rm of the daemon's" bash -c \
+  "! grep -qE -- '--container-options|--network|artifact-server-path artifacts|--rm|-P wid-systemd=( |$)' <(head -1 '$FAKE_STATE/act.inner')"
+check "daemon ci systemd: the inner act: offline, its own server path and cache" bash -c \
+  "grep -q -- '--action-offline-mode .*--artifact-server-path /home/runner/.bana/artifacts --action-cache-path /home/runner/.cache/act' <(head -1 '$FAKE_STATE/act.inner')"
+check "daemon ci systemd: all its act said in the build's systemd.log" grep -q '"jobID":"plan"' "$T/w/build/systemd.log"
+check "daemon ci systemd: no container left" same "$(ls "$FAKE_STATE/ctr" 2>/dev/null)" ""
+# A cancel (SIGINT, then a second one) reaches the act in the container, once each.
+rm -f "$FAKE_STATE/act.inner" "$FAKE_STATE/act.inner.int"
+FAKE_ACT_INT_SYSD=2 FAKE_ACT_SLEEP_SYSD=30 FAKE_ACT_OUT=$(cat "$sdfx/first.jsonl") FAKE_ACT_OUT_SYSD=$(cat "$sdfx/inner-sd.jsonl") \
+  BANA_PROJECT_ROOT=$src BANA_ACT_LOCKED=1 sdci --bg "${own_group[@]}" bash "$bana" ci quick --event event.json -- "${daemon_flags[@]}" >"$T/out" 2>"$T/err" &
+p=$!
+until_there "$FAKE_STATE/ctr/bana-systemd-other/act.pid"
+kill -INT "$p"
+until_there "$FAKE_STATE/act.inner.int"
+kill -TERM "$p"
+wait "$p" && st=0 || st=$?
+check "daemon ci systemd: SIGINT and SIGTERM reach the container's act once each" same "$(tr '\n' ' ' 2>/dev/null <"$FAKE_STATE/act.inner.int")" "int int "
+check "daemon ci systemd: and its status is passed on" same "$st" 1
+check "daemon ci systemd: its last line is in systemd.log" has "$T/w/build/systemd.log" "act: forced to stop, in its container"
+check "daemon ci systemd: no other container starts" same "$(inner_jobs)" "sd "
+check "daemon ci systemd: none left" same "$(ls "$FAKE_STATE/ctr" 2>/dev/null)" ""
+# The daemon dies (its pipes close): both acts run on.
+rm -f "$FAKE_STATE/late" "$FAKE_STATE/act.survived" "$FAKE_STATE/act.pid"
+mkfifo "$T/w/daemon.out"
+cat "$T/w/daemon.out" >/dev/null &
+reader=$!
+FAKE_ACT_LATE=1 FAKE_ACT_OUT=$(cat "$sdfx/first.jsonl") FAKE_ACT_OUT_SYSD=$(cat "$sdfx/inner-sd.jsonl") BANA_PROJECT_ROOT=$src BANA_ACT_LOCKED=1 \
+  sdci --bg bash "$bana" ci quick --event event.json -- "${daemon_flags[@]}" >"$T/w/daemon.out" 2>&1 &
+p=$!
+until_there "$FAKE_STATE/act.pid"
+kill "$reader"
+wait "$reader" 2>/dev/null || true
+touch "$FAKE_STATE/late"
+wait "$p" && st=0 || st=$?
+check "daemon ci systemd: both acts run on when the daemon's pipes close" same "$st $(sort "$FAKE_STATE/act.survived" 2>/dev/null | tr '\n' ' ')" "0 inner inner inner ok "
+rm -f "$T/w/daemon.out" "$FAKE_STATE/late"
+cd "$src"
+# By hand, Ctrl-C to the group: bash passes it on once; the container's act ends, and goes.
+rm -rf "$ci" "$FAKE_STATE/act.inner" "$FAKE_STATE/act.inner.int" "$FAKE_STATE/docker.rm"
+FAKE_LOCK_SEEN=$HOME/.bana/act.lock FAKE_ACT_INT_SYSD=1 FAKE_ACT_SLEEP_SYSD=30 FAKE_ACT_OUT=$(cat "$sdfx/first.txt") \
+  FAKE_ACT_OUT_SYSD=$(cat "$sdfx/inner-sd.txt") sdci --bg "${own_group[@]}" bash "$bana" ci >"$T/out" 2>&1 &
+p=$!
+until_there "$FAKE_STATE/ctr/bana-systemd-wid/act.pid"
+kill -INT -- "-$p"
+wait "$p" && st=0 || st=$?
+check "ci systemd: Ctrl-C reaches the container's act once" same "$(tr '\n' ' ' 2>/dev/null <"$FAKE_STATE/act.inner.int")" "int "
+check "ci systemd: Ctrl-C: no other container starts" same "$(inner_jobs)" "sd "
+check "ci systemd: Ctrl-C: last.log ends with its act's last line" same "$(tail -1 "$ci/last.log")" "act: interrupted, in its container"
+check "ci systemd: Ctrl-C: its act's last words in last.systemd.log" has "$ci/last.systemd.log" "act: interrupted, in its container"
+check "ci systemd: Ctrl-C: stopped" same "$st $(sed -n 's/^stopped=//p' "$ci/last.env")" "1 1"
+check "ci systemd: Ctrl-C: the container went, the lock held still" same "$(ls "$FAKE_STATE/ctr" 2>/dev/null) $(sort -u "$FAKE_STATE/docker.rm")" " held"
+check "ci systemd: Ctrl-C: the lock is gone after" test ! -e "$HOME/.bana/act.lock"
+check "ci systemd: Ctrl-C: the view still ends" grep -q "act's output: $ci/last.log" "$T/out"
+unset CARGO_TARGET_DIR
 
 # ---- bana fix: a failure handed to Claude Code, on a branch of its own -----------------------------
 # bana fix runs bana-manager (fix prepare makes the worktree, the brief and the prompt): the one
@@ -1551,8 +1749,8 @@ vmhome=$FAKE_STATE/orb/bana/home
 check "vm: the linux hook ran in it, as a user, on arm64" has "$FAKE_LOG" "linux hook as 1000 on aarch64"
 check "vm: the x86_64 one on x86_64" has "$FAKE_LOG" "linux hook as 1000 on x86_64"
 check "vm: its runner is named after the Mac, without USB labels" has "$FAKE_LOG" \
-  "--name wid-mbp-linux-arm64-1 --labels wid-linux,linux-arm64,mbp,big-disk,gpu --work"
-check "vm: the x86_64 runner" has "$FAKE_LOG" "--name wid-mbp-linux-x64-1 --labels wid-linux,linux-x64,mbp,big-disk,gpu --work"
+  "--name wid-mbp-linux-arm64-1 --labels wid-linux,wid-systemd,linux-arm64,mbp,big-disk,gpu --work"
+check "vm: the x86_64 runner" has "$FAKE_LOG" "--name wid-mbp-linux-x64-1 --labels wid-linux,wid-systemd,linux-x64,mbp,big-disk,gpu --work"
 check "vm: a systemd service (sudo svc.sh install USER)" has "$FAKE_LOG" "sudo ./svc.sh install"
 check "vm: its runners live in the machine's own home" test -e "$vmhome/.bana/wid/runners/wid-mbp-linux-arm64-1/.runner"
 check "vm: bana.conf's path leads its runner's PATH" has "$FAKE_LOG" "runner PATH starts $vmhome/.cargo/bin"
@@ -1606,9 +1804,9 @@ export FAKE_OS=Linux FAKE_ARCH=x86_64 FAKE_HOST=pve-ci FAKE_UID=1000 BANA_SYS_RO
 FAKE_MISSING="scons git" bash "$bana" up --linux 2 >"$T/out" 2>&1 || { cat "$T/out"; false; }
 check "linux: installs only the missing packages" has "$FAKE_LOG" "apt-get install -y -q git scons"
 check "linux: the first runner holds the USB device" has "$FAKE_LOG" \
-  "--name wid-pve-ci-linux-x64-1 --labels wid-linux,linux-x64,pve-ci,big-disk,usb-audio,usb-1c75-af70 --work"
+  "--name wid-pve-ci-linux-x64-1 --labels wid-linux,wid-systemd,linux-x64,pve-ci,big-disk,usb-audio,usb-1c75-af70 --work"
 check "linux: the second does not (two jobs never share a device)" has "$FAKE_LOG" \
-  "--name wid-pve-ci-linux-x64-2 --labels wid-linux,linux-x64,pve-ci,big-disk --work"
+  "--name wid-pve-ci-linux-x64-2 --labels wid-linux,wid-systemd,linux-x64,pve-ci,big-disk --work"
 check "linux: its kernel has snd-usb-audio, so no kernel packages" lacks "$FAKE_LOG" "linux-image"
 
 # A Debian cloud kernel (no sound drivers), and Ubuntu's virtual one.
@@ -2550,7 +2748,7 @@ grep -n -i private "$here/../README.md" "$here/../install.sh" "$gh_dir"/*.yml |
   grep -v -e 'Use the daemon only on a private repository' -e 'Use bana with private' \
     -e '# a private repository' -e '# Windows, a private repository' -e 'for private images' \
     -e 'Private code, public CI and releases: bana split' -e 'keeps its code in its private repository' \
-    -e 'logs private|public' >"$T/out" || true
+    -e 'logs private|public' -e 'no `PrivateUsers=` user units' >"$T/out" || true
 check "workflows: no 'private' about bana itself" same "$(cat "$T/out")" ""
 
 # ---- hook: bana's install.sh; the daemon moves to the new bana first, or nothing changes ---------
@@ -2895,7 +3093,8 @@ else
   rm .github/bana.conf
   git -c user.name=t -c user.email=t@t commit -qam "no bana.conf"
   mkdir -p "$FAKE_STATE/labels" "$FAKE_STATE/matrix"
-  for j in plan rust web background-linux; do printf 'self-hosted\nexample-linux\n' >"$FAKE_STATE/labels/$j"; done
+  for j in plan rust web; do printf 'self-hosted\nexample-linux\n' >"$FAKE_STATE/labels/$j"; done
+  printf 'self-hosted\nexample-systemd\n' >"$FAKE_STATE/labels/background-linux"
   printf 'self-hosted\nexample-macos\n' >"$FAKE_STATE/labels/macos"
   for t in linux-arm64 linux-x64; do printf 'self-hosted\nexample-linux\n%s\n' "$t" >"$FAKE_STATE/labels/package@target:$t"; done
   printf 'self-hosted\nexample-macos\nosx-arm64\n' >"$FAKE_STATE/labels/package@target:macos-arm64"
@@ -2912,11 +3111,27 @@ else
     "--matrix target:linux-arm64 --matrix target:linux-x64 --matrix target:macos-arm64 "
   check "add: each dry run on the copy, with no label mapped and act's defaults emptied" has "$FAKE_LOG" \
     "act workflow_dispatch -n --pull=false -W .github/workflows/ci.yml -P bana-none=x -P ubuntu-latest= -P ubuntu-22.04= -P ubuntu-20.04= -P ubuntu-18.04= -j plan"
-  check "add: Linux jobs in act.image" has "$T/out" "plan                        self-hosted example-linux              Linux container catthehacker/ubuntu:act-24.04  bana up runners"
+  check "add: Linux jobs in act.image" has "$T/out" "plan                        self-hosted example-linux              Linux container catthehacker/ubuntu:act-24.04                   bana up runners"
   check "add: on Linux, a Mac's job is not run" has "$T/out" "macos                       self-hosted example-macos              a Mac's job, not run on Linux"
   check "add: the matrix entries, each where it goes" has "$T/out" "package target=macos-arm64  self-hosted example-macos osx-arm64"
-  check "add: a SPLIT matrix" has "$T/out" "ci.yml:74: package: SPLIT: its entries go to different runners, and act 0.2.89 runs them all on the first one's: bana ci -j package -- --matrix target:linux-arm64,"
-  check "add: systemd's jobs, once" same "$(grep -c 'systemctl --user and loginctl' "$T/out")" 1
+  check "add: a SPLIT matrix" has "$T/out" "ci.yml:76: package: SPLIT: its entries go to different runners, and act 0.2.89 runs them all on the first one's: bana ci -j package -- --matrix target:linux-arm64,"
+  check "add: a job on example-systemd runs in a systemd container" has "$T/out" \
+    "background-linux            self-hosted example-systemd            a systemd container (catthehacker/ubuntu:act-24.04, host mode)  bana up runners"
+  check "add: and is not told it needs systemd" lacks "$T/out" "systemctl --user and loginctl"
+  check "add: a job that needs a systemd job is not run here, and says so" has "$T/out" \
+    "ci.yml:70: package: it needs background-linux, a systemd job: bana does not run it (act runs a job with the jobs it needs, and bana runs background-linux in a container of its own): drop the need, or accept that"
+  check "add: once" same "$(grep -c 'it needs background-linux, a systemd job' "$T/out")" 1
+  check "add: systemd jobs can run here: no reason why not" lacks "$T/out" "jobs that need systemd (background-linux) do not run here"
+  FAKE_DOCKER_API=1.47 FAKE_OS=Linux FAKE_ARCH=x86_64 bash "$bana" add --check >"$T/out" 2>&1 || true
+  check "add: Docker 1.47: why systemd jobs do not run here" has "$T/out" \
+    "ci.yml: jobs that need systemd (background-linux) do not run here: needs Docker 28 or later (writable cgroups)"
+  printf 'self-hosted\nexample-linux\n' >"$FAKE_STATE/labels/background-linux"
+  FAKE_OS=Linux FAKE_ARCH=x86_64 bash "$bana" add --check >"$T/out" 2>&1 || true
+  check "add: systemd's steps on a Linux job: give it example-systemd, once" same \
+    "$(grep -c 'background-linux: systemctl --user and loginctl need systemd: give the job runs-on example-systemd (bana ci and bana split run it in a systemd container)' "$T/out")" 1
+  check "add: and no job needs a systemd job then" lacks "$T/out" "a systemd job: bana does not run it"
+  printf 'self-hosted\nexample-systemd\n' >"$FAKE_STATE/labels/background-linux"
+  FAKE_OS=Linux FAKE_ARCH=x86_64 bash "$bana" add --check >"$T/out" 2>&1 && st=0 || st=$?
   check "add: \$RUNNER_ENVIRONMENT, where the workflow has it" has "$T/out" "ci.yml:58: macos: \$RUNNER_ENVIRONMENT is empty under act"
   # shellcheck disable=SC2016 # the workflow's
   check "add: the exact [[ \$RUNNER_ENVIRONMENT == self-hosted ]] gets || -n \${ACT:-}" has "$T/out" \
@@ -3003,7 +3218,7 @@ while select.select([fd], [], [], 60)[0]:
         buf = b""
 sys.exit(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))')
   "${on_terminal[@]}" l,y,y bash "$bana" add >"$T/out" 2>&1 || true
-  check "add (terminal): asks about the label it does not know" has "$T/out" "Label depot-ubuntu-24.04-4 (jobs depot): [l]inux / [m]ac / [s]kip / an image [linux]"
+  check "add (terminal): asks about the label it does not know" has "$T/out" "Label depot-ubuntu-24.04-4 (jobs depot): [l]inux / [m]ac / s[y]stemd / [s]kip / an image [linux]"
   check "add (terminal): bana.conf keeps its lines" same "$(head -3 .github/bana.conf)" "$(printf 'repo = acme/widget\nprefix = wid\nworkflow = ci.yml')"
   check "add (terminal): and gets the answer" has .github/bana.conf "act.platform.depot-ubuntu-24.04-4 = linux"
   check "add (terminal): in a block of its own" has .github/bana.conf "# bana add $(date +%Y-%m-%d)"

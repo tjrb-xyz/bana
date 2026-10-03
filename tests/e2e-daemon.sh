@@ -1108,6 +1108,120 @@ P=two until_ok 300 "two's build" finished "$t3"
 check "remove: two's build passed" same "$(P=two builds_of "$t3" | cut -d'|' -f2,3,4)" "success|push|1"
 P=two clean remove
 
+# ---- 9b. a job that needs systemd, in a systemd container ------------------------------------
+# A third project, sdp: plan; sd (it needs plan) on sdp-systemd, as a user with systemd, then
+# ci/step.sh: pass, sleep (600 s), or until (until the time ci/until says); an always() step;
+# after (it needs sd), which is not run here. The Linux act for the containers is the one this
+# test runs, put where bana ci keeps the pinned one (the daemon's builds get no BANA_SYSTEMD_ACT).
+if [[ $docker_mode == 1 ]]; then
+  say "9b. a job that needs systemd: its container, a cancel, kill -9 of the daemon"
+  P=sdp
+  d3=$HOME/.bana/sdp
+  w3=$T/sdp
+  case $(uname -m) in arm64 | aarch64) la=arm64 ;; *) la=x86_64 ;; esac
+  mkdir -p "$HOME/.bana/act-linux/0.2.89-$la"
+  cp "$act" "$HOME/.bana/act-linux/0.2.89-$la/act"
+  git init -q --bare "$T/sdp.git"
+  printf '[url "file://%s/sdp.git"]\n  insteadOf = https://github.com/acme/sdp.git\n' "$T" >>"$HOME/.gitconfig"
+  mkdir -p "$w3/.github/workflows" "$w3/ci"
+  git -C "$w3" init -q
+  git -C "$w3" remote add origin "https://github.com/acme/sdp.git"
+  printf '%s\n' "repo = acme/sdp" "prefix = sdp" "tiers = quick nightly" "daemon.poll = 3600" "daemon.token = none" \
+    "act.image = $image" >"$w3/.github/bana.conf"
+  # shellcheck disable=SC2016 # the workflow's and its step's
+  printf '%s\n' 'name: ci' 'on:' '  workflow_dispatch:' '    inputs:' '      tier:' '        default: quick' 'jobs:' \
+    '  plan:' '    runs-on: [self-hosted, sdp-linux]' '    steps:' '      - run: echo plan' \
+    '  sd:' '    needs: plan' '    runs-on: [self-hosted, sdp-systemd]' '    steps:' '      - uses: actions/checkout@v4' \
+    '      - name: systemd, as a user' '        run: |' '          sudo loginctl enable-linger "$USER"' \
+    '          echo "user manager $(systemctl --user is-system-running)"' '          sh ci/step.sh' \
+    '      - if: always()' '        run: echo "sd always ran"' \
+    '  after:' '    needs: sd' '    runs-on: [self-hosted, sdp-linux]' '    steps:' '      - run: echo after' \
+    >"$w3/.github/workflows/ci.yml"
+  # shellcheck disable=SC2016 # the step's
+  printf '%s\n' 'case $(cat ci/mode) in' 'sleep) echo sleeping; sleep 600 ;;' \
+    'until) echo waiting; while [ "$(date +%s)" -lt "$(cat ci/until)" ]; do sleep 1; done ;;' 'esac' \
+    'echo "sd: done ($(cat ci/mode))"' >"$w3/ci/step.sh"
+  echo pass >"$w3/ci/mode"
+  echo 0 >"$w3/ci/until"
+  git -C "$w3" add -A
+  git -C "$w3" commit -q -m "the systemd project"
+  git -C "$w3" push -q origin HEAD:main
+  git -C "$T/sdp.git" symbolic-ref HEAD refs/heads/main
+  push3() { # MODE MESSAGE: commits and pushes, then pokes; prints the sha
+    echo "$1" >"$w3/ci/mode"
+    echo "$2" >"$w3/ci/push"
+    git -C "$w3" add -A
+    git -C "$w3" commit -q -m "$2"
+    git -C "$w3" push -q origin HEAD:main
+    (cd "$w3" && bash "$bana" daemon poke >/dev/null)
+    git -C "$w3" rev-parse HEAD
+  }
+  sd_log() { cat "$d3/builds/$1/act.jsonl"; } # ID
+  says() { [[ -n $(builds_of "$1") ]] && grep -q "$2" "$d3/builds/$(builds_of "$1" | tail -n 1 | cut -d'|' -f1)/act.jsonl"; } # SHA TEXT
+  out=$(cd "$w3" && bash "$bana" add </dev/null 2>&1) && code=0 || code=$?
+  [[ $code == 0 ]] || echo "$out" >&2
+  check "systemd: bana add" same "$code" 0
+  until_ok 60 "sdp's first fetch" bash -c "grep -q '\"first_start_done\": true' '$d3/state.json'"
+
+  # A push: sd in its container, after not run here, and why.
+  g=$(push3 pass "passes, in a systemd container")
+  until_ok 600 "sdp's build" finished "$g"
+  until_ok 60 "the daemon idle" idle
+  id=$(builds_of "$g" | tail -n 1 | cut -d'|' -f1)
+  check "systemd: the build passed" same "$(state_of "$g")" success
+  check "systemd: bana/sd success" same "$(last "$g" bana/sd | cut -d'|' -f1)" success
+  check "systemd: its contexts: none for after" same "$(contexts "$g")" "bana bana/plan bana/sd "
+  check "systemd: bana says after is not run here, and why" bash -c \
+    "[[ \"\$1\" == 'success|'*'not run here: after (needs sd, a systemd job)' ]]" _ "$(last "$g" bana)"
+  check "systemd: systemd ran for its user, in the container" has <(sd_log "$id") '"msg":"user manager running\n"'
+  check "systemd: plan's end once (its run again inside is in systemd.log)" same \
+    "$(sd_log "$id" | grep -c '"jobID":"plan","jobResult":"success"') $(grep -c '"jobID":"plan","jobResult":"success"' "$d3/builds/$id/systemd.log")" "1 1"
+  clean "systemd: pass"
+  check "systemd: pass: no systemd container" same "$(docker ps -aq --filter name=bana-systemd-sdp)" ""
+
+  # A cancel while sd sleeps in its container: its always() step runs, and the container goes.
+  e=$(push3 sleep "sleeps, in a systemd container")
+  until_ok 300 "sd sleeping" says "$e" '"msg":"sleeping\\n"'
+  id=$(builds_of "$e" | tail -n 1 | cut -d'|' -f1)
+  check "systemd cancel: its container carries the daemon's label" test -n "$(containers)"
+  s=$(date +%s)
+  api "/builds/$id/cancel" -X POST >/dev/null
+  until_ok 200 "build $id ended" finished "$e"
+  until_ok 60 "the daemon idle" idle
+  took=$(($(date +%s) - s))
+  check "systemd cancel: the build ended as error, cancelled" same "$(builds_of "$e" | tail -n 1 | cut -d'|' -f2,5)" "error|cancelled from the page"
+  check "systemd cancel: within the ladder's first rung (60 s)" test "$took" -lt 60
+  check "systemd cancel: its always() step ran, in the container" has <(sd_log "$id") '"msg":"sd always ran\n"'
+  check "systemd cancel: no pending left on any context" same "$(for x in $(contexts "$e"); do last "$e" "$x" | cut -d'|' -f1; done | grep -c pending || true)" 0
+  clean "systemd cancel"
+
+  # kill -9 of the daemon while sd waits in its container; a restart sweeps it, and builds once.
+  echo $(($(date +%s) + 150)) >"$w3/ci/until"
+  f=$(push3 until "waits, in a systemd container, as the daemon is killed")
+  until_ok 300 "sd waiting" says "$f" '"msg":"waiting\\n"'
+  id=$(builds_of "$f" | tail -n 1 | cut -d'|' -f1)
+  ci_pid=$(jq_ 'j["pid"]' <"$d3/builds/$id/build.json")
+  kill -9 "$daemon_pid"
+  wait "$daemon_pid" 2>/dev/null || true
+  daemon_pid=''
+  check "systemd kill -9: bana ci runs on without the daemon" alive "$ci_pid"
+  check "systemd kill -9: its container too" test -n "$(containers)"
+  start_daemon
+  until_ok 120 "the retry" bash -c "grep -q 'build $id was interrupted; retried as build' '$T/daemon.log'"
+  check "systemd kill -9: the old bana ci was stopped at the restart" not alive "$ci_pid"
+  until_ok 600 "the retry finished" finished "$f"
+  until_ok 60 "the daemon idle" idle
+  check "systemd kill -9: the interrupted build, then its retry, which passed" same \
+    "$(builds_of "$f" | cut -d'|' -f2-)" "$(printf 'error|push|1|interrupted (bana restarted)\nsuccess|retry|2|')"
+  (cd "$w3" && bash "$bana" daemon poke >/dev/null)
+  sleep 3
+  until_ok 60 "the daemon idle" idle
+  check "systemd kill -9: retried exactly once" same "$(builds_of "$f" | wc -l | tr -d ' ')" 2
+  clean "systemd kill -9"
+  check "systemd kill -9: no systemd container" same "$(docker ps -aq --filter name=bana-systemd-sdp)" ""
+  P=two
+fi
+
 # ---- 10. bana split's public workflow, act as GitHub (BANA_E2E_SPLIT=1) -------------------------
 # bana.yml as bana split renders it, run by act with ubuntu-latest on this machine (a hosted
 # runner's VM): the fetch from a local bare origin over file:// (the deploy key's in GitHub's place),

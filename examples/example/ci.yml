@@ -56,9 +56,11 @@ jobs:
       - name: On a dedicated CI Mac only
         run: |
           if [[ ${BANA_DEDICATED:-} == 1 || $RUNNER_ENVIRONMENT == github-hosted ]]; then macos/driver/install.sh; fi
+  # It needs systemd (a user service, lingering): bana ci runs it in a systemd container, and
+  # bana up's Linux runners (systemd services) carry example-systemd too.
   background-linux:
     needs: plan
-    runs-on: ${{ fromJSON(vars.EXAMPLE_RUNNER_LINUX || '["self-hosted","example-linux"]') }}
+    runs-on: ${{ fromJSON(vars.EXAMPLE_RUNNER_SYSTEMD || '["self-hosted","example-systemd"]') }}
     steps:
       - name: install, serve, stop cleanly on SIGTERM, uninstall
         run: |

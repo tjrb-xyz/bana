@@ -1,6 +1,9 @@
 # bana ci's view of act's text output, by hand (lib/act.sh act_view): a line as each job starts
 # and ends, a failed step's last 20 lines, the plan's choice, why a job did not run, bana's own
 # lines and act's errors, then a count. BSD awk (macOS) and gawk alike.
+# A job that needs systemd: bana's [NAME] bana: next, in a systemd container (→, before act
+# starts), or bana: not run here: WHY (said once, counted as not run here); act's skip of it
+# (its label's place is systemd) says nothing, as bana's lines say it.
 #   -v list=FILE     act -l's table, for the jobs act ran nothing of (skipped)
 #      table=FILE    LABEL<TAB>PLACE lines (act_platform_table), for why a job was not run here
 #      only=JOB      bana ci -j's job: then the jobs not asked for are not called skipped
@@ -19,6 +22,7 @@ function reason(label, l, v, r) {
   if (v == "mac") return label ": on a Mac only"
   if (v ~ /^skip/) { r = v; sub(/^skip ?/, "", r); return label ": " (r != "" ? r : "act.platform." l " = skip") }
   if (v == "") return "no place here for " label ": see bana add"
+  if (v == "systemd") sysskip[job] = label
   return ""
 }
 # Whether act's text showed job NAME (act -l's): itself, a matrix's NAME-1, NAME-2…, or, for a
@@ -53,6 +57,18 @@ BEGIN {
   job = substr($0, 2, e - 2); sub(/^[^\/]*\//, "", job); job = trim(job)
   rest = substr($0, e + 2)
   seen[job] = 1
+  # bana's word on a job that needs systemd (lib/systemd.sh's sd_say).
+  if (index(rest, "bana: ") == 1) {
+    if (rest == "bana: next, in a systemd container") {
+      if (!(job in apart)) out("→ " job ": next, in a systemd container")
+      apart[job] = 1
+    } else if (index(rest, "bana: not run here: ") == 1 && !(job in skip)) {
+      skip[job] = 1
+      out(paint(2, "– " job ": not run here (" substr(rest, 21) ")"))
+      notrun++
+    }
+    next
+  }
   if (index(rest, "Skipping unsupported platform")) {
     if (job in skip) next
     label = rest; sub(/.*-P /, "", label); sub(/=\.\.\..*/, "", label)
@@ -107,6 +123,9 @@ BEGIN {
 # bana's own lines (say, warn, die).
 /^\033\[(1|31|33)m/ { out($0); next }
 END {
+  # act skipped it for a systemd label, and bana said nothing of it (its dry run failed).
+  for (j in sysskip)
+    if (!(j in apart) && !(j in skip) && !(j in started)) { out(paint(2, "– " j ": not run here (" sysskip[j] ": a job that needs systemd)")); notrun++ }
   if (only == "")
     for (i = 1; i <= jobs; i++)
       if (!ran(order[i])) { out(paint(2, "– " order[i] ": skipped (its if: was false, or a job it needs did not pass)")); skipped++ }

@@ -226,7 +226,10 @@ sd_after() { # MODE OUT...
   printed=" $(awk -F'\t' '$1 == "P" { printf "%s ", $2 }' "$f.first")"
   failed=" $(awk -F'\t' '$1 == "F" { printf "%s ", $2 }' "$f.first")"
   sysskip=" $(awk -F'\t' -v s="$sd_labels" '$1 == "S" && index(s, " " $3 " ") { printf "%s ", $2 }' "$f.first")"
-  unplaced=" $(awk -F'\t' -v s="$sd_labels" '$1 == "S" && !index(s, " " $3 " ") { printf "%s ", $2 }' "$f.first")"
+  # Not placed here: skipped for a label, none of whose labels is a systemd one (act names each
+  # label of a job it skips: [self-hosted, wid-systemd] says both).
+  unplaced=" $(awk -F'\t' -v s="$sd_labels" '$1 == "S" { if (index(s, " " $3 " ")) sys[$2]; else if (!($2 in o)) o[$2] = ++n }
+    END { for (i in o) if (!(i in sys)) printf "%s ", i }' "$f.first")"
   # The systemd jobs the probe missed, from act's skips: their entries, and bana's line.
   while IFS= read -r e; do
     printf '%s\n' "$e" >>"$f"
@@ -272,8 +275,8 @@ sd_first_of() { # LINES ID SET
 }
 
 # ID in a systemd container of its own: up, its act (its lines through sd_only, all of them to
-# sd_log), its uploads back, down. Its status: act's, or 1 when the container did not start or
-# its uploads were refused.
+# sd_log), its uploads back (unless stopped), down. Its status: act's, or 1 when the container
+# did not start or its uploads were refused, or 130 when a stop came before its act started.
 sd_one() { # MODE ID
   local mode=$1 id=$2 rc=0 t m e names files=()
   t=$(mktemp -d "${TMPDIR:-/tmp}/bana-sd.XXXXXX")
@@ -282,18 +285,21 @@ sd_one() { # MODE ID
   while IFS= read -r e; do files+=("$e"); done < <(sd_files)
   printf '# bana: %s, in a systemd container of %s\n' "$id" "$sd_image" >>"$sd_log"
   if ! sd_up "$sd_name" "$sd_image" "$sd_arch" "${sd_net:-}" "${sd_label:-}" "$sd_bin" "${sd_cache:-}" "$sd_root" ${files[@]+"${files[@]}"}; then
+    rm -rf "$t"
+    [[ -z ${sd_stop:-} ]] || return 130
     sd_say_id "$mode" "$id" "not run here: its systemd container did not start"
     sd_red "systemd job $id did not run: $sd_err"
-    rm -rf "$t"
     return 1
   fi
+  [[ -z ${sd_life:-} ]] || sd_lifeline "$sd_name" || true
+  # A stop from here on reaches its act (sd_int), or comes before it, and then it does not start.
+  sd_live=$sd_name
   if [[ -n ${sd_stop:-} ]]; then
+    sd_live=''
     sd_down "$sd_name"
     rm -rf "$t"
     return 130
   fi
-  [[ -z ${sd_life:-} ]] || sd_lifeline "$sd_name" || true
-  sd_live=$sd_name
   # Its own process group: a terminal's Ctrl-C reaches bash, which passes it on once (sd_int).
   m=$-
   set -m
@@ -302,7 +308,8 @@ sd_one() { # MODE ID
     2> >(exec 9>&-; trap '' INT; tee -a "$sd_log" >"$t/err"; : >"$t/e.done") &
   sd_child=$!
   [[ $m == *m* ]] || set +m
-  sd_wait "$sd_child" || rc=$?
+  # (bash 3.2 says so on stderr when a job of set -m's dies of a signal: not here.)
+  sd_wait "$sd_child" 2>/dev/null || rc=$?
   sd_child='' sd_live=''
   sd_copied "$t/o" "$t/e"
   if ((rc)) && [[ -z ${sd_stop:-} && ! -e $t/res ]]; then
@@ -310,7 +317,7 @@ sd_one() { # MODE ID
     e=$(awk '{ gsub(/\033\[[0-9;]*[A-Za-z]/, "") } /^Error: / { sub(/^Error: /, ""); print; exit }' "$t/err")
     sd_red "systemd job $id did not run: ${e:-its act ended with $rc}"
   fi
-  if [[ -n ${sd_art:-} ]] && ! sd_copy_out "$sd_name" "$sd_art"; then
+  if [[ -n ${sd_art:-} && -z ${sd_stop:-} ]] && ! sd_copy_out "$sd_name" "$sd_art"; then
     sd_red "systemd job $id: its uploads were refused: $sd_err"
     ((rc)) || rc=1
   fi
@@ -405,6 +412,7 @@ sd_up() { # NAME IMAGE ARCH NET PREFIX ACT CACHE [RO-PATH...]
     running | degraded) break ;;
     *"No such container"* | *"is not running"*) sd_err="its container stopped as systemd started"; sd_down "$n"; return 1 ;;
     esac
+    [[ -z ${sd_stop:-} ]] || { sd_err="stopped"; sd_down "$n"; return 1; }
     if ((SECONDS >= end)); then
       sd_err="systemd was not up in ${w}s ($(printf '%s' "$s" | tr -d '\000-\037'))"
       sd_down "$n"
@@ -516,7 +524,7 @@ sd_int() {
 # disguise), no control character. Text: the lines of ID's names (NAMES, a line each), as a
 # terminal shows them, and the lines that go on one of them. FLAG: made when ID's result came.
 sd_only() { # MODE ID NAMES FLAG
-  SD_NAMES=$3 awk -v mode="$1" -v id="$2" -v flag="$4" -v q='"' '
+  SD_NAMES=$3 sd_awk -v mode="$1" -v id="$2" -v flag="$4" -v q='"' '
     BEGIN { n = split(ENVIRON["SD_NAMES"], a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") want[a[i]] }
     function keep() { print; fflush() }
     mode == "json" {
@@ -546,6 +554,22 @@ sd_only() { # MODE ID NAMES FLAG
       }
       if (on && s !~ /^Error/) keep()
     }'
+}
+
+# awk, reading a pipe a line at a time. mawk (Debian's and Ubuntu's awk) waits for a full buffer
+# otherwise, and a job's lines would come late (a running job would look still); with -W
+# interactive it reads a line at a time, but a line longer than its buffer (4 KiB) ends its input
+# there: bash hands it the lines, each cut at 4000 bytes (such a line of act's JSON is then no
+# object, and dropped; all of it is in sd_log).
+sd_awk() {
+  if awk -W version </dev/null 2>/dev/null | grep -q mawk; then
+    (
+      LC_ALL=C
+      while IFS= read -r l || [[ -n $l ]]; do printf '%s\n' "${l:0:4000}"; done
+    ) | awk -W interactive "$@"
+  else
+    awk "$@"
+  fi
 }
 
 # Its uploads (/home/runner/.bana/artifacts), out of container NAME as an archive, checked as

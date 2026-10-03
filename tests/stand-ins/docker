@@ -49,6 +49,8 @@ run)
   echo "0123456789ab$name" ;;
 rm)
   shift
+  # FAKE_LOCK_SEEN=PATH: whether PATH (act.lock) was there as a container went, a line each.
+  if [[ -n ${FAKE_LOCK_SEEN:-} ]]; then if [[ -e $FAKE_LOCK_SEEN ]]; then echo held; else echo free; fi >>"$FAKE_STATE/docker.rm"; fi
   for a in "$@"; do [[ $a == -f ]] || gone "$a"; done ;;
 ps)
   for a in "$c"/*; do

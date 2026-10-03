@@ -16,6 +16,8 @@
 #     --remote         HEAD, pushed, on the project's bana split repository (docs/SPLIT.md)
 #   Linux jobs (<prefix>-linux, ubuntu-*) run in containers from bana.conf's act.image; on a
 #   Mac, macOS jobs (<prefix>-macos) run on the Mac itself, with its CoreAudio and USB devices.
+#   Jobs that need systemd (<prefix>-systemd) run next, each in a systemd container of act.image
+#   (Docker 28 or later; lib/systemd.sh), and a job that needs one of them is not run here.
 #   One act runs at a time on this machine: bana ci refuses while another one runs.
 #   A run keeps act's output in ~/.bana/<prefix>/ci/last.log, and what ran in last.env, for
 #   bana fix (bana.conf: ci.log = no runs act as before, which keeps its colours in containers).
@@ -24,6 +26,9 @@
 #   Anything after -- goes to act, and wins over act.args.
 
 act_usage() { awk '/^#   bana ci/, /^#   Anything/ { sub(/^# ?/, ""); print }' "$bana_root/lib/act.sh" >&2; exit 2; }
+
+# shellcheck source=SCRIPTDIR/systemd.sh
+source "$bana_root/lib/systemd.sh"
 
 # act talks to Docker's socket; OrbStack's is found through the docker CLI's context.
 act_docker() {
@@ -55,7 +60,9 @@ act_conf_keys() { # PREFIX.
 
 # Where a job runs, by the first of its runs-on labels that has a place (act's rule): bana.conf's
 # act.platform.<label> (lowercase) is linux (a container of act.image), mac (this Mac, in act's
-# host mode; elsewhere the job is not run), skip [reason] (not run), or an image of its own.
+# host mode; elsewhere the job is not run), systemd (a container of act.image whose PID 1 is
+# systemd, the job in it in act's host mode, as a user with sudo: lib/systemd.sh), skip [reason]
+# (not run), or an image of its own.
 # LABEL<TAB>VALUE lines: the built-in ones, then bana.conf's, which win (but for self-hosted,
 # which would take every self-hosted job, and a label with '=', which act cannot map).
 act_platform_table() {
@@ -63,7 +70,7 @@ act_platform_table() {
   {
     printf '%s\t%s\n' "$prefix-linux" linux ubuntu-latest linux ubuntu-24.04 linux ubuntu-22.04 linux \
       ubuntu-20.04 catthehacker/ubuntu:act-20.04 ubuntu-18.04 "skip no act image for 18.04" \
-      "$prefix-macos" mac macos-latest mac
+      "$prefix-macos" mac macos-latest mac "$prefix-systemd" systemd
     for l in $(act_conf_keys act.platform.); do printf '%s\t%s\n' "$l" "$(act_conf "act.platform.$l")"; done
   } | awk -F'\t' '{ l = tolower($1) } l == "self-hosted" || index(l, "=") { next } !(l in v) { o[++n] = l } { v[l] = $2 }
     END { for (i = 1; i <= n; i++) printf "%s\t%s\n", o[i], v[o[i]] }' |
@@ -89,7 +96,8 @@ act_platforms() { # IMAGE
     case $v in
     linux) v=$1 ;;
     mac) if [[ $os == Darwin ]]; then v=-self-hosted; else v=; fi ;;
-    skip | "skip "*) v= ;;
+    # act skips these jobs; each runs next, in a systemd container (act_both).
+    systemd | skip | "skip "*) v= ;;
     esac
     printf '%s\n' -P "$l=$v"
   done < <(act_platform_table)
@@ -120,7 +128,8 @@ act_lock() { # LABEL
     [[ $(cat "$lock/owner" 2>/dev/null || true) != "$owner" ]] || rm -rf "$lock"
   done
   # Until act ends, or starts through exec; if it cannot start, its pid is gone and the lock
-  # stale anyway.
+  # stale anyway. (act_both's EXIT trap, act_exit, frees it too, after the container.)
+  act_lock_mine=1
   trap 'rm -rf "$base_home/act.lock"' EXIT
   printf '%s\n' "$$" "$(act_started $$)" "$1" >"$lock/owner.$$"
   mv "$lock/owner.$$" "$lock/owner"
@@ -256,12 +265,78 @@ act_main() {
   done
   say "act: ${tier:-the workflow} from $(basename "$wf"), Linux jobs in $image ($arch, network $net)$([[ $os == Darwin ]] && echo ", macOS jobs on this Mac")"
   args=(workflow_dispatch "${args[@]}" ${extra[@]+"${extra[@]}"} ${jobs[@]+"${jobs[@]}"} ${pass[@]+"${pass[@]}"})
-  [[ -n $dry ]] || act_actions
-  # The daemon reads act's output itself, through relays that outlive it (act_relay).
-  [[ $locked != 1 ]] || exec act "${args[@]}" > >(act_relay) 2> >(act_relay >&2)
-  # A dry run leaves the last run's log.
-  [[ -z $dry && $(conf ci.log yes) != no ]] || exec act "${args[@]}"
+  # A dry run neither probes for jobs that need systemd nor starts their containers.
+  act_sys=''
+  if [[ -z $dry ]]; then
+    act_sd
+    act_actions
+  fi
+  if [[ -n $act_sys ]]; then
+    # Jobs that need systemd: bash stays act's parent, and runs them after it (act_both). The
+    # daemon reads their output as act's, through the same relays.
+    if [[ $locked == 1 ]]; then
+      act_both "${args[@]}" > >(act_relay) 2> >(act_relay >&2)
+      exit
+    elif [[ $(conf ci.log yes) == no ]]; then
+      act_both "${args[@]}"
+      exit
+    fi
+  else
+    [[ -z ${act_sdtmp:-} ]] || rm -rf "$act_sdtmp"
+    # The daemon reads act's output itself, through relays that outlive it (act_relay).
+    [[ $locked != 1 ]] || exec act "${args[@]}" > >(act_relay) 2> >(act_relay >&2)
+    # A dry run leaves the last run's log.
+    [[ -z $dry && $(conf ci.log yes) != no ]] || exec act "${args[@]}"
+  fi
   act_logged "${args[@]}"
+}
+
+# lib/systemd.sh's settings for this run (act_main's args, image, CPU and network): the labels
+# whose place is systemd, but those act.args or act's own options map again (act takes the last
+# -P); the containers' name and, under the daemon, its label (from the daemon's own act options,
+# never bana.conf's: its sweep removes what has it); act's action cache and its artifact
+# server's directory, as act has them here; and where the probe's entries and the containers'
+# acts' output go (systemd.log in the daemon's build, else ~/.bana/<prefix>/ci/last.systemd.log).
+# Uses act_main's locals.
+act_sd() {
+  local l v i a o=() again=' ' keep=' '
+  sysd_docker=(docker) sysd_act=(act)
+  sd_image=$image sd_arch=$arch sd_net=$net sd_root=$root sd_wf=$wf sd_life=1 sd_label='' sd_bin=''
+  sd_stop='' sd_live='' sd_cache=${XDG_CACHE_HOME:-$HOME/.cache}/act sd_art='' act_sdtmp=''
+  o=(${extra[@]+"${extra[@]}"} ${pass[@]+"${pass[@]}"})
+  for ((i = 0; i < ${#o[@]}; i++)); do
+    case ${o[i]} in
+    -P | --platform) a=${o[i + 1]:-} ;;
+    -P=* | --platform=*) a=${o[i]#*=} ;;
+    -P?*) a=${o[i]#-P} ;;
+    *) continue ;;
+    esac
+    [[ $a != *=* ]] || again="$again$(lower <<<"${a%%=*}") "
+  done
+  while IFS=$'\t' read -r l v; do
+    [[ $v != systemd || $again == *" $l "* ]] || keep="$keep$l "
+  done < <(act_platform_table)
+  sd_labels=$keep
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    case ${args[i]} in
+    --action-cache-path) sd_cache=${args[i + 1]:-$sd_cache} ;;
+    --action-cache-path=*) sd_cache=${args[i]#*=} ;;
+    --artifact-server-path) sd_art=${args[i + 1]:-} ;;
+    --artifact-server-path=*) sd_art=${args[i]#*=} ;;
+    esac
+  done
+  [[ $sd_cache == /* ]] || sd_cache=$here/$sd_cache
+  [[ -z $sd_art || $sd_art == /* ]] || sd_art=$here/$sd_art
+  if [[ $locked == 1 ]]; then
+    for a in ${pass[@]+"${pass[@]}"}; do
+      case $a in "--container-options=--label xyz.tjrb.bana="*) v=${a#*xyz.tjrb.bana=} ;; *) continue ;; esac
+      [[ ! $v =~ ^[a-z0-9-]+$ ]] || sd_label=$v
+    done
+    sd_log=$here/systemd.log
+  else
+    sd_log=$home/ci/last.systemd.log
+  fi
+  sd_name=bana-systemd-${sd_label:-$prefix}
 }
 
 # The workflow's actions, fetched before it runs, one job at a time (a dry run), and then
@@ -271,9 +346,27 @@ act_main() {
 # nothing; what this cannot fetch, the run fetches as before.
 # act's dry run still runs a host job's steps (-self-hosted): for it, every label goes to
 # the image, where a dry run runs nothing (the last -P wins).
+# With labels whose place is systemd, this dry run is lib/systemd.sh's probe (sd_probe), which
+# also finds the job entries that run in systemd containers (act_sys: some do, so act_both
+# runs); a fix round, offline already, still probes, fetching nothing.
 act_actions() {
-  local a i dry=()
-  for a in "${args[@]}"; do [[ $a != --action-offline-mode ]] || return 0; done
+  local a i off='' dry=()
+  for a in "${args[@]}"; do [[ $a != --action-offline-mode ]] || off=1; done
+  if [[ -n ${sd_labels// /} ]]; then
+    act_sdtmp=$(mktemp -d "${TMPDIR:-/tmp}/bana-sd.XXXXXX")
+    sd_probe_file=$act_sdtmp/probe
+    if sd_probe "$sd_probe_file" "${args[@]}"; then
+      if awk -F'\t' '$4 == 1 { f = 1 } END { exit !f }' "$sd_probe_file"; then act_sys=1; fi
+    else
+      # Said only when the workflow names a systemd label: the dry run fails for other reasons too.
+      for a in $sd_labels; do
+        if grep -qiF -- "$a" "$wf"; then warn "act's dry run failed, so no job that needs systemd runs here"; break; fi
+      done
+    fi
+    [[ -n $off ]] || args+=(--action-offline-mode)
+    return 0
+  fi
+  [[ -z $off ]] || return 0
   for ((i = 0; i < ${#args[@]}; i++)); do
     case ${args[i]} in
     -P | --platform) a=${args[i + 1]:-} ;;
@@ -296,6 +389,72 @@ act_relay() {
   trap '' PIPE INT
   local l
   while IFS= read -r l || [[ -n $l ]]; do printf '%s\n' "$l" 2>/dev/null || :; done
+}
+
+# act, then each job that needs systemd in a systemd container of its own (lib/systemd.sh):
+# bana's line for each before act starts (next, or not run here and why: sd_next), act with
+# their labels on no place (it skips those jobs), then sd_after. Its status: the first failure's.
+# bash stays act's parent (and the lock's pid) until the last act ends. The acts run in process
+# groups of their own: a terminal's Ctrl-C reaches bash and the view only, and bash passes each
+# INT, TERM or HUP it gets on to the act running then, once (act_forward), so the daemon's
+# cancel ladder (SIGINT, a second one, then SIGKILL) is as it was. A stop starts no other act.
+# Its EXIT trap (act_exit) removes the container, then frees the lock when it is this shell's.
+# Uses act_main's locals.
+act_both() { # ACT-ARGUMENT...
+  local mode=text a m st=0 rc=0
+  for a in "$@"; do case $a in --json | --json=[1tT]*) mode=json ;; esac; done
+  act_stop='' act_child='' act_sd_on='' sd_stop='' sd_live='' sd_args=("$@")
+  trap act_exit EXIT
+  trap act_forward INT TERM HUP
+  mkdir -p "${sd_log%/*}"
+  : >"$sd_log"
+  # The Linux act each container runs, pinned (lib/split.sh); without one, sd_why says so.
+  # shellcheck source=/dev/null # lib/split.sh, checked on its own (it sources this file)
+  [[ -n ${split_act_version:-} ]] || source "$bana_root/lib/split.sh"
+  act_linux "$sd_arch" || warn "jobs that need systemd: $sd_err"
+  sd_next "$mode"
+  [[ -z $act_stop ]] || return 130
+  # What act says also goes to 1 and 2 in act_sdtmp, for sd_after: .done marks each copy's end.
+  m=$-
+  set -m
+  (
+    trap - INT
+    exec act "$@" </dev/null
+  ) > >(trap '' INT; tee -i "$act_sdtmp/1"; : >"$act_sdtmp/1.done") 2> >(trap '' INT; tee -i "$act_sdtmp/2" >&2; : >"$act_sdtmp/2.done") &
+  act_child=$!
+  [[ $m == *m* ]] || set +m
+  # (bash 3.2 says so on stderr when a job of set -m's dies of a signal: not here.)
+  sd_wait "$act_child" 2>/dev/null || st=$?
+  act_child=''
+  sd_copied "$act_sdtmp/1" "$act_sdtmp/2"
+  if [[ -n $act_stop ]]; then
+    ((st)) || st=130
+    return "$st"
+  fi
+  act_sd_on=1
+  sd_after "$mode" "$act_sdtmp/1" "$act_sdtmp/2" || rc=$?
+  ((st)) || st=$rc
+  return "$st"
+}
+
+# An INT, TERM or HUP, on to the act running now, once: act's own (the first, here), or the one
+# in a systemd container (sd_int). From then on, no other act starts.
+act_forward() {
+  act_stop=1 sd_stop=1
+  if [[ -n ${act_child:-} ]]; then
+    kill -INT "$act_child" 2>/dev/null || true
+  else
+    sd_int
+  fi
+}
+
+# act_both's end, also an error's or a signal's: the container goes (its lifeline first), then
+# act_both's files, then the lock, when this shell took it (by hand, act_both runs in
+# act_logged's pipeline, whose shell frees it after the pipeline ends).
+act_exit() {
+  [[ -z ${act_sd_on:-} ]] || sd_down "$sd_name"
+  [[ -z ${act_sdtmp:-} ]] || rm -rf "$act_sdtmp"
+  [[ -z ${act_lock_mine:-} ]] || rm -rf "$base_home/act.lock"
 }
 
 # A run by hand keeps act's output, and what ran, for bana fix: in ~/.bana/<prefix>/ci,
@@ -322,10 +481,19 @@ act_logged() { # ACT-ARGUMENT...
   b=$(bana_commit)
   started=$(date +%s)
   # Ctrl-C reaches act, which stops its jobs and ends; tee -i, the view and bash (trapping it)
-  # wait for that, so the log ends as act's output does.
+  # wait for that, so the log ends as act's output does. With jobs that need systemd, act_both
+  # in the pipeline passes it on to the act running then (its EXIT trap removes the container
+  # before the pipeline ends, so before this shell frees the lock); last.systemd.log keeps all
+  # that each container's act said.
   trap 'stopped=1' INT
-  if act "$@" 2>&1 | tee -i "$dir/last.log.part" | act_view "$view"; then status=0; else status=${PIPESTATUS[0]}; fi
+  if [[ -n $act_sys ]]; then
+    if {
+      act_lock_mine=
+      act_both "$@"
+    } 2>&1 | tee -i "$dir/last.log.part" | act_view "$view"; then status=0; else status=${PIPESTATUS[0]}; fi
+  elif act "$@" 2>&1 | tee -i "$dir/last.log.part" | act_view "$view"; then status=0; else status=${PIPESTATUS[0]}; fi
   trap - INT
+  [[ -z ${act_sdtmp:-} ]] || rm -rf "$act_sdtmp"
   printf '%s\n' "sha=$sha" "ref=$ref" "dirty=$dirty" "tier=$tier" "job=${jobs[1]:-}" "event=$event" \
     "network=$net" "act=$v" "bana=$b" "started=$started" "ended=$(date +%s)" "exit=$status" \
     "stopped=${stopped:-0}" >"$dir/last.env.part"
@@ -358,7 +526,8 @@ act_view() { # VIEW(1|'')
   # Neither may read the view's input, act's output.
   act -l -C "$root" -W "$wf" </dev/null >"$lf" 2>/dev/null || true
   act_platform_table </dev/null >"$tf" 2>/dev/null || true
-  awk -v list="$lf" -v table="$tf" -v only="${jobs[1]:-}" -v logfile="$dir/last.log" -v tty="$tty" \
+  # (sd_awk: line by line, as act says them, also with mawk.)
+  sd_awk -v list="$lf" -v table="$tf" -v only="${jobs[1]:-}" -v logfile="$dir/last.log" -v tty="$tty" \
     -f "$bana_root/lib/view.awk" || cat || true
   rm -f "$lf" "$tf"
 }

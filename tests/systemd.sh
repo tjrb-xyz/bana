@@ -2,8 +2,9 @@
 # Jobs that need systemd, on real Docker and real act: lib/systemd.sh's container (systemd as
 # PID 1, unprivileged) on act.image, and act in it running a job in host mode as a user with
 # sudo: linger, a user unit that serves, the boundary seen from inside, Ctrl-C, a killed bash,
-# the uploads back; then a run as bana ci makes it (the probe, act, sd_after). It needs Docker
-# 28 or later and the image, so it runs only when asked, and skips (saying why) without them:
+# the uploads back; then a run as bana ci makes it (the probe, act, sd_after), and bana ci itself
+# by hand (its view, its log, Ctrl-C). It needs Docker 28 or later and the image, so it runs
+# only when asked, and skips (saying why) without them:
 #
 #   BANA_SYSTEMD=1 tests/systemd.sh
 #
@@ -291,6 +292,96 @@ check "run: all of the container's act in sd_log" has "$sd_log" '"jobID":"plan",
 check "run: both uploads here (plan's from act's run, sd's from its container)" same \
   "$(cd "$T/art2" && find . -mindepth 2 -maxdepth 2 | sort | tr '\n' ' ')" "./1/plan-up ./1/sd-up "
 check "run: nothing on stderr" same "$(cat "$T/run.err")" ""
+
+# ---- bana ci by hand: the view, the log, Ctrl-C ------------------------------------------------
+# A project of its own (prefix test-ci: its containers are bana-systemd-test-ci, which the EXIT
+# trap knows): plan; sd and sd2 (it needs sd) on test-ci-systemd, as a user with systemd; after
+# (it needs sd). slow.yml: a systemd job that sleeps, and a step that always runs.
+q=$T/q
+mkdir -p "$q/.github/workflows" "$T/hand/bin" "$T/hand/home"
+ln -s "$act" "$T/hand/bin/act"
+printf '#!/bin/sh\nexit 1\n' >"$T/hand/bin/gh"
+chmod 755 "$T/hand/bin/gh"
+cd "$q"
+git init -q .
+printf 'repo = acme/sdtest\nprefix = test-ci\ntiers =\nact.image = %s\nact.args = --pull=false\n' "$image" >.github/bana.conf
+cat >.github/workflows/ci.yml <<'EOF2'
+name: hand
+on: workflow_dispatch
+jobs:
+  plan:
+    runs-on: [self-hosted, test-ci-linux]
+    steps:
+      - run: echo plan
+  sd:
+    needs: plan
+    runs-on: [self-hosted, test-ci-systemd]
+    steps:
+      - run: |
+          sudo loginctl enable-linger "$USER"
+          echo "sd: user manager $(systemctl --user is-system-running)"
+  sd2:
+    needs: sd
+    runs-on: [self-hosted, test-ci-systemd]
+    steps:
+      - run: |
+          echo "sd2: user manager $(systemctl --user is-system-running)"
+  after:
+    needs: sd
+    runs-on: [self-hosted, test-ci-linux]
+    steps:
+      - run: echo after
+EOF2
+cat >.github/workflows/slow.yml <<'EOF2'
+name: slow
+on: workflow_dispatch
+jobs:
+  slow:
+    runs-on: [self-hosted, test-ci-systemd]
+    steps:
+      - run: echo sleeping; sleep 30
+      - if: always()
+        run: echo always ran
+EOF2
+git add -A
+git -c user.name=t -c user.email=t@t commit -q -m one
+hand() { # bana ci here, by hand, with the real act (a Linux one, for the containers too)
+  env HOME="$T/hand/home" PATH="$T/hand/bin:$PATH" BANA_SYSTEMD_ACT="$act" CARGO_TARGET_DIR="$T/none" \
+    "${BASH_UNDER_TEST:-bash}" "$here/../bin/bana" ci
+}
+ci=$T/hand/home/.bana/test-ci/ci
+hand >"$T/hand.out" 2>&1 && st=0 || st=$?
+check "hand: passes" same "$st $(sed -n 's/^exit=//p' "$ci/last.env")" "0 0"
+check "hand: the view: sd next" has "$T/hand.out" "→ sd: next, in a systemd container"
+check "hand: the view: sd passed" grep -qx '✓ sd' "$T/hand.out"
+check "hand: the view: sd2 passed" grep -qx '✓ sd2' "$T/hand.out"
+check "hand: the view: after is not run here, and why" has "$T/hand.out" "– after: not run here (needs sd, a systemd job)"
+check "hand: the view's count" grep -q '^3 passed, 1 not run here · ' "$T/hand.out"
+check "hand: systemd in sd, as a user" has "$ci/last.log" "| sd: user manager running"
+check "hand: and in sd2" has "$ci/last.log" "| sd2: user manager running"
+check "hand: plan's end once in last.log (its runs again inside are in last.systemd.log)" same \
+  "$(grep -c '^\[hand/plan *\] 🏁  Job succeeded' "$ci/last.log") $(grep -c '^\[hand/plan *\] 🏁  Job succeeded' "$ci/last.systemd.log")" "1 2"
+check "hand: no container left" same "$(docker ps -a --format '{{.Names}}' | grep '^bana-systemd-test-ci' || true)" ""
+check "hand: no lock left" test ! -e "$T/hand/home/.bana/act.lock"
+# Ctrl-C (SIGINT to the group, as a terminal sends it) while the systemd job sleeps.
+own_group=(python3 -c 'import os, signal, sys
+os.setpgid(0, 0)
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+os.execvp(sys.argv[1], sys.argv[1:])')
+env HOME="$T/hand/home" PATH="$T/hand/bin:$PATH" BANA_SYSTEMD_ACT="$act" CARGO_TARGET_DIR="$T/none" BANA_WORKFLOW=slow.yml \
+  "${own_group[@]}" "${BASH_UNDER_TEST:-bash}" "$here/../bin/bana" ci >"$T/slow.out" 2>&1 &
+hp=$!
+for ((i = 0; i < 600; i++)); do ! grep -qs '| sleeping' "$ci/last.systemd.log" || break; sleep 0.1; done
+sleep 1
+t0=$SECONDS
+kill -INT -- "-$hp"
+wait "$hp" && st=0 || st=$?
+check "hand: Ctrl-C: act in the container stops the job, before its sleep would have" test $((SECONDS - t0)) -lt 20
+check "hand: Ctrl-C: its always() step ran" has "$ci/last.log" "| always ran"
+check "hand: Ctrl-C: stopped" same "$st $(sed -n 's/^stopped=//p' "$ci/last.env")" "1 1"
+check "hand: Ctrl-C: no container left" same "$(docker ps -a --format '{{.Names}}' | grep '^bana-systemd-test-ci' || true)" ""
+check "hand: Ctrl-C: no lock left" test ! -e "$T/hand/home/.bana/act.lock"
+cd "$p"
 
 # ---- nothing left ------------------------------------------------------------------------------
 check "after: no bana-systemd-test container" same "$(docker ps -a --format '{{.Names}}' | grep '^bana-systemd-test' || true)" ""

@@ -430,10 +430,11 @@ add_answer() { # LABEL JOBS
   case $1 in *ubuntu* | *linux* | *debian*) d=linux ;; *mac* | *osx* | *darwin*) d=mac ;; *) d=skip ;; esac
   if [[ -z $i_ask ]]; then printf '%s\tskip unknown label\n' "$1" >>"$i_tmp/answers"; return; fi
   while :; do
-    read -r -p "Label $1 (jobs $2): [l]inux / [m]ac / [s]kip / an image [$d] " a || a=
+    read -r -p "Label $1 (jobs $2): [l]inux / [m]ac / s[y]stemd / [s]kip / an image [$d] " a || a=
     case ${a:-$d} in
     l | linux) a=linux ;;
     m | mac) a=mac ;;
+    y | systemd) a=systemd ;;
     s | skip) a=skip ;;
     */* | *:*) [[ $a =~ ^[A-Za-z0-9._/:@-]+$ ]] || continue ;;
     *) continue ;;
@@ -478,6 +479,7 @@ add_sort() {
         skip | "skip "*) reason=${reason:-${v#skip}} reason=${reason:- skipped} ;;
         mac) if [[ $os == Darwin ]]; then here="this Mac (host mode)" cls=mac; break; fi; mac=1 ;;
         linux) here="Linux container $(conf act.image catthehacker/ubuntu:act-24.04)" cls=linux; break ;;
+        systemd) here="a systemd container ($(conf act.image catthehacker/ubuntu:act-24.04), host mode)" cls=systemd; break ;;
         *) here="Linux container $v" cls=image; break ;;
         esac
       done
@@ -526,6 +528,7 @@ add_pool() { # LABELS
 add_has() { # LABEL linux|macos
   case $1 in
   self-hosted | x64 | arm64 | "$i_prefix-$2" | "$host" | usb-*) return 0 ;;
+  "$i_prefix-systemd") [[ $2 == linux ]] ;;
   linux | linux-x64 | linux-arm64) [[ $2 == linux ]] ;;
   macos | osx-x64 | osx-arm64) [[ $2 == macos ]] ;;
   *) [[ ,$(lower <<<"$extra_labels"), == *,$1,* ]] ;;
@@ -693,9 +696,13 @@ add_notes() {
     { grep -n 'runner\.environment' "$i_wf" | grep -v 'env\.ACT' || true; } | while IFS=: read -r n t; do
       [[ $e == *" $n "* ]] || printf '%s\tact never sets runner.environment, so this gate skips under bana: add || env.ACT == '"'true'"'\n' "$n"
     done
+    # A job on a systemd label runs where systemd is; any other is told to move there.
     { grep -nE 'systemctl --user|loginctl' "$i_wf" || true; } | while IFS=: read -r n t; do
-      printf '%s\tsystemctl --user and loginctl need systemd, which act'"'"'s containers lack: this fails under bana ci (a bana up pool runs it)\n' "$n"
+      job=$(add_job_at "$n")
+      [[ -z $job || -z $(awk -F'\t' -v j="$job" '$1 == j && $6 == "systemd"' "$i_tmp/sorted") ]] || continue
+      printf '%s\tsystemctl --user and loginctl need systemd: give the job runs-on %s (bana ci and bana split run it in a systemd container)\n' "$n" "$i_prefix-systemd"
     done
+    add_sysneeds
     { grep -nE '^[[:space:]]*ref:' "$i_wf" || true; } | while IFS=: read -r n t; do
       printf '%s\ta checkout ref: makes act clone from GitHub rather than build the pushed commit; remove it\n' "$n"
     done
@@ -742,6 +749,47 @@ add_notes() {
     seen+="$job:$t|"
     if ((n)); then echo "  $i_name:$n: ${job:+$job: }$t"; else echo "  $i_name: $t"; fi
   done <"$i_tmp/notes.all"
+}
+# The jobs that need a job that runs in a systemd container (all the way down): act runs a job
+# with the jobs it needs, and bana runs a systemd job in a container of its own, so they do not
+# run here. And why systemd jobs do not run here at all, when they do not (lib/systemd.sh).
+add_sysneeds() {
+  local sys g i
+  sys=" $(awk -F'\t' '$6 == "systemd" && !($1 in s) { s[$1]; printf "%s ", $1 }' "$i_tmp/sorted")"
+  [[ -n ${sys// /} ]] || return 0
+  # shellcheck disable=SC2016 # yq's
+  add_q '.jobs | to_entries | .[] | [.key, ([.value.needs] | flatten | map(select(. != null)) | join(" "))] | join("\t")' \
+    <"$i_wf" 2>/dev/null | awk -F'\t' -v sys="$sys" '
+    { id[++n] = $1; need[$1] = $2 }
+    function first(j,   k, m, a, x) {
+      m = split(need[j], a, " ")
+      for (k = 1; k <= m; k++) {
+        if (a[k] in done) continue
+        done[a[k]]
+        if (index(sys, " " a[k] " ")) return a[k]
+        if ((x = first(a[k])) != "") return x
+      }
+      return ""
+    }
+    END {
+      for (i = 1; i <= n; i++) {
+        if (index(sys, " " id[i] " ")) continue
+        split("", done); x = first(id[i])
+        if (x != "") printf "%s\t%s\n", id[i], x
+      }
+    }' | while IFS=$'\t' read -r i g; do
+    printf '%s\tit needs %s, a systemd job: bana does not run it (act runs a job with the jobs it needs, and bana runs %s in a container of its own): drop the need, or accept that\n' \
+      "$(add_line_of "$i")" "$g" "$g"
+  done
+  # shellcheck disable=SC2034 # sd_why's settings (lib/systemd.sh)
+  g=$(sysd_docker=(docker) sd_bin=''; sd_why 2>/dev/null) || g=
+  [[ -z $g || $g == "no act for its container" ]] ||
+    printf '0\tjobs that need systemd (%s) do not run here: %s\n' "$(printf '%s' "${sys# }" | sed 's/ $//')" "$g"
+}
+add_line_of() { # JOB: its line
+  local i
+  for ((i = 0; i < ${#j_id[@]}; i++)); do [[ ${j_id[i]} != "$1" ]] || { echo "${j_line[i]}"; return; }; done
+  echo 0
 }
 # The jobs whose matrix entries go to more than one place here (the same place under other
 # labels is no split: act's shared runs-on puts them there anyway).
@@ -801,7 +849,7 @@ add_conf() {
   fi
   while IFS=$'\t' read -r l v jobs; do
     if [[ $v == "skip unknown label" ]]; then
-      echo "# $l (jobs $jobs): a label bana does not know: linux, mac, skip or an image"
+      echo "# $l (jobs $jobs): a label bana does not know: linux, mac, systemd, skip or an image"
     else
       echo "# $l: jobs $jobs"
     fi

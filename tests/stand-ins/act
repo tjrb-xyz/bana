@@ -29,14 +29,33 @@ case " $* " in
 esac
 # In a systemd container (tests/stand-ins/docker, FAKE_IN_CONTAINER): its arguments in act.inner,
 # its environment in act.inner.env; FAKE_ACT_OUT_SYSD on stdout, FAKE_ACT_ERR_SYSD on stderr,
-# then FAKE_ACT_SLEEP_SYSD seconds, and FAKE_ACT_EXIT_SYSD. FAKE_ACT_INT as below.
+# then FAKE_ACT_SLEEP_SYSD seconds, and FAKE_ACT_EXIT_SYSD. FAKE_ACT_INT (or FAKE_ACT_INT_SYSD,
+# for this act only) as below; FAKE_ACT_INT_SYSD=2: the first SIGINT is noted (int in
+# act.inner.int) and act goes on, the second ends it, as act's force stop does.
+# FAKE_ACT_LATE as below, too.
 if [ -n "${FAKE_IN_CONTAINER:-}" ]; then
   echo "$*" >>"$FAKE_STATE/act.inner"
   env >"$FAKE_STATE/act.inner.env"
-  [ -z "${FAKE_ACT_INT:-}" ] || trap 'sleep 0.2; echo "act: interrupted, in its container"; echo int >>"$FAKE_STATE/act.inner.int"; exit 1' INT
+  n=0 s=''
+  case ${FAKE_ACT_INT_SYSD:-${FAKE_ACT_INT:-}} in
+  '') ;;
+  2) trap 'n=$((n + 1)); echo int >>"$FAKE_STATE/act.inner.int"; [ "$n" -lt 2 ] || { kill "$s" 2>/dev/null; echo "act: forced to stop, in its container"; exit 1; }' INT ;;
+  *) trap 'kill "$s" 2>/dev/null; sleep 0.2; echo "act: interrupted, in its container"; echo int >>"$FAKE_STATE/act.inner.int"; exit 1' INT ;;
+  esac
   [ -z "${FAKE_ACT_OUT_SYSD:-}" ] || printf '%s\n' "$FAKE_ACT_OUT_SYSD"
   [ -z "${FAKE_ACT_ERR_SYSD:-}" ] || printf '%s\n' "$FAKE_ACT_ERR_SYSD" >&2
-  if [ -n "${FAKE_ACT_SLEEP_SYSD:-}" ]; then sleep "$FAKE_ACT_SLEEP_SYSD" & wait $!; fi
+  if [ -n "${FAKE_ACT_SLEEP_SYSD:-}" ]; then
+    sleep "$FAKE_ACT_SLEEP_SYSD" &
+    s=$!
+    # A trap that lets act go on: it waits for the sleep again.
+    while kill -0 "$s" 2>/dev/null; do wait "$s" || :; done
+  fi
+  if [ -n "${FAKE_ACT_LATE:-}" ]; then
+    while [ ! -e "$FAKE_STATE/late" ]; do sleep 0.05; done
+    echo '{"msg":"late, in its container"}'
+    echo "late, in its container" >&2
+    echo inner >>"$FAKE_STATE/act.survived"
+  fi
   exit "${FAKE_ACT_EXIT_SYSD:-0}"
 fi
 if [ -d "$FAKE_STATE/labels" ]; then
@@ -61,10 +80,13 @@ fi
 case " $* " in *" -n --concurrent-jobs 1 "*) echo "$*" >>"$FAKE_STATE/act.fetch"; exit 0 ;; esac
 echo "$$" >"$FAKE_STATE/act.pid"
 env >"$FAKE_STATE/act.env"
-[ -z "${FAKE_ACT_INT:-}" ] || trap 'sleep 0.2; echo "act: interrupted, its containers removed"; exit 1' INT
+[ -z "${FAKE_ACT_INT:-}" ] || trap 'kill "$s" 2>/dev/null; sleep 0.2; echo "act: interrupted, its containers removed"; exit 1' INT
 [ -z "${FAKE_ACT_OUT:-}" ] || printf '%s\n' "$FAKE_ACT_OUT"
 if [ -n "${FAKE_ACT_INT:-}" ]; then
-  sleep "${FAKE_ACT_SLEEP:-30}"
+  # In the background, so that a SIGINT to act alone (the daemon's) ends it at once.
+  sleep "${FAKE_ACT_SLEEP:-30}" &
+  s=$!
+  wait "$s"
 elif [ -n "${FAKE_ACT_SLEEP:-}" ]; then
   exec sleep "$FAKE_ACT_SLEEP"
 fi

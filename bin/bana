@@ -441,7 +441,8 @@ runner_tarball() { # KIND ARCH
 # host, --label ones, and (for the runner that holds them) the USB audio devices.
 labels_for() { # KIND(linux|macos) USB(1|'')
   local kind=$1 l
-  l="$prefix-$kind,$([[ $kind == macos ]] && echo osx || echo linux)-$(cpu),$host"
+  # Every Linux runner is a systemd service, so its jobs have systemd: <prefix>-systemd too.
+  l="$prefix-$kind,$([[ $kind == linux ]] && echo "$prefix-systemd,")$([[ $kind == macos ]] && echo osx || echo linux)-$(cpu),$host"
   [[ -z $extra_labels ]] || l+=",$extra_labels"
   if [[ -n $2 && -z $no_usb ]]; then
     local u

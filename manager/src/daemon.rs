@@ -4025,8 +4025,9 @@ impl Shared {
             }
         };
         let pid = child.id().unwrap_or(0);
-        // `bana ci` execs act: from here the lock is act's, so it stays held
-        // while act runs even if the daemon dies.
+        // `bana ci` execs act, or, with jobs that need systemd, stays act's
+        // parent until the last act (in a systemd container) ends: either way
+        // this pid holds the lock while act runs, even if the daemon dies.
         let start = started(&s.path, pid).await;
         if !remote {
             let label = self.lock_label();

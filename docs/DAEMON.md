@@ -227,6 +227,16 @@ SIGINT, so its cleanup and `always()` steps run; a second one after 60 s, and af
 it started are killed. After every build the daemon ends any process the build left behind and removes act's
 workspaces; after one that did not end on its own, its job containers too.
 
+Jobs that need systemd (`<prefix>-systemd`, or `act.platform.<label> = systemd`) run after act, each in a
+systemd container of its own ([README](../README.md#jobs-that-need-systemd)). `bana ci` then stays act's parent
+(and the lock's pid) until the last of them ends, rather than exec'ing act; a build without such a job runs as
+before. The cancel's SIGINT, and the second one, reach the act running then, once each: the first act, or the
+one in the container. The container is labelled `xyz.tjrb.bana=<prefix>` and named `bana-systemd-<prefix>`;
+`bana ci` removes it before it ends (also on an error, and through a lifeline when it is killed), and the
+daemon's cleanup after a build that did not end on its own, and after a restart, removes any container with
+the project's label. What the act in the container said is in the build's `systemd.log`; only the job's own
+lines reach `act.jsonl`.
+
 ## Fix rounds
 
 A fix's rounds ([FIX.md](FIX.md#the-loop)) are builds too, one per failed job: `bana ci <tier> -j <job>` on a
@@ -567,13 +577,14 @@ Logs stay on the machine.
 | `~/.bana/<prefix>/daemon/settings` | the project's settings, from bana.conf: while it is there, the project is added |
 | `~/.bana/<prefix>/daemon/paused` | there while the project is paused |
 | `~/.bana/<prefix>/src/` | the daemon's clone |
-| `~/.bana/<prefix>/builds/<id>/` | each build: `build.json`, `act.jsonl` (act's log), `event.json`, `results.jsonl` and `report.md` (the CI report), `artifacts/` (act's), `dist/` (a green build's files and installer) |
+| `~/.bana/<prefix>/builds/<id>/` | each build: `build.json`, `act.jsonl` (act's log), `systemd.log` (the act in each systemd container, all of it), `event.json`, `results.jsonl` and `report.md` (the CI report), `artifacts/` (act's), `dist/` (a green build's files and installer) |
 | `~/.bana/<prefix>/act-cache/` | act's actions, and the macOS jobs' copies while they run |
 | `~/.bana/<prefix>/releases/` | each release: `<tag>.json`, `<tag>.log` (what gh said when it was published) and `<tag>.notes.md` (what went on GitHub) |
 | `~/.bana/<prefix>/fix/` | *Fix with Claude* and `bana fix`: each fix's worktree, and beside it `<sha7>.d/` with its brief and `rounds.json` ([FIX.md](FIX.md)) |
 | `~/.bana/<prefix>/state.json` | the queue, the heads seen, each branch's last green commit |
 | `~/.bana/<prefix>/vars` | optional, yours: `KEY=value` lines for `vars.*` |
 | `~/.bana/act.lock` | the lock shared with `bana ci` |
+| `~/.bana/act-linux/` | the pinned Linux act that systemd containers run, downloaded once a CPU |
 | `~/Library/Logs/bana/bana.log` | the daemon's log on a Mac (`journalctl --user -u bana` on Linux) |
 
 The last 100 builds are kept, and their artifacts and files for 7 days, but for the newest files of each branch
