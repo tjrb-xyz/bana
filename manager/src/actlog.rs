@@ -453,9 +453,11 @@ impl Build {
             return;
         }
         // A job act skipped here may run in a second act (bana ci's, in a Mac's
-        // Linux machine): its first line of its own makes it run.
+        // Linux machine): its first line of its own makes it run, here after
+        // all (the first act's skip said it runs elsewhere).
         if matches!(job.state, JobState::Waiting | JobState::Unsupported) {
             job.state = JobState::Running;
+            job.elsewhere = None;
         }
         job.started.get_or_insert(at);
         if let (Some(id), Some(name)) = (&l.step_id, &l.step) {
@@ -1763,6 +1765,18 @@ mod tests {
         let mut m = Build::new(&[(0, "mac".to_string())], 1);
         m.fold_lines(r#"{"jobID":"mac","matrix":{},"msg":"🚧  Skipping unsupported platform -- Try running with `-P wid-macos=...`"}"#, 1);
         assert_eq!(m.jobs[0].elsewhere, None);
+        // bana ci's second act, in a Mac's Linux machine, runs the systemd job
+        // the first one skipped: it ran here, and says nothing of elsewhere.
+        let (jsonl, list) = fixture!("machine");
+        let mut b = Build::new(&parse_list(list), 1);
+        b.fold_lines(jsonl, 1);
+        b.finish(Some(0), None, 2);
+        let j = b.jobs.iter().find(|j| j.key == "systemd").unwrap();
+        assert_eq!((j.state, j.elsewhere.as_deref()), (JobState::Success, None));
+        let res = crate::results::fold_json_listed(jsonl, &parse_list(list));
+        let back = crate::results::Results::from_jsonl(&res.to_jsonl());
+        let j = back.jobs.iter().find(|j| j.key == "systemd").unwrap();
+        assert_eq!(j.elsewhere, None);
     }
 
     #[test]
