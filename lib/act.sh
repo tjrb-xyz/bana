@@ -13,6 +13,7 @@
 #     -v, --verbose    act's own output as it comes (by default: a line as each job starts and
 #                      ends, a failed step's last lines, and why a job did not run)
 #     --event FILE     run with this event (a push's payload), whose inputs carry the tier
+#     --remote         HEAD, pushed, on the project's bana split repository (docs/SPLIT.md)
 #   Linux jobs (<prefix>-linux, ubuntu-*) run in containers from bana.conf's act.image; on a
 #   Mac, macOS jobs (<prefix>-macos) run on the Mac itself, with its CoreAudio and USB devices,
 #   and jobs that need systemd (<prefix>-systemd) run next, in the Mac's Linux machine (vm).
@@ -147,7 +148,7 @@ act_lock() { # LABEL
 }
 
 act_main() {
-  local tier='' x64='' list='' dry='' event='' secrets='' locked jobs=() pass=() args=() extra=() verbose=''
+  local tier='' x64='' list='' dry='' event='' secrets='' remote='' locked jobs=() pass=() args=() extra=() verbose=''
   local wf root here tiers image arch net i o dc all=() mlabels='' act_fetched=''
   while (($#)); do
     case $1 in
@@ -157,6 +158,7 @@ act_main() {
     -n | --dry-run) dry=1 ;;
     -v | --verbose) verbose=1 ;;
     --event) event=${2:?--event FILE}; shift ;;
+    --remote) remote=1 ;;
     --) shift; pass=("$@"); break ;;
     -h | --help | help) act_usage ;;
     -*) act_usage ;;
@@ -188,6 +190,21 @@ act_main() {
     die "This workflow takes no tier (bana.conf: tiers)"
   fi
   [[ -z $event || -f $event ]] || die "--event: no file $event"
+  # bana split: the daemon's build on the public repository's GitHub Actions (BANA_SPLIT_*), or
+  # --remote's, by hand. act is not run here; act's lines come from there.
+  if [[ -n ${BANA_SPLIT_REPO:-} || -n $remote ]]; then
+    # shellcheck source=/dev/null # lib/split.sh, checked on its own (it sources this file)
+    source "$bana_root/lib/split.sh"
+    if [[ -n $remote ]]; then
+      # shellcheck source=/dev/null # lib/daemon.sh, checked on its own
+      source "$bana_root/lib/daemon.sh"
+      split_ci_remote "$root" "$tier" "${jobs[1]:-}"
+      exit
+    fi
+    for ((i = 0; i < ${#pass[@]}; i++)); do [[ ${pass[i]} != --artifact-server-path ]] || o=${pass[i + 1]:-}; done
+    split_remote "$tier" "${jobs[1]:-}" "${o:-artifacts}"
+    exit
+  fi
   if [[ $locked != 1 ]]; then
     act_lock "bana ci${tier:+ $tier} ($prefix)"
     # Every run by hand is act's run 1, and download-artifact hands a run every artifact of
@@ -396,7 +413,7 @@ act_machine_jobs() { # FILE...
 # Under --json only the jobs' own lines (and errors) come out: the jobs they need ran in the
 # first act already. Uses act_main's locals.
 act_machine() { # IDS ACT-ARGUMENT...
-  local ids=$1 a=() f=() vc=() sc j l json='' v pf tf st=0 i names
+  local ids=$1 a=() fetch=() vc=() sc j l json='' v pf tf st=0 i names
   shift
   for ((i = 1; i <= $#; i++)); do
     case ${!i} in
@@ -407,9 +424,9 @@ act_machine() { # IDS ACT-ARGUMENT...
   while IFS= read -r j; do a+=("$j"); done < <(act_platforms_machine)
   for j in $ids; do a+=(-j "$j"); done
   if [[ -n $act_fetched ]]; then
-    for j in "${a[@]}"; do [[ $j == --action-offline-mode ]] || f+=("$j"); done
-    while IFS=$'\t' read -r l _; do f+=(-P "$l=$image"); done < <(act_platform_table)
-    f+=(-n --concurrent-jobs 1)
+    for j in "${a[@]}"; do [[ $j == --action-offline-mode ]] || fetch+=("$j"); done
+    while IFS=$'\t' read -r l _; do fetch+=(-P "$l=$image"); done < <(act_platform_table)
+    fetch+=(-n --concurrent-jobs 1)
   fi
   v=$(act --version 2>/dev/null | awk 'NR == 1 { print $NF }')
   [[ -n $v ]] || { warn "act has no version to install in the Linux machine"; return 1; }
@@ -436,7 +453,7 @@ act_machine() { # IDS ACT-ARGUMENT...
     [ "$pf" = - ] || echo $$ >"$pf"
     exec "$HOME/.local/bin/act-$v" "$@" --action-cache-path "$HOME/.cache/bana/$c"'
   # The fetch: a cancel meanwhile (act_forward) stops the run before it starts.
-  ((${#f[@]} == 0)) || "${vc[@]}" bash -c "$sc" bana-act "$here" - "$v" "$tf" "act-$prefix" "${f[@]}" >/dev/null 2>&1 || true
+  ((${#fetch[@]} == 0)) || "${vc[@]}" bash -c "$sc" bana-act "$here" - "$v" "$tf" "act-$prefix" "${fetch[@]}" >/dev/null 2>&1 || true
   if [[ -n $act_stop ]]; then rm -f "$tf"; return 130; fi
   act_vm_pid=$pf
   (trap - INT; exec "${vc[@]}" bash -c "$sc" bana-act "$here" "$pf" "$v" "$tf" "act-$prefix" "${a[@]}") > >(act_only "$json" "$ids" "$names") &

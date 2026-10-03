@@ -322,7 +322,16 @@ pub fn collect(dir: &Path, id: u64) -> Collection {
             ..Artifact::default()
         };
         let zip = root.join(name).join(format!("{name}.zip"));
-        if !zip.is_file() {
+        // A link (to a file anywhere) is never followed: only a plain file is read.
+        let meta = std::fs::symlink_metadata(&zip);
+        if meta.as_ref().is_ok_and(|m| !m.file_type().is_file()) {
+            let why = format!("{name}.zip is not a plain file");
+            refused.push(format!("{name}: {why}"));
+            a.problem = Some(why);
+            c.artifacts.push(a);
+            continue;
+        }
+        if meta.is_err() {
             a.problem = Some("an upload-artifact@v3 layout (no zip): not collected".into());
             c.artifacts.push(a);
             continue;
@@ -667,6 +676,15 @@ mod tests {
         let link = zip(&[("bin/demo", b"/etc/passwd", 0o120_777)]);
         let d = build("link", &[("pkg", link)]);
         refused(&d, &collect(&d, 1), "a symlink: bin/demo");
+    }
+
+    #[test]
+    fn a_linked_zip_is_refused() {
+        let d = build("linked", &[("pkg", zip(&[("notes.txt", b"one", FILE)]))]);
+        let z = d.join("artifacts/1/pkg/pkg.zip");
+        std::fs::rename(&z, d.join("elsewhere.zip")).unwrap();
+        std::os::unix::fs::symlink(d.join("elsewhere.zip"), &z).unwrap();
+        refused(&d, &collect(&d, 1), "pkg: pkg.zip is not a plain file");
     }
 
     #[test]

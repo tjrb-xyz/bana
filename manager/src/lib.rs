@@ -23,6 +23,7 @@ pub mod release;
 pub mod report;
 pub mod results;
 pub mod rounds;
+pub mod scan;
 pub mod server;
 pub mod sweep;
 #[cfg(target_os = "macos")]

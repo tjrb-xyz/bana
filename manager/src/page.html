@@ -121,6 +121,7 @@ code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px
       <details id="release-yours" hidden><summary>Your text before you loaded the newer notes</summary>
         <textarea id="release-yours-text" readonly></textarea></details>
       <p class="muted" id="release-check"></p>
+      <p class="error" id="release-public" hidden></p>
       <div class="row">
         <button id="release-save" type="button">Save notes</button>
         <button id="release-publish" class="primary" type="button"
@@ -481,7 +482,7 @@ function historyRows(l) {
     return `<tr class="${id === sel ? "sel" : ""}"><td><span class="dot ${esc(b.state)}"></span><a href="${esc(at("build=" + id))}">#${id}</a> <span class="muted">${esc(when)}</span></td>
       <td>${esc(b.ref)}</td><td class="mono">${esc(shortSha(b.sha))}</td><td>${esc(b.tier)}</td><td>${esc(why)}</td>
       <td>${b.started_at ? esc(dur(b.elapsed)) : ""}</td><td>${esc(st)}</td>
-      <td title="${esc(b.description)}">${esc(b.state)}${b.reason ? ": " + esc(b.reason) : ""}${b.tests ? ` <a class="chip" href="${esc(at(`build=${id}&report=1`))}">${esc(b.tests)}</a>` : ""}${filesChip(b)}${releaseChip(id)}</td></tr>`;
+      <td title="${esc(b.description)}">${esc(b.state)}${b.reason ? ": " + esc(b.reason) : ""}${b.tests ? ` <a class="chip" href="${esc(at(`build=${id}&report=1`))}">${esc(b.tests)}</a>` : ""}${filesChip(b)}${releaseChip(id)}${remoteChip(b)}</td></tr>`;
   }).join("");
 }
 
@@ -493,6 +494,14 @@ function filesChip(b) {
   return ` <a class="chip${b.files_problem ? " failure" : ""}" href="${esc(at("build=" + Number(b.id)))}"${b.files_problem ? ' title="See the build"' : ""}>${label}</a>`;
 }
 const filesSig = (v) => v ? `${v.files || 0}:${!!v.files_problem}` : "";
+// bana split: a build on the public repository's GitHub Actions, and its run there.
+function remoteChip(b) {
+  const r = b.remote;
+  if (!r) return "";
+  const label = `remote: ${r.repo}${r.run ? " #" + Number(r.run) : ""}`, url = githubUrl(r.url);
+  return url ? ` <a class="chip" href="${esc(url)}" target="_blank" rel="noopener" title="Its run on GitHub (public)">${esc(label)}</a>`
+    : ` <span class="chip" title="It builds on the public repository's GitHub Actions">${esc(label)}</span>`;
+}
 // The release a build decides: its card, whatever its state (published, Not now too).
 function releaseChip(id) {
   const x = releases.find((r) => Number(r.build) === id);
@@ -563,6 +572,10 @@ async function renderBuild() {
   add(`tier ${v.tier || "none"}`);
   add(v.trigger + (v.job ? `, job ${v.job} only` : "") + (v.attempt > 1 ? `, attempt ${v.attempt}` : ""));
   if (v.started_at) add((running ? "running for " : "took ") + dur(v.elapsed));
+  if (v.remote) {
+    const label = v.remote.run ? `remote run ${Number(v.remote.run)} in public repo ${v.remote.repo}` : `remote run in public repo ${v.remote.repo}`;
+    add(githubUrl(v.remote.url) ? link(v.remote.url, label) : label);
+  }
   $("build-cancel").hidden = !(running || v.state === "queued");
   $("build-rerun").hidden = !["success", "failure", "error"].includes(v.state);
   // Only a failure: a cancelled, timed-out or never-started build says nothing to fix.
@@ -981,6 +994,9 @@ function drawRelease() {
   const said = words.join("; ") + (r.dirty ? " (as saved)" : "");
   $("release-check").textContent = words.length ? said[0].toUpperCase() + said.slice(1) + "." : "";
   $("release-save").hidden = !open;
+  // bana split: the code is private, and the release goes to its public repository.
+  $("release-public").hidden = !(v.public_repo && open);
+  $("release-public").textContent = v.public_repo ? `These notes and files become public on ${v.public_repo}.` : "";
   $("release-publish").hidden = !["asking", "failed", "dismissed"].includes(v.state);
   $("release-publish").textContent = `Publish ${v.tag}`;
   $("release-dismiss").hidden = !["asking", "failed"].includes(v.state);
@@ -1039,7 +1055,7 @@ $("release-publish").addEventListener("click", async () => {
   if (rev == null || rel !== r || !r.v || r.v.error) return;
   const k = (r.v.files || []).length, n = r.v.notes || {};
   const title = $("release-name").value.trim() || r.v.default_title;
-  let ask = `Publish ${r.tag} on GitHub (${local ? local.repo : ""}) as "${title}", with the notes ${notesBy(n)} (rev ${Number(rev)}, `
+  let ask = `Publish ${r.tag} on GitHub (${r.v.public_repo || (local ? local.repo : "")}${r.v.public_repo ? ", public" : ""}) as "${title}", with the notes ${notesBy(n)} (rev ${Number(rev)}, `
     + `saved ${new Date(n.saved_at * 1000).toLocaleString()}) and its ${k} file${k === 1 ? "" : "s"}?`;
   if (r.swapped) ask = `The notes changed while this page was open: rev ${Number(rev)} (${notesBy(n)}) is not the rev ${r.swapped.from} you had. Read them first.\n\n` + ask;
   if (!confirm(ask)) return;

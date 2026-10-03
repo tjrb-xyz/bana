@@ -208,6 +208,11 @@ builds, `bana ci` says `act is busy here` and stops; while your `bana ci` runs, 
 Builds also wait while Docker does not answer (OrbStack not started yet after login), and a paused project's
 pushes wait.
 
+A project with [bana split](SPLIT.md) on (`split.ci = github`) builds its pushes on its public repository's
+GitHub Actions: such a build needs neither Docker nor the lock here, but holds the build slot while GitHub runs
+it. Its statuses say `remote OWNER/NAME:` and link the run; its log, report and `bana fix` are as for a build
+here, and the daemon writes its CI report to the private repository as a commit comment. Fix rounds always build here.
+
 A build that takes longer than `daemon.timeout` (120 minutes of awake time) is cancelled. A cancel sends act a
 SIGINT, so its cleanup and `always()` steps run; a second one after 60 s, and after 30 s more act and everything
 it started are killed. After every build the daemon ends any process the build left behind and removes act's

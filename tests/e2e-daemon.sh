@@ -14,6 +14,8 @@
 #                            when Docker has it, else pulled from ghcr.io)
 #   BANA_E2E_PORT=N          the daemon's port (default 18470)
 #   BANA_E2E_KEEP=1          keep the scratch directory
+#   BANA_E2E_SPLIT=1         also bana split's public workflow (bana.yml), run by act as GitHub
+#                            would (its ubuntu-latest on this machine), on a local private origin
 #
 # Pushes: one that passes, one whose test fails, a [skip ci] one, one whose `sleep 600` is
 # cancelled through the daemon's API, and one whose daemon is killed (-9) mid-build and
@@ -1101,6 +1103,90 @@ rm -f "$hold2"
 P=two until_ok 300 "two's build" finished "$t3"
 check "remove: two's build passed" same "$(P=two builds_of "$t3" | cut -d'|' -f2,3,4)" "success|push|1"
 P=two clean remove
+
+# ---- 10. bana split's public workflow, act as GitHub (BANA_E2E_SPLIT=1) -------------------------
+# bana.yml as bana split renders it, run by act with ubuntu-latest on this machine (a hosted
+# runner's VM): the fetch from a local bare origin over file:// (the deploy key's in GitHub's place),
+# the inner act this test's, a job of each kind. Its console must hold the steps alone, and its
+# sealed output must open with the seal key here. (act's own artifact server takes no upload of
+# upload-artifact@v7: that step fails here, and the bundle is read where the runner sealed it.)
+if [[ ${BANA_E2E_SPLIT:-} == 1 && $docker_mode == 1 ]]; then
+  say "bana split: bana.yml, with act as GitHub"
+  sp=$T/split
+  mkdir -p "$sp/priv/.github/workflows" "$sp/pub/.github/workflows"
+  (
+    cd "$sp/priv"
+    git init -q -b main . && git remote add origin git@github.com:acme/secret.git
+    printf 'repo = acme/secret\nprefix = sec\ntiers = quick\nact.image = %s\n' "$image" >bana.conf
+    cat >.github/workflows/ci.yml <<'YML'
+on:
+  workflow_dispatch:
+    inputs:
+      tier: {type: string}
+jobs:
+  build:
+    runs-on: sec-linux
+    strategy:
+      matrix:
+        target: [MATRIXVALUE-x64]
+    steps:
+      - name: compile ${{ matrix.target }}
+        run: echo "PRIVATE-OUTPUT src/secret.rs:42"; mkdir -p out; echo binary >out/demo.txt
+      - id: v
+        run: echo "ver=PRIVATE-STEP-OUTPUT" >>"$GITHUB_OUTPUT"
+      - name: version ${{ steps.v.outputs.ver }} ${{ github.workspace }}
+        run: "true"
+      - run: echo "PRIVATE-SCRIPT" >/dev/null
+      - uses: actions/upload-artifact@v4
+        with: {name: demo, path: out/demo.txt}
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: cargo test
+        run: echo "PRIVATE-FAILURE assert_eq!(secret, 42)"; exit 1
+  host:
+    runs-on: sec-systemd
+    steps:
+      - name: on the runner's machine
+        run: echo "PRIVATE-HOST"
+YML
+    git add -A && git -c user.name=t -c user.email=t@t commit -q -m private
+    git clone -q --bare . "$sp/private.git"
+    bash "$bana" split render >"$sp/pub/.github/workflows/bana.yml"
+  )
+  ssha=$(git -C "$sp/priv" rev-parse HEAD)
+  check "split: bana.yml lints" same "$(cd "$sp/priv" && bash "$bana" split lint "$sp/pub/.github/workflows/bana.yml" 2>&1)" \
+    "$sp/pub/.github/workflows/bana.yml: as bana runs it"
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$sp/seal.pem" 2>/dev/null
+  openssl pkey -in "$sp/seal.pem" -pubout -out "$sp/seal.pub.pem" 2>/dev/null
+  git -C "$sp/pub" init -q -b main . && git -C "$sp/pub" add -A && git -C "$sp/pub" -c user.name=t -c user.email=t@t commit -q -m public
+  printf '{"inputs":{"id":"sec-7","sha":"%s","ref":"refs/heads/main","tier":"quick","job":"","logs":"private","nonce":"0123456789abcdef0123456789abcdef"}}\n' "$ssha" >"$sp/event.json"
+  : >"$sp/started"
+  # Without the stand-in gh ($T/bin), whose token GitHub would refuse for the action's clone.
+  PATH=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vx -e "$T/bin" -e "$here/stand-ins" | paste -sd: -) env -u GITHUB_TOKEN \
+    "$act" workflow_dispatch -C "$sp/pub" -W .github/workflows/bana.yml -e "$sp/event.json" -P ubuntu-latest=-self-hosted \
+    --artifact-server-path "$sp/art" --secret BANA_SOURCE=acme/secret --secret "BANA_SOURCE_KEY=unused over file://" \
+    --var "BANA_SEAL_PUB=$(cat "$sp/seal.pub.pem")" --env "BANA_TEST_SOURCE=file://$sp/private.git" \
+    --env "BANA_TEST_ACT=$act" >"$sp/console.txt" 2>&1 || true
+  check "split: the public console has each step, by its id" has "$sp/console.txt" "test / step 0: failed"
+  check "split: and the matrix job's" has "$sp/console.txt" "build / step v: ok"
+  check "split: no step's name (a script, an output, a matrix value)" not grep -qE 'compile|cargo test|version' "$sp/console.txt"
+  check "split: <prefix>-systemd's job, not on the runner's machine" not grep -qE 'host / |host: ' "$sp/console.txt"
+  check "split: the job summary" has "$sp/console.txt" "steps: "
+  check "split: no output, path or matrix value in public" not grep -qE 'PRIVATE|MATRIXVALUE|secret\.rs' "$sp/console.txt"
+  check "split: act.image pinned by digest" grep -q "sec-linux=[^']*@sha256:[0-9a-f]\{64\}'" "$sp/pub/.github/workflows/bana.yml"
+  sealed=$(find "$HOME/.cache/act" -path '*/tmp/bana/sealed' -newer "$sp/started" -type d 2>/dev/null | head -1)
+  check "split: sealed" test -s "$sealed/bundle.enc" -a -s "$sealed/key.enc"
+  check "split: nothing in clear in the bundle" not grep -aq PRIVATE "$sealed/bundle.enc"
+  bash -c 'source "$1"; split_unseal "$2" "$3" "$4"' _ "$here/../lib/split.sh" "$sealed" "$sp/open" "$sp/seal.pem" 2>&1
+  check "split: it opens here, act's whole output" has "$sp/open/out/act.jsonl" "PRIVATE-FAILURE assert_eq!(secret, 42)"
+  check "split: and act's exit" same "$(cat "$sp/open/out/rc" 2>/dev/null)" 1
+  check "split: and the upload, where the daemon collects it" test -n "$(find "$sp/open/art/7" -name '*.zip' 2>/dev/null)"
+  check "split: the systemd job skipped, its label named for the daemon" has "$sp/open/out/act.jsonl" '-P sec-systemd=...'
+  check "split: and never run" not grep -q 'PRIVATE-HOST' "$sp/open/out/act.jsonl"
+else
+  echo "e2e-daemon: bana split's public workflow skipped (BANA_E2E_SPLIT=1 runs it)"
+fi
 
 stop_daemon
 check "stop: the daemon leaves no lock" test ! -e "$HOME/.bana/act.lock"
