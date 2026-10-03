@@ -297,6 +297,35 @@ pub fn default_notes(changes: &Changes, repo: &str, prev: Option<&str>, tag: &st
     s
 }
 
+/// [`default_notes`] for a public release repository whose code is
+/// private (`bana split`): the pull requests' titles and the commits'
+/// subjects only. No `#N` (it would link the public repo's own), no commit
+/// and no changelog link (both 404 there).
+pub fn public_notes(changes: &Changes) -> String {
+    let mut s = String::new();
+    if !changes.prs.is_empty() {
+        s.push_str("## Pull requests\n\n");
+        for p in &changes.prs {
+            s.push_str(&format!("- {}\n", p.title));
+        }
+        s.push('\n');
+    }
+    if !changes.other.is_empty() || changes.more > 0 {
+        s.push_str("## Other changes\n\n");
+        for c in &changes.other {
+            s.push_str(&format!("- {}\n", c.subject));
+        }
+        if changes.more > 0 {
+            s.push_str(&format!("- and {} more\n", changes.more));
+        }
+        s.push('\n');
+    }
+    if s.is_empty() {
+        s.push_str("No changes.\n");
+    }
+    s.trim_end().to_string() + "\n"
+}
+
 fn short_sha(sha: &str) -> &str {
     sha.get(..7).unwrap_or(sha)
 }
@@ -814,6 +843,16 @@ mod tests {
             default_notes(&Changes::default(), "o/example", None, "v0.1.0"),
             "**Full changelog**: https://github.com/o/example/commits/v0.1.0\n"
         );
+        // A public release repo's (bana split): titles and subjects, no #N, sha or link.
+        let public = public_notes(&changes);
+        assert_eq!(
+            public,
+            "## Pull requests\n\n- Add C\n- Add feature A\n\n## Other changes\n\n- Tidy the docs\n"
+        );
+        assert!(
+            !public.contains("(#") && !public.contains("0123456") && !public.contains("https://")
+        );
+        assert_eq!(public_notes(&Changes::default()), "No changes.\n");
 
         let written = "## Highlights\n\n\
                        - Feature A, at last (#1)\n\

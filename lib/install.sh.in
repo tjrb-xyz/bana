@@ -103,7 +103,7 @@ download() { # ASSET DIR
     gh release download "$TAG" -R "$REPO" -p "$1" -D "$2" --clobber
   elif command -v curl >/dev/null 2>&1; then
     curl -fL --proto '=https' --tlsv1.2 --progress-bar -o "$2/$1" "$url/$1" ||
-      die "could not download $url/$1 (a private repository needs gh: gh auth login)"
+      die "could not download $url/$1 (is $TAG published there? A private repository's files need gh: gh auth login)"
   else
     die "need the GitHub CLI (gh) or curl to download"
   fi

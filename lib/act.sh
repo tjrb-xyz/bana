@@ -11,6 +11,7 @@
 #     --list           the jobs, without running them
 #     -n, --dry-run    what would run
 #     --event FILE     run with this event (a push's payload), whose inputs carry the tier
+#     --remote         HEAD, pushed, on the project's bana split repository (docs/SPLIT.md)
 #   Linux jobs (<prefix>-linux, ubuntu-*) run in containers from bana.conf's act.image; on a
 #   Mac, macOS jobs (<prefix>-macos) run on the Mac itself, with its CoreAudio and USB devices,
 #   and jobs that need systemd (<prefix>-systemd) run next, in the Mac's Linux machine (vm).
@@ -145,7 +146,7 @@ act_lock() { # LABEL
 }
 
 act_main() {
-  local tier='' x64='' list='' dry='' event='' secrets='' locked jobs=() pass=() args=() extra=()
+  local tier='' x64='' list='' dry='' event='' secrets='' remote='' locked jobs=() pass=() args=() extra=()
   local wf root here tiers image arch net i o dc all=() mlabels='' act_fetched=''
   while (($#)); do
     case $1 in
@@ -154,6 +155,7 @@ act_main() {
     --list | -l) list=1 ;;
     -n | --dry-run) dry=1 ;;
     --event) event=${2:?--event FILE}; shift ;;
+    --remote) remote=1 ;;
     --) shift; pass=("$@"); break ;;
     -h | --help | help) act_usage ;;
     -*) act_usage ;;
@@ -185,6 +187,21 @@ act_main() {
     die "This workflow takes no tier (bana.conf: tiers)"
   fi
   [[ -z $event || -f $event ]] || die "--event: no file $event"
+  # bana split: the daemon's build on the public repository's GitHub Actions (BANA_SPLIT_*), or
+  # --remote's, by hand. act is not run here; act's lines come from there.
+  if [[ -n ${BANA_SPLIT_REPO:-} || -n $remote ]]; then
+    # shellcheck source=/dev/null # lib/split.sh, checked on its own (it sources this file)
+    source "$bana_root/lib/split.sh"
+    if [[ -n $remote ]]; then
+      # shellcheck source=/dev/null # lib/daemon.sh, checked on its own
+      source "$bana_root/lib/daemon.sh"
+      split_ci_remote "$root" "$tier" "${jobs[1]:-}"
+      exit
+    fi
+    for ((i = 0; i < ${#pass[@]}; i++)); do [[ ${pass[i]} != --artifact-server-path ]] || o=${pass[i + 1]:-}; done
+    split_remote "$tier" "${jobs[1]:-}" "${o:-artifacts}"
+    exit
+  fi
   if [[ $locked != 1 ]]; then
     act_lock "bana ci${tier:+ $tier} ($prefix)"
     # Every run by hand is act's run 1, and download-artifact hands a run every artifact of

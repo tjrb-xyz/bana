@@ -352,6 +352,27 @@ gh release download v0.1.0 -R OWNER/REPO -p install.ps1 -O - | Out-String | iex 
 [docs/DAEMON.md](docs/DAEMON.md#releases) has the rest: how the previous release is found, the checks before a
 publish, Claude's tools, and the settings that keep Claude from publishing around bana.
 
+## Private code, public CI and releases: bana split
+
+`bana split on`, in the checkout of a project bana added, keeps its code in its private repository and builds it
+on a second, public repository's GitHub Actions (free standard runners), where its releases are published too.
+The wizard checks first, shows the plan and what becomes public, and takes your typed yes; it makes the public
+repository with gh, or opens GitHub's new-repository page filled in. The public repository holds a README and
+bana's own workflow, which fetches each pushed commit with a read-only deploy key, builds it with act, and prints
+only its steps; the full output is encrypted to a key on your machine, and the daemon writes it to the code's
+repository (a commit comment) and to its page, labelled as a remote run with a link to it.
+
+```sh
+bana split plan                  # what it would do; changes nothing
+bana split on                    # the wizard (bana add --split adds the project and runs it)
+bana split ci github|local       # where pushes build; fix rounds always build here
+bana split logs private|public   # the public log: steps only, or the whole output too
+bana split check                 # the public side as bana left it
+bana split off                   # undo: the deploy key first; the repository stays
+```
+
+[docs/SPLIT.md](docs/SPLIT.md) has how it works, what is public, and what to check on GitHub before relying on it.
+
 ## bana up: a runner pool (optional)
 
 | On | `bana up` makes | Labels |
@@ -622,10 +643,11 @@ bana install [BUILD | --from FILE|DIR]     # a daemon build's files, on this mac
 bana mcp             # bana's tools for Claude Code, by hand (an MCP server on stdio)
 bana daemon install [--port N] [--no-tray | --tray] [--no-open] [--now]   # once a machine
 bana daemon status|log|open|poke|run|uninstall   # docs/DAEMON.md
-bana add [--check] [--diff] [--workflow F] [--no-hook] [--no-claude]   # a project's CI on the daemon here
+bana add [--check] [--diff] [--workflow F] [--no-hook] [--no-claude] [--split[=R]]   # a project's CI here
 bana list            # the projects added here
 bana remove [PROJECT] [--purge]   # a project's CI here goes
 bana pause|resume [PROJECT]       # hold its automatic builds, or build them again
+bana split [on | off | plan | check | ci github|local | logs private|public | sync | rekey]   # docs/SPLIT.md
 bana up [--linux N] [--x64 N] [--no-mac] [--dedicated] [--label L] [--no-usb] [--token T]
 bana status          # this machine's runners and USB audio devices, and the pool
 bana usb             # the USB audio devices here, and the labels they give
