@@ -1,0 +1,16 @@
+# machine.jsonl: bana ci's two acts on a Mac. The first runs linux in a container and skips
+# systemd (its label's platform is machine); the second runs systemd in the Linux machine,
+# and only its lines are kept.
+name: ci
+on: workflow_dispatch
+jobs:
+  systemd:
+    runs-on: [self-hosted, wid-systemd]
+    steps:
+      - name: test
+        run: echo systemd ok
+  linux:
+    runs-on: [self-hosted, wid-linux]
+    steps:
+      - name: test
+        run: echo linux ok

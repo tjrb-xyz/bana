@@ -430,10 +430,11 @@ add_answer() { # LABEL JOBS
   case $1 in *ubuntu* | *linux* | *debian*) d=linux ;; *mac* | *osx* | *darwin*) d=mac ;; *) d=skip ;; esac
   if [[ -z $i_ask ]]; then printf '%s\tskip unknown label\n' "$1" >>"$i_tmp/answers"; return; fi
   while :; do
-    read -r -p "Label $1 (jobs $2): [l]inux / [m]ac / [s]kip / an image [$d] " a || a=
+    read -r -p "Label $1 (jobs $2): [l]inux / [m]ac / mac[h]ine (systemd) / [s]kip / an image [$d] " a || a=
     case ${a:-$d} in
     l | linux) a=linux ;;
     m | mac) a=mac ;;
+    h | machine) a=machine ;;
     s | skip) a=skip ;;
     */* | *:*) [[ $a =~ ^[A-Za-z0-9._/:@-]+$ ]] || continue ;;
     *) continue ;;
@@ -454,7 +455,7 @@ add_sort() {
       l=$(lower <<<"$l")
       IFS=$'\t' read -r v how <<<"$(add_class "$l")"
       case $how in never | eq) continue ;; ask) printf '%s\t%s\n' "$l" "$job" ;; esac
-      case $v in skip | "skip "* | mac) ;; *) break ;; esac
+      case $v in skip | "skip "* | mac | machine) ;; *) break ;; esac
     done
   done <"$i_tmp/rows" | awk -F'\t' '!($1 in j) { o[++n] = $1 } index(" " j[$1] " ", " " $2 " ") == 0 { j[$1] = j[$1] (j[$1] == "" ? "" : " ") $2 }
     END { for (i = 1; i <= n; i++) printf "%s\t%s\n", o[i], j[o[i]] }' >"$i_tmp/asks"
@@ -463,7 +464,7 @@ add_sort() {
   : >"$i_tmp/sorted"
   : >"$i_tmp/keys"
   while IFS=$'\t' read -r job entry kind labels info; do
-    here='' cls='' mac='' reason='' un=0
+    here='' cls='' mac='' mach='' reason='' un=0
     case $kind in
     uses) here="calls ${info}: its jobs are not listed" cls=uses ;;
     container) here="its container $info" cls=container ;;
@@ -477,6 +478,9 @@ add_sort() {
         case $v in
         skip | "skip "*) reason=${reason:-${v#skip}} reason=${reason:- skipped} ;;
         mac) if [[ $os == Darwin ]]; then here="this Mac (host mode)" cls=mac; break; fi; mac=1 ;;
+        machine)
+          if [[ -n $(act_machine_labels) ]]; then here="the Linux machine $vm (host mode, systemd)" cls=machine; break; fi
+          mach=1 ;;
         linux) here="Linux container $(conf act.image catthehacker/ubuntu:act-24.04)" cls=linux; break ;;
         *) here="Linux container $v" cls=image; break ;;
         esac
@@ -484,6 +488,7 @@ add_sort() {
       if [[ -z $here ]]; then
         cls=none
         if [[ -n $mac ]]; then here="a Mac's job, not run on $os" cls=mac
+        elif [[ -n $mach ]]; then here="not run on $os: needs a Mac's Linux machine" cls=machine
         elif [[ -z $labels && $info == needs ]]; then here="decided at run time (its runs-on or matrix reads needs.)" labels=-
         elif [[ -z $labels ]]; then here="not run: act gives it no labels" un=1 labels=-
         elif [[ -n $reason ]]; then here="not run:$reason"
@@ -526,6 +531,7 @@ add_pool() { # LABELS
 add_has() { # LABEL linux|macos
   case $1 in
   self-hosted | x64 | arm64 | "$i_prefix-$2" | "$host" | usb-*) return 0 ;;
+  "$i_prefix-systemd") [[ $2 == linux ]] ;;
   linux | linux-x64 | linux-arm64) [[ $2 == linux ]] ;;
   macos | osx-x64 | osx-arm64) [[ $2 == macos ]] ;;
   *) [[ ,$(lower <<<"$extra_labels"), == *,$1,* ]] ;;
@@ -694,7 +700,7 @@ add_notes() {
       [[ $e == *" $n "* ]] || printf '%s\tact never sets runner.environment, so this gate skips under bana: add || env.ACT == '"'true'"'\n' "$n"
     done
     { grep -nE 'systemctl --user|loginctl' "$i_wf" || true; } | while IFS=: read -r n t; do
-      printf '%s\tsystemctl --user and loginctl need systemd, which act'"'"'s containers lack: this fails under bana ci (a bana up pool runs it)\n' "$n"
+      printf '%s\tsystemctl --user and loginctl need systemd, which act'"'"'s containers lack: give the job runs-on <prefix>-systemd (not <prefix>-linux), and bana ci runs it in a Mac'"'"'s Linux machine (a bana up pool runs it too)\n' "$n"
     done
     { grep -nE '^[[:space:]]*ref:' "$i_wf" || true; } | while IFS=: read -r n t; do
       printf '%s\ta checkout ref: makes act clone from GitHub rather than build the pushed commit; remove it\n' "$n"
@@ -801,7 +807,7 @@ add_conf() {
   fi
   while IFS=$'\t' read -r l v jobs; do
     if [[ $v == "skip unknown label" ]]; then
-      echo "# $l (jobs $jobs): a label bana does not know: linux, mac, skip or an image"
+      echo "# $l (jobs $jobs): a label bana does not know: linux, mac, machine, skip or an image"
     else
       echo "# $l: jobs $jobs"
     fi

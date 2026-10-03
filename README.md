@@ -149,12 +149,23 @@ bana ci -- --reuse               # anything after -- goes to act; --reuse keeps 
 | `<prefix>-linux`, `ubuntu-latest`, `ubuntu-24.04`, `ubuntu-22.04` | a container from `act.image` (default `catthehacker/ubuntu:act-24.04`) |
 | `ubuntu-20.04` | a container from `catthehacker/ubuntu:act-20.04` |
 | `<prefix>-macos`, `macos-latest` | on a Mac, on the Mac itself (act's host mode, in a copy of your working tree); elsewhere skipped |
+| `<prefix>-systemd` | on a Mac, in its Linux machine (`vm`, an OrbStack or Lima Ubuntu with systemd), in act's host mode, after the rest; elsewhere skipped |
 | `ubuntu-18.04`, and any other label | not run (act has no image for 18.04), unless an `act.platform.<label>` key gives it a place |
 
 A job takes the first of its labels that has a place, as act does. `act.platform.<label>` (lowercase) in
-bana.conf is `linux` (a container from `act.image`), `mac` (the Mac itself; elsewhere not run), `skip [reason]`
-(not run) or an image of its own; `bana add` asks and writes these. `self-hosted` and a label with `=` cannot
-be keys. After a run, bana names the jobs that had no place: *not run here: JOB (runs-on: ...): see bana add*.
+bana.conf is `linux` (a container from `act.image`), `mac` (the Mac itself; elsewhere not run), `machine` (the
+Mac's Linux machine; elsewhere not run), `skip [reason]` (not run) or an image of its own; `bana add` asks and
+writes these. `self-hosted` and a label with `=` cannot be keys. After a run, bana names the jobs that had no
+place: *not run here: JOB (runs-on: ...): see bana add*.
+
+**Jobs that need systemd** (a user service, `loginctl`) cannot run in act's containers: act starts each one with
+its own entrypoint, so systemd never boots there. Give such a job `runs-on: [self-hosted, <prefix>-systemd]`
+(not `<prefix>-linux` too: a job takes its first label with a place). On a Mac, `bana ci` then runs a second
+act once the first has ended, in the Linux machine `vm` (made if missing, with `packages.linux`, `hook.linux`
+and act at the Mac's version, as `bana linux-prepare`): the skipped jobs, and the Linux jobs they need, run in
+act's host mode there, as the machine's user (who has passwordless sudo), on the same checkout and event.
+Under the daemon only those jobs' lines reach the build, so a job they need is not reported twice. A job that
+needs a macOS job cannot run there. `bana up`'s Linux runners are systemd services, and have the label too.
 
 The run uses your working tree, uncommitted changes included, and the workflow's tier input (`tiers`,
 `tier_input` in bana.conf). Artifacts land in `~/.bana/act/artifacts/1/<name>/<name>.zip` (upload-artifact@v4:
@@ -367,8 +378,8 @@ bana split off                   # undo: the deploy key first; the repository st
 | On | `bana up` makes | Labels |
 |---|---|---|
 | a Mac | a macOS runner as a LaunchAgent, so it runs in your login session: real CoreAudio, real USB devices | `<prefix>-macos`, `osx-arm64` |
-| a Mac | Linux runners in two OrbStack machines: `bana` on the Mac's CPU, `bana-x64` (x86_64 through Rosetta) | `<prefix>-linux`, `linux-arm64` or `linux-x64` |
-| Linux | Linux runners as systemd services (a Proxmox VM or container, any Debian/Ubuntu) | `<prefix>-linux`, `linux-<cpu>` |
+| a Mac | Linux runners in two OrbStack machines: `bana` on the Mac's CPU, `bana-x64` (x86_64 through Rosetta) | `<prefix>-linux`, `<prefix>-systemd`, `linux-arm64` or `linux-x64` |
+| Linux | Linux runners as systemd services (a Proxmox VM or container, any Debian/Ubuntu) | `<prefix>-linux`, `<prefix>-systemd`, `linux-<cpu>` |
 
 Every runner also gets `self-hosted` and the machine's name, plus any `--label`. A machine with USB audio devices
 adds `usb-audio` and `usb-<vid>-<pid>` for each (see [USB audio](#usb-audio)). `<prefix>` comes from your
@@ -458,7 +469,7 @@ Every key can be overridden by `BANA_<KEY>` in the environment (`plan.path.rust`
 | `act.image` | `catthehacker/ubuntu:act-24.04` | the image `bana ci` runs Linux jobs in |
 | `act.network` | `bridge` | the Docker network of Linux jobs: `bridge` gives each job a localhost of its own, as on GitHub; `host` (act's default) shares the Docker host's between all of them |
 | `act.args` | | more act options for `bana ci` and the daemon's builds (`--reuse`) |
-| `act.platform.<label>` | see [bana ci](#bana-ci-the-workflow-on-this-machine) | where `bana ci` and the daemon run jobs with this runs-on label: `linux`, `mac`, `skip [reason]` or an image (`bana add` writes these) |
+| `act.platform.<label>` | see [bana ci](#bana-ci-the-workflow-on-this-machine) | where `bana ci` and the daemon run jobs with this runs-on label: `linux`, `mac`, `machine`, `skip [reason]` or an image (`bana add` writes these) |
 | `act.docker_config` | `~/.bana/docker` | the Docker config act pulls with: bana's own, without your logins, so macOS never asks for your Keychain password; `~/.docker` for private images |
 | `ci.log` | `yes` | `bana ci` keeps act's output in `~/.bana/<prefix>/ci/last.log` for `bana fix`, through a pipe, so Linux jobs print without colours; `no` gives act your terminal, and keeps nothing |
 | `daemon.*` | | which pushes the daemon builds, and how ([docs/DAEMON.md](docs/DAEMON.md#settings)) |
@@ -487,8 +498,8 @@ jobs:
 Jobs see `BANA_MACHINE` and, on a machine joined with `--dedicated`, `BANA_DEDICATED=1`: use it to guard
 invasive tests (installing drivers, restarting services) that should not run on someone's laptop.
 
-Under `bana ci` and the daemon, act maps `<prefix>-linux` to a container and `<prefix>-macos` to the Mac; the
-other labels matter only to a pool. To move jobs between the daemon's machines and a pool without editing the
+Under `bana ci` and the daemon, act maps `<prefix>-linux` to a container and `<prefix>-macos` to the Mac, and a
+second act runs `<prefix>-systemd` jobs in the Mac's Linux machine; the other labels matter only to a pool. To move jobs between the daemon's machines and a pool without editing the
 workflow, take `runs-on` from a variable, as the worked example does:
 
 ```yaml
