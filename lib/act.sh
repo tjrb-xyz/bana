@@ -410,7 +410,7 @@ act_machine_jobs() { # FILE...
 # Under --json only the jobs' own lines (and errors) come out: the jobs they need ran in the
 # first act already. Uses act_main's locals.
 act_machine() { # IDS ACT-ARGUMENT...
-  local ids=$1 a=() f=() vc=() sc j l json='' v pf tf st=0 i
+  local ids=$1 a=() fetch=() vc=() sc j l json='' v pf tf st=0 i
   shift
   for ((i = 1; i <= $#; i++)); do
     case ${!i} in
@@ -421,9 +421,9 @@ act_machine() { # IDS ACT-ARGUMENT...
   while IFS= read -r j; do a+=("$j"); done < <(act_platforms_machine)
   for j in $ids; do a+=(-j "$j"); done
   if [[ -n $act_fetched ]]; then
-    for j in "${a[@]}"; do [[ $j == --action-offline-mode ]] || f+=("$j"); done
-    while IFS=$'\t' read -r l _; do f+=(-P "$l=$image"); done < <(act_platform_table)
-    f+=(-n --concurrent-jobs 1)
+    for j in "${a[@]}"; do [[ $j == --action-offline-mode ]] || fetch+=("$j"); done
+    while IFS=$'\t' read -r l _; do fetch+=(-P "$l=$image"); done < <(act_platform_table)
+    fetch+=(-n --concurrent-jobs 1)
   fi
   v=$(act --version 2>/dev/null | awk 'NR == 1 { print $NF }')
   [[ -n $v ]] || { warn "act has no version to install in the Linux machine"; return 1; }
@@ -445,7 +445,7 @@ act_machine() { # IDS ACT-ARGUMENT...
     [ "$pf" = - ] || echo $$ >"$pf"
     exec "$HOME/.local/bin/act-$v" "$@" --action-cache-path "$HOME/.cache/bana/$c"'
   # The fetch: a cancel meanwhile (act_forward) stops the run before it starts.
-  ((${#f[@]} == 0)) || "${vc[@]}" bash -c "$sc" bana-act "$here" - "$v" "$tf" "act-$prefix" "${f[@]}" >/dev/null 2>&1 || true
+  ((${#fetch[@]} == 0)) || "${vc[@]}" bash -c "$sc" bana-act "$here" - "$v" "$tf" "act-$prefix" "${fetch[@]}" >/dev/null 2>&1 || true
   if [[ -n $act_stop ]]; then rm -f "$tf"; return 130; fi
   act_vm_pid=$pf
   (trap - INT; exec "${vc[@]}" bash -c "$sc" bana-act "$here" "$pf" "$v" "$tf" "act-$prefix" "${a[@]}") > >(act_only "$json" "$ids") &
