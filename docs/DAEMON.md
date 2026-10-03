@@ -148,9 +148,12 @@ that project:
 - the release bana asks about, or `#p=<prefix>&release=<tag>` ([Releases](#releases));
 - *Pause automatic builds* ([Projects](#projects)), *Check now* (fetch at once) and *Clear queue* (drops a
   backlog after a long time away);
-- *Run now*: a branch or tag at a tier, at the front of the queue. That is how a nightly runs;
+- *Run now…*: a branch or tag at a tier, all jobs or one (with the jobs it needs), at the front of the
+  queue, once you say yes. That is how a nightly runs;
 - the queue, each build with *Remove*;
-- the build: its jobs, the live log of the one you pick (a failed step opens by itself), *Cancel* and *Re-run*
+- the build: its jobs, the live log of the one you pick (a failed step opens by itself), *Run JOB…* for the
+  job picked (`bana ci -j`: it posts that job's statuses, and those of the jobs it needs, but not the build's
+  `bana`, moves no green and leaves the commit's own build to come), *Cancel* and *Re-run*
   (the same commit and tier again, even if it was built), and on a failed build *Fix with Claude*
   ([FIX.md](FIX.md)), then the fix's card: its rounds, *Keep*, *Push*, *Compare on GitHub*, *More rounds* and
   *Discard*;

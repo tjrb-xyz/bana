@@ -73,7 +73,7 @@ builds*) and *Quit bana*, which stops local CI until the next login.
 **The page**, *Local CI*, has a project picker (with two or more projects), the queue, the running build with
 its jobs and live log, and the history. *Run now* builds a branch at any tier, which is how a nightly runs.
 *Pause automatic builds* holds the pushes (the running build finishes, and Run now still builds); *Cancel* stops
-one; *Re-run* builds the same commit again.
+one; *Re-run…* builds the same commit again, and *Run JOB…* one job of it (and the jobs it needs), after asking.
 
 **Which pushes run:** branches matching `daemon.branches` (all but `dependabot/*` and `renovate/*`), tags
 matching `daemon.tags` (none by default), and not a head commit with `[skip ci]` or another of GitHub's skip
@@ -139,6 +139,7 @@ brew install act                 # and OrbStack, for Docker
 bana ci                          # every job, with the first tier (quick)
 bana ci nightly                  # another tier
 bana ci -j rust                  # one job, and the jobs it needs
+bana ci -v                       # act's own output as it comes, not bana's view of it
 bana ci --x64                    # Linux containers as x86_64 (Rosetta, on Apple silicon)
 bana ci --list                   # the jobs
 bana ci -- --reuse               # anything after -- goes to act; --reuse keeps containers, and their builds
@@ -177,6 +178,13 @@ act's output also goes to `~/.bana/<prefix>/ci/last.log`, and what ran to `last.
 tier, job, network, versions, exit status, and whether Ctrl-C stopped it), for `bana fix`, which a failed run
 points to. `ci.log = no` skips it. The workflow's `vars.*` come from `~/.bana/<prefix>/vars` (`KEY=value`
 lines) if you write one, as under the daemon.
+
+The terminal shows bana's view of the run, not act's output: a line as each job starts (`▶ rust`) and ends
+(`✓ rust`, or `✗ rust: cargo clippy` and that step's last 20 lines), what the workflow's plan chose
+(`plan (quick): runs rust web · skips background`), and why a job did not run: *not run here* with its label's
+place (`dsper-macos: on a Mac only`, `dsper-systemd: needs OrbStack or Lima…`), or *skipped* (its `if:` was
+false, or a job it needs did not pass: act prints nothing for those). Then a count and the log's path. `-v`
+shows act's output instead; the log has all of it either way.
 
 Limits worth knowing:
 - act uses your working tree only for a checkout step without `ref:` (or with `ref:` equal to the current ref).
@@ -635,7 +643,7 @@ send the jobs elsewhere without a change to the workflow.
 ## Commands
 
 ```sh
-bana ci [TIER] [-j JOB] [--x64] [--list] [--event FILE] [-- ACT-OPTIONS]
+bana ci [TIER] [-j JOB] [-v] [--x64] [--list] [--event FILE] [-- ACT-OPTIONS]
 bana fix [BUILD | last | --log FILE|-] [--open | --headless]   # and brief, list, push, drop: docs/FIX.md
 bana report [BUILD | last | --log FILE|-] [--json]   # the CI report, per standard
 bana installer DIST (--tag T | --label L)   # the project's install.sh, install.ps1 and SHA256SUMS

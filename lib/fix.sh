@@ -203,7 +203,9 @@ fix_headless() { # BANA-MANAGER FIX WT DIR
   extra=$(conf fix.allow) turns=$(conf fix.turns 60) budget=$(conf fix.budget_usd 5)
   [[ -z $extra ]] || allow+=" $extra"
   say "Claude Code works on fix $fix unattended (at most $turns turns and \$$budget): tail -f $log"
-  (cd "$wt" && exec claude -p "$(cat "$dir/prompt.txt")" -n "bana fix $fix" --permission-mode dontAsk \
+  local named=()
+  ! fix_claude_names || named=(-n "bana fix $fix")
+  (cd "$wt" && exec claude -p "$(cat "$dir/prompt.txt")" ${named[@]+"${named[@]}"} --permission-mode dontAsk \
     --allowedTools "$allow" --disallowedTools "$deny" --max-turns "$turns" --max-budget-usd "$budget" \
     --strict-mcp-config --mcp-config "$mc" --output-format stream-json --verbose) </dev/null >"$log" || rc=$?
   # The last line whose type is result, whatever the order of its keys.
@@ -280,9 +282,16 @@ fix_start() {
   # A log pasted on stdin used it up: Claude Code gets the terminal back.
   if [[ ! -t 0 ]] && (: </dev/tty) 2>/dev/null; then exec </dev/tty; fi
   cd "$wt" || die "No worktree $wt"
-  # --mcp-config takes several values: -n ends them, before the prompt.
-  exec claude ${mcp[@]+"${mcp[@]}"} -n "bana fix $fix" "$(cat "$dir/prompt.txt")"
+  # --mcp-config takes several values: -n ends them, before the prompt (or --, for a Claude
+  # Code without session names).
+  if fix_claude_names; then
+    exec claude ${mcp[@]+"${mcp[@]}"} -n "bana fix $fix" "$(cat "$dir/prompt.txt")"
+  fi
+  exec claude ${mcp[@]+"${mcp[@]}"} -- "$(cat "$dir/prompt.txt")"
 }
+
+# Whether this Claude Code names a session (-n, --name): older ones say "unknown option '-n'".
+fix_claude_names() { claude --help 2>/dev/null | grep -q -- '--name'; }
 
 # ---- the fixes ---------------------------------------------------------------------------
 

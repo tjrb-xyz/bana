@@ -877,6 +877,9 @@ struct RunNow {
     git_ref: String,
     #[serde(default)]
     tier: String,
+    /// Only this job (a workflow job id) and the jobs it needs.
+    #[serde(default)]
+    job: Option<String>,
 }
 
 async fn run_now(State(d): D, Json(b): Json<RunNow>) -> Response {
@@ -886,8 +889,14 @@ async fn run_now(State(d): D, Json(b): Json<RunNow>) -> Response {
     if !b.tier.is_empty() && !valid_tier(&b.tier) {
         return err(StatusCode::BAD_REQUEST, "tier: a word from the settings");
     }
+    if b.job
+        .as_deref()
+        .is_some_and(|j| !crate::rounds::valid_job(j))
+    {
+        return err(StatusCode::BAD_REQUEST, "job: a workflow job's id");
+    }
     // Refused unless the ref is a head fetched and the tier a settings' tier.
-    match d.run_now(&b.git_ref, &b.tier) {
+    match d.run_now(&b.git_ref, &b.tier, b.job.as_deref()) {
         Ok(id) => Json(json!({ "build": id })).into_response(),
         Err(e) => err(StatusCode::BAD_REQUEST, e),
     }
@@ -1966,6 +1975,8 @@ esac"#,
             (json!({"ref": "main"}), "tier"),
             (json!({"ref": "--help", "tier": "quick"}), "ref"),
             (json!({"ref": "main", "tier": "a b"}), "tier"),
+            (json!({"ref": "main", "tier": "quick", "job": "-x"}), "job"),
+            (json!({"ref": "main", "tier": "quick", "job": "a b"}), "job"),
         ] {
             let (code, v) = post("/ci/v1/p/p/builds", Some(body.clone())).await;
             assert_eq!(code, 400, "{body}: {v}");
@@ -1982,6 +1993,21 @@ esac"#,
         assert_eq!(l["watcher"]["paused"], true);
         assert_eq!(l["queue"][0]["id"], queued, "{l}");
         assert_eq!(l["queue"][0]["trigger"], "manual");
+        // One job of it, asked for by id.
+        let (code, v) = post(
+            "/ci/v1/p/p/builds",
+            Some(json!({"ref": "main", "tier": "quick", "job": "plan"})),
+        )
+        .await;
+        assert_eq!(code, 200, "{v}");
+        let one = v["build"].as_u64().unwrap();
+        let (_, l) = call(&app, "GET", "/ci/v1/p/p/local", None, true).await;
+        assert_eq!(
+            l["queue"][1]["id"], one,
+            "after the other hand-asked build: {l}"
+        );
+        assert_eq!(l["queue"][1]["job"], "plan", "{l}");
+        assert_eq!(d.cancel(one, "not this one"), Ok(()));
         until("the queue to wait for Docker", || {
             d.summary().queue.first().and_then(|q| q.waiting.clone())
                 == Some("waiting for Docker".into())

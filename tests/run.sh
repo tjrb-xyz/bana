@@ -418,7 +418,11 @@ ci=$HOME/.bana/wid/ci
 env_of() { sed -n "s/^$1=//p" "$ci/last.env"; }
 FAKE_ACT_OUT='[ci/rust] ⭐ Run Main cargo test' FAKE_ACT_EXIT=1 bash "$bana" ci -j rust >"$T/out" 2>"$T/err" && st=0 || st=$?
 check "log: bana ci exits with act's status (1)" same "$st" 1
-check "log: act's output on the terminal" has "$T/out" "[ci/rust] ⭐ Run Main cargo test"
+check "log: the terminal shows the job starting, not act's line" has "$T/out" "▶ rust"
+check "log: and where act's output is" has "$T/out" "act's output: $ci/last.log"
+FAKE_ACT_OUT='[ci/rust] ⭐ Run Main cargo test' FAKE_ACT_EXIT=1 bash "$bana" ci -v -j rust >"$T/out" 2>"$T/err" || true
+check "log: -v: act's output on the terminal, as it comes" has "$T/out" "[ci/rust] ⭐ Run Main cargo test"
+FAKE_ACT_OUT='[ci/rust] ⭐ Run Main cargo test' FAKE_ACT_EXIT=1 bash "$bana" ci -j rust >"$T/out" 2>"$T/err" && st=0 || st=$?
 check "log: and in ci/last.log" has "$ci/last.log" "[ci/rust] ⭐ Run Main cargo test"
 check "log: with act's stderr" has "$ci/last.log" "Error: Job 'rust' failed"
 check "log: under their names once act ended" test ! -e "$ci/last.log.part" -a ! -e "$ci/last.env.part"
@@ -615,6 +619,41 @@ FAKE_OS=Linux FAKE_ARCH=aarch64 BANA_SYS_ROOT=$FAKE_STATE/vmroot bash "$bana" li
 check "linux-prepare: act from its releases, for this CPU" has "$FAKE_LOG" \
   "https://github.com/nektos/act/releases/download/v0.2.89/act_Linux_arm64.tar.gz"
 check "linux-prepare: a failed download says so" has "$T/out" "Could not download act 0.2.89"
+
+# ---- bana ci's view: act's text, recorded (act 0.2.89, host mode), as bana ci shows it ----------
+view() { # OS MACHINE-LABELS [ONLY]
+  awk -v list="$here/fixtures/view/list.txt" -v table="$T/view.table" -v machine="$2" -v vm=bana -v os="$1" \
+    -v only="${3:-}" -v logfile=/home/me/.bana/wid/ci/last.log -f "$here/../lib/view.awk" <"$here/fixtures/view/act.txt"
+}
+printf 'wid-linux\tlinux\nwid-macos\tmac\nwid-systemd\tmachine\nold-ubuntu\tskip no act image\n' >"$T/view.table"
+view Linux '' >"$T/view"
+check "view: a job's start" has "$T/view" "▶ rust"
+check "view: its end" has "$T/view" "✓ plan"
+check "view: a failure names its step" has "$T/view" "✗ rust: clippy"
+check "view: and shows its last 20 lines" same "$(grep -c '^    warning line' "$T/view") $(grep -c 'warning line 10$' "$T/view")" "20 0"
+check "view: the plan's choice" has "$T/view" "  plan (quick): runs rust · skips background"
+check "view: a job its if: skipped says so" has "$T/view" "– background-linux: skipped (its if: was false, or a job it needs did not pass)"
+check "view: a Mac's job on Linux" has "$T/view" "– macOS tests: not run here (wid-macos: on a Mac only)"
+check "view: systemd's job on Linux" has "$T/view" "– sd: not run here (wid-systemd: needs a Mac's Linux machine)"
+check "view: act's own lines stay in the log" lacks "$T/view" "Run Set up job"
+check "view: and the step's output lines" lacks "$T/view" "compiling"
+check "view: act's 'Error: Job failed' is not said twice" lacks "$T/view" "Error: Job 'rust' failed"
+check "view: the count, and where act's output is" has "$T/view" \
+  "1 passed, 1 failed, 1 skipped, 2 not run here · act's output: /home/me/.bana/wid/ci/last.log"
+view Darwin 'wid-systemd ' >"$T/view"
+check "view: on a Mac with OrbStack, systemd's job runs next" has "$T/view" "→ sd: next, in the Linux machine bana (with systemd)"
+check "view: and is not counted as not run" has "$T/view" "1 not run here"
+view Darwin '' >"$T/view"
+check "view: on a Mac without orb or limactl, it says so" has "$T/view" \
+  "– sd: not run here (wid-systemd: needs OrbStack or Lima, and neither orb nor limactl is on PATH)"
+view Linux '' rust >"$T/view"
+check "view: with -j, jobs not asked for are not called skipped" lacks "$T/view" "background-linux: skipped"
+printf '%s\n' $'\033[1mact: quick\033[0m' 'apt-get: 30 lines of noise' $'\033[33mThe Linux machine bana is not ready\033[0m' \
+  'Error: workflow is not valid' | awk -v list=/dev/null -v table=/dev/null -f "$here/../lib/view.awk" >"$T/view"
+check "view: bana's own lines" has "$T/view" "act: quick"
+check "view: and its warnings" has "$T/view" "The Linux machine bana is not ready"
+check "view: act's errors" has "$T/view" "Error: workflow is not valid"
+check "view: not other lines" lacks "$T/view" "apt-get"
 
 # ---- bana fix: a failure handed to Claude Code, on a branch of its own -----------------------------
 # bana fix runs bana-manager (fix prepare makes the worktree, the brief and the prompt): the one
@@ -1016,6 +1055,11 @@ print(list(s), s["bana"]["args"])' "$(claude_arg 17)")" "['bana'] ['mcp', '--dir
   check "fix: in a terminal too, the fix is registered with the daemon" has "$FAKE_LOG" \
     "-X POST -H Content-Type: application/json --data {\"fix\":\"$x5\"} http://127.0.0.1:8470/ci/v1/p/wid/fixes"
   check "fix: and Claude Code starts, interactive" same "$(claude_arg 1)" "-n"
+  # An older Claude Code, without -n (--name): -- ends the options before the prompt.
+  FAKE_CLAUDE_NO_NAME=1 bash "$bana" fix --log "$paste" >"$T/out" 2>&1 || true
+  check "fix: a Claude Code without session names gets no -n" lacks "$T/out" "unknown option"
+  check "fix: -- before the prompt instead" same "$(claude_arg 1) $(claude_argc)" "-- 2"
+  check "fix: and the prompt" same "$(claude_arg 2)" "$(cat "$d/fix/$x5.d/prompt.txt")"
   bash "$bana" fix list >"$T/out" 2>&1 || true
   check "fix list: where it stands, its rounds and round 0" has "$T/out" "$x5  open, 0 of 5 rounds, round 0 failed; bana/fix-$x5"
   : >"$FAKE_LOG"
@@ -1880,7 +1924,7 @@ p=$T/w/p r=$T/w/p/v$V m=$HOME/.bana/daemon.d sha=0123456789abcdef0123456789abcde
 mkdir -p "$r/bin" "$r/lib" "$T/w/b"
 sed "s/^BANA_COMMIT=/BANA_COMMIT=$sha/" "$bana" >"$r/bin/bana"
 chmod 755 "$r/bin/bana"
-cp "$here"/../lib/*.sh "$here"/../lib/install.*.in "$r/lib/"
+cp "$here"/../lib/*.sh "$here"/../lib/*.awk "$here"/../lib/install.*.in "$r/lib/"
 fake_manager() { # VERSION
   cat >"$r/bin/bana-manager" <<EOF
 #!/bin/sh
@@ -1938,7 +1982,7 @@ health_pid() { curl -fsS http://127.0.0.1:8470/ci/v1/health | sed -n 's/.*"pid":
 # A copy of bana (T), with a lib file of its own.
 copy_bana() { # DIR
   rm -rf "$1" && mkdir -p "$1/bin" "$1/lib"
-  cp "$bana" "$1/bin/" && cp "$here"/../lib/*.sh "$here"/../lib/install.*.in "$1/lib/"
+  cp "$bana" "$1/bin/" && cp "$here"/../lib/*.sh "$here"/../lib/*.awk "$here"/../lib/install.*.in "$1/lib/"
 }
 (cd "$HOME" && bash "$bana" daemon install --no-open) >"$T/out" 2>&1 || { cat "$T/out"; false; }
 check "handover: a first install has no snapshot before" test ! -e "$m.prev" -a ! -e "$m.new"
@@ -2129,7 +2173,7 @@ check "package: the four archives, install.sh, SHA256SUMS and notes.md" same "$(
 check "package: SHA256SUMS passes sha256sum -c" bash -c "cd '$T/dist' && sha256sum -c --quiet SHA256SUMS"
 check "package: SHA256SUMS has the archives and install.sh" same "$(awk '{ print $2 }' "$T/dist/SHA256SUMS" | tr '\n' ' ')" \
   "bana-v$V-linux-arm64.tar.gz bana-v$V-linux-x64.tar.gz bana-v$V-macos-arm64.tar.gz bana-v$V-macos-x64.tar.gz install.sh "
-want=$( (cd "$here/.." && { printf '%s\n' bin/bana bin/bana-manager LICENSE README.md lib/install.sh.in lib/install.ps1.in lib/split.yml.in; ls lib/*.sh; }) |
+want=$( (cd "$here/.." && { printf '%s\n' bin/bana bin/bana-manager LICENSE README.md lib/install.sh.in lib/install.ps1.in lib/split.yml.in; ls lib/*.sh lib/*.awk; }) |
   sed "s|^|bana-v$V/|" | LC_ALL=C sort)
 for p in linux-x64 linux-arm64 macos-x64 macos-arm64; do
   check "package: $p holds bana-v$V/, with bana's files and nothing else" same "$(tar -tzf "$T/dist/bana-v$V-$p.tar.gz" | LC_ALL=C sort)" "$want"

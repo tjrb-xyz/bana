@@ -310,7 +310,7 @@ d_snapshot() { # DIR BIN
   local f
   d_put "$2" "$1/bana-manager" 755
   d_put "$bana_root/bin/bana" "$1/bin/bana" 755
-  for f in "$bana_root"/lib/*.sh "$bana_root"/lib/install.*.in; do d_put "$f" "$1/lib/$(basename "$f")" 644; done
+  for f in "$bana_root"/lib/*.sh "$bana_root"/lib/*.awk "$bana_root"/lib/install.*.in; do d_put "$f" "$1/lib/$(basename "$f")" 644; done
 }
 
 # The daemon's own clone of the project: made from your checkout (quick), then pointed at GitHub.
