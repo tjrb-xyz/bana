@@ -64,12 +64,13 @@ jobs:
 
   # The daemon end to end: real act and Docker, pushes to a local origin, statuses
   # through the gh stand-in, a cancel from the API, kill -9 and a restart, the fix
-  # loop with the test as Claude Code (bana's MCP server over stdio), and a second
-  # project: one build at a time, bana pause and resume, bana remove.
+  # loop with the test as Claude Code (bana's MCP server over stdio), a second
+  # project: one build at a time, bana pause and resume, bana remove; and bana split's
+  # public workflow, run by act as GitHub, with a job in a systemd container.
   e2e:
     if: inputs.called || github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - name: act ${{ env.ACT_VERSION }}
@@ -84,7 +85,7 @@ jobs:
       - name: tests/systemd.sh
         run: BANA_SYSTEMD=1 BANA_SYSTEMD_PULL=1 BANA_SYSTEMD_ACT="$RUNNER_TEMP/act/act" tests/systemd.sh
       - name: tests/e2e-daemon.sh
-        run: BANA_E2E=1 BANA_E2E_ACT="$RUNNER_TEMP/act/act" tests/e2e-daemon.sh
+        run: BANA_E2E=1 BANA_E2E_SPLIT=1 BANA_E2E_ACT="$RUNNER_TEMP/act/act" tests/e2e-daemon.sh
 
   # On a Mac: the manager with its menu bar compiled, a real LaunchAgent install, and
   # the daemon end to end with host jobs only (no Docker on GitHub's Macs). One job,

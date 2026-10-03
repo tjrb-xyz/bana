@@ -28,8 +28,8 @@ check "split render: the runner is lib/split.sh's own" same \
 check "split render: act, pinned" has "$T/w/runner.sh" "split_act_sha256='0191d6f1f3b716b5c55820032605d05fc3c1cdbf581ebeff655019e5dd1524c0'"
 check "split render: GitHub's host key, pinned" has "$T/w/runner.sh" "split_host_key='github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5"
 check "split render: Linux jobs in act.image, pinned by digest" has "$T/w/runner.sh" "'-P' 'wid-linux=catthehacker/ubuntu:act-24.04@sha256:c58e2b364da03b0c804c7d660f2ecbedf2f221a382b9baa0b344b0144780ff43'"
-check "split render: <prefix>-systemd's not run (not on the runner's machine, which holds the key)" has "$T/w/runner.sh" "'-P' 'wid-systemd=' "
-check "split render: no job on the runner's machine" lacks "$T/w/runner.sh" "=-self-hosted"
+check "split render: <prefix>-systemd on no place for act's first run (a systemd container's, after it)" has "$T/w/runner.sh" "'-P' 'wid-systemd=' "
+check "split render: no job on the runner's machine" bash -c "! grep '^split_platforms=' '$T/w/runner.sh' | grep -q -- '=-self-hosted'"
 check "split render: an image of its own, unless pinned, not run" has "$T/w/runner.sh" "'-P' 'ubuntu-20.04=' "
 check "split render: macOS jobs not run" has "$T/w/runner.sh" "'-P' 'wid-macos='"
 check "split render: no \${{ }} in the runner" lacks "$T/w/runner.sh" '${{'
@@ -230,6 +230,146 @@ check "steps: only the step lines, by act's ids" same "$(sp split_runner_steps <
 check "steps, here (bana's machine): with their names" same "$(BANA_LOGS=here sp split_runner_steps <"$fx/act.jsonl" | sed -n 2p)" \
   "rust / cargo test: failed (12s)"
 check "steps, logs public: and the output" same "$(BANA_LOGS=public sp split_runner_steps <"$fx/act.jsonl" | grep -c PRIVATE)" 2
+
+# ---- split: jobs that need systemd, on the runner (lib/systemd.sh's part; stand-in docker and act) ----
+# tests/fixtures/systemd's workflow and act's recordings (tests/run.sh's systemd section): plan; sd
+# (it needs plan), sd2 (it needs sd) and gated on wid-systemd; after (it needs sd). The runner's act
+# and docker run under env -i: these wrappers give the stand-ins their settings (sdenv) back, and
+# note the names of the environment docker was given.
+fresh
+mkdir -p .github/workflows "$FAKE_STATE/list"
+cp "$sdfx/ci.yml" .github/workflows/ci.yml
+for j in sd sd2 after gated; do cp "$sdfx/list-$j.txt" "$FAKE_STATE/list/$j"; done
+git add -A && git -c user.name=t -c user.email=t@t commit -q -m one
+git clone -q --bare . "$T/w/private.git"
+sha=$(git rev-parse HEAD)
+bash "$bana" split render >"$T/w/bana.yml"
+runner_of "$T/w/bana.yml" >"$T/w/runner.sh"
+check "split systemd render: wid-systemd on no place in split_platforms (act's first run skips it)" \
+  grep -q "^split_platforms=(.* '-P' 'wid-systemd=' " "$T/w/runner.sh"
+check "split systemd render: and in split_sysd, the jobs run after it" grep -qx "split_sysd=( 'wid-systemd' )" "$T/w/runner.sh"
+check "split systemd render: their image, act.image pinned by digest" grep -qx \
+  "split_sysd_image='catthehacker/ubuntu:act-24.04@sha256:c58e2b364da03b0c804c7d660f2ecbedf2f221a382b9baa0b344b0144780ff43'" "$T/w/runner.sh"
+check "split systemd render: lib/systemd.sh's part, word for word" same \
+  "$(awk '/^# ---- systemd: /, /^# ---- end of systemd/' "$T/w/runner.sh")" \
+  "$(awk '/^# ---- systemd: /, /^# ---- end of systemd/' "$bana_root/lib/systemd.sh")"
+check "split systemd render: lints as bana runs it" same "$(bash "$bana" split lint "$T/w/bana.yml" 2>&1)" "$T/w/bana.yml: as bana runs it"
+check "split systemd render: no job on the runner's machine in split_platforms" bash -c \
+  "! grep '^split_platforms=' '$T/w/runner.sh' | grep -q -- '=-self-hosted'"
+printf 'act.platform.wid-systemd = linux\nact.platform.box = systemd\n' >>.github/bana.conf
+bash "$bana" split render >"$T/w/b2.yml"
+check "split systemd render: <prefix>-systemd on linux: an image, not in split_sysd" bash -c \
+  "grep -q \"'-P' 'wid-systemd=catthehacker/ubuntu:act-24.04@sha256:\" '$T/w/b2.yml' && grep -q \"split_sysd=( 'box' )\" '$T/w/b2.yml'"
+git checkout -q .github/bana.conf
+# The lint: lib/systemd.sh's container as bana has it, and nothing more.
+mutant "--privileged" '{ sub(/run -d --rm --name/, "run -d --privileged --rm --name"); print }' "--privileged: more than the systemd container has"
+mutant "--cap-add SYS_ADMIN" '{ sub(/run -d --rm --name/, "run -d --cap-add SYS_ADMIN --rm --name"); print }' "--cap-add: more than"
+mutant "a Docker socket" '{ sub(/-v "\$bin:\/bana\/bin\/act:ro"/, "-v /var/run/docker.sock:/var/run/docker.sock:ro -v \"$bin:/bana/bin/act:ro\""); print }' "docker.sock:"
+mutant "--cgroupns=host" '{ sub(/--cgroupns=private/, "--cgroupns=host"); print }' "--cgroupns=host: more than"
+mutant "other flags" '{ sub(/ --tmpfs \/run\/lock/, ""); print }' "the systemd container's flags are not bana's"
+mutant "no flags line" '!/^ *sd_run_flags=/' "not one sd_run_flags line, bana's"
+mutant "a second flags line" '{ print } /^ *sd_run_flags=/ { print }' "not one sd_run_flags line, bana's"
+mutant "a mount, writable" '{ sub(/sd_mounts\+=\(-v "\$1:\$1:ro"\)/, "sd_mounts+=(-v \"$1:$1\")"); print }' "a mount, other than read-only as it is"
+mutant "a -v, writable" '{ sub(/-v "\$bin:\/bana\/bin\/act:ro"/, "-v \"$bin:/bana/bin/act\""); print }' "a mount, not read-only: \$bin:/bana/bin/act"
+mutant "seccomp unconfined" '{ sub(/run -d --rm --name/, "run -d --security-opt seccomp=unconfined --rm --name"); print }' "--security-opt or --cgroupns, outside the systemd container's flags"
+mutant "--pid=host" '{ sub(/run -d --rm --name/, "run -d --pid=host --rm --name"); print }' "--pid: more than"
+mutant "--network host" '{ sub(/run -d --rm --name/, "run -d --network host --rm --name"); print }' "--network host: more than"
+mutant "--device" '{ sub(/run -d --rm --name/, "run -d --device /dev/kvm --rm --name"); print }' "--device: more than"
+mutant "--mount" '{ sub(/run -d --rm --name/, "run -d --mount type=bind,src=/,dst=/h --rm --name"); print }' "--mount: more than"
+mutant "an unpinned systemd image" '{ sub(/^ *split_sysd_image=.*/, "          split_sysd_image='"'"'catthehacker/ubuntu:act-24.04'"'"'"); print }' "split_sysd_image=catthehacker/ubuntu:act-24.04: an image pinned by digest only"
+mutant "a systemd label that is more" '{ sub(/^ *split_sysd=.*/, "          split_sysd=( '"'"'wid-systemd'"'"' \"$(id)\" )"); print }' "split_sysd: labels alone"
+# The runner's build: sd, sd2 and gated each in a container of their own.
+rt=$T/w/rt
+mkdir -p "$rt" "$T/w/sdbin"
+run_step fetch BANA_SOURCE=acme/widget BANA_SOURCE_KEY="$key" BANA_TEST_SOURCE="file://$T/w/private.git" >/dev/null 2>&1
+d=$rt/bana
+cat >"$T/w/sdbin/docker" <<EOF
+#!/bin/sh
+env | cut -d= -f1 >>'$FAKE_STATE/docker.envnames'
+. '$T/w/sdenv'
+exec '$here/stand-ins/docker' "\$@"
+EOF
+cat >"$T/w/sdact" <<EOF
+#!/bin/sh
+. '$T/w/sdenv'
+exec '$here/stand-ins/act' "\$@"
+EOF
+chmod +x "$T/w/sdbin/docker" "$T/w/sdact"
+sdenv() { # NAME=VALUE...: the stand-ins' settings, as well as the recordings
+  {
+    printf 'export FAKE_STATE=%q FAKE_LOG=%q\n' "$FAKE_STATE" "$FAKE_LOG"
+    printf 'export FAKE_ACT_LIST="$(cat %q)" FAKE_ACT_PROBE="$(cat %q)"\n' "$sdfx/list.txt" "$sdfx/probe.jsonl"
+    printf 'export FAKE_ACT_OUT="$(cat %q)" FAKE_ACT_OUT_SYSD="$(cat %q)"\n' "$sdfx/first.jsonl" "$sdfx/inner-sd.jsonl"
+    for a in "$@"; do printf 'export %q\n' "$a"; done
+  } >"$T/w/sdenv"
+}
+sd_build() { # [NAME=VALUE...]: the build step, the stand-ins set so (BANA_*: the runner's inputs)
+  local a e=() r=()
+  for a in "$@"; do case $a in BANA_*) r+=("$a") ;; *) e+=("$a") ;; esac; done
+  rm -rf "$FAKE_STATE/ctr" "$FAKE_STATE/act.inner" "$FAKE_STATE/act.probe" "$FAKE_STATE/docker.run" "$FAKE_STATE/docker.envnames" "$d/out" "$d/art"
+  : >"$FAKE_LOG"
+  sdenv ${e[@]+"${e[@]}"}
+  run_step build BANA_TEST_ACT="$T/w/sdact" PATH="$T/w/sdbin:$PATH" DOCKER_HOST=unix:///run/stand-in.sock ${r[@]+"${r[@]}"} >"$T/out" 2>&1 && st=0 || st=$?
+}
+mkdir -p "$T/w/up/artifacts/1/sd-up"
+echo up >"$T/w/up/artifacts/1/sd-up/sd-up.zip"
+sd_build FAKE_SYSD_ART="$T/w/up/artifacts"
+check "split runner systemd: the build passes" same "$st:$(cat "$d/out/rc")" "0:0"
+check "split runner systemd: a container each for sd, sd2 (it needs sd) and gated" same "$(inner_jobs)" "sd sd2 gated "
+check "split runner systemd: none left" same "$(ls "$FAKE_STATE/ctr" 2>/dev/null)" ""
+check "split runner systemd: named for the build" grep -qx -- 'bana-systemd-wid-7' "$FAKE_STATE/docker.run"
+check "split runner systemd: its mounts: the checkout, act's cache and act, read-only, nothing else" same \
+  "$(awk 'p == "-v" { print } { p = $0 }' "$FAKE_STATE/docker.run" | sort -u | tr '\n' ' ')" \
+  "$(printf '%s\n' "$T/w/sdact:/bana/bin/act:ro" "$d/cache:/bana/in/cache:ro" "$d/src:$d/src:ro" | sort | tr '\n' ' ')"
+check "split runner systemd: nothing more in docker run (no privilege, socket or host namespace)" sd_nothing_more "$FAKE_STATE/docker.run"
+check "split runner systemd: no label, no network" bash -c "! grep -qx -- '--label\|--network' '$FAKE_STATE/docker.run'"
+check "split runner systemd: the event file, a copy" has "$FAKE_LOG" "docker cp -L $d/event.json bana-systemd-wid-7:$d/event.json"
+check "split runner systemd: docker's environment: PATH, HOME and DOCKER_HOST alone" same \
+  "$(grep -Evx 'PWD|SHLVL|_' "$FAKE_STATE/docker.envnames" | LC_ALL=C sort -u | tr '\n' ' ')" "DOCKER_HOST HOME PATH "
+check "split runner systemd: no token in the container's act" bash -c "! grep -q GITHUB_TOKEN '$FAKE_STATE/act.inner.env' '$FAKE_LOG'"
+check "split runner systemd: the first act's environment as before" same \
+  "$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$FAKE_STATE/act.env" | cut -d= -f1 | grep -Evx 'PWD|SHLVL|_|FAKE_.*' | LC_ALL=C sort | tr '\n' ' ')" "DOCKER_HOST HOME PATH RUNNER_TEMP "
+a=" $(head -1 "$FAKE_STATE/act.inner") "
+check "split runner systemd: the inner act: host mode for the Linux and systemd labels, none for the rest, offline" bash -c \
+  "for w in ' -P wid-linux=-self-hosted ' ' -P wid-systemd=-self-hosted ' ' -P ubuntu-latest=-self-hosted ' ' -P wid-macos= ' ' -P ubuntu-20.04= ' ' -j sd --concurrent-jobs 1 ' ' --artifact-server-path /home/runner/.bana/artifacts ' ' --action-cache-path /home/runner/.cache/act ' ' --action-offline-mode '; do [[ '$a' == *\"\$w\"* ]] || { echo \"lacks \$w\" >&2; exit 1; }; done; [[ '$a' != *' --rm '* && '$a' != *'$d/cache'* ]]"
+check "split runner systemd: the first act takes act's cache, for the containers" grep -q -- "--action-cache-path $d/cache " <(grep '^act workflow_dispatch' "$FAKE_LOG" | grep -v bana-systemd-probe)
+check "split runner systemd: act.jsonl: bana's next line for sd" has "$d/out/act.jsonl" '"jobID":"sd","matrix":{},"msg":"bana: next, in a systemd container"'
+check "split runner systemd: act.jsonl: after is not run, and why" has "$d/out/act.jsonl" '"jobID":"after","matrix":{},"msg":"bana: not run here: needs sd, a systemd job"'
+check "split runner systemd: act.jsonl: sd's result once, plan's once" same \
+  "$(grep -c '"jobID":"sd","jobResult":"success"' "$d/out/act.jsonl") $(grep -c '"jobID":"plan","jobResult":"success"' "$d/out/act.jsonl")" "1 1"
+check "split runner systemd: all the containers' act said, in out/systemd.log" same "$(grep -c '"jobID":"plan","jobResult":"success"' "$d/out/systemd.log")" 3
+check "split runner systemd: the console: sd, by its id" grep -qx 'sd: ok' "$T/out"
+check "split runner systemd: the console: plan once" same "$(grep -cx 'plan: ok' "$T/out")" 1
+check "split runner systemd: nothing of bana's lines in public" lacks "$T/out" "bana: "
+check "split runner systemd: sd's upload, back in art/" same "$(cat "$d/art/1/sd-up/sd-up.zip" 2>/dev/null)" up
+: >"$T/w/summary"
+run_step summary GITHUB_STEP_SUMMARY="$T/w/summary" >/dev/null 2>&1
+check "split runner systemd: the summary counts plan's steps once, and sd's" same \
+  "$(grep -c '^| plan / ' "$T/w/summary") $(grep -c '^| sd / ' "$T/w/summary")" \
+  "$(grep -c '"jobID":"plan".*"stepResult"' "$sdfx/first.jsonl") $(grep -c '"jobID":"sd".*"stepResult"' "$sdfx/inner-sd.jsonl")"
+# The first failure's status.
+sd_build FAKE_ACT_EXIT_SYSD=3
+check "split runner systemd: sd failing: its status" same "$st:$(cat "$d/out/rc")" "3:3"
+sd_build FAKE_ACT_EXIT=2 FAKE_ACT_EXIT_SYSD=3
+check "split runner systemd: act failing, then sd: act's status" same "$st:$(cat "$d/out/rc")" "2:2"
+# Docker before 28: not run here, said in act.jsonl alone.
+sd_build FAKE_DOCKER_API=1.47
+check "split runner systemd: Docker 1.47: no container, the build passes" same "$st $(cat "$FAKE_STATE/docker.run" 2>/dev/null)" "0 "
+check "split runner systemd: Docker 1.47: why, in act.jsonl" has "$d/out/act.jsonl" '"jobID":"sd","matrix":{},"msg":"bana: not run here: needs Docker 28 or later (writable cgroups)"'
+check "split runner systemd: Docker 1.47: nothing of it in public" bash -c "! grep -q 'Docker\|sd' '$T/out'"
+# A one-job build: the probe and act take its -j too.
+sd_build BANA_JOB=sd
+check "split runner systemd: BANA_JOB=sd: the probe takes -j sd" has "$FAKE_STATE/act.probe" " -j sd "
+check "split runner systemd: BANA_JOB=sd: sd runs in its container" same "$st $(inner_jobs | cut -d' ' -f1)" "0 sd"
+# No label with the place systemd: no probe, no container, act as before.
+printf 'act.platform.wid-systemd = skip\n' >>.github/bana.conf
+bash "$bana" split render >"$T/w/b3.yml"
+runner_of "$T/w/b3.yml" >"$T/w/runner.sh"
+check "split systemd render: act.platform.<prefix>-systemd = skip: split_sysd is empty" grep -qx 'split_sysd=( )' "$T/w/runner.sh"
+check "split systemd render: and it lints" same "$(bash "$bana" split lint "$T/w/b3.yml" 2>&1)" "$T/w/b3.yml: as bana runs it"
+sd_build
+check "split runner systemd: none: no probe, no container" same "$st $(cat "$FAKE_STATE/act.probe" "$FAKE_STATE/docker.run" 2>/dev/null)" "0 "
+git checkout -q .
 
 # ---- split: bana split on, the wizard (GitHub: the gh stand-in's store) --------------------------
 # A terminal for bana: SCRIPT's lines are `expect TEXT` (wait until bana printed it), `send TEXT`
@@ -674,6 +814,7 @@ BANA_SPLIT_CONSENT=$yes_phrase bash "$bana" split on --repo acme/widget-releases
 rb=$T/w/runner && mkdir -p "$rb/out" "$rb/art/7/package"
 cp "$fx/act.jsonl" "$rb/out/act.jsonl" && echo 1 >"$rb/out/rc" && echo "Error: Job 'rust' failed" >"$rb/out/act.err"
 echo tarball >"$rb/art/7/package/pkg.tar.gz.zip"
+echo 'all that act said in a systemd container' >"$rb/out/systemd.log"
 # A bundle sealed by another run (run 1), to this machine's key.
 cp -R "$rb" "$T/w/rb2" && GITHUB_RUN_ID=1 BANA_ID=wid-7 BANA_SHA=$(git rev-parse HEAD) BANA_NONCE=0123456789abcdef0123456789abcdef \
   BANA_SEAL_PUB=$(cat "$s/seal.pub.pem") sp split_runner_seal "$T/w/rb2" "$T/w/bundle" >/dev/null
@@ -698,6 +839,8 @@ check "remote build: and its progress" has "$T/out" '{"bana":"remote","msg":"acm
 check "remote build: act's stderr" has "$T/err" "Error: Job 'rust' failed"
 check "remote build: remote.json" same "$(cat "$b7/remote.json")" \
   "{\"repo\": \"acme/widget-releases\", \"run\": $run, \"url\": \"https://github.com/acme/widget-releases/actions/runs/$run\", \"logs\": \"private\"}"
+check "remote build: its systemd containers' whole output, as the build's systemd.log" same \
+  "$(cat "$b7/systemd.log" 2>/dev/null)" 'all that act said in a systemd container'
 check "remote build: the uploads where the daemon collects them" same "$(cat "$b7/artifacts/7/package/pkg.tar.gz.zip")" tarball
 check "remote build: the sealed bundle deleted from GitHub" test ! -e "$pub/runs/$run/artifact"
 check "remote build: dispatched with the build's inputs, and a nonce" bash -c "tr '\n' ' ' <'$pub/runs/$run/inputs' |

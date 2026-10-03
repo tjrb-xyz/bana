@@ -2,9 +2,10 @@
 # Jobs that need systemd, on real Docker and real act: lib/systemd.sh's container (systemd as
 # PID 1, unprivileged) on act.image, and act in it running a job in host mode as a user with
 # sudo: linger, a user unit that serves, the boundary seen from inside, Ctrl-C, a killed bash,
-# the uploads back; then a run as bana ci makes it (the probe, act, sd_after), and bana ci itself
-# by hand (its view, its log, Ctrl-C). It needs Docker 28 or later and the image, so it runs
-# only when asked, and skips (saying why) without them:
+# the uploads back; then a run as bana ci makes it (the probe, act, sd_after), bana ci itself by
+# hand (its view, its log, Ctrl-C), and bana split's runner (bana.yml's build step). It needs
+# Docker 28 or later and the image, so it runs only when asked, and skips (saying why) without
+# them:
 #
 #   BANA_SYSTEMD=1 tests/systemd.sh
 #
@@ -381,6 +382,71 @@ check "hand: Ctrl-C: its always() step ran" has "$ci/last.log" "| always ran"
 check "hand: Ctrl-C: stopped" same "$st $(sed -n 's/^stopped=//p' "$ci/last.env")" "1 1"
 check "hand: Ctrl-C: no container left" same "$(docker ps -a --format '{{.Names}}' | grep '^bana-systemd-test-ci' || true)" ""
 check "hand: Ctrl-C: no lock left" test ! -e "$T/hand/home/.bana/act.lock"
+cd "$p"
+
+# ---- bana split's runner: the same, on GitHub's side (bana.yml's runner.sh, as rendered) ---------
+# A private project (plan; sd on wid-systemd, it needs plan: systemd as a user, the host's marker
+# looked for, an upload; after, it needs sd), its bana.yml rendered here, and the runner's build
+# step on its checkout, with RUNNER_TEMP in scratch and act this test's: as on GitHub, but here.
+s=$T/split
+mkdir -p "$s/p/.github/workflows" "$s/home" "$s/rt/bana"
+cd "$s/p"
+git init -q .
+printf 'repo = acme/sdsplit\nprefix = wid\ntiers = quick\nact.image = %s\n' "$image" >.github/bana.conf
+cat >.github/workflows/ci.yml <<EOF
+name: ci
+on:
+  workflow_dispatch:
+    inputs:
+      tier: {type: string}
+jobs:
+  plan:
+    runs-on: [self-hosted, wid-linux]
+    steps:
+      - run: echo PRIVATE-PLAN
+  sd:
+    needs: plan
+    runs-on: [self-hosted, wid-systemd]
+    steps:
+      - name: PRIVATE-NAME
+        run: |
+          sudo loginctl enable-linger "\$USER"
+          echo "PRIVATE-HOST user manager \$(systemctl --user is-system-running)"
+          sudo ps -eo args | grep -q '[b]ana-host-marker' && echo "the host's marker seen" || echo "no host process seen"
+          [ -e /var/run/docker.sock ] || [ -e /run/docker.sock ] && echo "a docker socket" || echo "no docker socket"
+          [ -e "\$RUNNER_TEMP/bana/key" ] && echo "the key's path seen" || echo "no key path"
+          echo up >up.txt
+      - uses: actions/upload-artifact@v4
+        with: {name: sd-up, path: up.txt}
+  after:
+    needs: sd
+    runs-on: [self-hosted, wid-linux]
+    steps:
+      - run: echo after
+EOF
+git add -A
+git -c user.name=t -c user.email=t@t commit -q -m one
+env HOME="$s/home" PATH="$T/hand/bin:$PATH" "${BASH_UNDER_TEST:-bash}" "$here/../bin/bana" split render >"$s/bana.yml" 2>"$s/err" ||
+  { cat "$s/err" >&2; exit 1; }
+check "split: bana.yml lints" same "$(env HOME="$s/home" "${BASH_UNDER_TEST:-bash}" "$here/../bin/bana" split lint "$s/bana.yml" 2>&1)" "$s/bana.yml: as bana runs it"
+awk '/<<.BANA_RUNNER.$/ { on = 1; next } on && /^ *BANA_RUNNER$/ { exit } on { sub(/^          /, ""); print }' "$s/bana.yml" >"$s/runner.sh"
+git clone -q "$s/p" "$s/rt/bana/src"
+env RUNNER_TEMP="$s/rt" BANA_ID=test-split-1 BANA_SHA="$(git rev-parse HEAD)" BANA_TIER=quick BANA_JOB='' BANA_LOGS=private \
+  BANA_TEST_ACT="$act" GITHUB_TOKEN=ghp_not_for_the_container "${BASH_UNDER_TEST:-bash}" "$s/runner.sh" build >"$s/console.txt" 2>&1 && st=0 || st=$?
+o=$s/rt/bana/out
+check "split: the build passes" same "$st $(cat "$o/rc")" "0 0"
+check "split: the console has sd, by its id" grep -qx 'sd: ok' "$s/console.txt"
+check "split: and its steps, by their ids" grep -qx 'sd / step 0: ok ([0-9]*s)' "$s/console.txt"
+check "split: no name, output or bana line in public" bash -c "! grep -qE 'PRIVATE|bana: |systemd container' '$s/console.txt'"
+check "split: act.jsonl: sd's success once, plan's once" same \
+  "$(grep -c '"jobID":"sd","jobResult":"success"' "$o/act.jsonl") $(grep -c '"jobID":"plan","jobResult":"success"' "$o/act.jsonl")" "1 1"
+check "split: systemd ran for its user" has "$o/act.jsonl" '"msg":"PRIVATE-HOST user manager running\n"'
+check "split: the boundary held: no host process, no docker socket, no key path" same \
+  "$(grep -cF -e '"msg":"no host process seen\n"' -e '"msg":"no docker socket\n"' -e '"msg":"no key path\n"' "$o/act.jsonl")" 3
+check "split: after is not run here, and why" has "$o/act.jsonl" '"jobID":"after","matrix":{},"msg":"bana: not run here: needs sd, a systemd job"'
+check "split: all the container's act said, in out/systemd.log" has "$o/systemd.log" '"jobID":"plan","jobResult":"success"'
+check "split: sd's upload, in art/" test -n "$(find "$s/rt/bana/art" -path '*/sd-up/*' -type f 2>/dev/null)"
+check "split: no container left" same "$(docker ps -a --format '{{.Names}}' | grep '^bana-systemd-test-split' || true)" ""
 cd "$p"
 
 # ---- nothing left ------------------------------------------------------------------------------

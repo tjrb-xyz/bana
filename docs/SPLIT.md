@@ -116,15 +116,48 @@ The public workflow takes `workflow_dispatch` alone, with the inputs id, sha, re
   bana.conf's `act.image`, pinned by digest: the default's digest is in lib/split.sh, an image by tag gets
   the digest Docker has for it here (`docker pull` it first, or write `NAME@sha256:…`), and an
   `act.platform.*` image runs only when pinned. No job runs on the runner's own machine (act's host mode):
-  GitHub's runner holds the deploy key in its memory and has passwordless sudo. So `<prefix>-systemd` jobs
-  are not run there, nor are macOS jobs: a remote build reports them as not run here (a systemd job as
-  "needs systemd, which this bana.yml does not run: bana split sync"). A split project's systemd jobs run on
-  your machine;
+  GitHub's runner holds the deploy key in its memory and has passwordless sudo. macOS jobs are not run
+  there: a remote build reports them as not run here. Jobs that need systemd (`<prefix>-systemd`, or a label
+  with `act.platform.<label> = systemd`) run after act, each in a systemd container of their own, as
+  `bana ci` runs them here (below). A `bana.yml` rendered before this skips them, and the daemon says
+  "needs systemd, which this bana.yml does not run: bana split sync";
 - **summary**: the table of steps;
 - **seal**: act's output and the jobs' uploads, as a tar, encrypted with AES-256-CBC (pbkdf2) under a fresh
   key; that key, the ciphertext's sha256, the run's id and bana's build, commit and nonce are encrypted with
   RSA-OAEP to `BANA_SEAL_PUB`;
 - **upload**: the artifact `bana-sealed`, kept a day.
+
+### Jobs that need systemd, on the runner
+
+The same code as `bana ci`'s (lib/systemd.sh, carried word for word in `bana.yml`): act's dry run finds the
+jobs whose label's place is systemd (`split_sysd` in the runner); bana says each is next; act runs the rest,
+skipping them; then each runs in a fresh container of `act.image`, pinned by digest (`split_sysd_image`),
+whose PID 1 is systemd, in act's host mode inside it as a user with sudo (the jobs it needs run again
+there, and only its own lines reach `act.jsonl`; all its act said is in `out/systemd.log`, sealed, which the
+daemon keeps as the build's `systemd.log`). A job that needs a systemd job is not run (act runs a job with
+its needs), and says so. The container:
+
+- has Docker's default capabilities, seccomp and AppArmor profiles: no `--privileged`, no added capability,
+  no device, no Docker socket, no namespace of the runner's (its cgroup namespace is its own, writable only
+  in its own subtree: `--cgroupns=private --security-opt writable-cgroups=true`, Docker 28 or later);
+- cannot see the runner's processes: Runner.Worker, which keeps the deploy key in its memory, is in a PID
+  namespace it has no view of, and reading another process's memory needs ptrace or a mount, which its
+  capabilities do not include;
+- has every bind mount read-only: the fetched checkout, act's action cache and the pinned act. The event
+  file goes in as a copy. Never `$RUNNER_TEMP/bana` as a whole (runner.sh, out/, the key's path), `$HOME`,
+  the runner's work directory, or `GITHUB_ENV`, `GITHUB_OUTPUT`, `GITHUB_PATH` and `GITHUB_STEP_SUMMARY`,
+  so a job cannot steer the summary or the seal;
+- gets no secret and no token; its docker CLI runs under `env -i` (PATH, HOME, DOCKER_HOST);
+- gives back only its uploads, as an archive bash checks as it checks a sealed bundle (plain files and
+  directories, no path out of them, 8 GiB at most) and opens without owners or setuid into `art/`.
+
+So it is the boundary act's Linux job containers already have, in which the private code runs as root on
+that runner, with systemd as PID 1 and a writable view of its own cgroup subtree added. `bana split lint`
+checks the container's flags line word for word, that its one mount helper is read-only, that every `-v` is
+`:ro`, and refuses `--privileged`, `--cap-add`, a Docker socket, `--pid`, `--ipc`, `--uts`, `--userns`,
+`--device`, `--volumes-from`, `--volume`, `--mount`, host networking, `--cgroupns=host`, `unconfined`, and
+`--security-opt` or `--cgroupns` anywhere else; `split_sysd_image` must be pinned by digest. On cgroup v1
+(not GitHub's runners), root in the container can raise limits on its own cgroup: limits bana does not set.
 
 The daemon dispatches the run on the public repository's default branch, after checking `bana.yml` at that
 branch's head, with a fresh nonce, and takes only the run named `bana <build> <nonce>`, made since, by that
@@ -227,8 +260,9 @@ commit comment) and to bana's page. Even so:
   in act's containers. The key is off disk by then, but GitHub's runner keeps it in its
   memory: code that escapes its container could read it, and a malicious dependency
   could send your code anywhere.
-- Jobs that need secrets get none. macOS, Windows and <prefix>-systemd jobs do not run
-  there: systemd jobs are for this machine.
+- Jobs that need secrets get none. macOS and Windows jobs do not run there. Jobs that
+  need systemd (<prefix>-systemd) do, each in an unprivileged systemd container: the same
+  boundary as act's other containers, which cannot see the runner's processes.
 - Release notes, release files and the installer are public on purpose. Binaries can be
   reverse-engineered.
 - If you turn logs to public, compiler errors, test output, paths and source lines become
@@ -291,11 +325,17 @@ scratch pair of repositories (a private one with a small workflow, and `bana spl
 10. gh's run list fields bana matches a run by (`event`, `headBranch`, `headSha`, `createdAt`, and the
    run-name with the nonce), `gh workflow run --ref`, `repos/O/R/commits/BRANCH`, `contents?ref=SHA`,
    `actions/workflows/bana.yml`'s `state` and `gh workflow enable`, and the rulesets list and its PUT.
+11. Jobs that need systemd on the runner (cgroup v2, the systemd cgroup driver, AppArmor, Docker 28 or
+   later on `ubuntu-latest`): a run with a `<prefix>-systemd` job that runs `sudo loginctl enable-linger
+   "$USER"` and `systemctl --user` passes, its console shows `JOB / step N: ok` by ids alone, and, from the
+   opened bundle, the job saw no process outside its container and no Docker socket. bana's own e2e job
+   (tests/systemd.sh, `BANA_E2E_SPLIT=1`) runs this on GitHub with act as GitHub; the first real run checks it
+   on GitHub's own runner.
 
 ## Limits
 
-Linux jobs only, in containers (act inside `ubuntu-latest`): `<prefix>-systemd` and macOS jobs run on your
-machine; jobs that need secrets, private submodules or private git
+Linux jobs only, in containers (act inside `ubuntu-latest`; jobs that need systemd in a systemd container,
+whose needs run again inside): macOS jobs run on your machine; jobs that need secrets, private submodules or private git
 dependencies stay with `bana split ci local`. act on a hosted runner pulls its images each run, so it is
 slower than act here, and behaves as act does, not as GitHub's own runner. A remote build holds bana's one
 build slot while it waits on GitHub, so other projects' builds here wait too. With your machine off, nothing

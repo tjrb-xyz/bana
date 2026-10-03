@@ -28,7 +28,8 @@
 #   bana split lint [FILE]        checks a bana.yml (default: the render): only
 #                                 workflow_dispatch, no permissions, no ${{ }} in run:, no
 #                                 action but upload-artifact pinned, no cache, 1-day retention,
-#                                 images pinned by digest, no job on the runner's machine
+#                                 images pinned by digest, no job on the runner's machine,
+#                                 the systemd container as bana runs it (unprivileged)
 # Off a terminal, on takes --repo and BANA_SPLIT_CONSENT (the exact phrase it asks for).
 
 split_usage() { awk '/^#   bana split \[status/, /^# Off a terminal/ { sub(/^# ?/, ""); print }' "$bana_root/lib/split.sh" >&2; exit 2; }
@@ -115,11 +116,12 @@ split_runner_fetch() { # DIR
 
 # act, pinned, on the commit (images pulled when missing): no secrets, no GITHUB_TOKEN, no
 # Docker socket in the job containers, an environment of three variables. Its output goes to
-# out/act.jsonl, and only its steps reach the log as they end. BANA_TEST_ACT: an act already
-# here (tests).
+# out/act.jsonl, and only its steps reach the log as they end. Jobs that need systemd
+# (split_sysd's labels) run after it, each in an unprivileged systemd container of
+# split_sysd_image (split_runner_act). BANA_TEST_ACT: an act already here (tests).
 split_runner_build() { # DIR
   local d=$1 act=${BANA_TEST_ACT:-} rc=0 pid args=() envs=() tier=''
-  mkdir -p "$d/out" "$d/art" "$d/bin"
+  mkdir -p "$d/out" "$d/art" "$d/bin" "$d/cache"
   echo 1 >"$d/out/rc"
   if [[ ! -d $d/src/.git ]]; then
     echo "build: failed (nothing was fetched)"
@@ -139,20 +141,58 @@ split_runner_build() { # DIR
     "${BANA_REF:-}" "$BANA_SHA" "$tier" >"$d/event.json"
   args=(workflow_dispatch --json --rm --pull=false --container-daemon-socket - -C "$d/src"
     -W "$d/src/.github/workflows/$split_workflow" -e "$d/event.json" --artifact-server-path "$d/art"
-    --artifact-server-port $((20000 + RANDOM % 20000)) --container-architecture linux/amd64
+    --artifact-server-port $((20000 + RANDOM % 20000)) --action-cache-path "$d/cache" --container-architecture linux/amd64
     --env "GITHUB_RUN_ID=${BANA_ID##*-}" --env "GITHUB_RUN_NUMBER=${BANA_ID##*-}"
     "${split_platforms[@]}")
   [[ -z ${BANA_JOB:-} ]] || args+=(-j "$BANA_JOB")
   echo "build: act $split_act_version, the workflow $split_workflow${BANA_TIER:+ at $BANA_TIER}${BANA_JOB:+, job $BANA_JOB}"
   envs=(PATH="$PATH" HOME="$HOME" RUNNER_TEMP="$RUNNER_TEMP")
   [[ -z ${DOCKER_HOST:-} ]] || envs+=(DOCKER_HOST="$DOCKER_HOST")
-  env -i "${envs[@]}" "$act" "${args[@]}" >"$d/out/act.jsonl" 2>"$d/out/act.err" </dev/null &
+  split_runner_act "$d" "$act" >"$d/out/act.jsonl" 2>"$d/out/act.err" </dev/null &
   pid=$!
   split_runner_follow "$d/out/act.jsonl" "$pid"
   wait "$pid" || rc=$?
   echo "$rc" >"$d/out/rc"
   if ((rc)); then echo "build: failed (act exited with $rc)"; else echo "build: ok"; fi
   return "$rc"
+}
+
+# act's run (split_runner_build's args and envs), in the background. With jobs that need
+# systemd: lib/systemd.sh's probe first, bana's line for each of them, act (which skips them),
+# then each in a systemd container of its own (sd_after): the docker CLI under env -i too, no
+# label, no lifeline (the runner's machine is thrown away), no secret, no token; read-only, the
+# checkout, act's action cache and the pinned act; the event file, a copy; their uploads back
+# into art/, checked. Their own lines go to act.jsonl (sd_only), all their act said to
+# out/systemd.log (sealed). Its status: the first failure's.
+split_runner_act() { # DIR ACT (in the background: a subshell, whose settings are its own)
+  local d=$1 st=0 rc=0 l sys=''
+  unset GITHUB_TOKEN
+  # shellcheck disable=SC2034 # lib/systemd.sh's settings (its part, below)
+  sysd_act=(env -i "${envs[@]}" "$2")
+  sysd_docker=(env -i PATH="$PATH" HOME="$HOME")
+  [[ -z ${DOCKER_HOST:-} ]] || sysd_docker+=(DOCKER_HOST="$DOCKER_HOST")
+  sysd_docker+=(docker)
+  sd_args=("${args[@]}") sd_labels=' '
+  for l in ${split_sysd[@]+"${split_sysd[@]}"}; do sd_labels="$sd_labels$(printf '%s' "$l" | tr '[:upper:]' '[:lower:]') "; done
+  # shellcheck disable=SC2034 # lib/systemd.sh's settings
+  sd_image=$split_sysd_image sd_arch=linux/amd64 sd_net='' sd_label='' sd_bin=$2 sd_cache=$d/cache
+  # shellcheck disable=SC2034 # lib/systemd.sh's settings
+  sd_root=$d/src sd_wf=$d/src/.github/workflows/$split_workflow sd_probe_file=$d/probe sd_log=$d/out/systemd.log
+  # shellcheck disable=SC2034 # lib/systemd.sh's settings
+  sd_art=$d/art sd_name=bana-systemd-${BANA_ID:-run} sd_life='' sd_stop='' sd_live=''
+  if [[ -n ${sd_labels// /} ]] && sd_probe "$sd_probe_file" "${args[@]}" &&
+    awk -F'\t' '$4 == 1 { f = 1 } END { exit !f }' "$sd_probe_file"; then
+    # The probe fetched the actions into act's cache, which each container gets a copy of.
+    sys=1 sd_args+=(--action-offline-mode)
+    : >"$sd_log"
+    sd_next json
+  fi
+  env -i "${envs[@]}" "$2" "${args[@]}" </dev/null || st=$?
+  if [[ -n $sys ]]; then
+    sd_after json "$d/out/act.jsonl" "$d/out/act.err" || rc=$?
+    ((st)) || st=$rc
+  fi
+  return "$st"
 }
 
 # act's lines, as they come, through split_runner_steps, until act ends. Workflow commands
@@ -248,9 +288,10 @@ split_sha256() { # FILE
 }
 # ---- end of the runner --------------------------------------------------------------
 
-# The runner's part of this file, as text: what bana.yml carries.
+# The runner's part of this file, then lib/systemd.sh's, as text: what bana.yml carries.
 split_runner_text() {
   awk '/^# ---- the runner: /, /^# ---- end of the runner/' "$bana_root/lib/split.sh"
+  awk '/^# ---- systemd: /, /^# ---- end of systemd/' "$bana_root/lib/systemd.sh"
 }
 
 # DIR/sealed (key.enc, bundle.enc) opened with PEM into OUT: out/ and art/. Refused, with
@@ -307,12 +348,13 @@ split_unseal() { # SEALED OUT PEM [RUN ID SHA NONCE]
 
 # ---- the public repository's workflow ---------------------------------------------------
 
-# bana.yml for this project: lib/split.yml.in with the runner, its pins, and the project's
-# workflow, tier input, timeout and platforms: Linux jobs in act.image, pinned by digest; macOS
-# and <prefix>-systemd jobs not run (no job runs on the runner's own machine, which holds the
-# deploy key in its memory: a systemd job runs on bana's machine).
+# bana.yml for this project: lib/split.yml.in with the runner (and lib/systemd.sh's part), its
+# pins, and the project's workflow, tier input, timeout and platforms: Linux jobs in act.image,
+# pinned by digest; jobs that need systemd (<prefix>-systemd) each in an unprivileged systemd
+# container of that image (split_sysd, split_sysd_image); macOS and Windows jobs not run. No job
+# runs on the runner's own machine (act's host mode), which holds the deploy key in its memory.
 split_render() {
-  local wf tin t image runner l v p=()
+  local wf tin t image runner l v p=() sysd=()
   # shellcheck source=SCRIPTDIR/act.sh
   source "$bana_root/lib/act.sh"
   wf=$(conf workflow ci.yml)
@@ -324,13 +366,13 @@ split_render() {
   while IFS=$'\t' read -r l v; do
     case $v in
     linux) v=$image ;;
+    systemd) v='' sysd+=("$l") ;;
     mac | skip | "skip "* | -*) v= ;;
     *@sha256:*) ;;
     *) v= ;; # an image of its own, unless pinned by digest: not run
     esac
     p+=("-P" "$l=$v")
   done < <(act_platform_table)
-  p+=("-P" "$prefix-systemd=")
   runner=$(
     echo "set -euo pipefail"
     printf 'split_act_version=%s\nsplit_act_sha256=%s\nsplit_host_key=%s\n' "$(split_q "$split_act_version")" \
@@ -339,6 +381,10 @@ split_render() {
     printf 'split_platforms=('
     for v in "${p[@]}"; do printf ' %s' "$(split_q "$v")"; done
     printf ' )\n'
+    # Not split_platforms: the lint's rule for those (no host mode) is about act's first run.
+    printf 'split_sysd=('
+    for v in ${sysd[@]+"${sysd[@]}"}; do printf ' %s' "$(split_q "$v")"; done
+    printf ' )\nsplit_sysd_image=%s\n' "$(split_q "$image")"
     split_runner_text
     echo 'split_runner_main "$@"'
   )
@@ -375,12 +421,41 @@ split_image() { # IMAGE
   echo "$1@${d#*@}"
 }
 
+# The systemd container's flags and its one mount helper, as lib/systemd.sh has them: the lint
+# takes no other (split_lint).
+split_sd_flags='sd_run_flags=(--cgroupns=private --security-opt writable-cgroups=true --tmpfs /run --tmpfs /run/lock --stop-signal SIGRTMIN+3 -e container=docker --entrypoint /sbin/init)'
+# shellcheck disable=SC2016 # bash's text, not expanded here
+split_sd_mount='sd_mounts+=(-v "$1:$1:ro")'
+
 # Checks a bana.yml: why it is not one bana runs, a line each (nothing: it is).
 split_lint() { # FILE
-  awk -v q="'" '
+  awk -v q="'" -v flags="$split_sd_flags" -v mount="$split_sd_mount" '
     function bad(why) { print why; n++ }
     function ind(s) { match(s, /^ */); return RLENGTH }
     { line = $0; i = ind(line) }
+    # The systemd container (lib/systemd.sh, in the runner, so in a run: block): its flags as
+    # bana has them, on one line; its mounts read-only; nothing that would give it more.
+    line !~ /^[ \t]*#/ {
+      t = line; sub(/^[ \t]+/, "", t)
+      if (index(t, "sd_run_flags=") == 1) { nflags++; if (t != flags) bad("line " NR ": the systemd container'"'"'s flags are not bana'"'"'s") }
+      else if (t ~ /--security-opt|--cgroupns/) bad("line " NR ": --security-opt or --cgroupns, outside the systemd container'"'"'s flags")
+      if (index(t, "sd_mounts+=(") == 1 && t != mount) bad("line " NR ": a mount, other than read-only as it is")
+      r = t
+      while ((j = index(r, "-v \"")) > 0) {
+        r = substr(r, j + 4); v = substr(r, 1, index(r, "\"") - 1)
+        if (v !~ /:ro$/) bad("line " NR ": a mount, not read-only: " v)
+      }
+      if (match(t, /--privileged|--cap-add|docker\.sock([^e]|$)|--pid|--ipc|--uts|--userns|--device|--volumes-from|--volume|--mount|--network[ =]host|--net=host|--cgroupns=host|=unconfined/))
+        bad("line " NR ": " substr(t, RSTART, RLENGTH) ": more than the systemd container has")
+      if (t ~ /^split_sysd_image=/) {
+        v = t; sub(/^split_sysd_image=/, "", v); gsub(q, "", v); h = v; sub(/^.*@sha256:/, "", h)
+        if (index(v, "@sha256:") == 0 || length(h) != 64 || h !~ /^[0-9a-f]+$/) bad("line " NR ": split_sysd_image=" v ": an image pinned by digest only")
+      }
+      if (t ~ /^split_sysd=\(/) {
+        v = t; sub(/^split_sysd=\( */, "", v)
+        if (v !~ /^('"'"'[a-z0-9_.-]+'"'"' )*\)$/) bad("line " NR ": split_sysd: labels alone")
+      }
+    }
     # The platforms of the runner: each image pinned by digest, none on its own machine.
     /split_platforms=\(/ {
       rest = line; pre = q "-P" q " " q
@@ -414,6 +489,7 @@ split_lint() { # FILE
     END {
       if (!perms) bad("no permissions: {} (the token would get the default scopes)")
       if (!ret) bad("no retention-days: 1 on the upload")
+      if (nflags != 1) bad("not one sd_run_flags line, bana'"'"'s (the systemd container'"'"'s flags)")
       exit n > 0
     }' "$1"
 }
@@ -655,8 +731,9 @@ commit comment) and to bana's page. Even so:
   in act's containers. The key is off disk by then, but GitHub's runner keeps it in its
   memory: code that escapes its container could read it, and a malicious dependency
   could send your code anywhere.
-- Jobs that need secrets get none. macOS, Windows and <prefix>-systemd jobs do not run
-  there: systemd jobs are for this machine.
+- Jobs that need secrets get none. macOS and Windows jobs do not run there. Jobs that
+  need systemd (<prefix>-systemd) do, each in an unprivileged systemd container: the same
+  boundary as act's other containers, which cannot see the runner's processes.
 - Release notes, release files and the installer are public on purpose. Binaries can be
   reverse-engineered.
 - If you turn logs to public, compiler errors, test output, paths and source lines become
@@ -1346,6 +1423,8 @@ split_remote() { # TIER JOB ARTIFACTS
   if [[ -f $tmp/open/out/act.jsonl ]]; then
     cat "$tmp/open/out/act.jsonl"
     cat "$tmp/open/out/act.err" >&2 2>/dev/null || true
+    # All that act said in each systemd container (its own lines are in act.jsonl), as bana ci keeps it.
+    [[ ! -f $tmp/open/out/systemd.log ]] || cp "$tmp/open/out/systemd.log" systemd.log 2>/dev/null || true
     rc=$(cat "$tmp/open/out/rc" 2>/dev/null) || rc=1
     [[ $rc =~ ^[0-9]+$ ]] || rc=1
     if [[ -n $(ls -A "$tmp/open/art" 2>/dev/null) ]]; then

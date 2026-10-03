@@ -402,7 +402,9 @@ The wizard checks first, shows the plan and what becomes public, and takes your 
 repository with gh, or opens GitHub's new-repository page filled in. The public repository holds a README and
 bana's own workflow, which fetches each pushed commit with a read-only deploy key, builds it with act, and prints
 only its steps; the full output is encrypted to a key on your machine, and the daemon writes it to the code's
-repository (a commit comment) and to its page, labelled as a remote run with a link to it.
+repository (a commit comment) and to its page, labelled as a remote run with a link to it. Jobs that need
+systemd run there as `bana ci` runs them here, each in an unprivileged systemd container, which cannot see the
+runner's processes (its memory holds the deploy key); macOS jobs do not run there.
 
 ```sh
 bana split plan                  # what it would do; changes nothing

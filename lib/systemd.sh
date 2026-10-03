@@ -450,7 +450,9 @@ sd_up() { # NAME IMAGE ARCH NET PREFIX ACT CACHE [RO-PATH...]
     chmod 440 /etc/sudoers.d/runner
     mkdir -p /home/runner/.cache/act /home/runner/.bana/artifacts
     for a in /bana/in/cache/*@*; do [ ! -d "$a" ] || cp -R "$a" /home/runner/.cache/act/; done
-    chown -R runner: /home/runner
+    # Not -R on /home/runner: a mount may be under it (on a GitHub runner, RUNNER_TEMP is).
+    chown runner: /home/runner
+    chown -R runner: /home/runner/.cache /home/runner/.bana
     loginctl enable-linger runner
     systemctl start "user@$u.service"
     for x in "$r" "$@"; do

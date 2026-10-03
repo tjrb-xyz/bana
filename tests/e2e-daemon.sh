@@ -1265,8 +1265,19 @@ jobs:
   host:
     runs-on: sec-systemd
     steps:
-      - name: on the runner's machine
-        run: echo "PRIVATE-HOST"
+      - name: in a systemd container on the runner
+        run: |
+          sudo loginctl enable-linger "$USER"
+          echo "PRIVATE-HOST $(systemctl --user is-system-running)"
+      - name: the boundary, seen from inside
+        run: |
+          sudo ps -eo args >ps.txt
+          awk '/runner\.sh|Runner\.(Worker|Listener)|dockerd/ || (/act workflow_dispatch/ && $1 != "/bana/bin/act") { f = 1 } END { exit !f }' ps.txt &&
+            echo "BOUNDARY outer process seen" || echo "BOUNDARY no outer process"
+          sudo grep -l BANA_SOURCE_KEY /proc/[0-9]*/environ >/dev/null 2>&1 && echo "BOUNDARY a key in an environment" || echo "BOUNDARY no key in any environment"
+          [ -e /var/run/docker.sock ] || [ -e /run/docker.sock ] && echo "BOUNDARY a docker socket" || echo "BOUNDARY no docker socket"
+          sudo find / -path /proc -prune -o -path /sys -prune -o \( -name runner.sh -o -name known_hosts \) -path '*/bana/*' -print 2>/dev/null | grep -q . &&
+            echo "BOUNDARY the runner's files seen" || echo "BOUNDARY none of the runner's files"
 YML
     git add -A && git -c user.name=t -c user.email=t@t commit -q -m private
     git clone -q --bare . "$sp/private.git"
@@ -1289,7 +1300,8 @@ YML
   check "split: the public console has each step, by its id" has "$sp/console.txt" "test / step 0: failed"
   check "split: and the matrix job's" has "$sp/console.txt" "build / step v: ok"
   check "split: no step's name (a script, an output, a matrix value)" not grep -qE 'compile|cargo test|version' "$sp/console.txt"
-  check "split: <prefix>-systemd's job, not on the runner's machine" not grep -qE 'host / |host: ' "$sp/console.txt"
+  check "split: <prefix>-systemd's job, in a systemd container, by its id" has "$sp/console.txt" "| host / step 0: ok ("
+  check "split: and its end" grep -q '| host: ok' "$sp/console.txt"
   check "split: the job summary" has "$sp/console.txt" "steps: "
   check "split: no output, path or matrix value in public" not grep -qE 'PRIVATE|MATRIXVALUE|secret\.rs' "$sp/console.txt"
   check "split: act.image pinned by digest" grep -q "sec-linux=[^']*@sha256:[0-9a-f]\{64\}'" "$sp/pub/.github/workflows/bana.yml"
@@ -1300,8 +1312,14 @@ YML
   check "split: it opens here, act's whole output" has "$sp/open/out/act.jsonl" "PRIVATE-FAILURE assert_eq!(secret, 42)"
   check "split: and act's exit" same "$(cat "$sp/open/out/rc" 2>/dev/null)" 1
   check "split: and the upload, where the daemon collects it" test -n "$(find "$sp/open/art/7" -name '*.zip' 2>/dev/null)"
-  check "split: the systemd job skipped, its label named for the daemon" has "$sp/open/out/act.jsonl" '-P sec-systemd=...'
-  check "split: and never run" not grep -q 'PRIVATE-HOST' "$sp/open/out/act.jsonl"
+  check "split: the systemd job: bana's next line" has "$sp/open/out/act.jsonl" '"jobID":"host","matrix":{},"msg":"bana: next, in a systemd container"'
+  check "split: and its own run, in its container, with systemd for its user" has "$sp/open/out/act.jsonl" '"msg":"PRIVATE-HOST running\n"'
+  check "split: and its success, once" same "$(grep -c '"jobID":"host","jobResult":"success"' "$sp/open/out/act.jsonl")" 1
+  check "split: the boundary, seen from inside: no outer process, key, docker socket or runner's file" same \
+    "$(grep -o '"msg":"BOUNDARY [^"]*' "$sp/open/out/act.jsonl" | sed 's/^"msg":"BOUNDARY //; s/\\n$//' | tr '\n' '|')" \
+    "no outer process|no key in any environment|no docker socket|none of the runner's files|"
+  check "split: all its container's act said, sealed" test -s "$sp/open/out/systemd.log"
+  check "split: no systemd container left" same "$(docker ps -aq --filter name=bana-systemd-sec-7)" ""
 else
   echo "e2e-daemon: bana split's public workflow skipped (BANA_E2E_SPLIT=1 runs it)"
 fi
